@@ -58,7 +58,7 @@ pub struct SessionHandle {
     /// Send `()` to cancel; dropping the sender has the same effect.
     pub cancel:     tokio::sync::oneshot::Sender<()>,
     /// Resolves when the session exits cleanly or with an error string.
-    pub done:       tokio::sync::oneshot::Receiver<Result<(), String>>,
+    pub done:       tokio::sync::oneshot::Receiver<Result<(), VfsError>>,
     /// Local TCP port bound by the backend (port-forward only; `None` for exec sessions).
     pub local_port: Option<u16>,
     /// Stdin writer for TTY exec sessions; absent for port-forward and non-interactive exec.

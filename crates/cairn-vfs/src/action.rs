@@ -102,8 +102,10 @@ pub enum ActionCtx {
 pub struct SessionHandle {
     /// Send `()` (or drop) to cancel the session.
     pub cancel: tokio::sync::oneshot::Sender<()>,
-    /// Resolves when the session exits cleanly or with a redacted error message.
-    pub done: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    /// Resolves when the session exits cleanly or with an error. Carries a [`VfsError`] (not a bare
+    /// string) so the consumer can apply [`VfsError::redacted`] before display — keeping the error
+    /// type and redaction contract structural rather than convention.
+    pub done: tokio::sync::oneshot::Receiver<Result<(), VfsError>>,
     /// The local TCP port a port-forward bound; `None` for exec sessions.
     pub local_port: Option<u16>,
     /// Writer for an interactive exec's stdin; `None` for port-forward / non-interactive exec.
