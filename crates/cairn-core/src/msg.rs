@@ -153,6 +153,8 @@ pub enum AppEffect {
         /// Whether to move (delete source after copy) rather than copy.
         is_move: bool,
     },
+    /// Cancel the in-flight transfer, if any.
+    CancelTransfer,
     /// Delete entries on a connection.
     Delete {
         /// The connection.

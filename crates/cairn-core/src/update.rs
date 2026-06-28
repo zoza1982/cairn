@@ -130,7 +130,12 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             });
             Vec::new()
         }
-        // No overlay open: confirm/cancel and the plan-only actions are no-ops.
+        // With no overlay, Cancel (Esc) aborts an in-flight transfer if one is running.
+        Action::Cancel if state.transfer_bytes.is_some() => {
+            state.status = Some("Cancelling transfer…".to_owned());
+            vec![AppEffect::CancelTransfer]
+        }
+        // No overlay open: confirm/cancel and the plan-only actions are otherwise no-ops.
         Action::Confirm | Action::Cancel | Action::ApproveAll | Action::Reject => Vec::new(),
         Action::Refresh => reload(state, state.focus),
         Action::CycleSort => {
@@ -1145,6 +1150,21 @@ mod tests {
             Msg::Event(AppEvent::TransferProgress { bytes: 8192 }),
         );
         assert_eq!(s.transfer_bytes, Some(8192));
+    }
+
+    #[test]
+    fn cancel_aborts_an_in_flight_transfer_else_is_a_no_op() {
+        // Pure-reducer assertion: that `CancelTransfer` is emitted. The token actually aborting the
+        // transfer is covered by the app-level `cancelled_transfer_reports_a_non_error_completion`.
+        let mut s = state();
+        // No transfer, no overlay: Cancel does nothing.
+        assert!(update(&mut s, Msg::Action(Action::Cancel)).is_empty());
+        // Start a transfer, then Cancel emits CancelTransfer.
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(matches!(&fx[..], [AppEffect::CancelTransfer]));
+        assert!(s.status.as_deref().unwrap().contains("Cancelling"));
     }
 
     #[test]
