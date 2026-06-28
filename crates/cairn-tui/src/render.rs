@@ -112,13 +112,17 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
     }
 }
 
-/// Draw the transfer-queue view: the active transfer (if any) plus the pending list, with the
-/// selection cursor marked.
+/// Draw the transfer-queue view: the active transfer(s) plus the pending list, with the selection
+/// cursor marked on the pending rows.
 fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     let pending = &state.transfer_queue;
-    let h = u16::try_from(pending.len())
+    let active = &state.active_transfers;
+    // Active section is `active.len()` rows, or 1 row ("active: (none)") when empty.
+    let active_rows = active.len().max(1);
+    let rows = active_rows.saturating_add(pending.len());
+    let h = u16::try_from(rows)
         .unwrap_or(u16::MAX)
-        .saturating_add(5) // active line + 2 borders + blank + hint
+        .saturating_add(4) // 2 borders + blank separator + hint line
         .min(frame.area().height);
     let area = centered(frame.area(), 60, h.max(5));
     frame.render_widget(Clear, area);
@@ -127,10 +131,25 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
         .border_style(Style::default().fg(Color::Cyan));
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(match state.active_transfers.first() {
-        Some(t) => format!("active: transferring… {}", human_bytes(t.bytes)),
-        None => "active: (none)".to_owned(),
-    }));
+    if active.is_empty() {
+        lines.push(Line::from("active: (none)".to_owned()));
+    } else {
+        for t in active {
+            let state_label = if t.paused {
+                "paused"
+            } else {
+                "transferring…"
+            };
+            let pct = match t.total {
+                Some(total) if total > 0 => format!(" ({}%)", pct_of(t.bytes, total)),
+                _ => String::new(),
+            };
+            lines.push(Line::from(format!(
+                "active: {state_label} {}{pct}",
+                human_bytes(t.bytes)
+            )));
+        }
+    }
     for (i, q) in pending.iter().enumerate() {
         let verb = if q.is_move { "move" } else { "copy" };
         let marker = if i == cursor { "> " } else { "  " };
@@ -364,54 +383,12 @@ fn list_window(cursor: usize, total: usize, rows: usize) -> usize {
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let pane = state.active();
     let count = pane_count_label(pane);
-    // A live transfer takes over the status line with progress (bytes, %/ETA when the total is
-    // known, rate, and queue depth). At concurrency 1 there is at most one; the N>1 aggregate view
-    // is a follow-up.
-    let line = if let Some(t) = state.active_transfers.first() {
-        let bytes = t.bytes;
-        // "X" or "X / Y (Z%)" when a pre-scanned total is available.
-        let amount = match t.total {
-            Some(total) if total > 0 => {
-                let pct = ((bytes as f64 / total as f64) * 100.0).min(100.0) as u64;
-                format!("{} / {} ({pct}%)", human_bytes(bytes), human_bytes(total))
-            }
-            _ => human_bytes(bytes),
-        };
-        // While paused, drop the rate/ETA (they're meaningless when stopped) and show a paused label.
-        let (rate, eta) = if t.paused {
-            (String::new(), String::new())
-        } else {
-            let rate = match t.rate {
-                Some(r) => format!(" at {}/s", human_bytes(r)),
-                None => String::new(),
-            };
-            // ETA needs both a total and a positive rate; suppress a sub-second "ETA 0s" tail.
-            let eta = match (t.total, t.rate) {
-                (Some(total), Some(r)) if r > 0 && total > bytes => {
-                    let secs = (total - bytes) / r;
-                    if secs > 0 {
-                        format!(", ETA {}", human_duration(secs))
-                    } else {
-                        String::new()
-                    }
-                }
-                _ => String::new(),
-            };
-            (rate, eta)
-        };
-        let paused = t.paused;
-        let queued = state.transfer_queue.len();
-        let suffix = if queued > 0 {
-            format!(" (+{queued} queued)")
-        } else {
-            String::new()
-        };
-        let label = if paused {
-            "⏸ paused"
-        } else {
-            "⇅ transferring…"
-        };
-        Line::from(format!(" {count}   {label} {amount}{rate}{eta}{suffix}"))
+    // Priority: a live transfer (single or aggregate) takes over the status line; otherwise the
+    // transient status message (if any); otherwise the key hints.
+    let line = if !state.active_transfers.is_empty() {
+        Line::from(format!(" {count}   {}", transfer_status(state)))
+    } else if let Some(msg) = &state.status {
+        Line::from(format!(" {count}   {msg}"))
     } else {
         let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · p pause · r refresh · ^O conn · ^T queue · ^A ai";
         Line::from(format!(" {count}   {help}"))
@@ -420,6 +397,91 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         Paragraph::new(line).style(Style::default().fg(theme.status)),
         area,
     );
+}
+
+/// The transfer segment of the status line. One active transfer renders exactly as before
+/// (`⇅ X / Y (Z%) at R/s, ETA Ns`); multiple render an aggregate (`⇅ N active · …`). A `(+K queued)`
+/// suffix is appended when transfers wait for a free slot.
+fn transfer_status(state: &AppState) -> String {
+    let active = &state.active_transfers;
+    let queued = state.transfer_queue.len();
+    let suffix = if queued > 0 {
+        format!(" (+{queued} queued)")
+    } else {
+        String::new()
+    };
+    let paused = active.iter().filter(|t| t.paused).count();
+
+    // Aggregate byte/total/rate across active transfers. `total` is `None` if any is unknown
+    // (a partial percentage would mislead); `rate` sums only running (non-paused) transfers.
+    let bytes: u64 = active
+        .iter()
+        .fold(0u64, |acc, t| acc.saturating_add(t.bytes));
+    let total: Option<u64> = active
+        .iter()
+        .try_fold(0u64, |acc, t| t.total.map(|x| acc.saturating_add(x)));
+    let amount = match total {
+        Some(total) if total > 0 => {
+            format!(
+                "{} / {} ({}%)",
+                human_bytes(bytes),
+                human_bytes(total),
+                pct_of(bytes, total)
+            )
+        }
+        _ => human_bytes(bytes),
+    };
+
+    if active.len() == 1 {
+        // Single transfer: identical format to the pre-concurrency status line.
+        let t = &active[0];
+        if t.paused {
+            return format!("⏸ paused {amount}{suffix}");
+        }
+        let rate = match t.rate {
+            Some(r) => format!(" at {}/s", human_bytes(r)),
+            None => String::new(),
+        };
+        let eta = match (t.total, t.rate) {
+            (Some(tot), Some(r)) if r > 0 && tot > t.bytes => {
+                let secs = (tot - t.bytes) / r;
+                if secs > 0 {
+                    format!(", ETA {}", human_duration(secs))
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
+        return format!("⇅ transferring… {amount}{rate}{eta}{suffix}");
+    }
+
+    // Multiple transfers: a compact aggregate (per-transfer detail is in the Ctrl-T overlay).
+    let n = active.len();
+    if paused == n {
+        return format!("⏸ {n} paused · {amount}{suffix}");
+    }
+    let running_rate: u64 = active
+        .iter()
+        .filter(|t| !t.paused)
+        .filter_map(|t| t.rate)
+        .sum();
+    let rate = if running_rate > 0 {
+        format!(" at {}/s", human_bytes(running_rate))
+    } else {
+        String::new()
+    };
+    let head = if paused > 0 {
+        format!("⇅ {n} active, {paused} paused")
+    } else {
+        format!("⇅ {n} active")
+    };
+    format!("{head} · {amount}{rate}{suffix}")
+}
+
+/// Integer percentage of `bytes` out of `total`, clamped to `[0, 100]`. Caller ensures `total > 0`.
+fn pct_of(bytes: u64, total: u64) -> u64 {
+    ((bytes as f64 / total as f64) * 100.0).min(100.0) as u64
 }
 
 /// Format a duration in seconds compactly (`45s`, `3m12s`, `1h05m`).
@@ -484,7 +546,8 @@ mod tests {
         s
     }
 
-    /// Push a single active transfer with the given progress, for status-line/overlay render tests.
+    /// Push an active transfer with the given progress, for status-line/overlay render tests. Mints a
+    /// fresh id from `next_transfer_id` so repeated pushes get distinct ids (mirrors the reducer).
     fn set_transfer(
         s: &mut AppState,
         bytes: u64,
@@ -492,8 +555,10 @@ mod tests {
         total: Option<u64>,
         paused: bool,
     ) {
+        let id = s.next_transfer_id;
+        s.next_transfer_id += 1;
         s.active_transfers.push(cairn_core::ActiveTransfer {
-            id: 1,
+            id,
             label: "Copying 1 item(s)…".to_owned(),
             bytes,
             rate,
@@ -677,6 +742,60 @@ mod tests {
             "expected human-readable byte total"
         );
         assert!(text.contains("512.0 KiB/s"), "expected throughput rate");
+    }
+
+    #[test]
+    fn status_line_aggregates_multiple_active_transfers() {
+        let mut s = ready_state();
+        set_transfer(&mut s, 1024 * 1024, Some(512 * 1024), None, false);
+        set_transfer(&mut s, 1024 * 1024, Some(512 * 1024), None, false);
+        let text = render_text(&s, 100, 24);
+        assert!(
+            text.contains("2 active"),
+            "expected aggregate header: {text}"
+        );
+        assert!(text.contains("2.0 MiB"), "summed bytes: {text}");
+        assert!(text.contains("1.0 MiB/s"), "summed rate: {text}");
+    }
+
+    #[test]
+    fn status_line_shows_some_paused_in_aggregate() {
+        let mut s = ready_state();
+        set_transfer(&mut s, 1024, Some(512), None, false);
+        set_transfer(&mut s, 1024, None, None, true);
+        let text = render_text(&s, 100, 24);
+        assert!(
+            text.contains("2 active, 1 paused"),
+            "expected mixed state: {text}"
+        );
+    }
+
+    #[test]
+    fn status_line_all_paused_aggregate() {
+        let mut s = ready_state();
+        set_transfer(&mut s, 1024, None, None, true);
+        set_transfer(&mut s, 1024, None, None, true);
+        let text = render_text(&s, 100, 24);
+        assert!(
+            text.contains("2 paused"),
+            "expected all-paused label: {text}"
+        );
+        assert!(
+            !text.contains("active"),
+            "no 'active' when all paused: {text}"
+        );
+    }
+
+    #[test]
+    fn status_line_falls_back_to_the_status_message_when_idle() {
+        // With no active transfer, a transient status message is shown (it was previously invisible).
+        let mut s = ready_state();
+        s.status = Some("All transfers cancelled".to_owned());
+        let text = render_text(&s, 100, 24);
+        assert!(
+            text.contains("All transfers cancelled"),
+            "status message must be visible: {text}"
+        );
     }
 
     #[test]

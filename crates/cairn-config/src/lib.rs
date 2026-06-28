@@ -40,6 +40,9 @@ pub struct Config {
     /// on-run confirm. Empty by default.
     #[serde(default)]
     pub shell_actions: Vec<ShellActionDef>,
+    /// Transfer-engine preferences.
+    #[serde(default)]
+    pub transfers: TransfersConfig,
 }
 
 impl Default for Config {
@@ -49,7 +52,33 @@ impl Default for Config {
             ui: UiConfig::default(),
             connections: Vec::new(),
             shell_actions: Vec::new(),
+            transfers: TransfersConfig::default(),
         }
+    }
+}
+
+/// Transfer-engine preferences (`[transfers]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransfersConfig {
+    /// How many transfers may run at once (the raw config value). Read it through
+    /// [`effective_concurrency`](TransfersConfig::effective_concurrency), which clamps to `>= 1`;
+    /// `1` is strict FIFO. Default 2.
+    pub concurrency: usize,
+}
+
+impl Default for TransfersConfig {
+    fn default() -> Self {
+        Self { concurrency: 2 }
+    }
+}
+
+impl TransfersConfig {
+    /// The effective concurrency limit, clamped to at least 1 (a configured `0` would wedge the
+    /// queue — every transfer would be queued and none would ever start).
+    #[must_use]
+    pub fn effective_concurrency(&self) -> usize {
+        self.concurrency.max(1)
     }
 }
 
@@ -534,6 +563,36 @@ mod tests {
         let warn = cfg.secure_shell_actions(&path);
         assert!(warn.is_none(), "owner-only config is trusted: {warn:?}");
         assert_eq!(cfg.shell_actions.len(), 1);
+    }
+
+    #[test]
+    fn transfers_concurrency_defaults_and_clamps() {
+        assert_eq!(Config::default().transfers.effective_concurrency(), 2);
+        assert_eq!(
+            TransfersConfig { concurrency: 4 }.effective_concurrency(),
+            4
+        );
+        // A configured 0 is clamped to 1 (else the queue would never drain).
+        assert_eq!(
+            TransfersConfig { concurrency: 0 }.effective_concurrency(),
+            1
+        );
+    }
+
+    #[test]
+    fn transfers_config_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.transfers.concurrency = 3;
+        cfg.save(&path).unwrap();
+        assert_eq!(
+            Config::load(&path)
+                .unwrap()
+                .transfers
+                .effective_concurrency(),
+            3
+        );
     }
 
     #[test]

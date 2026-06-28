@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Concurrent transfers** (M2): up to N transfers now run at once (default **2**, set via
+  `[transfers] concurrency` in config; clamped to ≥ 1). The status line shows an aggregate while
+  several run (`⇅ 2 active · 2.0 MiB at 1.0 MiB/s (+1 queued)`), and the `Ctrl-T` queue view lists
+  every active transfer plus the pending ones. `p` pauses/resumes and `Esc` cancels *all* active
+  transfers; the rest queue (FIFO) and start as slots free. A transfer task that dies unexpectedly
+  always releases its slot. Idle status messages (e.g. "Transfer paused") are now shown on the status
+  line instead of being silently dropped.
 - **Shell-command actions** (M8-7): bind a key in config to run a local program against the entry
   under the cursor — e.g. `[[shell_actions]]` with `name`/`key`/`command`/`args` (placeholders
   `{path}`/`{dir}`/`{name}`). **Security-first** (see ADR-0005): argv-only with **no shell**

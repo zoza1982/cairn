@@ -66,6 +66,8 @@ async fn run_async() -> anyhow::Result<()> {
 
     // Load user config (keybinding overrides, connection profiles, …); fall back to defaults.
     let config = load_config();
+    // How many transfers run at once (clamped to >= 1 so a stray `0` can't wedge the queue).
+    state.concurrency_limit = config.transfers.effective_concurrency();
 
     // Validate the (file-trusted) shell actions, dropping any malformed entry with a warning. The
     // surviving list, in order, is the single source of index alignment shared by the keymap,
@@ -266,6 +268,31 @@ struct TransferControls {
     pause: watch::Sender<bool>,
 }
 
+/// Drop-guard that emits a synthetic [`AppEvent::TransferDone`] if the transfer task ends without
+/// sending its own (a panic or an early drop). This keeps the reducer's `active_transfers` and the
+/// runtime's control map from leaking a slot. Disarmed once the task produces its real outcome event.
+struct TransferDoneGuard {
+    id: TransferId,
+    event_tx: mpsc::Sender<AppEvent>,
+    armed: bool,
+}
+
+impl Drop for TransferDoneGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort (`try_send`, no `.await` allowed in Drop). If the bounded event channel is
+            // momentarily full the synthetic event is dropped and this transfer's slot leaks for the
+            // process lifetime — but the channel (256 deep) is ~never near full at concurrency ≤ a
+            // few while a task panics, so the race is negligible.
+            let _ = self.event_tx.try_send(AppEvent::TransferDone {
+                id: self.id,
+                status: "Transfer interrupted".to_owned(),
+                error: true,
+            });
+        }
+    }
+}
+
 /// Translate a terminal event into a reducer message (or `None` to ignore).
 ///
 /// While a text prompt is capturing input, keys are routed to the field as [`Msg::Text`] rather than
@@ -340,11 +367,20 @@ fn dispatch(
                 },
             );
             tokio::spawn(async move {
+                // A drop-guard guarantees a terminal event even if the transfer task panics or is
+                // dropped mid-run, so its control entry + active-transfer slot are always reclaimed
+                // (otherwise a panicked task at concurrency > 1 would slowly leak slots).
+                let mut guard = TransferDoneGuard {
+                    id,
+                    event_tx: event_tx.clone(),
+                    armed: true,
+                };
                 let ev = run_transfer_effect(
                     &registry, id, src_conn, dst_conn, items, is_move, overwrite, &event_tx,
                     cancel, paused,
                 )
                 .await;
+                guard.armed = false; // completed normally; the real event below reports the outcome
                 let _ = event_tx.send(ev).await;
             });
         }
@@ -1357,6 +1393,44 @@ mod tests {
         let registry = VfsRegistry::new();
         let ev = run_shell_action_effect(&registry, &[], 0, LEFT, VfsPath::root()).await;
         assert!(matches!(ev, AppEvent::ShellActionDone { error: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn transfer_done_guard_emits_synthetic_done_when_dropped_armed() {
+        // Dropping an armed guard (the task panicked / was dropped before completing) must emit a
+        // terminal TransferDone so the reducer + control map release the slot.
+        let (tx, mut rx) = mpsc::channel(8);
+        let guard = TransferDoneGuard {
+            id: 7,
+            event_tx: tx,
+            armed: true,
+        };
+        drop(guard);
+        let ev = rx.try_recv().ok();
+        assert!(
+            matches!(
+                ev,
+                Some(AppEvent::TransferDone {
+                    id: 7,
+                    error: true,
+                    ..
+                })
+            ),
+            "expected a synthetic TransferDone{{id:7,error:true}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_done_guard_is_silent_when_disarmed() {
+        // Normal completion disarms the guard before sending the real event → no synthetic duplicate.
+        let (tx, mut rx) = mpsc::channel(8);
+        let guard = TransferDoneGuard {
+            id: 7,
+            event_tx: tx,
+            armed: false,
+        };
+        drop(guard);
+        assert!(rx.try_recv().is_err(), "disarmed guard must emit nothing");
     }
 
     #[tokio::test]
