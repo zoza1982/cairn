@@ -27,6 +27,7 @@ cairn-backend-local = { workspace = true }
 cairn-transfer = { workspace = true }
 cairn-tui = { workspace = true }
 cairn-ai = { workspace = true }
+cairn-config = { workspace = true }
 anyhow = "1"
 futures = "0.3"
 serde_json = "1"

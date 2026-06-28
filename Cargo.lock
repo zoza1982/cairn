@@ -221,6 +221,7 @@ dependencies = [
  "anyhow",
  "cairn-ai",
  "cairn-backend-local",
+ "cairn-config",
  "cairn-core",
  "cairn-transfer",
  "cairn-tui",

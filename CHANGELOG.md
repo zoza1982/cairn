@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Config-driven **keybindings** (M8-7): a `[ui.keybindings]` map of chord → action (e.g.
+  `"ctrl+a" = "ai_propose"`) layered over the built-in scheme. `cairn-tui::Keymap` parses chords
+  (`ctrl+`/`alt+`/`shift+`, named keys, `f1`–`f12`) and action names, warns on (but skips) bad
+  entries, and resolves overrides-then-default; the binary loads the user config at startup and falls
+  back to defaults if it is missing or unreadable. Themes and shell-command actions are deferred (the
+  latter is process execution and needs a security review).
 - AI **plan → confirm** overlay (M7-6): `Ctrl-A` asks the assistant to propose a plan, which opens a
   review overlay showing each step with its reversibility. Approve step-by-step (`↵`), reject (`x`),
   or — only when no step is irreversible — bulk-approve (`a`); `Esc` aborts. The reducer
