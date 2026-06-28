@@ -99,39 +99,72 @@ fn vpath(s: &str) -> Result<VfsPath, String> {
     VfsPath::parse(s).map_err(|e| format!("bad path '{s}': {e}"))
 }
 
+/// A compact byte-size summary (`512 B`, `1.2 KiB`) for a step's output line.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    // Guard the boundary: `{:.1}` could round e.g. 1023.97 KiB up to "1024.0 KiB"; bump a unit.
+    if unit < UNITS.len() - 1 && (v * 10.0).round() >= 10240.0 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    format!("{v:.1} {}", UNITS[unit])
+}
+
 #[async_trait]
 impl StepExecutor for BinaryStepExecutor {
-    async fn execute(&self, step: &PlanStep) -> Result<(), String> {
+    async fn execute(&self, step: &PlanStep) -> Result<Option<String>, String> {
         match step.tool.as_str() {
             "list" => {
-                // Drain the listing to confirm it succeeds; the entries are not surfaced until step
-                // output is a first-class channel (RFC-0007 Gap 1), so this is a validate-only probe.
+                // Drain the listing and report its entry count (RFC-0007 Gap 1: a short, secret-free
+                // summary surfaced to the user — the entries themselves are never fed to the model).
                 let i: ConnPath = parse_input(step)?;
                 let vfs = self.vfs(&i.conn).await?;
                 let dir = vpath(&i.path)?;
                 let mut stream = vfs.list(&dir, ListOpts::default());
+                let mut entries = 0usize;
                 while let Some(page) = stream.next().await {
-                    page.map_err(|e| e.redacted().to_string())?;
+                    entries += page.map_err(|e| e.redacted().to_string())?.entries.len();
                 }
-                Ok(())
+                Ok(Some(format!("{entries} entries")))
             }
             "stat" => {
                 let i: ConnPath = parse_input(step)?;
                 let vfs = self.vfs(&i.conn).await?;
-                vfs.stat(&vpath(&i.path)?)
+                let e = vfs
+                    .stat(&vpath(&i.path)?)
                     .await
-                    .map(|_| ())
-                    .map_err(|e| e.redacted().to_string())
+                    .map_err(|err| err.redacted().to_string())?;
+                Ok(Some(if e.is_dir() {
+                    "directory".to_owned()
+                } else {
+                    match e.size {
+                        Some(n) => format!("file, {}", human_size(n)),
+                        None => "file".to_owned(),
+                    }
+                }))
             }
             "read" => {
-                // Validate-only until step output exists (RFC-0007 Gap 1): opening confirms the file
-                // is reachable; the contents are not streamed anywhere yet.
+                // Opening confirms reachability and reports the size; contents are never streamed
+                // anywhere (and never to the model) — a byte count is the secret-free summary.
                 let i: ConnPath = parse_input(step)?;
                 let vfs = self.vfs(&i.conn).await?;
-                vfs.open_read(&vpath(&i.path)?, None)
+                let handle = vfs
+                    .open_read(&vpath(&i.path)?, None)
                     .await
-                    .map(|_| ())
-                    .map_err(|e| e.redacted().to_string())
+                    .map_err(|e| e.redacted().to_string())?;
+                Ok(Some(match handle.len_hint() {
+                    Some(n) => format!("read {}", human_size(n)),
+                    None => "readable".to_owned(),
+                }))
             }
             "copy" | "move" => {
                 let i: CopyMoveInput = parse_input(step)?;
@@ -160,7 +193,7 @@ impl StepExecutor for BinaryStepExecutor {
                 let cancel = CancellationToken::new();
                 run_transfer(&src, &dst, &items, spec, &cancel, &mut |_| {})
                     .await
-                    .map(|_| ())
+                    .map(|_| None)
                     .map_err(|e| e.redacted())
             }
             "delete" => {
@@ -171,12 +204,14 @@ impl StepExecutor for BinaryStepExecutor {
                 } else {
                     Recurse::No
                 };
+                let mut removed = 0usize;
                 for p in &i.paths {
                     vfs.remove(&vpath(p)?, recurse)
                         .await
                         .map_err(|e| e.redacted().to_string())?;
+                    removed += 1;
                 }
-                Ok(())
+                Ok(Some(format!("removed {removed}")))
             }
             "exec" => {
                 // Route through the backend's `Vfs::invoke` (RFC-0007 Gap 1). The local backends
@@ -192,7 +227,12 @@ impl StepExecutor for BinaryStepExecutor {
                     .invoke(&vpath(&i.path)?, ActionId::new(action_ids::EXEC), ctx)
                     .await
                 {
-                    Ok(ActionOutcome::Done | ActionOutcome::Text(_)) => Ok(()),
+                    Ok(ActionOutcome::Done) => Ok(None),
+                    // SECURITY: surface only a bounded size summary, never the raw command output —
+                    // exec stdout is arbitrary (could contain secrets) and `PlanStep.output` is
+                    // contractually a short, secret-free summary. (Dormant today: no backend yet
+                    // returns `Text`.)
+                    Ok(ActionOutcome::Text(t)) => Ok(Some(format!("{} bytes output", t.len()))),
                     // `Stream`/`Session` outcomes carry live I/O (follow-mode output, an interactive
                     // TTY, a port-forward) that this fire-and-forget executor has no channel to
                     // surface — dropping the handle would cancel the session and falsely report
@@ -225,6 +265,7 @@ mod tests {
             capability: capability_for(tool).unwrap(),
             status: StepStatus::Approved,
             error: None,
+            output: None,
         }
     }
 
@@ -246,6 +287,15 @@ mod tests {
     }
 
     #[test]
+    fn human_size_scales_and_guards_the_boundary() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(human_size(1_048_575), "1.0 MiB"); // not "1024.0 KiB"
+    }
+
+    #[test]
     fn parse_conn_handles() {
         assert_eq!(parse_conn("conn:7"), Ok(ConnectionId(7)));
         assert!(parse_conn("7").is_err());
@@ -257,19 +307,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("doomed.txt"), b"x").unwrap();
         let exec = exec_for(dir.path()).await;
-        exec.execute(&step(
-            "list",
-            serde_json::json!({"conn":"conn:1","path":"/"}),
-        ))
-        .await
-        .unwrap();
-        exec.execute(&step(
-            "delete",
-            serde_json::json!({"conn":"conn:1","paths":["/doomed.txt"]}),
-        ))
-        .await
-        .unwrap();
+        // `list` surfaces an entry-count summary (RFC-0007 Gap 1).
+        let out = exec
+            .execute(&step(
+                "list",
+                serde_json::json!({"conn":"conn:1","path":"/"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("1 entries"));
+        let out = exec
+            .execute(&step(
+                "delete",
+                serde_json::json!({"conn":"conn:1","paths":["/doomed.txt"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("removed 1"));
         assert!(!dir.path().join("doomed.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn stat_and_read_surface_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap(); // 5 bytes
+        let exec = exec_for(dir.path()).await;
+        let out = exec
+            .execute(&step(
+                "stat",
+                serde_json::json!({"conn":"conn:1","path":"/a.txt"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("file, 5 B"));
+        let out = exec
+            .execute(&step(
+                "read",
+                serde_json::json!({"conn":"conn:1","path":"/a.txt"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("read 5 B"));
     }
 
     #[tokio::test]

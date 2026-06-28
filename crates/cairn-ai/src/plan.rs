@@ -54,6 +54,9 @@ pub struct PlanStep {
     pub status: StepStatus,
     /// On failure, a redacted message describing why (set by [`Plan::execute`]).
     pub error: Option<String>,
+    /// On success, an optional short, secret-free summary of what the step produced (e.g. a read
+    /// step's byte count) — surfaced to the user, never fed back to the model (RFC-0007 Gap 1).
+    pub output: Option<String>,
 }
 
 /// A proposed, then executable, plan.
@@ -111,8 +114,10 @@ pub enum PlanError {
 /// Executes a single approved step (wired to the broker/backends by the caller).
 #[async_trait]
 pub trait StepExecutor {
-    /// Execute `step`. Returns `Err(message)` on failure.
-    async fn execute(&self, step: &PlanStep) -> Result<(), String>;
+    /// Execute `step`. On success, return an optional short, secret-free summary of what the step
+    /// produced (e.g. `"12 entries"` for a list), or `None` for steps with no meaningful output.
+    /// Returns `Err(message)` (already redacted) on failure.
+    async fn execute(&self, step: &PlanStep) -> Result<Option<String>, String>;
 }
 
 impl Plan {
@@ -133,6 +138,7 @@ impl Plan {
                 capability,
                 status: StepStatus::Pending,
                 error: None,
+                output: None,
             });
         }
         Ok(Self {
@@ -242,7 +248,10 @@ impl Plan {
                 return Ok(());
             }
             match exec.execute(&self.steps[i]).await {
-                Ok(()) => self.steps[i].status = StepStatus::Done,
+                Ok(output) => {
+                    self.steps[i].status = StepStatus::Done;
+                    self.steps[i].output = output;
+                }
                 Err(msg) => {
                     self.steps[i].status = StepStatus::Failed;
                     self.steps[i].error = Some(msg);
@@ -289,14 +298,14 @@ mod tests {
     }
     #[async_trait]
     impl StepExecutor for MockExec {
-        async fn execute(&self, step: &PlanStep) -> Result<(), String> {
+        async fn execute(&self, step: &PlanStep) -> Result<Option<String>, String> {
             let mut ex = self.executed.lock().unwrap();
             let idx = ex.len();
             ex.push(step.tool.clone());
             if self.fail_at == Some(idx) {
                 return Err("boom".into());
             }
-            Ok(())
+            Ok(None)
         }
     }
 

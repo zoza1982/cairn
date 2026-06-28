@@ -340,10 +340,23 @@ fn dispatch(
                 let exec = crate::executor::BinaryStepExecutor::new(registry, vec![LEFT, RIGHT]);
                 let n = plan.steps.len();
                 let ev = match plan.execute(&exec, &|| cancel.is_cancelled()).await {
-                    Ok(()) if plan.state == cairn_ai::PlanState::Done => AppEvent::AiPlanExecuted {
-                        status: format!("Plan complete: {n} step(s) executed"),
-                        error: false,
-                    },
+                    Ok(()) if plan.state == cairn_ai::PlanState::Done => {
+                        // Surface the steps' secret-free output summaries (RFC-0007 Gap 1).
+                        let outputs: Vec<String> = plan
+                            .steps
+                            .iter()
+                            .filter_map(|s| s.output.as_ref().map(|o| format!("{}→{o}", s.tool)))
+                            .collect();
+                        let detail = if outputs.is_empty() {
+                            format!("{n} step(s) executed")
+                        } else {
+                            outputs.join("; ")
+                        };
+                        AppEvent::AiPlanExecuted {
+                            status: format!("Plan complete: {detail}"),
+                            error: false,
+                        }
+                    }
                     Ok(()) if plan.state == cairn_ai::PlanState::Aborted => {
                         let done = plan
                             .steps

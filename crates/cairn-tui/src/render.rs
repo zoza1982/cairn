@@ -451,6 +451,7 @@ mod tests {
                 capability: capability_for(t).unwrap(),
                 status: StepStatus::Pending,
                 error: None,
+                output: None,
             })
             .collect();
         Plan {
