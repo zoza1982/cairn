@@ -22,7 +22,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Safe `getuid` for the shell-action config file-trust check (no `unsafe`; the workspace forbids it).
 # Already in the dependency tree (via tokio/tempfile); widely used, permissive (MIT/Apache-2.0/BSD).
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -943,7 +943,7 @@ async fn spawn_shell_action(
 fn kill_process_tree(pid: Option<u32>) {
     if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
         if let Some(pid) = rustix::process::Pid::from_raw(pid) {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
     }
 }
