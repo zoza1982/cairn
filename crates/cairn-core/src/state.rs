@@ -34,6 +34,41 @@ impl Side {
     }
 }
 
+/// How a pane orders its entries. Directories always sort before files regardless of mode; the mode
+/// only decides the ordering *within* each group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    /// Case-insensitive by name, ascending (the default, MC-like).
+    #[default]
+    Name,
+    /// By size, largest first. Entries without a known size (e.g. directories) sort after sized ones.
+    Size,
+    /// By modification time, newest first. Entries without a known time sort last.
+    Modified,
+}
+
+impl SortMode {
+    /// The next mode in the cycle (`Name → Size → Modified → Name`).
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Size,
+            Self::Size => Self::Modified,
+            Self::Modified => Self::Name,
+        }
+    }
+
+    /// A short label for the status/header (e.g. `"name"`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Size => "size",
+            Self::Modified => "modified",
+        }
+    }
+}
+
 /// The state of a directory listing in a pane.
 #[derive(Debug, Clone)]
 pub enum Listing {
@@ -69,6 +104,10 @@ pub struct PaneState {
     pub cursor: usize,
     /// Marked (multi-selected) entry indices.
     pub marked: BTreeSet<usize>,
+    /// How entries are ordered within the pane.
+    pub sort: SortMode,
+    /// Whether hidden entries (e.g. dotfiles) are listed. Passed to the backend as `ListOpts::all`.
+    pub show_hidden: bool,
 }
 
 impl PaneState {
@@ -81,6 +120,8 @@ impl PaneState {
             listing: Listing::Loading,
             cursor: 0,
             marked: BTreeSet::new(),
+            sort: SortMode::default(),
+            show_hidden: false,
         }
     }
 

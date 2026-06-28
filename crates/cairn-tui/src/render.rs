@@ -188,8 +188,12 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
         theme.unfocused_border
     };
     let title = format!(" {} ", pane.cwd.as_str());
+    // Bottom-right status: current sort mode, plus a `+hidden` flag when dotfiles are shown.
+    let hidden = if pane.show_hidden { " +hidden" } else { "" };
+    let status = format!(" sort: {}{hidden} ", pane.sort.label());
     let block = Block::bordered()
         .title(title)
+        .title_bottom(Line::from(status).right_aligned())
         .border_style(Style::default().fg(border));
 
     match &pane.listing {

@@ -42,6 +42,10 @@ pub enum Action {
     Cancel,
     /// Reload the active pane.
     Refresh,
+    /// Cycle the active pane's sort mode (name → size → modified). Re-orders in place, no re-list.
+    CycleSort,
+    /// Toggle whether the active pane lists hidden entries (re-lists with the new `all` flag).
+    ToggleHidden,
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
     /// Ask the AI assistant to propose a plan (opens the plan → confirm overlay when it arrives).
@@ -102,6 +106,8 @@ pub enum AppEffect {
         conn: ConnectionId,
         /// Directory to list.
         dir: VfsPath,
+        /// Include hidden entries (maps to `ListOpts::all`).
+        all: bool,
     },
     /// Copy or move entries from one connection to another.
     Transfer {
