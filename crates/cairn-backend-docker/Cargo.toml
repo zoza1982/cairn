@@ -16,7 +16,6 @@ workspace = true
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
 async-trait = "0.1"
-bytes = "1"
 futures = "0.3"
 bollard = "0.21"
 smol_str = "0.3"

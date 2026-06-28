@@ -14,8 +14,8 @@ pub use real::BollardDocker;
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryExt, EntryKind, Scheme, VfsPath};
 use cairn_vfs::{
-    ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs, VfsError,
-    WriteHandle, WriteOpts,
+    apply_byte_range, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs,
+    VfsError, WriteHandle, WriteOpts,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -75,7 +75,20 @@ impl<O: ContainerOps> DockerVfs<O> {
                     e
                 })
                 .collect(),
-            ["images", _one] => Vec::new(), // image layer browse deferred
+            ["images", tag] => {
+                // The image must exist; its layer browse is deferred (RFC-0004).
+                let exists = self
+                    .ops
+                    .list_images()
+                    .await?
+                    .iter()
+                    .any(|img| img.tags.iter().any(|t| t == tag) || img.id == *tag);
+                if exists {
+                    Vec::new()
+                } else {
+                    return Err(VfsError::NotFound(dir));
+                }
+            }
             ["containers", name, rest @ ..] => {
                 let in_path = join_in_container(rest);
                 self.ops
@@ -112,6 +125,8 @@ fn join_in_container(rest: &[&str]) -> String {
 
 impl<O: ContainerOps> CapabilityProvider for DockerVfs<O> {
     fn caps(&self) -> Caps {
+        // The Vfs mapping honors ranged reads (in-memory clamp). The real adapter's in-container
+        // fs ops (list/read) are the deferred integration step; until then they return Unsupported.
         Caps::LIST | Caps::READ | Caps::RANDOM_READ
     }
 }
@@ -138,8 +153,21 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
     async fn stat(&self, path: &VfsPath) -> Result<Entry, VfsError> {
         let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
         match segs.as_slice() {
-            [] | ["containers"] | ["images"] | ["images", _] => {
+            [] | ["containers"] | ["images"] => {
                 Ok(Entry::new(path.file_name().unwrap_or(""), EntryKind::Dir))
+            }
+            ["images", tag] => {
+                let exists = self
+                    .ops
+                    .list_images()
+                    .await?
+                    .iter()
+                    .any(|img| img.tags.iter().any(|t| t == tag) || img.id == *tag);
+                if exists {
+                    Ok(Entry::new(*tag, EntryKind::Dir))
+                } else {
+                    Err(VfsError::NotFound(path.clone()))
+                }
             }
             ["containers", name] => {
                 let exists = self
@@ -180,15 +208,9 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
         };
         let sliced = match range {
             None => data,
-            Some(r) => {
-                let total = data.len() as u64;
-                let start = r.offset.min(total) as usize;
-                let end = match r.len {
-                    Some(l) => ((r.offset + l).min(total)) as usize,
-                    None => data.len(),
-                };
-                data[start..end].to_vec()
-            }
+            // Clamp in memory (no transport-level seek yet); saturating, so a pathological
+            // caller-controlled range can never overflow or panic the slice.
+            Some(r) => apply_byte_range(&data, r).to_vec(),
         };
         let len = sliced.len() as u64;
         Ok(ReadHandle::new(
@@ -276,6 +298,73 @@ mod tests {
         );
         assert!(matches!(
             vfs.stat(&p("/containers/nope")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ranged_read_clamps_and_never_panics() {
+        let vfs = backend();
+        let path = p("/containers/web/etc/hostname"); // "web-1\n", 6 bytes
+                                                      // A pathological range must clamp to empty, not overflow/panic.
+        let mut rh = vfs
+            .open_read(
+                &path,
+                Some(ByteRange {
+                    offset: u64::MAX,
+                    len: Some(1),
+                }),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        rh.read_to_end(&mut out).await.unwrap();
+        assert!(out.is_empty());
+        // A normal sub-range still works.
+        let mut rh = vfs
+            .open_read(
+                &path,
+                Some(ByteRange {
+                    offset: 0,
+                    len: Some(3),
+                }),
+            )
+            .await
+            .unwrap();
+        let mut out = String::new();
+        rh.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "web");
+    }
+
+    #[tokio::test]
+    async fn stat_rejects_unknown_image_and_routes() {
+        let vfs = backend();
+        assert!(vfs.stat(&p("/images/nginx:latest")).await.unwrap().is_dir());
+        assert!(matches!(
+            vfs.stat(&p("/images/nope")).await,
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.stat(&p("/bogus")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn listing_a_file_or_missing_dir_is_not_found() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.list(&p("/containers/web/etc/hostname"), ListOpts::default())
+                .next()
+                .await
+                .unwrap(),
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.list(&p("/containers/web/missing"), ListOpts::default())
+                .next()
+                .await
+                .unwrap(),
             Err(VfsError::NotFound(_))
         ));
     }

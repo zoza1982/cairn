@@ -124,11 +124,19 @@ pub(crate) mod mock {
                 .files
                 .get(container)
                 .ok_or_else(|| Self::nf(container))?;
+            // A path that is itself a file is not a directory.
+            if tree.contains_key(path) {
+                return Err(Self::nf(path));
+            }
             let prefix = if path == "/" {
                 "/".to_owned()
             } else {
                 format!("{path}/")
             };
+            // A non-root directory must have at least one child to exist.
+            if path != "/" && !tree.keys().any(|k| k.starts_with(&prefix)) {
+                return Err(Self::nf(path));
+            }
             let mut dirs = std::collections::BTreeSet::new();
             let mut files = Vec::new();
             for (key, data) in tree {

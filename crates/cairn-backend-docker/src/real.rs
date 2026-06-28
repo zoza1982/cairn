@@ -36,27 +36,54 @@ fn backend_err(e: impl std::fmt::Display) -> VfsError {
     }
 }
 
+/// Map bollard's container-state enum to the cairn-types state.
+fn map_state(s: Option<bollard::models::ContainerSummaryStateEnum>) -> ContainerState {
+    use bollard::models::ContainerSummaryStateEnum as B;
+    match s {
+        Some(B::CREATED) => ContainerState::Created,
+        Some(B::RUNNING) => ContainerState::Running,
+        Some(B::PAUSED) => ContainerState::Paused,
+        Some(B::RESTARTING) => ContainerState::Restarting,
+        Some(B::EXITED) => ContainerState::Exited,
+        Some(B::DEAD) => ContainerState::Dead,
+        // REMOVING / STOPPING / EMPTY / None have no precise cairn equivalent.
+        _ => ContainerState::Unknown,
+    }
+}
+
 #[async_trait]
 impl ContainerOps for BollardDocker {
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, VfsError> {
+        // `all: true` so stopped/exited containers are listed too (the Engine default is
+        // running-only), keeping `list` and `stat` consistent across container states.
+        let opts = bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        };
         let list = self
             .docker
-            .list_containers(None::<bollard::query_parameters::ListContainersOptions>)
+            .list_containers(Some(opts))
             .await
             .map_err(backend_err)?;
         Ok(list
             .into_iter()
-            .map(|c| ContainerInfo {
-                id: c.id.unwrap_or_default(),
-                name: c
+            .map(|c| {
+                let id = c.id.unwrap_or_default();
+                // Fall back to the id when a container has no names, so the entry stays
+                // navigable rather than collapsing to an empty path segment.
+                let name = c
                     .names
                     .unwrap_or_default()
                     .first()
                     .map(|n| n.trim_start_matches('/').to_owned())
-                    .unwrap_or_default(),
-                image: c.image.unwrap_or_default(),
-                // State-enum mapping is a refinement; the engine value is normalized later.
-                state: ContainerState::Unknown,
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                ContainerInfo {
+                    id,
+                    name,
+                    image: c.image.unwrap_or_default(),
+                    state: map_state(c.state),
+                }
             })
             .collect())
     }
@@ -81,7 +108,7 @@ impl ContainerOps for BollardDocker {
     }
 
     async fn stat(&self, _container: &str, _path: &str) -> Result<RemoteMeta, VfsError> {
-        Err(VfsError::Unsupported(Caps::READ))
+        Err(VfsError::Unsupported(Caps::LIST))
     }
 
     async fn read(&self, _container: &str, _path: &str) -> Result<Vec<u8>, VfsError> {

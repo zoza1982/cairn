@@ -48,6 +48,22 @@ pub struct ByteRange {
     pub len: Option<u64>,
 }
 
+/// Apply a [`ByteRange`] to an in-memory buffer, clamping to the buffer's bounds.
+///
+/// Used by backends that buffer a whole object and slice in memory (no transport-level seek).
+/// The arithmetic is saturating, so an arbitrary caller-controlled `offset`/`len` (e.g. `u64::MAX`)
+/// clamps to an empty slice instead of overflowing or panicking.
+#[must_use]
+pub fn apply_byte_range(data: &[u8], range: ByteRange) -> &[u8] {
+    let total = data.len() as u64;
+    let start = range.offset.min(total) as usize;
+    let end = match range.len {
+        Some(l) => range.offset.saturating_add(l).min(total) as usize,
+        None => data.len(),
+    };
+    &data[start..end]
+}
+
 /// Options controlling a write.
 #[derive(Debug, Clone, Default)]
 pub struct WriteOpts {
@@ -142,5 +158,70 @@ pub trait Vfs: CapabilityProvider + Send + Sync + 'static {
     /// Invoke a discovered action. Defaults to unsupported.
     async fn invoke(&self, _action: ActionId, _ctx: ActionCtx) -> Result<ActionOutcome, VfsError> {
         Err(VfsError::Unsupported(Caps::empty()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_byte_range, ByteRange};
+
+    #[test]
+    fn byte_range_clamps_and_saturates() {
+        let data = b"web-1\n"; // 6 bytes
+                               // Normal sub-range.
+        assert_eq!(
+            apply_byte_range(
+                data,
+                ByteRange {
+                    offset: 0,
+                    len: Some(3)
+                }
+            ),
+            b"web"
+        );
+        // Offset past EOF -> empty.
+        assert_eq!(
+            apply_byte_range(
+                data,
+                ByteRange {
+                    offset: 99,
+                    len: Some(3)
+                }
+            ),
+            b""
+        );
+        // len running past EOF clamps to the tail.
+        assert_eq!(
+            apply_byte_range(
+                data,
+                ByteRange {
+                    offset: 4,
+                    len: Some(100)
+                }
+            ),
+            b"1\n"
+        );
+        // None len reads to the end.
+        assert_eq!(
+            apply_byte_range(
+                data,
+                ByteRange {
+                    offset: 4,
+                    len: None
+                }
+            ),
+            b"1\n"
+        );
+        // Pathological offset+len must not overflow/panic -> empty.
+        assert_eq!(
+            apply_byte_range(
+                data,
+                ByteRange {
+                    offset: u64::MAX,
+                    len: Some(1)
+                }
+            ),
+            b""
+        );
     }
 }

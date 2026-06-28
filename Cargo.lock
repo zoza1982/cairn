@@ -252,7 +252,6 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bollard",
- "bytes",
  "cairn-types",
  "cairn-vfs",
  "futures",

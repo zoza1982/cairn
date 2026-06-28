@@ -164,15 +164,7 @@ pub(crate) mod mock {
             };
             Ok(match range {
                 None => b.clone(),
-                Some(r) => {
-                    let total = b.len() as u64;
-                    let start = r.offset.min(total) as usize;
-                    let end = match r.len {
-                        Some(l) => ((r.offset + l).min(total)) as usize,
-                        None => b.len(),
-                    };
-                    b[start..end].to_vec()
-                }
+                Some(r) => cairn_vfs::apply_byte_range(b, r).to_vec(),
             })
         }
 
