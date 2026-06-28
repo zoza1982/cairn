@@ -26,6 +26,7 @@ cairn-secrets = { path = "crates/cairn-secrets", version = "0.0.0" }
 cairn-vault = { path = "crates/cairn-vault", version = "0.0.0" }
 cairn-broker = { path = "crates/cairn-broker", version = "0.0.0" }
 cairn-config = { path = "crates/cairn-config", version = "0.0.0" }
+cairn-ai = { path = "crates/cairn-ai", version = "0.0.0" }
 
 
 # Lints applied across the whole workspace. Keep the bar high, but keep velocity:
