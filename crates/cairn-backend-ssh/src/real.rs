@@ -8,7 +8,7 @@
 use crate::ops::{RemoteEntry, RemoteMeta, SftpOps};
 use async_trait::async_trait;
 use cairn_types::{EntryKind, VfsPath};
-use cairn_vfs::{ByteRange, VfsError};
+use cairn_vfs::{ByteRange, RetryPolicy, VfsError};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -82,21 +82,27 @@ impl SftpOps for RealSftp {
     }
 
     async fn stat(&self, path: &str) -> Result<RemoteMeta, VfsError> {
-        let md = self
-            .session
-            .metadata(path)
-            .await
-            .map_err(|e| map_err(e, path))?;
-        let kind = kind_of(&md);
-        Ok(RemoteMeta {
-            kind,
-            size: if kind == EntryKind::File {
-                Some(md.len())
-            } else {
-                None
-            },
-            modified: md.modified().ok(),
+        // `stat` is idempotent, so retry it with backoff on a transient transport failure. Mutating
+        // ops (write/remove/rename) are intentionally NOT auto-retried — a retried partial mutation
+        // could double-apply.
+        cairn_vfs::retry(RetryPolicy::default(), || async {
+            let md = self
+                .session
+                .metadata(path)
+                .await
+                .map_err(|e| map_err(e, path))?;
+            let kind = kind_of(&md);
+            Ok(RemoteMeta {
+                kind,
+                size: if kind == EntryKind::File {
+                    Some(md.len())
+                } else {
+                    None
+                },
+                modified: md.modified().ok(),
+            })
         })
+        .await
     }
 
     async fn read(&self, path: &str, range: Option<ByteRange>) -> Result<Vec<u8>, VfsError> {
