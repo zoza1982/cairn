@@ -6,6 +6,8 @@
 
 pub mod keymap;
 mod render;
+mod theme;
 
 pub use keymap::{action_for, Keymap};
 pub use render::render;
+pub use theme::Theme;

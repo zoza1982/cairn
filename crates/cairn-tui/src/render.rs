@@ -1,5 +1,6 @@
-//! Rendering the [`AppState`] with ratatui. Pure: takes `&AppState`, performs no I/O.
+//! Rendering the [`AppState`] with ratatui. Pure: takes `&AppState` + `&Theme`, performs no I/O.
 
+use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{AppState, Listing, Overlay, PaneState, Side};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -8,15 +9,15 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-/// Render the whole application: two panes over a one-line status bar.
-pub fn render(frame: &mut Frame, state: &AppState) {
+/// Render the whole application: two panes over a one-line status bar, themed by `theme`.
+pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    render_pane(frame, left, state, Side::Left);
-    render_pane(frame, right, state, Side::Right);
-    render_status(frame, status, state);
+    render_pane(frame, left, state, Side::Left, theme);
+    render_pane(frame, right, state, Side::Right, theme);
+    render_status(frame, status, state, theme);
     render_overlay(frame, state);
 }
 
@@ -32,6 +33,7 @@ fn render_connections(
         .min(frame.area().height);
     let area = centered(frame.area(), 50, h.max(3));
     frame.render_widget(Clear, area);
+    // Overlays use fixed semantic accents (not the user's pane palette) so prompts stay distinct.
     let block = Block::bordered()
         .title(" Open connection ")
         .border_style(Style::default().fg(Color::Cyan));
@@ -177,13 +179,13 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
-fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side) {
+fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, theme: &Theme) {
     let pane = state.pane(side);
     let focused = state.focus == side;
     let border = if focused {
-        Color::Cyan
+        theme.focused_border
     } else {
-        Color::DarkGray
+        theme.unfocused_border
     };
     let title = format!(" {} ", pane.cwd.as_str());
     let block = Block::bordered()
@@ -196,7 +198,7 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side) {
         }
         Listing::Error(msg) => {
             let p = Paragraph::new(Line::from(format!("error: {msg}")))
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(theme.error))
                 .block(block);
             frame.render_widget(p, area);
         }
@@ -209,9 +211,7 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side) {
                     let suffix = if e.is_dir() { "/" } else { "" };
                     let text = format!("{mark}{}{suffix}", e.name);
                     let style = if e.is_dir() {
-                        Style::default()
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::BOLD)
+                        Style::default().fg(theme.dir).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     };
@@ -220,7 +220,9 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side) {
                 .collect();
 
             let highlight = if focused {
-                Style::default().bg(Color::Cyan).fg(Color::Black)
+                Style::default()
+                    .bg(theme.selection_bg)
+                    .fg(theme.selection_fg)
             } else {
                 Style::default().add_modifier(Modifier::REVERSED)
             };
@@ -238,13 +240,13 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side) {
     }
 }
 
-fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let pane = state.active();
     let count = pane_count_label(pane);
     let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^A ai";
     let line = Line::from(format!(" {count}   {help}"));
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().fg(Color::Gray)),
+        Paragraph::new(line).style(Style::default().fg(theme.status)),
         area,
     );
 }
@@ -284,7 +286,9 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = ready_state();
-        terminal.draw(|f| render(f, &state)).unwrap();
+        terminal
+            .draw(|f| render(f, &state, &Theme::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let text: String = buffer
             .content()
@@ -318,7 +322,9 @@ mod tests {
 
     fn render_text(state: &AppState, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| render(f, state)).unwrap();
+        terminal
+            .draw(|f| render(f, state, &Theme::default()))
+            .unwrap();
         terminal
             .backend()
             .buffer()
@@ -380,7 +386,7 @@ mod tests {
         let mut s = AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root());
         s.panes[0].listing = Listing::Loading;
         s.panes[1].listing = Listing::Error("permission denied".into());
-        terminal.draw(|f| render(f, &s)).unwrap();
+        terminal.draw(|f| render(f, &s, &Theme::default())).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let text: String = buffer
             .content()

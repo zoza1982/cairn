@@ -56,6 +56,13 @@ pub struct UiConfig {
     /// warning rather than rejecting the whole config.
     #[serde(default)]
     pub keybindings: BTreeMap<String, String>,
+    /// Theme color overrides on top of the [`theme`](UiConfig::theme) preset: a map of role →
+    /// color. Roles are `focused_border`/`unfocused_border`/`dir`/`error`/`status`/`selection_bg`/
+    /// `selection_fg`; color *values must be strings* — names (`"cyan"`, `"bright-blue"`) or
+    /// `#rrggbb`. Unknown roles, unparseable colors, and an unknown `theme` preset are ignored with a
+    /// warning (the dark preset is used).
+    #[serde(default)]
+    pub colors: BTreeMap<String, String>,
 }
 
 impl Default for UiConfig {
@@ -64,6 +71,7 @@ impl Default for UiConfig {
             keymap: "mc".to_owned(),
             theme: "dark".to_owned(),
             keybindings: BTreeMap::new(),
+            colors: BTreeMap::new(),
         }
     }
 }
@@ -153,6 +161,7 @@ mod tests {
         let cfg = Config::load(&dir.path().join("nope.toml")).unwrap();
         assert_eq!(cfg.version, SCHEMA_VERSION);
         assert_eq!(cfg.ui.keymap, "mc");
+        assert_eq!(cfg.ui.theme, "dark"); // load-bearing: the resolver falls back to dark
         assert!(cfg.connections.is_empty());
     }
 
@@ -197,6 +206,23 @@ mod tests {
     }
 
     #[test]
+    fn theme_colors_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.ui.theme = "dark".into();
+        cfg.ui
+            .colors
+            .insert("focused_border".into(), "magenta".into());
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.ui.colors.get("focused_border").map(String::as_str),
+            Some("magenta")
+        );
+    }
+
+    #[test]
     fn keybindings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -225,6 +251,7 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.ui.keymap, "vim");
         assert!(cfg.ui.keybindings.is_empty());
+        assert!(cfg.ui.colors.is_empty());
     }
 
     #[test]
