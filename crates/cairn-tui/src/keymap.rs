@@ -12,9 +12,14 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
-    // Ctrl-C always quits.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return Some(Action::Quit);
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            // Ctrl-C always quits.
+            KeyCode::Char('c') => Some(Action::Quit),
+            // Ctrl-A asks the AI assistant to propose a plan.
+            KeyCode::Char('a') => Some(Action::AiPropose),
+            _ => None,
+        };
     }
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
@@ -32,6 +37,11 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Char('r') => Some(Action::Refresh),
+        // Plan-overlay actions (no-ops when no overlay is open).
+        // NOTE: revisit when text-input overlays land — 'a'/'x' must not fire while a text field
+        // is capturing input.
+        KeyCode::Char('a') => Some(Action::ApproveAll),
+        KeyCode::Char('x') => Some(Action::Reject),
         _ => None,
     }
 }
@@ -61,6 +71,18 @@ mod tests {
         assert_eq!(action_for(press(KeyCode::Char('q'))), Some(Action::Quit));
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(action_for(ctrl_c), Some(Action::Quit));
+    }
+
+    #[test]
+    fn ai_keys() {
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(action_for(ctrl_a), Some(Action::AiPropose));
+        // Plain 'a'/'x' drive the plan overlay (no-ops elsewhere).
+        assert_eq!(
+            action_for(press(KeyCode::Char('a'))),
+            Some(Action::ApproveAll)
+        );
+        assert_eq!(action_for(press(KeyCode::Char('x'))), Some(Action::Reject));
     }
 
     #[test]

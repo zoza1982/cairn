@@ -1,5 +1,6 @@
 //! Rendering the [`AppState`] with ratatui. Pure: takes `&AppState`, performs no I/O.
 
+use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{AppState, Listing, Overlay, PaneState, Side};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -39,6 +40,94 @@ fn render_overlay(frame: &mut Frame, overlay: &Overlay) {
             .alignment(Alignment::Center);
             frame.render_widget(body, area);
         }
+        Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
+    }
+}
+
+/// Draw the AI plan → confirm overlay: the summary, each step with its approval status and
+/// reversibility, and the available actions (bulk-approve only when no step is irreversible).
+fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize) {
+    let h = (plan.steps.len() as u16)
+        .saturating_add(6)
+        .min(frame.area().height);
+    let area = centered(frame.area(), 64, h);
+    frame.render_widget(Clear, area);
+
+    let block = Block::bordered()
+        .title(" AI plan — review before running ")
+        .border_style(Style::default().fg(Color::Magenta));
+    // Lay content out within the block's interior so nothing overwrites the border.
+    let content = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [summary_area, steps_area, help_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(content);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(plan.summary.clone()))
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        summary_area,
+    );
+
+    let items: Vec<ListItem> = plan
+        .steps
+        .iter()
+        .map(|s| {
+            let (marker, color) = match s.status {
+                StepStatus::Pending => ('·', Color::Gray),
+                StepStatus::Approved => ('✓', Color::Green),
+                StepStatus::Rejected => ('✗', Color::Red),
+                StepStatus::Done => ('●', Color::Cyan),
+                StepStatus::Failed => ('!', Color::Red),
+            };
+            let rev = match s.capability.reversibility {
+                Reversibility::Safe => "safe",
+                Reversibility::Recoverable => "recoverable",
+                Reversibility::Irreversible => "IRREVERSIBLE",
+            };
+            let line = format!(
+                "{marker} {:<8} [{rev}]  {}",
+                verb_label(s.capability.verb),
+                s.description
+            );
+            ListItem::new(line).style(Style::default().fg(color))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Magenta).fg(Color::Black))
+        .highlight_symbol("▶ ");
+    let mut list_state = ListState::default();
+    if !plan.steps.is_empty() {
+        list_state.select(Some(cursor.min(plan.steps.len() - 1)));
+    }
+    frame.render_stateful_widget(list, steps_area, &mut list_state);
+
+    let help = if plan.can_bulk_approve() {
+        "↵ approve · a approve all · x reject · esc abort"
+    } else {
+        "↵ approve · x reject · esc abort · no bulk (irreversible)"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(help)).style(Style::default().fg(Color::Gray)),
+        help_area,
+    );
+}
+
+/// A short label for a tool verb shown in the plan overlay.
+fn verb_label(verb: Verb) -> &'static str {
+    match verb {
+        Verb::List => "list",
+        Verb::Stat => "stat",
+        Verb::Read => "read",
+        Verb::Copy => "copy",
+        Verb::Move => "move",
+        Verb::Delete => "delete",
+        Verb::Exec => "exec",
+        Verb::OpenConnection => "connect",
     }
 }
 
@@ -119,7 +208,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let pane = state.active();
     let count = pane_count_label(pane);
     let help =
-        "q quit · Tab switch · ↵ open · ⌫ up · Space mark · c copy · m move · d del · r refresh";
+        "q quit · Tab switch · ↵ open · Space mark · c copy · m move · d del · r refresh · ^A ai";
     let line = Line::from(format!(" {count}   {help}"));
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::Gray)),
@@ -172,6 +261,62 @@ mod tests {
         assert!(text.contains("README.md"));
         assert!(text.contains("src"));
         assert!(text.contains("quit"));
+    }
+
+    fn plan(tools: &[&str]) -> cairn_ai::Plan {
+        use cairn_ai::{capability_for, Plan, PlanState, PlanStep, StepStatus};
+        let steps = tools
+            .iter()
+            .map(|t| PlanStep {
+                tool: (*t).to_owned(),
+                input: serde_json::Value::Null,
+                description: format!("{t} the things"),
+                capability: capability_for(t).unwrap(),
+                status: StepStatus::Pending,
+            })
+            .collect();
+        Plan {
+            summary: "archive old logs".to_owned(),
+            steps,
+            state: PlanState::Proposed,
+        }
+    }
+
+    fn render_text(state: &AppState, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, state)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn ai_plan_overlay_shows_steps_and_bulk_approve_for_safe_plan() {
+        let mut s = ready_state();
+        s.overlay = Some(cairn_core::Overlay::AiPlan {
+            plan: plan(&["list", "copy"]),
+            cursor: 0,
+        });
+        let text = render_text(&s, 80, 24);
+        assert!(text.contains("AI plan"));
+        assert!(text.contains("archive old logs"));
+        assert!(text.contains("approve all")); // safe plan → bulk-approve offered
+    }
+
+    #[test]
+    fn ai_plan_overlay_hides_bulk_approve_for_irreversible_plan() {
+        let mut s = ready_state();
+        s.overlay = Some(cairn_core::Overlay::AiPlan {
+            plan: plan(&["copy", "delete"]),
+            cursor: 0,
+        });
+        let text = render_text(&s, 80, 24);
+        assert!(text.contains("IRREVERSIBLE"));
+        assert!(text.contains("no bulk"));
     }
 
     #[test]

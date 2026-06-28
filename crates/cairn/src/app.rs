@@ -143,9 +143,61 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
                 let _ = event_tx.send(ev).await;
             });
         }
+        AppEffect::RequestAiPlan { prompt } => {
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = event_tx
+                    .send(AppEvent::AiPlanProposed(propose_plan(&prompt).await))
+                    .await;
+            });
+        }
+        AppEffect::ExecutePlan { plan } => {
+            // Step execution against real backends is the next integration step (it needs the
+            // tool→backend dispatch and live providers); for now we acknowledge approval honestly.
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = event_tx
+                    .send(AppEvent::OpDone {
+                        status: format!(
+                            "Approved {} step(s); execution wiring is the next step",
+                            plan.steps.len()
+                        ),
+                        error: false,
+                    })
+                    .await;
+            });
+        }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
         other => tracing::warn!(effect = ?other, "unhandled effect"),
     }
+}
+
+/// Ask the assistant to propose a plan. Until the HTTP providers (M7-2) land, this uses an offline
+/// `MockProvider`; the plan → confirm flow it drives in the UI is the real thing.
+async fn propose_plan(prompt: &str) -> Result<cairn_ai::Plan, String> {
+    use cairn_ai::{request_plan, LlmRequest, Message, MockProvider, Role};
+    // A representative proposal that exercises the plan → confirm UI (mixed reversibility).
+    let provider = MockProvider::proposing(serde_json::json!({
+        "summary": format!("Plan for: {prompt}"),
+        "steps": [
+            {"tool": "list",   "input": {"path": "/logs"}, "description": "scan logs"},
+            {"tool": "copy",   "input": {}, "description": "copy matches to the other pane"},
+            {"tool": "delete", "input": {}, "description": "remove the originals"}
+        ]
+    }));
+    let req = LlmRequest {
+        system: None,
+        messages: vec![Message {
+            role: Role::User,
+            text: prompt.to_owned(),
+        }],
+        tools: Vec::new(),
+    };
+    // `AgentError`'s Display is our own, secret-free enum. When the HTTP providers (M7-2) land,
+    // map their transport errors to categorized, redacted messages here before they reach the UI.
+    request_plan(&provider, req)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn run_transfer_effect(
