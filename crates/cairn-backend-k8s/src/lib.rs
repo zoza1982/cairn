@@ -16,8 +16,9 @@ pub use ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteM
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryExt, EntryKind, Scheme, VfsPath};
 use cairn_vfs::{
-    apply_byte_range, join_abs_path, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle,
-    Recurse, Vfs, VfsError, WriteHandle, WriteOpts,
+    apply_byte_range, join_abs_path, ActionDescriptor, ActionId, ActionKind, ByteRange,
+    CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs, VfsError, WriteHandle,
+    WriteOpts,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -253,6 +254,41 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
     async fn remove(&self, _path: &VfsPath, _recurse: Recurse) -> Result<(), VfsError> {
         Err(VfsError::Unsupported(Caps::DELETE))
     }
+
+    /// Advertise the action surface by depth: a pod offers `logs` and `port-forward`; a container
+    /// offers `logs` and `exec`. Actions are discoverable now; live invocation (log/exec streams and
+    /// port-forward sessions over the cluster API) is the integration step, so the inherited
+    /// [`Vfs::invoke`] still returns [`VfsError::Unsupported`].
+    fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
+        let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
+        let logs = || ActionDescriptor {
+            id: ActionId::new("logs"),
+            label: SmolStr::new("Stream logs"),
+            kind: ActionKind::Stream,
+            destructive: false,
+        };
+        match segs.as_slice() {
+            [_ctx, _ns, _pod] => vec![
+                logs(),
+                ActionDescriptor {
+                    id: ActionId::new("port-forward"),
+                    label: SmolStr::new("Port-forward"),
+                    kind: ActionKind::Session,
+                    destructive: false,
+                },
+            ],
+            [_ctx, _ns, _pod, _container, ..] => vec![
+                logs(),
+                ActionDescriptor {
+                    id: ActionId::new("exec"),
+                    label: SmolStr::new("Exec"),
+                    kind: ActionKind::Interactive,
+                    destructive: false,
+                },
+            ],
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +474,29 @@ mod tests {
         let vfs = backend();
         assert!(matches!(
             vfs.open_write(&p("/prod/default/web-0/app/x"), WriteOpts::default())
+                .await,
+            Err(VfsError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn action_surface_varies_by_depth() {
+        let vfs = backend();
+        let ids = |path: &str| -> Vec<String> {
+            vfs.actions_at(&p(path))
+                .iter()
+                .map(|a| a.id.0.to_string())
+                .collect()
+        };
+        // Pod: logs + port-forward. Container: logs + exec.
+        assert_eq!(ids("/prod/default/web-0"), vec!["logs", "port-forward"]);
+        assert_eq!(ids("/prod/default/web-0/app"), vec!["logs", "exec"]);
+        // The navigation tree above a pod has no actions.
+        assert!(vfs.actions_at(&p("/prod/default")).is_empty());
+        assert!(vfs.actions_at(&p("/")).is_empty());
+        // Invocation is the integration step — still unsupported.
+        assert!(matches!(
+            vfs.invoke(ActionId::new("logs"), cairn_vfs::ActionCtx::None)
                 .await,
             Err(VfsError::Unsupported(_))
         ));

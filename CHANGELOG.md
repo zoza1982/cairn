@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Container/cluster **action surface** (M6-3/M6-6): the Docker and Kubernetes backends now advertise
+  their backend-specific actions via `actions_at` — Docker exposes `exec`/`logs` across a container's
+  subtree; Kubernetes exposes `logs`/`port-forward` on a pod and `logs`/`exec` on a container (by
+  path depth). The actions are discoverable and unit-tested; live invocation (streaming/sessions over
+  the engine/cluster API) remains the integration step, so `invoke` still returns `Unsupported`.
 - `cairn-ai` **tool-call degradation** (M7-2): a `ToolSupport` tier on the provider trait
   (Native → JsonSchema → Text) and a `degrade` module that adapts how a plan is requested
   (native tool vs a JSON-object / fenced-block instruction in the prompt) and parsed back

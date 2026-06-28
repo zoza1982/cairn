@@ -14,8 +14,9 @@ pub use real::BollardDocker;
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryExt, EntryKind, Scheme, VfsPath};
 use cairn_vfs::{
-    apply_byte_range, join_abs_path, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle,
-    Recurse, Vfs, VfsError, WriteHandle, WriteOpts,
+    apply_byte_range, join_abs_path, ActionDescriptor, ActionId, ActionKind, ByteRange,
+    CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs, VfsError, WriteHandle,
+    WriteOpts,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -217,6 +218,30 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
     async fn remove(&self, _path: &VfsPath, _recurse: Recurse) -> Result<(), VfsError> {
         Err(VfsError::Unsupported(Caps::DELETE))
     }
+
+    /// Advertise the per-container actions (`exec`, `logs`) anywhere within a container's subtree.
+    /// The action surface is discoverable now; live invocation (streaming over the Docker API) is the
+    /// integration step, so the inherited [`Vfs::invoke`] still returns [`VfsError::Unsupported`].
+    fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
+        let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
+        match segs.as_slice() {
+            ["containers", _name, ..] => vec![
+                ActionDescriptor {
+                    id: ActionId::new("exec"),
+                    label: SmolStr::new("Exec"),
+                    kind: ActionKind::Interactive,
+                    destructive: false,
+                },
+                ActionDescriptor {
+                    id: ActionId::new("logs"),
+                    label: SmolStr::new("Stream logs"),
+                    kind: ActionKind::Stream,
+                    destructive: false,
+                },
+            ],
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +390,27 @@ mod tests {
         let vfs = backend();
         assert!(matches!(
             vfs.open_write(&p("/containers/web/x"), WriteOpts::default())
+                .await,
+            Err(VfsError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn containers_advertise_exec_and_logs_actions() {
+        let vfs = backend();
+        // Containers (and their subtree) expose exec + logs; the top-level tree does not.
+        let ids: Vec<String> = vfs
+            .actions_at(&p("/containers/web"))
+            .iter()
+            .map(|a| a.id.0.to_string())
+            .collect();
+        assert_eq!(ids, vec!["exec", "logs"]);
+        assert!(!vfs.actions_at(&p("/containers/web/etc")).is_empty());
+        assert!(vfs.actions_at(&p("/containers")).is_empty());
+        assert!(vfs.actions_at(&p("/images/nginx:latest")).is_empty());
+        // Invocation is the integration step — still unsupported.
+        assert!(matches!(
+            vfs.invoke(ActionId::new("logs"), cairn_vfs::ActionCtx::None)
                 .await,
             Err(VfsError::Unsupported(_))
         ));

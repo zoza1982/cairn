@@ -22,7 +22,7 @@
 | **Current milestone** | **Hermetic cores delivered across M0–M8; SDK/service integration env-deferred** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core & plan→confirm UI + M8 runtime, WIT RFC & keybindings + M4 SFTP-mapping + M6 Docker- & K8s-mapping ✅ · cloud providers + live-transport (SSH/Docker/K8s) + LLM HTTP providers + WASM component bridge ⏭ |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 30 / 17 / 0 / 0 / 24 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 30 / 20 / 0 / 0 / 21 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
 
@@ -186,10 +186,10 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 |---|---|---|---|---|---|---|
 | M6-1 | RFC: **Docker backend** (fs via archive API, image layers, exec/logs) | container-backend-engineer, technical-writer | M1-1 | RFC merged | approved before M6-2 | ✅ (RFC-0004, #20) |
 | M6-2 | `cairn-backend-docker` (`bollard`): list containers+images; browse container fs (tar); image layers RO | container-backend-engineer | M6-1, M3-5 | rustdoc; backend README | against dind: browse fs; copy in/out | 🟡 mapping core (#20): `ContainerOps` seam + `DockerVfs` routing (containers/images/in-container fs) mock-tested; `BollardDocker` lists containers+images live; in-container fs via tar + live daemon = integration step |
-| M6-3 | Docker actions: `exec`, `logs` (Stream), start/stop | container-backend-engineer | M6-2 | rustdoc | exec interactive stream; logs follow | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-3 | Docker actions: `exec`, `logs` (Stream), start/stop | container-backend-engineer | M6-2 | rustdoc | exec interactive stream; logs follow | 🟡 action surface (#27): `actions_at` advertises `exec`/`logs` across a container subtree, mock-tested; live streaming invocation (bollard exec/logs) = integration step |
 | M6-4 | RFC: **Kubernetes backend** (ctx→ns→pod→container→fs, exec/cp/logs/port-forward, auth) | kube-staff-engineer, technical-writer | M1-1 | RFC merged | approved before M6-5 | ✅ (RFC-0005, #21) |
 | M6-5 | `cairn-backend-k8s` (`kube`): navigable tree, watch strategy, kubeconfig/exec-plugin auth via broker | kube-staff-engineer | M6-4, M3-5 | rustdoc; backend README | against `kind`: browse ns/pods; multi-context | 🟡 mapping core (#21): `KubeOps` seam + `KubeVfs` routing (ctx→ns→pod→container→fs) + per-depth `caps_at`, mock-tested; live `kube-rs` adapter (+ its TLS stack) + watch = integration step |
-| M6-6 | K8s cp (tar over exec), `logs(follow)` Stream, `exec` (tty), `port-forward` (Session) | kube-staff-engineer | M6-5 | rustdoc | cp out of pod completes (no stall); port-forward holds | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-6 | K8s cp (tar over exec), `logs(follow)` Stream, `exec` (tty), `port-forward` (Session) | kube-staff-engineer | M6-5 | rustdoc | cp out of pod completes (no stall); port-forward holds | 🟡 action surface (#27): `actions_at` advertises pod `logs`/`port-forward` and container `logs`/`exec` by depth, mock-tested; live streams/sessions + tar-cp (kube SDK) = integration step |
 | M6-7 | Stream/Session UI: live log viewer (follow+filter), exec pane, port-forward status | tui-engineer | M6-3, M6-6 | user docs | **Demo:** stream pod logs; exec; copy pod→S3 | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
 
 ### M7 — Agentic AI (plan→confirm→execute) · **security-review required**
