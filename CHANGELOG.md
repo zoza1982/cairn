@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open_connection` remains deferred pending the broker-backed opener.
 
 ### Added
+- **AI freeform prompt** (M7-6): `Ctrl-A` now opens a text prompt for a natural-language request
+  instead of sending a hardcoded demo string — the entered text drives the plan → confirm → execute
+  flow. The freeform prompt accepts arbitrary input (paths, spaces); while the assistant is preparing
+  a plan, actions that would open a competing overlay are suppressed so the proposal can't clobber
+  another modal. (Live LLM providers remain the integration step; the offline `MockProvider` still
+  builds the plan.)
 - **Text-input overlay + mkdir/rename** (M2-3): a reusable single-line prompt (`Overlay::Prompt`)
   with a terminal-agnostic `TextEdit` message, driving two first consumers — `F7` creates a directory
   and `F2` renames the entry under the cursor (configurable as `make_dir` / `rename`). While a prompt

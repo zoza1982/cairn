@@ -5,10 +5,6 @@ use cairn_ai::Plan;
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{ListPage, VfsError};
 
-/// The placeholder request sent to the assistant by [`Action::AiPropose`] until freeform prompt
-/// entry (a text-input overlay) lands. The plan → confirm flow it drives is fully real.
-pub(crate) const DEMO_AI_PROMPT: &str = "Archive logs older than 30 days to the other pane";
-
 /// A high-level user action, resolved from input by the TUI keymap. Kept independent of any terminal
 /// library so the core stays UI-agnostic and unit-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

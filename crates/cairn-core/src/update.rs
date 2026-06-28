@@ -1,6 +1,6 @@
 //! The pure reducer: `update(&mut AppState, Msg) -> Vec<AppEffect>`. No I/O, no `.await`.
 
-use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit, DEMO_AI_PROMPT};
+use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 use crate::state::{AppState, Listing, Overlay, PromptKind, Side, SortMode};
 use cairn_types::{Entry, VfsPath};
 use std::sync::Arc;
@@ -36,6 +36,18 @@ pub fn initial_effects(state: &AppState) -> Vec<AppEffect> {
 fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     if state.overlay.is_some() {
         return apply_overlay_action(state, action);
+    }
+    // While the assistant is preparing a plan, suppress actions that would open a competing overlay:
+    // the proposal opens its own review overlay when it arrives and must not clobber another modal
+    // (e.g. a half-typed prompt or a delete confirmation). AiPropose has its own pending guard below.
+    if state.ai_pending
+        && matches!(
+            action,
+            Action::MakeDir | Action::Rename | Action::Delete | Action::OpenConnections
+        )
+    {
+        state.status = Some("The assistant is preparing a plan…".to_owned());
+        return Vec::new();
     }
     match action {
         Action::CursorUp => {
@@ -79,11 +91,12 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             if state.ai_pending {
                 return Vec::new(); // a request is already in flight
             }
-            state.ai_pending = true;
-            state.status = Some("Asking the assistant…".to_owned());
-            vec![AppEffect::RequestAiPlan {
-                prompt: DEMO_AI_PROMPT.to_owned(),
-            }]
+            // Open a freeform prompt; the request is sent when the user submits it.
+            state.overlay = Some(Overlay::Prompt {
+                kind: PromptKind::AiPrompt,
+                input: String::new(),
+            });
+            Vec::new()
         }
         Action::OpenConnections => {
             if state.connections.is_empty() {
@@ -167,14 +180,14 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
 /// Handle a text-editing keystroke. Only meaningful while a [`Overlay::Prompt`] is open; otherwise a
 /// no-op (a stray keystroke between closing the prompt and the input layer noticing).
 fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
-    let Some(Overlay::Prompt { input, .. }) = &mut state.overlay else {
+    let Some(Overlay::Prompt { input, kind }) = &mut state.overlay else {
         return Vec::new();
     };
     match edit {
         TextEdit::Insert(c) => {
-            // Reject path separators and control characters at the source — the name is a single
-            // path component, validated again on submit.
-            if !c.is_control() && c != '/' {
+            // Always reject control characters. A filename prompt also rejects `/` at the source (it
+            // is a single path component, re-validated on submit); a freeform prompt accepts it.
+            if !(c.is_control() || (kind.is_filename() && c == '/')) {
                 input.push(c);
             }
             Vec::new()
@@ -191,9 +204,40 @@ fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
     }
 }
 
-/// Validate the prompt's text and turn it into the corresponding effect, then close the overlay. On
-/// an invalid name the prompt stays open and a status message explains why.
+/// Dispatch a submitted prompt to its per-kind handler. The single exhaustive match means a new
+/// [`PromptKind`] cannot be silently dropped. The clone ends the borrow on `state.overlay` before the
+/// handlers take `&mut state` (and is cheap — `AiPrompt`/`MakeDir` are trivial, `Rename` clones one
+/// `VfsPath`, the same allocation the rename path already made).
 fn submit_prompt(state: &mut AppState) -> Vec<AppEffect> {
+    let Some(Overlay::Prompt { kind, .. }) = &state.overlay else {
+        return Vec::new();
+    };
+    match kind.clone() {
+        PromptKind::AiPrompt => submit_ai_prompt(state),
+        PromptKind::MakeDir | PromptKind::Rename { .. } => submit_filename_prompt(state),
+    }
+}
+
+/// Submit a freeform AI request: accepts arbitrary text (only non-empty required), drives a plan
+/// request rather than a filesystem effect.
+fn submit_ai_prompt(state: &mut AppState) -> Vec<AppEffect> {
+    let Some(Overlay::Prompt { input, .. }) = &state.overlay else {
+        return Vec::new();
+    };
+    let prompt = input.trim().to_owned();
+    if prompt.is_empty() {
+        state.status = Some("Enter a request for the assistant".to_owned());
+        return Vec::new();
+    }
+    state.overlay = None;
+    state.ai_pending = true;
+    state.status = Some("Asking the assistant…".to_owned());
+    vec![AppEffect::RequestAiPlan { prompt }]
+}
+
+/// Submit a filename prompt (new directory / rename). On an invalid name the prompt stays open and a
+/// status message explains why.
+fn submit_filename_prompt(state: &mut AppState) -> Vec<AppEffect> {
     let Some(Overlay::Prompt { kind, input }) = &state.overlay else {
         return Vec::new();
     };
@@ -232,6 +276,8 @@ fn submit_prompt(state: &mut AppState) -> Vec<AppEffect> {
                 to,
             }
         }
+        // `submit_prompt` routes AiPrompt to `submit_ai_prompt`; unreachable here.
+        PromptKind::AiPrompt => return Vec::new(),
     };
     state.overlay = None;
     vec![effect]
@@ -1217,11 +1263,86 @@ mod tests {
     }
 
     #[test]
-    fn ai_propose_emits_request_effect() {
+    fn ai_propose_opens_a_freeform_prompt_then_submit_requests_a_plan() {
         let mut s = state();
+        // AiPropose opens a prompt rather than firing immediately.
         let fx = update(&mut s, Msg::Action(Action::AiPropose));
-        assert_eq!(fx.len(), 1);
-        assert!(matches!(fx[0], AppEffect::RequestAiPlan { .. }));
+        assert!(fx.is_empty());
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::Prompt {
+                kind: PromptKind::AiPrompt,
+                ..
+            })
+        ));
+        // The freeform prompt accepts `/` (unlike a filename prompt, which rejects path separators).
+        type_text(&mut s, "archive /var/log to the other pane");
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(s.ai_pending);
+        assert!(s.overlay.is_none());
+        match &fx[..] {
+            [AppEffect::RequestAiPlan { prompt }] => {
+                assert_eq!(prompt, "archive /var/log to the other pane");
+            }
+            other => panic!("expected RequestAiPlan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ai_prompt_rejects_an_empty_request() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::AiPropose));
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty());
+        assert!(!s.ai_pending);
+        assert!(s.overlay.is_some(), "stays open on empty request");
+    }
+
+    #[test]
+    fn ai_prompt_rejects_a_whitespace_only_request() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::AiPropose));
+        type_text(&mut s, "   ");
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty());
+        assert!(!s.ai_pending);
+        assert!(s.overlay.is_some(), "stays open on whitespace-only request");
+    }
+
+    #[test]
+    fn cancelling_the_ai_prompt_leaves_no_pending_request() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::AiPropose));
+        type_text(&mut s, "never mind");
+        let fx = update(&mut s, Msg::Text(TextEdit::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        assert!(!s.ai_pending, "cancel must not strand a pending request");
+    }
+
+    #[test]
+    fn overlay_openers_are_suppressed_while_a_plan_is_pending() {
+        let mut s = state();
+        request_ai(&mut s, "do something"); // ai_pending = true, no overlay
+        for action in [
+            Action::MakeDir,
+            Action::Rename,
+            Action::Delete,
+            Action::OpenConnections,
+        ] {
+            let fx = update(&mut s, Msg::Action(action));
+            assert!(fx.is_empty(), "{action:?} should be suppressed");
+            assert!(
+                s.overlay.is_none(),
+                "{action:?} must not open a competing overlay while a plan is pending"
+            );
+        }
+        // The arriving plan can therefore safely open its review overlay.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::AiPlanProposed(Ok(make_plan(&["list"])))),
+        );
+        assert!(matches!(s.overlay, Some(Overlay::AiPlan { .. })));
     }
 
     #[test]
@@ -1387,10 +1508,17 @@ mod tests {
         assert_eq!(s.status.as_deref(), Some("Plan rejected"));
     }
 
+    /// Drive the AI flow up through submitting a request: returns once `ai_pending` is set.
+    fn request_ai(s: &mut AppState, prompt: &str) {
+        let _ = update(s, Msg::Action(Action::AiPropose));
+        type_text(s, prompt);
+        let _ = update(s, Msg::Text(TextEdit::Submit));
+    }
+
     #[test]
     fn empty_plan_does_not_open_overlay() {
         let mut s = state();
-        let _ = update(&mut s, Msg::Action(Action::AiPropose)); // sets ai_pending
+        request_ai(&mut s, "do something"); // sets ai_pending
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::AiPlanProposed(Ok(make_plan(&[])))),
@@ -1403,12 +1531,13 @@ mod tests {
     #[test]
     fn ai_propose_is_suppressed_while_a_request_is_in_flight() {
         let mut s = state();
-        let fx = update(&mut s, Msg::Action(Action::AiPropose));
-        assert_eq!(fx.len(), 1); // first request goes out
+        request_ai(&mut s, "do something"); // first request goes out
         assert!(s.ai_pending);
+        // While pending, AiPropose neither opens a prompt nor fires again.
         let fx = update(&mut s, Msg::Action(Action::AiPropose));
-        assert!(fx.is_empty()); // second is suppressed
-                                // The proposal clears the pending flag.
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        // The proposal clears the pending flag.
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::AiPlanProposed(Ok(make_plan(&["list"])))),
