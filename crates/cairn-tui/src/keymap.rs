@@ -26,6 +26,11 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => Some(Action::Leave),
         KeyCode::Tab => Some(Action::SwitchPane),
         KeyCode::Char(' ') | KeyCode::Insert => Some(Action::ToggleMark),
+        KeyCode::F(5) | KeyCode::Char('c') => Some(Action::Copy),
+        KeyCode::F(6) | KeyCode::Char('m') => Some(Action::Move),
+        KeyCode::F(8) | KeyCode::Delete | KeyCode::Char('d') => Some(Action::Delete),
+        KeyCode::Char('y') => Some(Action::Confirm),
+        KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Char('r') => Some(Action::Refresh),
         _ => None,
     }

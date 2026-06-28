@@ -24,11 +24,13 @@ cairn-core = { workspace = true }
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
 cairn-backend-local = { workspace = true }
+cairn-transfer = { workspace = true }
 cairn-tui = { workspace = true }
 anyhow = "1"
 futures = "0.3"
 ratatui = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

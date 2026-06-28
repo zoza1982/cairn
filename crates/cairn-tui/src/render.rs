@@ -1,10 +1,10 @@
 //! Rendering the [`AppState`] with ratatui. Pure: takes `&AppState`, performs no I/O.
 
-use cairn_core::{AppState, Listing, PaneState, Side};
-use ratatui::layout::{Constraint, Layout, Rect};
+use cairn_core::{AppState, Listing, Overlay, PaneState, Side};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 /// Render the whole application: two panes over a one-line status bar.
@@ -16,6 +16,42 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     render_pane(frame, left, state, Side::Left);
     render_pane(frame, right, state, Side::Right);
     render_status(frame, status, state);
+    if let Some(overlay) = &state.overlay {
+        render_overlay(frame, overlay);
+    }
+}
+
+/// Draw a modal overlay centered over the screen.
+fn render_overlay(frame: &mut Frame, overlay: &Overlay) {
+    match overlay {
+        Overlay::ConfirmDelete { paths, .. } => {
+            let area = centered(frame.area(), 44, 6);
+            frame.render_widget(Clear, area);
+            let block = Block::bordered()
+                .title(" Confirm delete ")
+                .border_style(Style::default().fg(Color::Red));
+            let body = Paragraph::new(vec![
+                Line::from(format!("Delete {} item(s)?", paths.len())),
+                Line::from(""),
+                Line::from("[y] Yes    [n] No"),
+            ])
+            .block(block)
+            .alignment(Alignment::Center);
+            frame.render_widget(body, area);
+        }
+    }
+}
+
+/// A centered rect of at most `w`×`h`, clamped to `area`.
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side) {
@@ -82,7 +118,8 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side) {
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let pane = state.active();
     let count = pane_count_label(pane);
-    let help = "q quit · Tab switch · ↵ open · ⌫ up · Space mark · r refresh";
+    let help =
+        "q quit · Tab switch · ↵ open · ⌫ up · Space mark · c copy · m move · d del · r refresh";
     let line = Line::from(format!(" {count}   {help}"));
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::Gray)),

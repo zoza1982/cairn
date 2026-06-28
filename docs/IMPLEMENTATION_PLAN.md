@@ -22,7 +22,7 @@
 | **Current milestone** | **M2 — Operations & transfer engine** (🟡 in progress) |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones complete** | 0 / 9 |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 14 / 6 / 51 / 0 / 0 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 15 / 8 / 48 / 0 / 0 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows (scaffold) |
 | **Long-pole items** | `M1-1` Vfs trait · `M3-5` broker · all backend RFCs |
 
@@ -128,9 +128,9 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 | M2-2 | `cairn-transfer` core: stream-through copy + dir-tree walk, server-copy fast path | storage-engineer, rust-staff-engineer | M2-1 | rustdoc | cross-backend copy via MockVfs (tests) | ✅ #11 |
 | M2-3 | Move = rename-or-(copy→verify→delete); conflict policy (Skip/Overwrite/Rename/NewerWins/Prompt) | storage-engineer | M2-2 | rustdoc | move + all conflict modes tested | ✅ #11 |
 | M2-4 | Pause/resume/cancel, retry w/ backoff+jitter, global+per-backend semaphores | storage-engineer, network-engineer | M2-2 | rustdoc | cancel mid-chunk (tested) | 🟡 cancellation done; pause/resume/retry/semaphores deferred to M5/queue |
-| M2-5 | Transfer queue UI overlay: per-item progress/speed/ETA, reorder, controls | tui-engineer | M2-2, M1-6 | user docs | **Demo:** copy a big tree local→local with live queue | ☐ |
-| M2-6 | Operation overlays: mkdir/rename/delete(confirm)/copy/move wired to engine | tui-engineer, software-engineer | M2-2 | user docs | F5–F8 flows; destructive ops confirm | ☐ |
-| M2-7 | Confirm-dialog + overlay-stack input interception (foundation for plan→confirm) | tui-engineer, security-engineer | M2-6 | rustdoc | destructive effect cannot dispatch without confirm (test) | ☐ |
+| M2-5 | Transfer queue UI overlay: per-item progress/speed/ETA, reorder, controls | tui-engineer | M2-2, M1-6 | user docs | **Demo:** copy a big tree local→local with live queue | 🟡 status-line feedback done; full queue overlay (live progress/reorder/pause) deferred |
+| M2-6 | Operation keys: copy (F5/c), move (F6/m), delete (F8/d) wired to engine | tui-engineer, software-engineer | M2-2 | user docs | copy/move/delete flows work; delete confirms | 🟡 copy/move/delete done; mkdir/rename deferred |
+| M2-7 | Confirm-dialog + overlay input interception (foundation for plan→confirm) | tui-engineer, security-engineer | M2-6 | rustdoc | destructive op cannot dispatch without confirm (tested) | ✅ #12 |
 
 ### M3 — Secrets foundation (vault + broker) · **security-review required on every item**
 

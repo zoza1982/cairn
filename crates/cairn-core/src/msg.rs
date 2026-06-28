@@ -25,6 +25,16 @@ pub enum Action {
     SwitchPane,
     /// Toggle the mark on the entry under the cursor.
     ToggleMark,
+    /// Copy the marked (or current) entries to the other pane.
+    Copy,
+    /// Move the marked (or current) entries to the other pane.
+    Move,
+    /// Delete the marked (or current) entries (asks for confirmation).
+    Delete,
+    /// Confirm a pending modal action.
+    Confirm,
+    /// Cancel a pending modal action / dismiss an overlay.
+    Cancel,
     /// Reload the active pane.
     Refresh,
     /// Quit the application.
@@ -54,6 +64,13 @@ pub enum AppEvent {
         /// The page result.
         result: Result<ListPage, VfsError>,
     },
+    /// A copy/move/delete operation finished; carries a status message and whether it failed.
+    OpDone {
+        /// Human-readable, secret-free status.
+        status: String,
+        /// Whether the operation failed.
+        error: bool,
+    },
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -68,5 +85,23 @@ pub enum AppEffect {
         conn: ConnectionId,
         /// Directory to list.
         dir: VfsPath,
+    },
+    /// Copy or move entries from one connection to another.
+    Transfer {
+        /// Source connection.
+        src_conn: ConnectionId,
+        /// Destination connection.
+        dst_conn: ConnectionId,
+        /// `(source, destination)` path pairs.
+        items: Vec<(VfsPath, VfsPath)>,
+        /// Whether to move (delete source after copy) rather than copy.
+        is_move: bool,
+    },
+    /// Delete entries on a connection.
+    Delete {
+        /// The connection.
+        conn: ConnectionId,
+        /// Paths to delete.
+        paths: Vec<VfsPath>,
     },
 }
