@@ -15,7 +15,7 @@ workspace = true
 [dependencies]
 cairn-secrets = { workspace = true }
 argon2 = "0.5"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 getrandom = "0.2"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
