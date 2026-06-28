@@ -82,6 +82,22 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         state.status = Some("A plan is executing — press Esc to cancel it first".to_owned());
         return Vec::new();
     }
+    // A navigation/selection keystroke dismisses any lingering transient status (now that the status
+    // line renders it when idle): the key hints return and a stale "Copied…"/"error:" line doesn't
+    // persist across unrelated moves. An arm that sets its own status below overwrites this.
+    if matches!(
+        action,
+        Action::CursorUp
+            | Action::CursorDown
+            | Action::CursorTop
+            | Action::CursorBottom
+            | Action::Enter
+            | Action::Leave
+            | Action::SwitchPane
+            | Action::ToggleMark
+    ) {
+        state.status = None;
+    }
     match action {
         Action::CursorUp => {
             let p = state.active_mut();
@@ -1606,6 +1622,20 @@ mod tests {
         ));
         assert!(!t_paused(&s));
         assert_eq!(s.status.as_deref(), Some("Transfer resumed"));
+    }
+
+    #[test]
+    fn a_transient_status_is_cleared_by_navigation() {
+        // The status line renders `state.status` when idle; a navigation keystroke must dismiss it so
+        // a stale "Copied…"/"error:" message doesn't linger (and the key hints return).
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        s.status = Some("Copied 1 file(s)".to_owned());
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        assert!(
+            s.status.is_none(),
+            "navigation dismisses a transient status"
+        );
     }
 
     #[test]

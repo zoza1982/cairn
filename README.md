@@ -84,8 +84,9 @@ By default `s` cycles the active pane's sort order (name → size → modified �
 hidden entries (dotfiles) are listed; the current sort mode and hidden state show in each pane's
 bottom-right corner. `F7` creates a new directory and `F2` renames the entry under the cursor (both
 open a text prompt; `Enter` confirms, `Esc` cancels). `/` filters the listing as you type
-(`Enter` keeps the filter, `Esc` clears it). During a transfer, `p` pauses/resumes it and `Esc`
-cancels it; `Ctrl-T` opens the transfer queue.
+(`Enter` keeps the filter, `Esc` clears it). During a transfer, `p` pauses/resumes and `Esc`
+cancels (all active transfers); `Ctrl-T` opens the transfer queue. Up to two transfers run at once by
+default — set `[transfers] concurrency = N` in config to change it.
 
 ```toml
 [ui.keybindings]
