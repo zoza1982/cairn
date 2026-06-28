@@ -12,6 +12,7 @@ mod update;
 
 pub use msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 pub use state::{
-    AppState, ConnectionChoice, Listing, Overlay, PaneState, PromptKind, Side, SortMode,
+    AppState, ConnectionChoice, Listing, Overlay, PaneState, PromptKind, QueuedTransfer, Side,
+    SortMode,
 };
 pub use update::{initial_effects, update};

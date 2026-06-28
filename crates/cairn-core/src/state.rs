@@ -2,8 +2,24 @@
 
 use cairn_ai::Plan;
 use cairn_types::{ConnectionId, Entry, VfsPath};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
+
+/// A transfer waiting in the queue behind the active one (transfers run one at a time).
+///
+/// SYNC: mirrors the fields of `AppEffect::Transfer` minus `overwrite` (a dequeued transfer always
+/// starts a fresh attempt with `overwrite: false`). Keep in step if that effect gains a field.
+#[derive(Debug, Clone)]
+pub struct QueuedTransfer {
+    /// Source connection.
+    pub src_conn: ConnectionId,
+    /// Destination connection.
+    pub dst_conn: ConnectionId,
+    /// The `(source, destination)` pairs to transfer.
+    pub items: Vec<(VfsPath, VfsPath)>,
+    /// Whether the transfer is a move.
+    pub is_move: bool,
+}
 
 /// Which pane is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,9 +323,11 @@ pub struct AppState {
     /// Connections the switcher can open in a pane (populated from config at startup).
     pub connections: Vec<ConnectionChoice>,
     /// Cumulative bytes of the **single** in-flight transfer (`Some` while one runs), for the
-    /// progress display. The reducer allows at most one active transfer (a second `start_transfer` is
-    /// refused while this is `Some`), so one slot suffices; only a `TransferDone` clears it.
+    /// progress display. Transfers run one at a time; only a `TransferDone` clears it.
     pub transfer_bytes: Option<u64>,
+    /// Transfers waiting behind the active one. A copy/move issued while one is running is enqueued
+    /// here and started (FIFO) when the active transfer finishes.
+    pub transfer_queue: VecDeque<QueuedTransfer>,
 }
 
 impl AppState {
@@ -328,6 +346,7 @@ impl AppState {
             ai_pending: false,
             connections: Vec::new(),
             transfer_bytes: None,
+            transfer_queue: VecDeque::new(),
         }
     }
 

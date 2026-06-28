@@ -1,19 +1,24 @@
 //! The pure reducer: `update(&mut AppState, Msg) -> Vec<AppEffect>`. No I/O, no `.await`.
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
-use crate::state::{AppState, Listing, Overlay, PromptKind, Side, SortMode};
+use crate::state::{AppState, Listing, Overlay, PromptKind, QueuedTransfer, Side, SortMode};
 use cairn_types::{Entry, VfsPath};
 use std::sync::Arc;
 
 /// Apply a message to the state, returning any effects to run. Deterministic and side-effect-free.
 #[must_use]
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<AppEffect> {
-    match msg {
+    let mut effects = match msg {
         Msg::Action(action) => apply_action(state, action),
         Msg::Text(edit) => apply_text(state, edit),
         Msg::Event(event) => apply_event(state, event),
         Msg::Tick => Vec::new(),
-    }
+    };
+    // Drain the transfer queue whenever nothing blocks it — covers the case where an overlay that was
+    // open when the active transfer finished has since closed. `advance_queue` is a no-op while a
+    // transfer is running, an overlay is open, or the queue is empty, so this is safe after any msg.
+    effects.extend(advance_queue(state));
+    effects
 }
 
 /// The effects needed to populate both panes at startup.
@@ -412,6 +417,7 @@ fn apply_confirm_overwrite_action(state: &mut AppState, action: Action) -> Vec<A
         Action::Cancel => {
             state.overlay = None;
             state.status = Some("Transfer cancelled".to_owned());
+            // The queue is drained by the tail call in `update` now that the overlay is closed.
             Vec::new()
         }
         _ => Vec::new(),
@@ -602,12 +608,6 @@ fn op_targets(state: &AppState, side: Side) -> Vec<(VfsPath, String)> {
 }
 
 fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
-    // One transfer at a time: the progress indicator is a single slot, so refuse to start a second
-    // while one runs rather than corrupt the display or have its completion clear the wrong one.
-    if state.transfer_bytes.is_some() {
-        state.status = Some("A transfer is already in progress".to_owned());
-        return Vec::new();
-    }
     let src = state.focus;
     let dst = src.other();
     let targets = op_targets(state, src);
@@ -623,6 +623,22 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
             items.push((from.clone(), to));
         }
     }
+    if items.is_empty() {
+        return Vec::new();
+    }
+    // One transfer at a time: if one is already running, queue this one and start it (FIFO) when the
+    // active transfer finishes. (`start_transfer` only runs with no overlay open; a transfer paused
+    // on an overwrite prompt has `transfer_bytes` cleared, and its queue drains on cancel.)
+    if state.transfer_bytes.is_some() {
+        state.transfer_queue.push_back(QueuedTransfer {
+            src_conn,
+            dst_conn,
+            items,
+            is_move,
+        });
+        state.status = Some(format!("Queued ({} pending)", state.transfer_queue.len()));
+        return Vec::new();
+    }
     // Marks are NOT cleared here: if the pre-check finds a conflict and the user cancels the
     // overwrite prompt, nothing was transferred and the selection must survive. `finish_op` clears
     // marks on actual completion (`TransferDone`).
@@ -634,6 +650,25 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
         dst_conn,
         items,
         is_move,
+        overwrite: false,
+    }]
+}
+
+/// Start the next queued transfer when nothing is running or awaiting a decision. Called when the
+/// active transfer finishes and when an overwrite prompt is dismissed, so the queue keeps draining.
+fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
+    if state.transfer_bytes.is_some() || state.overlay.is_some() {
+        return Vec::new();
+    }
+    let Some(next) = state.transfer_queue.pop_front() else {
+        return Vec::new();
+    };
+    arm_transfer(state, next.is_move, next.items.len());
+    vec![AppEffect::Transfer {
+        src_conn: next.src_conn,
+        dst_conn: next.dst_conn,
+        items: next.items,
+        is_move: next.is_move,
         overwrite: false,
     }]
 }
@@ -778,9 +813,20 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             is_move,
             conflicts,
         } => {
-            // The transfer didn't run (no overwrite); drop the progress indicator and the
-            // "Copying…" status, and ask first.
+            // The transfer didn't run (no overwrite); drop the progress indicator.
             state.transfer_bytes = None;
+            // Don't clobber an overlay the user already has open (e.g. a delete confirmation): put
+            // the transfer back at the front of the queue so the tail-drain retries it (and shows
+            // the overwrite prompt) once that overlay closes.
+            if state.overlay.is_some() {
+                state.transfer_queue.push_front(QueuedTransfer {
+                    src_conn,
+                    dst_conn,
+                    items,
+                    is_move,
+                });
+                return Vec::new();
+            }
             state.status = None;
             state.overlay = Some(Overlay::ConfirmOverwrite {
                 src_conn,
@@ -796,6 +842,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // finishing mid-transfer can't wipe it (and a stray late `TransferProgress` is ignored
             // by its `is_some` guard once this resets the slot).
             state.transfer_bytes = None;
+            // The queue is drained by the tail call in `update`.
             finish_op(state, &status, error)
         }
     }
@@ -1314,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_transfer_is_refused_while_one_is_in_flight() {
+    fn a_second_transfer_is_queued_then_starts_when_the_first_finishes() {
         let mut s = state();
         deliver(
             &mut s,
@@ -1326,10 +1373,137 @@ mod tests {
         );
         let fx = update(&mut s, Msg::Action(Action::Copy));
         assert!(matches!(&fx[..], [AppEffect::Transfer { .. }]));
-        // A second transfer while the first runs is refused (no effect, status explains).
+        // A second transfer while the first runs is queued, not refused (no effect now).
         let fx = update(&mut s, Msg::Action(Action::Move));
         assert!(fx.is_empty());
-        assert!(s.status.as_deref().unwrap().contains("already in progress"));
+        assert_eq!(s.transfer_queue.len(), 1);
+        assert!(s.status.as_deref().unwrap().contains("Queued"));
+        // When the first finishes, the queued one starts (its own Transfer effect is emitted).
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferDone {
+                status: "Copied".to_owned(),
+                error: false,
+            }),
+        );
+        assert!(s.transfer_queue.is_empty());
+        assert_eq!(
+            s.transfer_bytes,
+            Some(0),
+            "the queued transfer is now active"
+        );
+        assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
+    }
+
+    #[test]
+    fn queue_drains_after_an_unrelated_overlay_opened_during_the_active_transfer() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active
+        let _ = update(&mut s, Msg::Action(Action::Move)); // B queued
+        assert_eq!(s.transfer_queue.len(), 1);
+        // A delete confirmation is opened over the running transfer.
+        let _ = update(&mut s, Msg::Action(Action::Delete));
+        assert!(matches!(s.overlay, Some(Overlay::ConfirmDelete { .. })));
+        // A finishes while the dialog is open: B can't start under the overlay.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferDone {
+                status: "Copied".to_owned(),
+                error: false,
+            }),
+        );
+        assert_eq!(
+            s.transfer_queue.len(),
+            1,
+            "B waits while the overlay is open"
+        );
+        // Dismissing the dialog drains the queue (tail-drain in `update`).
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(
+            s.transfer_queue.is_empty(),
+            "B starts once the overlay closes"
+        );
+        assert_eq!(s.transfer_bytes, Some(0));
+        assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
+    }
+
+    #[test]
+    fn a_conflict_does_not_clobber_an_open_overlay_and_retries_after_it_closes() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("a", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active
+                                                           // User opens a delete dialog over the running transfer.
+        let _ = update(&mut s, Msg::Action(Action::Delete));
+        assert!(matches!(s.overlay, Some(Overlay::ConfirmDelete { .. })));
+        // A reports a conflict while the delete dialog is open — it must NOT replace the dialog.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferConflict {
+                src_conn: ConnectionId(1),
+                dst_conn: ConnectionId(2),
+                items: vec![(VfsPath::root(), VfsPath::root())],
+                is_move: false,
+                conflicts: 1,
+            }),
+        );
+        assert!(
+            matches!(s.overlay, Some(Overlay::ConfirmDelete { .. })),
+            "the delete dialog is preserved"
+        );
+        assert_eq!(
+            s.transfer_queue.len(),
+            1,
+            "the conflicted transfer is re-queued"
+        );
+        // Dismissing the delete dialog retries the transfer (tail-drain re-issues its Transfer
+        // effect; the effect runner then re-detects the conflict and shows the overwrite prompt).
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(s.transfer_queue.is_empty());
+        assert_eq!(s.transfer_bytes, Some(0));
+        assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
+    }
+
+    #[test]
+    fn cancelling_an_overwrite_prompt_drains_the_queue() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        // First transfer starts; a second is queued behind it.
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let _ = update(&mut s, Msg::Action(Action::Move));
+        assert_eq!(s.transfer_queue.len(), 1);
+        // The first transfer then hits a conflict → overwrite prompt (clears the active slot).
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferConflict {
+                src_conn: ConnectionId(1),
+                dst_conn: ConnectionId(2),
+                items: vec![(VfsPath::root(), VfsPath::root())],
+                is_move: false,
+                conflicts: 1,
+            }),
+        );
+        assert!(matches!(s.overlay, Some(Overlay::ConfirmOverwrite { .. })));
+        // Cancelling the prompt abandons that transfer and drains the queue: the next one starts.
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(s.overlay.is_none());
+        assert!(s.transfer_queue.is_empty());
+        assert_eq!(s.transfer_bytes, Some(0));
+        assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
     }
 
     #[test]
