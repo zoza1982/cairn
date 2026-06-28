@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AI **plan → confirm** overlay (M7-6): `Ctrl-A` asks the assistant to propose a plan, which opens a
+  review overlay showing each step with its reversibility. Approve step-by-step (`↵`), reject (`x`),
+  or — only when no step is irreversible — bulk-approve (`a`); `Esc` aborts. The reducer
+  (`Overlay::AiPlan`) is pure and unit-tested; the overlay renders via ratatui (`TestBackend` tests).
+  Plans are produced from an offline `MockProvider` until the HTTP providers (M7-2) land; step
+  execution against backends is the next integration step.
 - RFC-0006 (plugin host & WIT ABI): the `cairn:plugin@1.0.0` WIT package (`types`/`host`/`backend`
   interfaces, `backend-plugin` world), the host↔guest mapping onto the `Vfs` trait, the
   capability-grant and credential-brokering model, resource limits/cancellation, and WIT semver

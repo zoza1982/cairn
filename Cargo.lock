@@ -219,6 +219,7 @@ name = "cairn"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cairn-ai",
  "cairn-backend-local",
  "cairn-core",
  "cairn-transfer",
@@ -227,6 +228,7 @@ dependencies = [
  "cairn-vfs",
  "futures",
  "ratatui",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -336,8 +338,10 @@ dependencies = [
 name = "cairn-core"
 version = "0.0.0"
 dependencies = [
+ "cairn-ai",
  "cairn-types",
  "cairn-vfs",
+ "serde_json",
 ]
 
 [[package]]
@@ -375,9 +379,11 @@ dependencies = [
 name = "cairn-tui"
 version = "0.0.0"
 dependencies = [
+ "cairn-ai",
  "cairn-core",
  "cairn-types",
  "ratatui",
+ "serde_json",
 ]
 
 [[package]]

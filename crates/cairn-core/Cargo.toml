@@ -15,3 +15,7 @@ workspace = true
 [dependencies]
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
+cairn-ai = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"

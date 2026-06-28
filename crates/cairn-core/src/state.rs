@@ -1,5 +1,6 @@
 //! The application state model.
 
+use cairn_ai::Plan;
 use cairn_types::{ConnectionId, Entry, VfsPath};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -121,6 +122,13 @@ pub enum Overlay {
         conn: ConnectionId,
         /// The paths to delete.
         paths: Vec<VfsPath>,
+    },
+    /// Review an AI-proposed plan before executing it (plan → confirm).
+    AiPlan {
+        /// The proposed plan; its steps carry per-step approval state.
+        plan: Plan,
+        /// The step the review cursor is on (for step-through approval).
+        cursor: usize,
     },
 }
 

@@ -1,8 +1,13 @@
 //! Messages, events, and effects — the three families of the TEA loop.
 
 use crate::state::Side;
+use cairn_ai::Plan;
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{ListPage, VfsError};
+
+/// The placeholder request sent to the assistant by [`Action::AiPropose`] until freeform prompt
+/// entry (a text-input overlay) lands. The plan → confirm flow it drives is fully real.
+pub(crate) const DEMO_AI_PROMPT: &str = "Archive logs older than 30 days to the other pane";
 
 /// A high-level user action, resolved from input by the TUI keymap. Kept independent of any terminal
 /// library so the core stays UI-agnostic and unit-testable.
@@ -37,6 +42,12 @@ pub enum Action {
     Cancel,
     /// Reload the active pane.
     Refresh,
+    /// Ask the AI assistant to propose a plan (opens the plan → confirm overlay when it arrives).
+    AiPropose,
+    /// In the plan overlay: approve every step at once (only honored when no step is irreversible).
+    ApproveAll,
+    /// In the plan overlay: reject the step under the review cursor.
+    Reject,
     /// Quit the application.
     Quit,
 }
@@ -71,6 +82,8 @@ pub enum AppEvent {
         /// Whether the operation failed.
         error: bool,
     },
+    /// The assistant proposed a plan, or failed to (carries a redacted message).
+    AiPlanProposed(Result<Plan, String>),
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -103,5 +116,15 @@ pub enum AppEffect {
         conn: ConnectionId,
         /// Paths to delete.
         paths: Vec<VfsPath>,
+    },
+    /// Ask the AI assistant to propose a plan for a natural-language request.
+    RequestAiPlan {
+        /// The user's request.
+        prompt: String,
+    },
+    /// Execute an approved plan's steps.
+    ExecutePlan {
+        /// The fully-approved plan.
+        plan: Plan,
     },
 }

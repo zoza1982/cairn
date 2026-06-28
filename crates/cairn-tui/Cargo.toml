@@ -15,4 +15,8 @@ workspace = true
 [dependencies]
 cairn-core = { workspace = true }
 cairn-types = { workspace = true }
+cairn-ai = { workspace = true }
 ratatui = "0.29"
+
+[dev-dependencies]
+serde_json = "1"
