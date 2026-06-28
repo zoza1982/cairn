@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Connection switcher** (M4-5): `Ctrl-O` opens an overlay listing the available connections — the
+  built-in local roots (`/`, `$HOME`) plus any `scheme = "local"` profiles from config — and selecting
+  one re-points the active pane to it at its root. The reducer (`Overlay::Connections`) and overlay
+  render are unit-tested; opening a *new* remote connection (SSH/cloud) is the integration step.
 - Container/cluster **action surface** (M6-3/M6-6): the Docker and Kubernetes backends now advertise
   their backend-specific actions via `actions_at` — Docker exposes `exec`/`logs` across a container's
   subtree; Kubernetes exposes `logs`/`port-forward` on a pod and `logs`/`exec` on a container (by

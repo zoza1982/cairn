@@ -130,6 +130,20 @@ pub enum Overlay {
         /// The step the review cursor is on (for step-through approval).
         cursor: usize,
     },
+    /// Pick a connection to open in the active pane (the choices live in [`AppState::connections`]).
+    Connections {
+        /// The selection cursor into [`AppState::connections`].
+        cursor: usize,
+    },
+}
+
+/// A selectable connection for the switcher: a registered backend plus a human-readable label.
+#[derive(Debug, Clone)]
+pub struct ConnectionChoice {
+    /// The backend connection to switch the pane to.
+    pub conn: ConnectionId,
+    /// Display label (e.g. `"local: /home/me"` or a profile's name).
+    pub label: String,
 }
 
 /// The whole application state. Holds plain data only — no service handles, no I/O.
@@ -147,6 +161,8 @@ pub struct AppState {
     pub status: Option<String>,
     /// Whether an AI plan request is in flight (suppresses duplicate requests).
     pub ai_pending: bool,
+    /// Connections the switcher can open in a pane (populated from config at startup).
+    pub connections: Vec<ConnectionChoice>,
 }
 
 impl AppState {
@@ -163,6 +179,7 @@ impl AppState {
             should_quit: false,
             status: None,
             ai_pending: false,
+            connections: Vec::new(),
         }
     }
 

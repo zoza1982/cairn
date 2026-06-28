@@ -42,6 +42,8 @@ pub enum Action {
     Cancel,
     /// Reload the active pane.
     Refresh,
+    /// Open the connection switcher (pick a backend to open in the active pane).
+    OpenConnections,
     /// Ask the AI assistant to propose a plan (opens the plan → confirm overlay when it arrives).
     AiPropose,
     /// In the plan overlay: approve every step at once (only honored when no step is irreversible).

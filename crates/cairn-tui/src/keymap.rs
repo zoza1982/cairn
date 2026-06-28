@@ -191,6 +191,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
             KeyCode::Char('c') => Some(Action::Quit),
             // Ctrl-A asks the AI assistant to propose a plan.
             KeyCode::Char('a') => Some(Action::AiPropose),
+            // Ctrl-O opens the connection switcher.
+            KeyCode::Char('o') => Some(Action::OpenConnections),
             _ => None,
         };
     }
@@ -250,6 +252,8 @@ mod tests {
     fn ai_keys() {
         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
         assert_eq!(action_for(ctrl_a), Some(Action::AiPropose));
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(action_for(ctrl_o), Some(Action::OpenConnections));
         // Plain 'a'/'x' drive the plan overlay (no-ops elsewhere).
         assert_eq!(
             action_for(press(KeyCode::Char('a'))),

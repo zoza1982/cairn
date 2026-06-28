@@ -18,8 +18,43 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     render_pane(frame, right, state, Side::Right);
     render_status(frame, status, state);
     if let Some(overlay) = &state.overlay {
-        render_overlay(frame, overlay);
+        match overlay {
+            // The connection switcher needs the choice list, which lives on the AppState.
+            Overlay::Connections { cursor } => {
+                render_connections(frame, &state.connections, *cursor);
+            }
+            other => render_overlay(frame, other),
+        }
     }
+}
+
+/// Draw the connection switcher: a centered list of the configured connections.
+fn render_connections(
+    frame: &mut Frame,
+    connections: &[cairn_core::ConnectionChoice],
+    cursor: usize,
+) {
+    let h = (connections.len() as u16)
+        .saturating_add(2)
+        .min(frame.area().height);
+    let area = centered(frame.area(), 50, h.max(3));
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Open connection ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let items: Vec<ListItem> = connections
+        .iter()
+        .map(|c| ListItem::new(c.label.clone()))
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
+        .highlight_symbol("> ");
+    let mut st = ListState::default();
+    if !connections.is_empty() {
+        st.select(Some(cursor.min(connections.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut st);
 }
 
 /// Draw a modal overlay centered over the screen.
@@ -41,6 +76,8 @@ fn render_overlay(frame: &mut Frame, overlay: &Overlay) {
             frame.render_widget(body, area);
         }
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
+        // Rendered by `render` (it needs the AppState's connection list).
+        Overlay::Connections { .. } => {}
     }
 }
 
@@ -207,8 +244,7 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side) {
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let pane = state.active();
     let count = pane_count_label(pane);
-    let help =
-        "q quit · Tab switch · ↵ open · Space mark · c copy · m move · d del · r refresh · ^A ai";
+    let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^A ai";
     let line = Line::from(format!(" {count}   {help}"));
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::Gray)),
@@ -305,6 +341,26 @@ mod tests {
         assert!(text.contains("AI plan"));
         assert!(text.contains("archive old logs"));
         assert!(text.contains("approve all")); // safe plan → bulk-approve offered
+    }
+
+    #[test]
+    fn connection_switcher_lists_choices() {
+        let mut s = ready_state();
+        s.connections = vec![
+            cairn_core::ConnectionChoice {
+                conn: ConnectionId(3),
+                label: "local: /".into(),
+            },
+            cairn_core::ConnectionChoice {
+                conn: ConnectionId(4),
+                label: "local: ~/work".into(),
+            },
+        ];
+        s.overlay = Some(cairn_core::Overlay::Connections { cursor: 0 });
+        let text = render_text(&s, 80, 24);
+        assert!(text.contains("Open connection"));
+        assert!(text.contains("local: /"));
+        assert!(text.contains("work"));
     }
 
     #[test]

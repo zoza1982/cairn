@@ -83,6 +83,14 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 prompt: DEMO_AI_PROMPT.to_owned(),
             }]
         }
+        Action::OpenConnections => {
+            if state.connections.is_empty() {
+                state.status = Some("No other connections configured".to_owned());
+            } else {
+                state.overlay = Some(Overlay::Connections { cursor: 0 });
+            }
+            Vec::new()
+        }
         // No overlay open: confirm/cancel and the plan-only actions are no-ops.
         Action::Confirm | Action::Cancel | Action::ApproveAll | Action::Reject => Vec::new(),
         Action::Refresh => reload(state, state.focus),
@@ -105,8 +113,61 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
     match &state.overlay {
         Some(Overlay::ConfirmDelete { .. }) => apply_confirm_delete_action(state, action),
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
+        Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
         None => Vec::new(),
     }
+}
+
+/// Drive the connection switcher: navigate the choice list and open the selected connection in the
+/// active pane.
+fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    let n = state.connections.len();
+    let Some(Overlay::Connections { cursor }) = &mut state.overlay else {
+        return Vec::new();
+    };
+    match action {
+        Action::CursorUp => {
+            *cursor = cursor.saturating_sub(1);
+            Vec::new()
+        }
+        Action::CursorDown => {
+            if *cursor + 1 < n {
+                *cursor += 1;
+            }
+            Vec::new()
+        }
+        Action::Confirm | Action::Enter => {
+            let choice = state.connections[*cursor].clone();
+            state.overlay = None;
+            state.status = Some(format!("Opened {}", choice.label));
+            let side = state.focus;
+            navigate_to_conn(state, side, choice.conn)
+        }
+        Action::Cancel => {
+            state.overlay = None;
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Re-point a pane to a different connection, resetting it to the root and reloading.
+fn navigate_to_conn(
+    state: &mut AppState,
+    side: Side,
+    conn: cairn_types::ConnectionId,
+) -> Vec<AppEffect> {
+    let p = state.pane_mut(side);
+    p.conn = conn;
+    p.cwd = VfsPath::root();
+    p.listing = Listing::Loading;
+    p.cursor = 0;
+    p.marked.clear();
+    vec![AppEffect::List {
+        pane: side,
+        conn,
+        dir: VfsPath::root(),
+    }]
 }
 
 fn apply_confirm_delete_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
@@ -721,6 +782,65 @@ mod tests {
         assert!(fx.is_empty());
         assert!(s.overlay.is_none());
         assert_eq!(s.status.as_deref(), Some("Plan aborted"));
+    }
+
+    #[test]
+    fn connection_switcher_opens_and_repoints_pane() {
+        use crate::state::ConnectionChoice;
+        let mut s = state();
+        s.connections = vec![
+            ConnectionChoice {
+                conn: ConnectionId(1),
+                label: "local: /a".into(),
+            },
+            ConnectionChoice {
+                conn: ConnectionId(7),
+                label: "local: /b".into(),
+            },
+        ];
+        // Open the switcher.
+        let fx = update(&mut s, Msg::Action(Action::OpenConnections));
+        assert!(fx.is_empty());
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::Connections { cursor: 0 })
+        ));
+        // Move to the second choice and select it.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(s.overlay.is_none());
+        // The active pane now points at the chosen connection, at the root, loading.
+        assert_eq!(s.active().conn, ConnectionId(7));
+        assert_eq!(s.active().cwd.as_str(), "/");
+        assert!(matches!(s.active().listing, Listing::Loading));
+        assert!(matches!(&fx[..], [AppEffect::List { conn, .. }] if *conn == ConnectionId(7)));
+    }
+
+    #[test]
+    fn connection_switcher_with_no_choices_is_a_noop() {
+        let mut s = state();
+        let fx = update(&mut s, Msg::Action(Action::OpenConnections));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        assert!(s
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("No other connections"));
+    }
+
+    #[test]
+    fn connection_switcher_cancel_closes() {
+        use crate::state::ConnectionChoice;
+        let mut s = state();
+        s.connections = vec![ConnectionChoice {
+            conn: ConnectionId(1),
+            label: "local".into(),
+        }];
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
     }
 
     #[test]
