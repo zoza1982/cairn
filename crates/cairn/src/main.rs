@@ -4,6 +4,7 @@
 //! minimal) command line, and will eventually launch the TUI event loop. Cairn is in early
 //! development; see `docs/IMPLEMENTATION_PLAN.md` for status and `docs/LLD.md` for the architecture.
 
+mod app;
 mod cli;
 mod logging;
 mod panic;
@@ -37,16 +38,17 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the application proper. For now this only initializes logging and reports that the TUI is not
-/// yet wired up; the event loop arrives with the M1 milestone.
+/// Run the application: initialize logging, then hand off to the TUI event loop.
 fn run() -> ExitCode {
     logging::init();
     tracing::info!(version = APP_VERSION, "cairn starting");
-    println!(
-        "{APP_NAME} {APP_VERSION} — early development. The interactive TUI is not wired up yet; \
-         see docs/IMPLEMENTATION_PLAN.md."
-    );
-    ExitCode::SUCCESS
+    match app::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{APP_NAME}: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]

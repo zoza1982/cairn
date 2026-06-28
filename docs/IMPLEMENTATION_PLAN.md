@@ -22,7 +22,7 @@
 | **Current milestone** | **M1 — The abstraction, proven** (🟡 in progress) |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones complete** | 0 / 9 |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 7 / 3 / 61 / 0 / 0 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 11 / 5 / 55 / 0 / 0 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows (scaffold) |
 | **Long-pole items** | `M1-1` Vfs trait · `M3-5` broker · all backend RFCs |
 
@@ -113,12 +113,12 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 | M1-2 | RFC: **local backend** deep design (symlinks, perms, watch, Windows paths) | rust-staff-engineer, technical-writer | M1-1 | RFC merged | approved before M1-3 | ✅ #8 (RFC-0001) |
 | M1-3 | `cairn-backend-local`: list, stat, read/write (ranged), mkdir/remove/rename/set_perms; correct `Caps` | software-engineer, rust-staff-engineer | M1-2 | rustdoc; RFC-0001 | unit + temp-dir tests green (6) | ✅ #8 |
 | M1-4 | `cairn-core` TEA skeleton: `AppState`, `Msg/AppEvent/AppEffect`, pure `update()` | rust-staff-engineer, software-architect | M0-5 | confirm ADR-0001; rustdoc | `update()` unit-tested pure (10 tests); no I/O in core | ✅ #9 |
-| M1-5 | Effect runner (binary): tokio rt, `VfsRegistry`, TaskId→(handle,cancel), bounded coalesced `event_tx` | rust-staff-engineer | M1-1, M1-4 | rustdoc | spawns/cancels listing; progress coalescing ~10 Hz test | ☐ |
-| M1-6 | `cairn-tui` render skeleton: ratatui+crossterm loop, dual panes, breadcrumb, status, F-key bar | tui-engineer | M1-4 | rustdoc; theming note | renders a static `AppState`; resize OK; zero I/O in render (review) | ☐ |
-| M1-7 | Input + keymap engine: decode on blocking thread, `ModalContext`, MC preset, chord trie + conflict detect | tui-engineer | M1-6 | keybindings doc | nav keys work; chord timeout; conflict test | ☐ |
-| M1-8 | Wire it together: browse local FS in both panes (streamed pages → `Arc<Vec<Entry>>`), nav in/out | tui-engineer, software-engineer | M1-3, M1-5, M1-7 | quickstart docs | **Demo:** browse `~`, panes independent, never blocks | ☐ |
-| M1-9 | Large-list virtualization + off-thread sort/filter (nucleo), filter-as-you-type | tui-engineer, performance-tuning-engineer | M1-8 | perf note | 100k dir smooth; first page <100 ms (benchmark) | ☐ |
-| M1-10 | Multi-select, sort (name/size/date/type), show/hide hidden | software-engineer, tui-engineer | M1-8 | user docs | selection + sort unit tests | ☐ |
+| M1-5 | Effect runner (binary): tokio rt, `VfsRegistry`, async list dispatch, bounded `event_tx` | rust-staff-engineer | M1-1, M1-4 | rustdoc | spawns listing tasks; results flow back as events (tested) | ✅ #10 |
+| M1-6 | `cairn-tui` render: ratatui dual panes, titles, status bar; pure over `&AppState` | tui-engineer | M1-4 | rustdoc | renders static `AppState` (TestBackend tests); zero I/O in render | ✅ #10 |
+| M1-7 | Input + keymap: blocking-thread reader, MC/vim default keymap (chords/presets later) | tui-engineer | M1-6 | rustdoc | nav/quit keys mapped (tests); input off the async runtime | ✅ #10 |
+| M1-8 | Wire-up: TEA event loop in the binary; browse local FS in both panes, nav in/out, non-blocking | tui-engineer, software-engineer | M1-3, M1-5, M1-7 | rustdoc | **Demo:** `cairn` opens cwd dual-pane, navigate, Tab, marks, quit | ✅ #10 |
+| M1-9 | Large-list virtualization + off-thread sort/filter, filter-as-you-type | tui-engineer, performance-tuning-engineer | M1-8 | perf note | 100k dir smooth; first page <100 ms | 🟡 ratatui scrolls selection into view; true windowing + off-thread sort/filter deferred |
+| M1-10 | Multi-select, sort (name/size/date/type), show/hide hidden | software-engineer, tui-engineer | M1-8 | user docs | selection + sort unit tests | 🟡 marks + dirs-first/name sort done; size/date sort + hidden toggle deferred |
 
 ### M2 — Operations & transfer engine
 
