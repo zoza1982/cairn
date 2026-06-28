@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-backend-docker`: the Docker/OCI backend's `Vfs` mapping over a `ContainerOps` transport
+  seam — a navigable tree (`/containers/<name>/…` browses a container's filesystem, `/images/<tag>`
+  lists images), read-only, fully unit-tested against an in-memory mock, plus a `bollard` adapter
+  that lists containers and images live. In-container filesystem access (tar/exec) and a live daemon
+  are the integration step; RFC-0004 (M6-1/M6-2).
 - `cairn-backend-ssh`: the SSH/SFTP backend's `Vfs` mapping over an `SftpOps` transport seam
   (list/stat/ranged-read/write/mkdir/rename/recursive-remove), fully unit-tested against an
   in-memory mock, plus a `russh-sftp` adapter; RFC-0003. Live SSH transport is the integration
