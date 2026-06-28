@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-ai` **tool-call degradation** (M7-2): a `ToolSupport` tier on the provider trait
+  (Native → JsonSchema → Text) and a `degrade` module that adapts how a plan is requested
+  (native tool vs a JSON-object / fenced-block instruction in the prompt) and parsed back
+  (structured tool call, bare JSON object, or fenced ```json block, with a string-aware brace
+  matcher). `request_plan` now adapts to the provider's declared tier; all three tiers are tested
+  against `MockProvider`. The concrete Ollama / OpenAI-compatible HTTP transport is the integration
+  step.
 - Config-driven **keybindings** (M8-7): a `[ui.keybindings]` map of chord → action (e.g.
   `"ctrl+a" = "ai_propose"`) layered over the built-in scheme. `cairn-tui::Keymap` parses chords
   (`ctrl+`/`alt+`/`shift+`, named keys, `f1`–`f12`) and action names, warns on (but skips) bad

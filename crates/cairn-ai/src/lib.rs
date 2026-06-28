@@ -8,6 +8,7 @@
 //! §10.
 
 mod context;
+mod degrade;
 mod plan;
 mod provider;
 mod tools;
@@ -15,12 +16,13 @@ mod tools;
 pub use context::{
     looks_out_of_scope, wrap_untrusted, ConnectionView, PaneView, WorldSnapshot, SYSTEM_POLICY,
 };
+pub use degrade::{decode_plan, encode_request, DegradeError};
 pub use plan::{
     Plan, PlanError, PlanState, PlanStep, ProposedPlan, ProposedStep, StepExecutor, StepStatus,
 };
 pub use provider::{
     LlmProvider, LlmRequest, LlmResponse, Message, MockProvider, ProviderError, Role, ToolDef,
-    Usage, DEFAULT_CLOUD_MODEL,
+    ToolSupport, Usage, DEFAULT_CLOUD_MODEL,
 };
 pub use tools::{allows_bulk_approve, capability_for, Capability, Reversibility, Verb, TOOLS};
 
@@ -42,20 +44,29 @@ pub enum AgentError {
     BadPlan,
 }
 
-/// Ask the provider for a plan and parse it. The model must respond with a `propose_plan` tool call;
-/// any other response is [`AgentError::NoPlan`]. Unknown tools in the plan are rejected.
+impl From<DegradeError> for AgentError {
+    fn from(e: DegradeError) -> Self {
+        match e {
+            DegradeError::NotAPlanCall | DegradeError::NoJson => AgentError::NoPlan,
+            DegradeError::BadJson => AgentError::BadPlan,
+        }
+    }
+}
+
+/// Ask the provider for a plan and parse it, **adapting to the provider's tool-calling tier**
+/// ([`LlmProvider::tool_support`]): native tool calls, a JSON-object instruction, or a fenced-block
+/// instruction for the weakest models (see the `degrade` module). Unknown tools in the plan are
+/// rejected.
 ///
 /// # Errors
 /// See [`AgentError`].
 pub async fn request_plan(provider: &dyn LlmProvider, req: LlmRequest) -> Result<Plan, AgentError> {
-    match provider.complete(req).await? {
-        LlmResponse::ToolCall { name, input } if name == "propose_plan" => {
-            let proposed: ProposedPlan =
-                serde_json::from_value(input).map_err(|_| AgentError::BadPlan)?;
-            Ok(Plan::from_proposed(proposed)?)
-        }
-        _ => Err(AgentError::NoPlan),
-    }
+    let tier = provider.tool_support();
+    let resp = provider.complete(encode_request(tier, req)).await?;
+    let payload = decode_plan(tier, &resp)?;
+    let proposed: ProposedPlan =
+        serde_json::from_value(payload).map_err(|_| AgentError::BadPlan)?;
+    Ok(Plan::from_proposed(proposed)?)
 }
 
 #[cfg(test)]
@@ -78,6 +89,46 @@ mod tests {
         assert_eq!(plan.steps.len(), 3);
         assert!(!plan.can_bulk_approve()); // contains a delete
         assert_eq!(plan.state, PlanState::Proposed);
+    }
+
+    #[tokio::test]
+    async fn request_plan_degrades_across_tool_tiers() {
+        let plan_obj = serde_json::json!({
+            "summary": "tidy up",
+            "steps": [{"tool": "list", "input": {"path": "/"}, "description": "list"}]
+        });
+        // Native: structured tool call.
+        let native = MockProvider::proposing(plan_obj.clone());
+        assert_eq!(
+            request_plan(&native, LlmRequest::default())
+                .await
+                .unwrap()
+                .steps
+                .len(),
+            1
+        );
+        // JsonSchema: a bare JSON object in the reply text.
+        let schema = MockProvider::new(vec![LlmResponse::Text(format!("{plan_obj}"))])
+            .with_support(ToolSupport::JsonSchema);
+        assert_eq!(
+            request_plan(&schema, LlmRequest::default())
+                .await
+                .unwrap()
+                .steps
+                .len(),
+            1
+        );
+        // Text: a fenced ```json block.
+        let text = MockProvider::new(vec![LlmResponse::Text(format!("```json\n{plan_obj}\n```"))])
+            .with_support(ToolSupport::Text);
+        assert_eq!(
+            request_plan(&text, LlmRequest::default())
+                .await
+                .unwrap()
+                .steps
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
