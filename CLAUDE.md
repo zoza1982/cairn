@@ -187,6 +187,8 @@ explicitly in the PR — never silently.
 - Adding a dependency requires justification in the PR (why this crate, why not std, license, maintenance).
 - Licenses must be permissive and compatible with Apache-2.0/MIT (enforced via `cargo-deny`).
 - Keep the dependency tree lean; prefer well-maintained, widely-used crates.
+- Before adopting or upgrading a dependency, consult its **current** docs via the Context7 MCP —
+  APIs and recommended usage shift between versions.
 
 ## 11. Security & secrets
 
@@ -212,5 +214,10 @@ explicitly in the PR — never silently.
 - Fill the PR template completely; update `CHANGELOG.md` and relevant docs in the same PR.
 - Keep the PRD high-level; put architecture in `docs/` (LLD) and sequencing in the Implementation Plan.
 - Use Conventional Commits and the co-author trailer above.
+- **Use the Context7 MCP for library/API docs.** When working with an external crate, framework,
+  SDK, CLI, or cloud service (ratatui, tokio, the AWS/GCP/Azure SDKs, kube-rs, wasmtime, …), fetch
+  current docs via Context7 (`resolve-library-id` → `query-docs`) rather than relying on memory —
+  training data may be stale and APIs change between versions. Prefer it over web search for library
+  docs. (Skip for general programming concepts or our own code.)
 - When unsure about scope or an irreversible/outward-facing action (pushing, creating releases,
   deleting), confirm first.
