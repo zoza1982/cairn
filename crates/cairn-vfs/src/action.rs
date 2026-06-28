@@ -99,17 +99,23 @@ pub enum ActionCtx {
 /// The caller (the TUI) holds it for the session's lifetime: send on `cancel` (or drop the sender)
 /// to terminate; await `done` for the exit result. `local_port` is set for a port-forward; `stdin`
 /// feeds an interactive TTY exec.
+#[non_exhaustive]
 pub struct SessionHandle {
     /// Send `()` (or drop) to cancel the session.
     pub cancel: tokio::sync::oneshot::Sender<()>,
     /// Resolves when the session exits cleanly or with an error. Carries a [`VfsError`] (not a bare
     /// string) so the consumer can apply [`VfsError::redacted`] before display — keeping the error
-    /// type and redaction contract structural rather than convention.
+    /// type and redaction contract structural rather than convention. Backends must not panic if the
+    /// consumer has dropped this receiver (a torn-down session pane): discard the send error.
     pub done: tokio::sync::oneshot::Receiver<Result<(), VfsError>>,
     /// The local TCP port a port-forward bound; `None` for exec sessions.
     pub local_port: Option<u16>,
-    /// Writer for an interactive exec's stdin; `None` for port-forward / non-interactive exec.
+    /// Writer for an interactive exec's stdin; `None` for port-forward / non-interactive exec. The
+    /// consumer owns it for the session's lifetime.
     pub stdin: Option<tokio::sync::mpsc::Sender<Bytes>>,
+    /// Reader for an interactive exec's combined stdout/stderr; `None` for port-forward. The consumer
+    /// owns it and drains it to display output.
+    pub stdout: Option<tokio::sync::mpsc::Receiver<Bytes>>,
 }
 
 /// The result of invoking an action.

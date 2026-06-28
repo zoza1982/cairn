@@ -228,6 +228,8 @@ impl Vfs for MockVfs {
         _action: ActionId,
         _ctx: ActionCtx,
     ) -> Result<ActionOutcome, VfsError> {
+        // Unconditional `Done` — sufficient for VFS-path tests; action-outcome tests use the
+        // concrete backends with MockDocker/MockKube.
         Ok(ActionOutcome::Done)
     }
 }

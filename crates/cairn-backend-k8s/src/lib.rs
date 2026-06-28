@@ -258,8 +258,8 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
     /// Advertise the action surface by depth: a pod offers `logs` and `port-forward`; a container
     /// offers `logs` and `exec`. This reflects path *shape*, not existence (it does no I/O); existence
     /// is enforced by `stat`/`invoke`. Actions are discoverable now; live invocation (log/exec streams
-    /// and port-forward sessions over the cluster API) is the integration step, so the inherited
-    /// [`Vfs::invoke`] still returns [`VfsError::Unsupported`].
+    /// and port-forward sessions over the cluster API) is the integration step, so the overridden
+    /// [`Vfs::invoke`] returns `VfsError::Backend { code: "not_implemented" }`.
     fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
         let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
         let logs = || ActionDescriptor {
@@ -279,7 +279,9 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
                     destructive: false,
                 },
             ],
-            // depth >= CONTAINER_LEVEL: a container, or a path inside its filesystem.
+            // depth >= CONTAINER_LEVEL: a container, or a path inside its filesystem. When `invoke`
+            // is wired live it must route to the pod+container (first four segments); the in-container
+            // path tail, if any, is not used by logs/exec.
             [_ctx, _ns, _pod, _container, ..] => vec![
                 logs(),
                 ActionDescriptor {

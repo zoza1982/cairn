@@ -223,7 +223,7 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
     /// This reflects path *shape*, not existence (it does no I/O, mirroring how the UI calls it on an
     /// already-navigated node); existence is enforced by `stat`/`invoke`. The action surface is
     /// discoverable now; live invocation (streaming over the Docker API) is the integration step, so
-    /// the inherited [`Vfs::invoke`] still returns [`VfsError::Unsupported`].
+    /// the overridden [`Vfs::invoke`] returns `VfsError::Backend { code: "not_implemented" }`.
     fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
         let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
         match segs.as_slice() {
