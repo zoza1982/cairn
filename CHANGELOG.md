@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interactive/streaming exec can't masquerade as success before its output channel exists.
   `open_connection` remains deferred pending the broker-backed opener.
 
+### Fixed
+- **Interactive copy/move no longer silently overwrites** (M2-6): a UI copy/move that would clobber
+  an existing destination now opens an "Overwrite?" confirm (showing how many collide) instead of
+  overwriting silently. Confirm re-runs with overwrite enabled; cancel abandons the transfer leaving
+  destinations untouched. (The AI executor already refused such overwrites.)
+
 ### Added
 - **Large-list row virtualization** (M1-9): only the on-screen window of rows is materialized each
   frame (the cursor is kept roughly centred), so browsing a directory with tens of thousands of

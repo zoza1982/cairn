@@ -377,10 +377,44 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
     }
     match &state.overlay {
         Some(Overlay::ConfirmDelete { .. }) => apply_confirm_delete_action(state, action),
+        Some(Overlay::ConfirmOverwrite { .. }) => apply_confirm_overwrite_action(state, action),
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
         // A text prompt captures keystrokes as `Msg::Text`; non-quit actions don't reach it.
         Some(Overlay::Prompt { .. }) | None => Vec::new(),
+    }
+}
+
+/// Confirm (or cancel) overwriting existing destinations. On confirm, re-issue the transfer with
+/// `overwrite: true`; on cancel, abandon it without touching the destinations.
+fn apply_confirm_overwrite_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        Action::Confirm | Action::Enter => {
+            let Some(Overlay::ConfirmOverwrite {
+                src_conn,
+                dst_conn,
+                items,
+                is_move,
+                ..
+            }) = state.overlay.take()
+            else {
+                return Vec::new();
+            };
+            arm_transfer(state, is_move, items.len());
+            vec![AppEffect::Transfer {
+                src_conn,
+                dst_conn,
+                items,
+                is_move,
+                overwrite: true,
+            }]
+        }
+        Action::Cancel => {
+            state.overlay = None;
+            state.status = Some("Transfer cancelled".to_owned());
+            Vec::new()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -589,20 +623,29 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
             items.push((from.clone(), to));
         }
     }
-    state.status = Some(format!(
-        "{} {} item(s)…",
-        if is_move { "Moving" } else { "Copying" },
-        items.len()
-    ));
-    // Begin tracking transfer progress (updated by `TransferProgress`, cleared on `TransferDone`).
-    state.transfer_bytes = Some(0);
-    state.pane_mut(src).marked.clear();
+    // Marks are NOT cleared here: if the pre-check finds a conflict and the user cancels the
+    // overwrite prompt, nothing was transferred and the selection must survive. `finish_op` clears
+    // marks on actual completion (`TransferDone`).
+    arm_transfer(state, is_move, items.len());
+    // First pass does not overwrite: the effect runner checks for collisions and reports
+    // `TransferConflict` (→ confirm overlay) instead of clobbering existing destinations.
     vec![AppEffect::Transfer {
         src_conn,
         dst_conn,
         items,
         is_move,
+        overwrite: false,
     }]
+}
+
+/// Set the "Moving/Copying N item(s)…" status and begin tracking transfer progress. Shared by the
+/// initial attempt and the post-confirm re-issue so the two can't drift.
+fn arm_transfer(state: &mut AppState, is_move: bool, count: usize) {
+    state.status = Some(format!(
+        "{} {count} item(s)…",
+        if is_move { "Moving" } else { "Copying" },
+    ));
+    state.transfer_bytes = Some(0);
 }
 
 fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
@@ -728,6 +771,26 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             Vec::new()
         }
         AppEvent::OpDone { status, error } => finish_op(state, &status, error),
+        AppEvent::TransferConflict {
+            src_conn,
+            dst_conn,
+            items,
+            is_move,
+            conflicts,
+        } => {
+            // The transfer didn't run (no overwrite); drop the progress indicator and the
+            // "Copying…" status, and ask first.
+            state.transfer_bytes = None;
+            state.status = None;
+            state.overlay = Some(Overlay::ConfirmOverwrite {
+                src_conn,
+                dst_conn,
+                items,
+                is_move,
+                conflicts,
+            });
+            Vec::new()
+        }
         AppEvent::TransferDone { status, error } => {
             // Only a transfer's own completion clears its progress indicator — so an unrelated op
             // finishing mid-transfer can't wipe it (and a stray late `TransferProgress` is ignored
@@ -1165,6 +1228,89 @@ mod tests {
         let fx = update(&mut s, Msg::Action(Action::Cancel));
         assert!(matches!(&fx[..], [AppEffect::CancelTransfer]));
         assert!(s.status.as_deref().unwrap().contains("Cancelling"));
+    }
+
+    #[test]
+    fn transfer_conflict_opens_overwrite_confirm_then_reissues_with_overwrite() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        // The effect runner reports a collision instead of clobbering.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferConflict {
+                src_conn: ConnectionId(1),
+                dst_conn: ConnectionId(2),
+                items: vec![(VfsPath::root(), VfsPath::root())],
+                is_move: false,
+                conflicts: 1,
+            }),
+        );
+        assert!(matches!(s.overlay, Some(Overlay::ConfirmOverwrite { .. })));
+        assert_eq!(s.transfer_bytes, None, "no transfer is running yet");
+        // Confirming re-issues the transfer with overwrite enabled.
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(s.overlay.is_none());
+        assert_eq!(s.transfer_bytes, Some(0));
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::Transfer {
+                overwrite: true,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn cancelling_overwrite_confirm_keeps_the_marked_selection() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        // Mark both files, then attempt a copy.
+        let _ = update(&mut s, Msg::Action(Action::ToggleMark));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::ToggleMark));
+        assert_eq!(s.active().marked.len(), 2);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        // A conflict comes back; the user cancels — the selection must survive (nothing transferred).
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferConflict {
+                src_conn: ConnectionId(1),
+                dst_conn: ConnectionId(2),
+                items: vec![(VfsPath::root(), VfsPath::root())],
+                is_move: false,
+                conflicts: 2,
+            }),
+        );
+        let _ = update(&mut s, Msg::Action(Action::Cancel));
+        assert_eq!(
+            s.active().marked.len(),
+            2,
+            "marks survive a cancelled overwrite"
+        );
+    }
+
+    #[test]
+    fn overwrite_confirm_cancel_abandons_the_transfer() {
+        let mut s = state();
+        s.overlay = Some(Overlay::ConfirmOverwrite {
+            src_conn: ConnectionId(1),
+            dst_conn: ConnectionId(2),
+            items: vec![(VfsPath::root(), VfsPath::root())],
+            is_move: true,
+            conflicts: 2,
+        });
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        assert!(s.status.as_deref().unwrap().contains("cancelled"));
     }
 
     #[test]

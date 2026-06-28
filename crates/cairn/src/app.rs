@@ -182,8 +182,11 @@ async fn event_loop(
         let Some(msg) = msg else { continue };
 
         // Clear before `update`: if `update(TransferDone)` ever emitted a new Transfer, it would get
-        // a fresh slot rather than one cleared right after dispatch.
-        if matches!(msg, Msg::Event(AppEvent::TransferDone { .. })) {
+        // a fresh slot rather than one cleared right after dispatch. A conflict means no transfer ran.
+        if matches!(
+            msg,
+            Msg::Event(AppEvent::TransferDone { .. } | AppEvent::TransferConflict { .. })
+        ) {
             transfer_cancel = None;
         }
         let effects = update(state, msg);
@@ -251,6 +254,7 @@ fn dispatch(
             dst_conn,
             items,
             is_move,
+            overwrite,
         } => {
             let registry = registry.clone();
             let event_tx = event_tx.clone();
@@ -259,7 +263,7 @@ fn dispatch(
             *transfer_cancel = Some(cancel.clone());
             tokio::spawn(async move {
                 let ev = run_transfer_effect(
-                    &registry, src_conn, dst_conn, items, is_move, &event_tx, cancel,
+                    &registry, src_conn, dst_conn, items, is_move, overwrite, &event_tx, cancel,
                 )
                 .await;
                 let _ = event_tx.send(ev).await;
@@ -380,12 +384,14 @@ fn outcome_summary(o: &cairn_transfer::TransferOutcome) -> String {
     format!("{} file(s), {} dir(s)", o.files, o.dirs)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_transfer_effect(
     registry: &VfsRegistry,
     src_conn: ConnectionId,
     dst_conn: ConnectionId,
     items: Vec<(VfsPath, VfsPath)>,
     is_move: bool,
+    overwrite: bool,
     event_tx: &mpsc::Sender<AppEvent>,
     cancel: CancellationToken,
 ) -> AppEvent {
@@ -396,6 +402,41 @@ async fn run_transfer_effect(
             error: true,
         };
     };
+    // Unless the user already confirmed, refuse to clobber: count existing destinations and bounce
+    // back a `TransferConflict` so the UI can ask first (data-safety — no silent overwrite). Only a
+    // definite `NotFound` is "safe to write"; any other stat error aborts rather than risk an
+    // overwrite (mirrors `run_rename_effect`). NOTE: this is check-then-act — a destination that
+    // appears in the TOCTOU window before the write is still overwritten.
+    if !overwrite {
+        let mut conflicts = 0usize;
+        for (_, to) in &items {
+            if cancel.is_cancelled() {
+                return AppEvent::TransferDone {
+                    status: "Transfer cancelled".to_owned(),
+                    error: false,
+                };
+            }
+            match dst.stat(to).await {
+                Ok(_) => conflicts += 1,
+                Err(VfsError::NotFound(_)) => {}
+                Err(e) => {
+                    return AppEvent::TransferDone {
+                        status: format!("Transfer aborted: {}", e.redacted()),
+                        error: true,
+                    };
+                }
+            }
+        }
+        if conflicts > 0 {
+            return AppEvent::TransferConflict {
+                src_conn,
+                dst_conn,
+                items,
+                is_move,
+                conflicts,
+            };
+        }
+    }
     let spec = TransferSpec {
         op: if is_move {
             TransferOp::Move
@@ -750,6 +791,7 @@ mod tests {
                 VfsPath::parse("/dst.txt").unwrap(),
             )],
             false,
+            true, // overwrite: skip the conflict pre-check in this cancellation test
             &tx,
             cancel,
         )
@@ -763,6 +805,42 @@ mod tests {
         }
         // The destination was never written.
         assert!(!dir.path().join("dst.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn transfer_pre_check_reports_a_conflict_for_an_existing_destination() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("src.txt"), b"new").unwrap();
+        std::fs::write(dir.path().join("dst.txt"), b"existing").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let (tx, _rx) = mpsc::channel(8);
+        // overwrite = false → the existing /dst.txt is detected and reported, not clobbered.
+        let ev = run_transfer_effect(
+            &registry,
+            LEFT,
+            LEFT,
+            vec![(
+                VfsPath::parse("/src.txt").unwrap(),
+                VfsPath::parse("/dst.txt").unwrap(),
+            )],
+            false,
+            false,
+            &tx,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(
+            ev,
+            AppEvent::TransferConflict { conflicts: 1, .. }
+        ));
+        // The existing destination is untouched.
+        assert_eq!(
+            std::fs::read(dir.path().join("dst.txt")).unwrap(),
+            b"existing"
+        );
     }
 
     #[tokio::test]

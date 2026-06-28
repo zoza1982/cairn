@@ -75,6 +75,21 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             .alignment(Alignment::Center);
             frame.render_widget(body, area);
         }
+        Overlay::ConfirmOverwrite { conflicts, .. } => {
+            let area = centered(frame.area(), 48, 6);
+            frame.render_widget(Clear, area);
+            let block = Block::bordered()
+                .title(" Overwrite? ")
+                .border_style(Style::default().fg(Color::Yellow));
+            let body = Paragraph::new(vec![
+                Line::from(format!("{conflicts} destination(s) already exist.")),
+                Line::from(""),
+                Line::from("[y] Overwrite    [n] Cancel"),
+            ])
+            .block(block)
+            .alignment(Alignment::Center);
+            frame.render_widget(body, area);
+        }
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
         Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),
     }
