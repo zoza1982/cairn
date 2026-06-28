@@ -22,7 +22,7 @@
 | **Current milestone** | **Hermetic cores delivered across M0–M8; SDK/service integration env-deferred** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core & plan→confirm UI + M8 runtime, WIT RFC & keybindings + M4 SFTP-mapping + M6 Docker- & K8s-mapping ✅ · cloud providers + live-transport (SSH/Docker/K8s) + LLM HTTP providers + WASM component bridge ⏭ |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 32 / 20 / 0 / 0 / 19 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 33 / 19 / 0 / 0 / 19 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
 
@@ -127,7 +127,7 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 | M1-6 | `cairn-tui` render: ratatui dual panes, titles, status bar; pure over `&AppState` | tui-engineer | M1-4 | rustdoc | renders static `AppState` (TestBackend tests); zero I/O in render | ✅ #10 |
 | M1-7 | Input + keymap: blocking-thread reader, MC/vim default keymap (chords/presets later) | tui-engineer | M1-6 | rustdoc | nav/quit keys mapped (tests); input off the async runtime | ✅ #10 |
 | M1-8 | Wire-up: TEA event loop in the binary; browse local FS in both panes, nav in/out, non-blocking | tui-engineer, software-engineer | M1-3, M1-5, M1-7 | rustdoc | **Demo:** `cairn` opens cwd dual-pane, navigate, Tab, marks, quit | ✅ #10 |
-| M1-9 | Large-list virtualization + off-thread sort/filter, filter-as-you-type | tui-engineer, performance-tuning-engineer | M1-8 | perf note | 100k dir smooth; first page <100 ms | 🟡 **filter-as-you-type done** (#39): `/` filters by case-insensitive name substring live; cursor/marks/ops index the filtered view; ratatui scrolls selection into view. True windowing + off-thread sort/filter (O(n) filtered scan) deferred |
+| M1-9 | Large-list virtualization + off-thread sort/filter, filter-as-you-type | tui-engineer, performance-tuning-engineer | M1-8 | perf note | 100k dir smooth; first page <100 ms | ✅ filter-as-you-type (#39) + **row virtualization** (#42): only the on-screen window of rows is materialized (cursor-centred `list_window`), so a 100k-dir frame is O(viewport) not O(entries). Off-thread sort/filter (the O(n) in-thread filtered scan) is a later perf pass, not a feature gap |
 | M1-10 | Multi-select, sort (name/size/date/type), show/hide hidden | software-engineer, tui-engineer | M1-8 | user docs | selection + sort unit tests | ✅ marks + name/size/modified/**type** sort (`s`) + hidden toggle (`.`) done (#35, #38): cursor follows its entry across re-sort, modes configurable via `[ui.keybindings]`, status shown per pane |
 
 ### M2 — Operations & transfer engine

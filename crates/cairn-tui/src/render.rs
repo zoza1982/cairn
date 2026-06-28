@@ -232,12 +232,18 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
             frame.render_widget(p, area);
         }
         Listing::Ready(_) => {
-            // Render the visible (filtered) view; cursor and marks index into it.
+            // Render the visible (filtered) view; cursor and marks index into it. Only the on-screen
+            // window of rows is materialized into `ListItem`s (virtualization), so a 100k-entry
+            // directory costs O(viewport), not O(entries), per frame.
             let visible = pane.visible();
-            let items: Vec<ListItem> = visible
+            let rows = usize::from(area.height.saturating_sub(2)); // minus top/bottom borders
+            let top = list_window(pane.cursor, visible.len(), rows);
+            let end = top.saturating_add(rows).min(visible.len());
+            let items: Vec<ListItem> = visible[top..end]
                 .iter()
                 .enumerate()
-                .map(|(i, e)| {
+                .map(|(offset, e)| {
+                    let i = top + offset; // index back into the visible view (marks are absolute)
                     let mark = if pane.marked.contains(&i) { '*' } else { ' ' };
                     let suffix = if e.is_dir() { "/" } else { "" };
                     let text = format!("{mark}{}{suffix}", e.name);
@@ -264,11 +270,24 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
 
             let mut list_state = ListState::default();
             if !visible.is_empty() {
-                list_state.select(Some(pane.cursor.min(visible.len() - 1)));
+                // Selection is relative to the windowed slice.
+                list_state.select(Some(pane.cursor.saturating_sub(top)));
             }
             frame.render_stateful_widget(list, area, &mut list_state);
         }
     }
+}
+
+/// The first visible-view index to render so the cursor stays on screen, given the viewport `rows`.
+///
+/// Keeps the cursor roughly centred and clamps so the last page fills the viewport (no blank space
+/// past the end). Stateless — derived from the cursor each frame, so no scroll offset to persist.
+fn list_window(cursor: usize, total: usize, rows: usize) -> usize {
+    if rows == 0 || total <= rows {
+        return 0;
+    }
+    let half = rows / 2;
+    cursor.saturating_sub(half).min(total - rows)
 }
 
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -402,6 +421,71 @@ mod tests {
         assert!(text.contains("AI plan"));
         assert!(text.contains("archive old logs"));
         assert!(text.contains("approve all")); // safe plan → bulk-approve offered
+    }
+
+    #[test]
+    fn list_window_keeps_cursor_visible_and_clamps() {
+        // Everything fits: no scrolling.
+        assert_eq!(list_window(0, 5, 10), 0);
+        assert_eq!(list_window(4, 5, 10), 0);
+        // Cursor near the top stays at offset 0.
+        assert_eq!(list_window(2, 100, 20), 0);
+        // Mid-list: cursor is roughly centred (cursor - rows/2).
+        assert_eq!(list_window(50, 100, 20), 40);
+        // Near the end: clamped so the last page fills the viewport.
+        assert_eq!(list_window(99, 100, 20), 80);
+        // Degenerate viewport.
+        assert_eq!(list_window(5, 100, 0), 0);
+    }
+
+    #[test]
+    fn huge_listing_renders_the_cursor_row_without_panicking() {
+        let mut s = ready_state();
+        let entries: Vec<_> = (0..10_000)
+            .map(|i| Entry::new(format!("file{i:05}"), EntryKind::File))
+            .collect();
+        s.panes[0].listing = Listing::Ready(std::sync::Arc::new(entries));
+        s.panes[0].cursor = 5000;
+        let text = render_text(&s, 80, 24);
+        // The cursor's row is within the rendered window even though only ~22 rows are materialized.
+        assert!(text.contains("file05000"), "cursor row should be visible");
+        // A far-away row is NOT in the window.
+        assert!(
+            !text.contains("file00001"),
+            "off-screen rows are not rendered"
+        );
+    }
+
+    #[test]
+    fn cursor_at_end_of_a_huge_listing_stays_visible() {
+        let mut s = ready_state();
+        let entries: Vec<_> = (0..10_000)
+            .map(|i| Entry::new(format!("file{i:05}"), EntryKind::File))
+            .collect();
+        s.panes[0].listing = Listing::Ready(std::sync::Arc::new(entries));
+        s.panes[0].cursor = 9999;
+        let text = render_text(&s, 80, 24);
+        assert!(text.contains("file09999"), "last row should be visible");
+        assert!(
+            text.contains("file09998"),
+            "the last page fills the viewport"
+        );
+    }
+
+    #[test]
+    fn a_mark_inside_the_window_renders_on_the_right_row() {
+        let mut s = ready_state();
+        let entries: Vec<_> = (0..10_000)
+            .map(|i| Entry::new(format!("file{i:05}"), EntryKind::File))
+            .collect();
+        s.panes[0].listing = Listing::Ready(std::sync::Arc::new(entries));
+        s.panes[0].cursor = 5000;
+        s.panes[0].marked.insert(5001); // an absolute visible index within the window
+        let text = render_text(&s, 80, 24);
+        assert!(
+            text.contains("*file05001"),
+            "marked row shows its '*' under the window offset"
+        );
     }
 
     #[test]

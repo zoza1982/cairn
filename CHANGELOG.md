@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open_connection` remains deferred pending the broker-backed opener.
 
 ### Added
+- **Large-list row virtualization** (M1-9): only the on-screen window of rows is materialized each
+  frame (the cursor is kept roughly centred), so browsing a directory with tens of thousands of
+  entries costs O(viewport) instead of O(entries) per render.
 - **Transfer cancellation** (M2-4): `Esc` aborts an in-flight copy/move — the engine's cooperative
   `CancellationToken` is now held on the runtime side and signalled by a `CancelTransfer` effect.
   Cancellation reports a non-error completion warning that partial changes may remain (a mid-flight
