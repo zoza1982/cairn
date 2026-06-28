@@ -46,6 +46,10 @@ pub enum Action {
     Filter,
     /// Open the transfer-queue overlay (view active + pending transfers).
     OpenQueue,
+    /// In the queue view: move the selected pending transfer earlier (up).
+    QueueMoveUp,
+    /// In the queue view: move the selected pending transfer later (down).
+    QueueMoveDown,
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
     /// Open a prompt to create a new directory in the active pane.

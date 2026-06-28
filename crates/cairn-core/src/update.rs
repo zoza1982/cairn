@@ -168,7 +168,13 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             vec![AppEffect::CancelTransfer]
         }
         // No overlay open: confirm/cancel and the plan-only actions are otherwise no-ops.
-        Action::Confirm | Action::Cancel | Action::ApproveAll | Action::Reject => Vec::new(),
+        // Queue reorder only acts inside the queue overlay; a no-op with no overlay open.
+        Action::Confirm
+        | Action::Cancel
+        | Action::ApproveAll
+        | Action::Reject
+        | Action::QueueMoveUp
+        | Action::QueueMoveDown => Vec::new(),
         Action::Refresh => reload(state, state.focus),
         Action::CycleSort => {
             let p = state.active_mut();
@@ -438,6 +444,26 @@ fn apply_transfer_queue_action(state: &mut AppState, action: Action) -> Vec<AppE
         Action::CursorDown => {
             if *cursor + 1 < len {
                 *cursor += 1;
+            }
+            Vec::new()
+        }
+        Action::QueueMoveUp => {
+            if *cursor > 0 && *cursor < len {
+                let c = *cursor;
+                state.transfer_queue.swap(c - 1, c);
+                if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
+                    *cursor -= 1;
+                }
+            }
+            Vec::new()
+        }
+        Action::QueueMoveDown => {
+            if *cursor + 1 < len {
+                let c = *cursor;
+                state.transfer_queue.swap(c, c + 1);
+                if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
+                    *cursor += 1;
+                }
             }
             Vec::new()
         }
@@ -1583,6 +1609,51 @@ mod tests {
         let _ = update(&mut s, Msg::Action(Action::Delete));
         assert!(s.transfer_queue.is_empty());
         assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn queue_reorder_moves_the_selected_pending_transfer() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("a", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active
+        let _ = update(&mut s, Msg::Action(Action::Move)); // queued #1 (a move)
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // queued #2 (a copy)
+        assert_eq!(s.transfer_queue.len(), 2);
+        assert!(s.transfer_queue[0].is_move && !s.transfer_queue[1].is_move);
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        // Select the 2nd pending (the copy) and move it up; the cursor follows it.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::QueueMoveUp));
+        assert!(!s.transfer_queue[0].is_move, "the copy moved to the front");
+        assert!(s.transfer_queue[1].is_move);
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 0 })
+        ));
+        // Moving up at the top is a no-op.
+        let _ = update(&mut s, Msg::Action(Action::QueueMoveUp));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 0 })
+        ));
+        // Move it back down: the copy returns to index 1, cursor follows.
+        let _ = update(&mut s, Msg::Action(Action::QueueMoveDown));
+        assert!(s.transfer_queue[0].is_move && !s.transfer_queue[1].is_move);
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 1 })
+        ));
+        // Moving down at the bottom is a no-op.
+        let _ = update(&mut s, Msg::Action(Action::QueueMoveDown));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 1 })
+        ));
+        // QueueMove with no overlay open is a harmless no-op that leaves the queue unchanged.
+        let before = s.transfer_queue.len();
+        s.overlay = None;
+        assert!(update(&mut s, Msg::Action(Action::QueueMoveDown)).is_empty());
+        assert_eq!(s.transfer_queue.len(), before);
     }
 
     #[test]

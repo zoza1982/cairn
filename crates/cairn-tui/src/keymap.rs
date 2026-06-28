@@ -111,6 +111,8 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "toggle_hidden" => Action::ToggleHidden,
         "filter" => Action::Filter,
         "open_queue" => Action::OpenQueue,
+        "queue_move_up" => Action::QueueMoveUp,
+        "queue_move_down" => Action::QueueMoveDown,
         "make_dir" => Action::MakeDir,
         "rename" => Action::Rename,
         "open_connections" => Action::OpenConnections,
@@ -221,6 +223,9 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Char('r') => Some(Action::Refresh),
+        // Shift-K/J move the selected pending transfer up/down in the queue view (no-op elsewhere).
+        KeyCode::Char('K') => Some(Action::QueueMoveUp),
+        KeyCode::Char('J') => Some(Action::QueueMoveDown),
         // 's' cycles the sort mode; '.' toggles hidden entries (ranger/vim convention).
         KeyCode::Char('s') => Some(Action::CycleSort),
         KeyCode::Char('.') => Some(Action::ToggleHidden),
@@ -448,6 +453,8 @@ mod tests {
             "toggle_hidden",
             "filter",
             "open_queue",
+            "queue_move_up",
+            "queue_move_down",
             "make_dir",
             "rename",
             "open_connections",
@@ -462,7 +469,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 25);
+        assert_eq!(names.len(), 27);
     }
 
     #[test]
