@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING** (`cairn-transfer`): `TransferError::Cancelled` now carries the partial
+  `TransferOutcome` completed before cancellation (`Cancelled(TransferOutcome)`), so a cancelled
+  transfer reports how much already happened (e.g. "Transfer cancelled after 3 file(s), 1 dir(s);
+  partial changes may remain") rather than implying nothing changed. Match it as `Cancelled(_)`.
 - AI executor **`exec` routing** (M7-6 / RFC-0007 Gap 1): the `exec` tool no longer returns a
   hardcoded "not yet available" stub — it now resolves its `conn:N` handle (allow-list enforced) and
   routes through `Vfs::invoke(path, ActionId::EXEC, ActionCtx::Exec{argv,tty})`, reaching whichever

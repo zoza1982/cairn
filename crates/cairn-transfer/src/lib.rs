@@ -106,9 +106,17 @@ pub async fn run_transfer(
     let mut outcome = TransferOutcome::default();
     for (from, to) in items {
         if cancel.is_cancelled() {
-            return Err(TransferError::Cancelled);
+            return Err(TransferError::Cancelled(outcome));
         }
-        transfer_one(src, dst, from, to, spec, cancel, progress, &mut outcome).await?;
+        // On cancellation, report the work actually completed so far (the nested marker carries a
+        // placeholder outcome; the accumulated `outcome` here is the real one).
+        if let Err(e) = transfer_one(src, dst, from, to, spec, cancel, progress, &mut outcome).await
+        {
+            return match e {
+                TransferError::Cancelled(_) => Err(TransferError::Cancelled(outcome)),
+                other => Err(other),
+            };
+        }
     }
     Ok(outcome)
 }
@@ -158,7 +166,9 @@ async fn copy_tree(
 
     while let Some((f, t)) = stack.pop_back() {
         if cancel.is_cancelled() {
-            return Err(TransferError::Cancelled);
+            // INVARIANT: this placeholder outcome is always replaced by `run_transfer` with the
+            // real accumulated outcome; these private helpers never surface `Cancelled` to callers.
+            return Err(TransferError::Cancelled(TransferOutcome::default()));
         }
         let meta = src.stat(&f).await?;
         if meta.is_dir() {
@@ -228,7 +238,9 @@ async fn copy_file(
     loop {
         if cancel.is_cancelled() {
             writer.abort().await;
-            return Err(TransferError::Cancelled);
+            // INVARIANT: this placeholder outcome is always replaced by `run_transfer` with the
+            // real accumulated outcome; these private helpers never surface `Cancelled` to callers.
+            return Err(TransferError::Cancelled(TransferOutcome::default()));
         }
         let n = reader.read(&mut buf).await.map_err(VfsError::Io)?;
         if n == 0 {
@@ -511,6 +523,82 @@ mod tests {
             &mut noop,
         )
         .await;
-        assert!(matches!(res, Err(TransferError::Cancelled)));
+        // Cancelled before any item ran → outcome reports nothing done.
+        assert!(matches!(
+            res,
+            Err(TransferError::Cancelled(o)) if o == TransferOutcome::default()
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_after_first_item_reports_partial_outcome() {
+        let (src, dst) = cross();
+        // Each small file is one chunk → one progress call. Cancel on the *second* call: the first
+        // item is fully copied, the second is aborted mid-chunk. The reported outcome should reflect
+        // exactly the completed first item.
+        let cancel = CancellationToken::new();
+        let mut calls = 0u32;
+        let mut on_progress = |_n: u64| {
+            calls += 1;
+            if calls == 2 {
+                cancel.cancel();
+            }
+        };
+        let res = run_transfer(
+            &src,
+            &dst,
+            &[(p("/top.txt"), p("/a.txt")), (p("/top.txt"), p("/b.txt"))],
+            TransferSpec::default(),
+            &cancel,
+            &mut on_progress,
+        )
+        .await;
+        match res {
+            Err(TransferError::Cancelled(o)) => {
+                assert_eq!(o.files, 1, "first item completed before cancel");
+                assert!(o.bytes > 0);
+            }
+            _ => panic!("expected Cancelled with a partial outcome"),
+        }
+        // The first destination was written; the second was aborted (MockVfs::abort removes the
+        // partial entry, so its stat must fail).
+        assert!(dst.stat(&p("/a.txt")).await.is_ok());
+        assert!(dst.stat(&p("/b.txt")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_move_reports_only_fully_moved_items() {
+        let (src, dst) = cross(); // cross-backend → move = copy then remove source
+        let cancel = CancellationToken::new();
+        let mut calls = 0u32;
+        let mut on_progress = |_n: u64| {
+            calls += 1;
+            if calls == 2 {
+                cancel.cancel();
+            }
+        };
+        let spec = TransferSpec {
+            op: TransferOp::Move,
+            ..TransferSpec::default()
+        };
+        let res = run_transfer(
+            &src,
+            &dst,
+            &[(p("/d/a.txt"), p("/a.txt")), (p("/d/b.txt"), p("/b.txt"))],
+            spec,
+            &cancel,
+            &mut on_progress,
+        )
+        .await;
+        match res {
+            Err(TransferError::Cancelled(o)) => assert_eq!(o.files, 1),
+            _ => panic!("expected Cancelled with one fully-moved file"),
+        }
+        // Item 1 was fully moved: dest exists, source gone.
+        assert!(dst.stat(&p("/a.txt")).await.is_ok());
+        assert!(src.stat(&p("/d/a.txt")).await.is_err());
+        // Item 2 was cancelled mid-copy: source still intact (no data lost), dest aborted.
+        assert!(src.stat(&p("/d/b.txt")).await.is_ok());
+        assert!(dst.stat(&p("/b.txt")).await.is_err());
     }
 }

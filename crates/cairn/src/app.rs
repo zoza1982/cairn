@@ -375,6 +375,11 @@ async fn propose_plan(prompt: &str) -> Result<cairn_ai::Plan, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A compact "N file(s), M dir(s)" summary shared by the success and cancelled status messages.
+fn outcome_summary(o: &cairn_transfer::TransferOutcome) -> String {
+    format!("{} file(s), {} dir(s)", o.files, o.dirs)
+}
+
 async fn run_transfer_effect(
     registry: &VfsRegistry,
     src_conn: ConnectionId,
@@ -420,16 +425,21 @@ async fn run_transfer_effect(
             // (so a transfer smaller than the coalescing step doesn't only ever show "0 B").
             let _ = event_tx.try_send(AppEvent::TransferProgress { bytes: out.bytes });
             AppEvent::TransferDone {
-                status: format!("{verb} {} file(s), {} dir(s)", out.files, out.dirs),
+                status: format!("{verb} {}", outcome_summary(&out)),
                 error: false,
             }
         }
-        Err(cairn_transfer::TransferError::Cancelled) => AppEvent::TransferDone {
-            // Cancellation is cooperative and mid-flight: items already processed are done (a move's
-            // earlier sources are already deleted), so warn that partial changes may remain rather
-            // than imply nothing happened. (Reporting the exact partial count needs the engine to
-            // carry its `TransferOutcome` through `Cancelled` — tracked follow-up.)
-            status: "Transfer cancelled (partial changes may remain)".to_owned(),
+        Err(cairn_transfer::TransferError::Cancelled(done)) => AppEvent::TransferDone {
+            // Cancellation is cooperative and mid-flight; report what already completed (a move's
+            // earlier sources are already deleted) so the user knows partial changes remain.
+            status: if done == cairn_transfer::TransferOutcome::default() {
+                "Transfer cancelled".to_owned()
+            } else {
+                format!(
+                    "Transfer cancelled after {}; partial changes may remain",
+                    outcome_summary(&done)
+                )
+            },
             error: false,
         },
         Err(e) => AppEvent::TransferDone {

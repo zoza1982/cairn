@@ -1,5 +1,6 @@
 //! [`TransferError`]: errors from the transfer engine.
 
+use crate::TransferOutcome;
 use cairn_types::VfsPath;
 use cairn_vfs::VfsError;
 
@@ -19,9 +20,11 @@ pub enum TransferError {
     /// Post-transfer verification failed for the destination.
     #[error("verification failed: {0}")]
     VerifyFailed(VfsPath),
-    /// The transfer was cancelled.
+    /// The transfer was cancelled. Carries the partial [`TransferOutcome`] completed before the
+    /// cancel took effect (items already transferred — a move's earlier sources are already deleted),
+    /// so the caller can report how much happened rather than imply nothing did.
     #[error("cancelled")]
-    Cancelled,
+    Cancelled(TransferOutcome),
 }
 
 impl TransferError {
@@ -35,7 +38,7 @@ impl TransferError {
             TransferError::Path(_) => "invalid path".to_owned(),
             TransferError::Conflict(_) => "destination already exists".to_owned(),
             TransferError::VerifyFailed(_) => "verification failed".to_owned(),
-            TransferError::Cancelled => "cancelled".to_owned(),
+            TransferError::Cancelled(_) => "cancelled".to_owned(),
         }
     }
 }
