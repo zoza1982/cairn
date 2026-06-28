@@ -161,6 +161,7 @@ mod tests {
         let cfg = Config::load(&dir.path().join("nope.toml")).unwrap();
         assert_eq!(cfg.version, SCHEMA_VERSION);
         assert_eq!(cfg.ui.keymap, "mc");
+        assert_eq!(cfg.ui.theme, "dark"); // load-bearing: the resolver falls back to dark
         assert!(cfg.connections.is_empty());
     }
 
@@ -250,6 +251,7 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.ui.keymap, "vim");
         assert!(cfg.ui.keybindings.is_empty());
+        assert!(cfg.ui.colors.is_empty());
     }
 
     #[test]

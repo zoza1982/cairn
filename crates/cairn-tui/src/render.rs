@@ -33,6 +33,7 @@ fn render_connections(
         .min(frame.area().height);
     let area = centered(frame.area(), 50, h.max(3));
     frame.render_widget(Clear, area);
+    // Overlays use fixed semantic accents (not the user's pane palette) so prompts stay distinct.
     let block = Block::bordered()
         .title(" Open connection ")
         .border_style(Style::default().fg(Color::Cyan));

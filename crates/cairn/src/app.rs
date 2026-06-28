@@ -68,14 +68,7 @@ async fn run_async() -> anyhow::Result<()> {
     state.connections = register_connections(&registry, &config).await;
 
     // Resolve the color theme from the preset + per-role config overrides.
-    let (theme, theme_warnings) = Theme::resolve(
-        &config.ui.theme,
-        config
-            .ui
-            .colors
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str())),
-    );
+    let (theme, theme_warnings) = Theme::resolve(&config.ui.theme, &config.ui.colors);
     for w in theme_warnings {
         tracing::warn!("{w}");
     }

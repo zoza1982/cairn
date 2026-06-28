@@ -48,9 +48,11 @@ impl Theme {
     /// Resolve a theme from a preset name plus per-role color overrides. Returns the theme and a list
     /// of human-readable warnings for unknown roles or unparseable colors (those are skipped).
     #[must_use]
-    pub fn resolve<'a, I>(preset: &str, overrides: I) -> (Self, Vec<String>)
+    pub fn resolve<I, K, V>(preset: &str, overrides: I) -> (Self, Vec<String>)
     where
-        I: IntoIterator<Item = (&'a str, &'a str)>,
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
     {
         // Only `dark` exists today; an unrecognized preset falls back to it with a warning.
         let mut theme = Self::DARK;
@@ -59,6 +61,7 @@ impl Theme {
             warnings.push(format!("theme: unknown preset `{preset}`, using `dark`"));
         }
         for (role, value) in overrides {
+            let (role, value) = (role.as_ref(), value.as_ref());
             let Ok(color) = Color::from_str(value) else {
                 warnings.push(format!("theme: unparseable color `{value}` for `{role}`"));
                 continue;
@@ -89,13 +92,26 @@ mod tests {
 
     #[test]
     fn unknown_preset_warns_and_falls_back() {
-        let (theme, warnings) = Theme::resolve("solarized", std::iter::empty());
+        let none = std::iter::empty::<(&str, &str)>;
+        let (theme, warnings) = Theme::resolve("solarized", none());
         assert_eq!(theme.focused_border, Theme::DARK.focused_border);
         assert_eq!(warnings.len(), 1);
         // The known presets and the empty default do not warn.
         for ok in ["dark", "default", ""] {
-            assert!(Theme::resolve(ok, std::iter::empty()).1.is_empty());
+            assert!(Theme::resolve(ok, none()).1.is_empty());
         }
+    }
+
+    #[test]
+    fn resolve_accepts_a_string_map_directly() {
+        // Mirrors `Keymap::from_overrides`: a `&BTreeMap<String,String>` works without adapting.
+        let map: std::collections::BTreeMap<String, String> =
+            [("dir".to_owned(), "green".to_owned())]
+                .into_iter()
+                .collect();
+        let (theme, warnings) = Theme::resolve("dark", &map);
+        assert!(warnings.is_empty());
+        assert_eq!(theme.dir, Color::Green);
     }
 
     #[test]
