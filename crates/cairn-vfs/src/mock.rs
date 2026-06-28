@@ -346,4 +346,12 @@ mod tests {
             Err(VfsError::NotFound(_))
         ));
     }
+
+    #[test]
+    fn local_path_defaults_to_none_for_a_non_local_backend() {
+        // A backend with no local filesystem identity must deny `local_path` by default, so features
+        // that shell out can never reach a remote backend.
+        let vfs = MockVfs::new(ConnectionId(1)).with_file("/f", b"x");
+        assert!(vfs.local_path(&p("/f")).is_none());
+    }
 }
