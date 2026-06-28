@@ -45,7 +45,7 @@ credentials handled safely and an AI layer that turns intent into reviewed, exec
 | Doc | Purpose |
 |-----|---------|
 | [PRD](docs/PRD.md) | Product requirements — *what* and *why* (high-level) |
-| Low-Level Design (LLD) | Architecture & technical design *(planned)* |
+| [LLD](docs/LLD.md) | Low-Level Design — architecture & technical design |
 | Implementation Plan | Milestones & sequencing *(planned)* |
 | [ADRs](docs/adr/) | Architecture Decision Records |
 | [RFCs](docs/rfcs/) | Design proposals for non-trivial work |

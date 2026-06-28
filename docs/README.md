@@ -3,7 +3,7 @@
 | Document | Status | Purpose |
 |----------|--------|---------|
 | [PRD.md](PRD.md) | Draft | Product requirements — *what* we build and *why* (high-level) |
-| Low-Level Design (LLD) | Planned | Architecture & technical design — VFS abstraction, async model, vault crypto, AI layer, plugin sandbox |
+| [LLD.md](LLD.md) | Draft | Low-Level Design — architecture, VFS abstraction, async/TEA model, transfer engine, vault crypto, AI layer, plugin sandbox |
 | Implementation Plan | Planned | Milestones, per-backend sequencing, testing & release strategy |
 
 ## Subdirectories
