@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-transfer`: the transfer engine — stream-through copy/move across any two backends,
+  directory-tree walk, server-side-copy fast path, conflict policies, size verification, and
+  cooperative cancellation; RFC-0002. 6 hermetic tests (M2-1..4).
 - `cairn-tui` (ratatui dual-pane render + keymap) and the binary event loop / effect runner:
   `cairn` now opens an interactive dual-pane local-filesystem browser — navigate, switch panes,
   mark, refresh, quit; non-blocking (M1-5/6/7/8). Graceful message when not run in a TTY.

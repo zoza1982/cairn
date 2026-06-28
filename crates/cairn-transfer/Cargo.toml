@@ -1,0 +1,26 @@
+[package]
+name = "cairn-transfer"
+description = "Cairn transfer engine: stream-through copy/move across any two VFS backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types = { workspace = true }
+cairn-vfs = { workspace = true }
+bytes = "1"
+futures = "0.3"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+cairn-vfs = { workspace = true, features = ["test-utils"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
