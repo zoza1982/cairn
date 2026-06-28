@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open_connection` remains deferred pending the broker-backed opener.
 
 ### Added
+- **Live transfer progress** (M2-5): the copy/move engine's progress is now surfaced — the status
+  line shows a running byte total (`⇅ transferring… 3.4 MiB`) while a transfer runs. Progress is
+  coalesced and delivered best-effort (non-blocking `try_send`, so it never stalls the transfer), and
+  a dedicated `TransferDone` event clears the indicator so an unrelated op finishing mid-transfer
+  can't wipe it. One transfer runs at a time (a second is refused while one is in flight).
 - **Filter-as-you-type** (M1-9): `/` filters the active pane's listing by a case-insensitive name
   substring, updating live as you type — `Enter` keeps the filter, `Esc` clears it. The cursor and
   marks index the filtered view, and copy/move/delete/rename/enter act only on visible entries;

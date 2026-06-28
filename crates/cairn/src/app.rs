@@ -25,6 +25,11 @@ use tokio_util::sync::CancellationToken;
 const LEFT: ConnectionId = ConnectionId(1);
 const RIGHT: ConnectionId = ConnectionId(2);
 
+/// UI progress granularity: the transfer callback notifies the status bar at most every this many
+/// bytes. 256 KiB balances update frequency against channel pressure; progress is sent best-effort
+/// (`try_send`, dropped when the channel is full), so there is no back-pressure on the transfer.
+const TRANSFER_PROGRESS_STEP: u64 = 256 * 1024;
+
 /// The resolved UI configuration threaded through the event loop (input mapping + colors).
 struct Ui {
     keymap: Keymap,
@@ -230,7 +235,9 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
             let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let ev = run_transfer_effect(&registry, src_conn, dst_conn, items, is_move).await;
+                let ev =
+                    run_transfer_effect(&registry, src_conn, dst_conn, items, is_move, &event_tx)
+                        .await;
                 let _ = event_tx.send(ev).await;
             });
         }
@@ -345,10 +352,11 @@ async fn run_transfer_effect(
     dst_conn: ConnectionId,
     items: Vec<(VfsPath, VfsPath)>,
     is_move: bool,
+    event_tx: &mpsc::Sender<AppEvent>,
 ) -> AppEvent {
     let (Some(src), Some(dst)) = (registry.get(src_conn).await, registry.get(dst_conn).await)
     else {
-        return AppEvent::OpDone {
+        return AppEvent::TransferDone {
             status: "connection unavailable".to_owned(),
             error: true,
         };
@@ -363,15 +371,31 @@ async fn run_transfer_effect(
         verify: VerifyPolicy::Size,
     };
     let cancel = CancellationToken::new();
-    let mut bytes = 0u64;
     let verb = if is_move { "Moved" } else { "Copied" };
-    match cairn_transfer::run_transfer(&src, &dst, &items, spec, &cancel, &mut |b| bytes += b).await
-    {
-        Ok(out) => AppEvent::OpDone {
-            status: format!("{verb} {} file(s), {} dir(s)", out.files, out.dirs),
-            error: false,
-        },
-        Err(e) => AppEvent::OpDone {
+    // Emit coalesced, non-blocking progress: accumulate bytes and notify the UI at most every
+    // `TRANSFER_PROGRESS_STEP` bytes via `try_send`, which drops the update if the bounded channel is
+    // full rather than stalling the transfer task (the render path must never be blocked here).
+    let mut bytes = 0u64;
+    let mut last_sent = 0u64;
+    let mut on_progress = |b: u64| {
+        bytes += b;
+        debug_assert!(bytes >= last_sent, "progress bytes must be cumulative");
+        if bytes - last_sent >= TRANSFER_PROGRESS_STEP {
+            last_sent = bytes;
+            let _ = event_tx.try_send(AppEvent::TransferProgress { bytes });
+        }
+    };
+    match cairn_transfer::run_transfer(&src, &dst, &items, spec, &cancel, &mut on_progress).await {
+        Ok(out) => {
+            // Flush the exact final total for one frame before `TransferDone` clears the indicator
+            // (so a transfer smaller than the coalescing step doesn't only ever show "0 B").
+            let _ = event_tx.try_send(AppEvent::TransferProgress { bytes: out.bytes });
+            AppEvent::TransferDone {
+                status: format!("{verb} {} file(s), {} dir(s)", out.files, out.dirs),
+                error: false,
+            }
+        }
+        Err(e) => AppEvent::TransferDone {
             status: format!("{} failed: {}", verb.trim_end_matches('d'), e.redacted()),
             error: true,
         },
