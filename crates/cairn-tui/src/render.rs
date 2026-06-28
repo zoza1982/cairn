@@ -90,9 +90,45 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             .alignment(Alignment::Center);
             frame.render_widget(body, area);
         }
+        Overlay::TransferQueue => render_transfer_queue(frame, state),
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
         Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),
     }
+}
+
+/// Draw the transfer-queue view: the active transfer (if any) plus the pending list.
+fn render_transfer_queue(frame: &mut Frame, state: &AppState) {
+    let pending = &state.transfer_queue;
+    let h = u16::try_from(pending.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(5) // active line + 2 borders + blank + hint
+        .min(frame.area().height);
+    let area = centered(frame.area(), 60, h.max(5));
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Transfer queue ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(match state.transfer_bytes {
+        Some(b) => format!("active: transferring… {}", human_bytes(b)),
+        None => "active: (none)".to_owned(),
+    }));
+    for (i, q) in pending.iter().enumerate() {
+        let verb = if q.is_move { "move" } else { "copy" };
+        lines.push(Line::from(format!(
+            "{}. {verb} {} item(s)",
+            i + 1,
+            q.items.len()
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(if pending.is_empty() {
+        "[Esc] Close".to_owned()
+    } else {
+        "[x] Clear pending    [Esc] Close".to_owned()
+    }));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Draw a single-line text prompt (new directory, rename) with the entered text and a block cursor.
@@ -321,7 +357,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             human_bytes(bytes)
         ))
     } else {
-        let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^A ai";
+        let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^T queue · ^A ai";
         Line::from(format!(" {count}   {help}"))
     };
     frame.render_widget(
@@ -510,6 +546,24 @@ mod tests {
             text.contains("*file05001"),
             "marked row shows its '*' under the window offset"
         );
+    }
+
+    #[test]
+    fn transfer_queue_overlay_lists_pending() {
+        let mut s = ready_state();
+        s.transfer_bytes = Some(1024);
+        s.transfer_queue.push_back(cairn_core::QueuedTransfer {
+            src_conn: ConnectionId(1),
+            dst_conn: ConnectionId(2),
+            items: vec![(VfsPath::root(), VfsPath::root())],
+            is_move: true,
+        });
+        s.overlay = Some(cairn_core::Overlay::TransferQueue);
+        let text = render_text(&s, 80, 24);
+        assert!(text.contains("Transfer queue"));
+        assert!(text.contains("active"));
+        assert!(text.contains("move"));
+        assert!(text.contains("Clear pending"));
     }
 
     #[test]
