@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-secrets`: zeroizing secret types and a log-redaction helper.
+- `cairn-vault`: encrypted secrets vault (XChaCha20-Poly1305 + Argon2id, header bound as AAD,
+  atomic writes); passphrase unlock; 7 hermetic crypto tests (M3-1/M3-2).
 - File operations in the TUI: copy (`c`/F5), move (`m`/F6), and delete (`d`/F8, with a confirm
   dialog) of the marked/current entries between panes, via the transfer engine; status feedback
   and auto-refresh (M2-6/M2-7).
