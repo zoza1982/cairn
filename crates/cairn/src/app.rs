@@ -124,9 +124,11 @@ async fn register_connections(registry: &VfsRegistry, config: &Config) -> Vec<Co
         }
     }
 
+    // Switcher connection ids follow the startup panes (LEFT/RIGHT) so they never collide.
+    let base = RIGHT.0 + 1;
     let mut choices = Vec::with_capacity(targets.len());
     for (i, (path, label)) in targets.into_iter().enumerate() {
-        let id = ConnectionId(3 + i as u64); // 1 and 2 are the two startup panes
+        let id = ConnectionId(base + i as u64);
         registry.insert(id, Arc::new(LocalVfs::new(id, path))).await;
         choices.push(ConnectionChoice { conn: id, label });
     }
@@ -180,7 +182,14 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
                 let result = list_dir(&registry, conn, &dir).await;
-                let _ = event_tx.send(AppEvent::Listed { pane, dir, result }).await;
+                let _ = event_tx
+                    .send(AppEvent::Listed {
+                        pane,
+                        conn,
+                        dir,
+                        result,
+                    })
+                    .await;
             });
         }
         AppEffect::Transfer {

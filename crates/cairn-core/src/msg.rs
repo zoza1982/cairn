@@ -72,6 +72,8 @@ pub enum AppEvent {
     Listed {
         /// Which pane requested it.
         pane: Side,
+        /// The connection it was listed on (ignored if the pane has since switched connection).
+        conn: ConnectionId,
         /// The directory that was listed (ignored if it no longer matches the pane's cwd).
         dir: VfsPath,
         /// The page result.

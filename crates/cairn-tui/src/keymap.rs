@@ -107,6 +107,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "confirm" => Action::Confirm,
         "cancel" => Action::Cancel,
         "refresh" => Action::Refresh,
+        "open_connections" => Action::OpenConnections,
         "ai_propose" => Action::AiPropose,
         "approve_all" => Action::ApproveAll,
         "reject" => Action::Reject,
@@ -402,6 +403,7 @@ mod tests {
             "confirm",
             "cancel",
             "refresh",
+            "open_connections",
             "ai_propose",
             "approve_all",
             "reject",
@@ -413,7 +415,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
     }
 
     #[test]

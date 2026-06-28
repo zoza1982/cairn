@@ -17,15 +17,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     render_pane(frame, left, state, Side::Left);
     render_pane(frame, right, state, Side::Right);
     render_status(frame, status, state);
-    if let Some(overlay) = &state.overlay {
-        match overlay {
-            // The connection switcher needs the choice list, which lives on the AppState.
-            Overlay::Connections { cursor } => {
-                render_connections(frame, &state.connections, *cursor);
-            }
-            other => render_overlay(frame, other),
-        }
-    }
+    render_overlay(frame, state);
 }
 
 /// Draw the connection switcher: a centered list of the configured connections.
@@ -34,7 +26,8 @@ fn render_connections(
     connections: &[cairn_core::ConnectionChoice],
     cursor: usize,
 ) {
-    let h = (connections.len() as u16)
+    let h = u16::try_from(connections.len())
+        .unwrap_or(u16::MAX)
         .saturating_add(2)
         .min(frame.area().height);
     let area = centered(frame.area(), 50, h.max(3));
@@ -57,9 +50,14 @@ fn render_connections(
     frame.render_stateful_widget(list, area, &mut st);
 }
 
-/// Draw a modal overlay centered over the screen.
-fn render_overlay(frame: &mut Frame, overlay: &Overlay) {
+/// Draw the active modal overlay (if any) centered over the screen. Takes `&AppState` so overlays
+/// that need extra state (the connection switcher's choice list) dispatch from a single site.
+fn render_overlay(frame: &mut Frame, state: &AppState) {
+    let Some(overlay) = &state.overlay else {
+        return;
+    };
     match overlay {
+        Overlay::Connections { cursor } => render_connections(frame, &state.connections, *cursor),
         Overlay::ConfirmDelete { paths, .. } => {
             let area = centered(frame.area(), 44, 6);
             frame.render_widget(Clear, area);
@@ -76,15 +74,14 @@ fn render_overlay(frame: &mut Frame, overlay: &Overlay) {
             frame.render_widget(body, area);
         }
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
-        // Rendered by `render` (it needs the AppState's connection list).
-        Overlay::Connections { .. } => {}
     }
 }
 
 /// Draw the AI plan → confirm overlay: the summary, each step with its approval status and
 /// reversibility, and the available actions (bulk-approve only when no step is irreversible).
 fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize) {
-    let h = (plan.steps.len() as u16)
+    let h = u16::try_from(plan.steps.len())
+        .unwrap_or(u16::MAX)
         .saturating_add(6)
         .min(frame.area().height);
     let area = centered(frame.area(), 64, h);

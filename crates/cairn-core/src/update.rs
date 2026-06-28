@@ -137,8 +137,10 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
             Vec::new()
         }
         Action::Confirm | Action::Enter => {
-            let choice = state.connections[*cursor].clone();
-            state.overlay = None;
+            let Some(Overlay::Connections { cursor }) = state.overlay.take() else {
+                return Vec::new();
+            };
+            let choice = state.connections[cursor].clone();
             state.status = Some(format!("Opened {}", choice.label));
             let side = state.focus;
             navigate_to_conn(state, side, choice.conn)
@@ -151,23 +153,15 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
     }
 }
 
-/// Re-point a pane to a different connection, resetting it to the root and reloading.
+/// Re-point a pane to a different connection, resetting it to the root and reloading (delegates to
+/// [`navigate`] after switching the connection so any future per-navigation reset is shared).
 fn navigate_to_conn(
     state: &mut AppState,
     side: Side,
     conn: cairn_types::ConnectionId,
 ) -> Vec<AppEffect> {
-    let p = state.pane_mut(side);
-    p.conn = conn;
-    p.cwd = VfsPath::root();
-    p.listing = Listing::Loading;
-    p.cursor = 0;
-    p.marked.clear();
-    vec![AppEffect::List {
-        pane: side,
-        conn,
-        dir: VfsPath::root(),
-    }]
+    state.pane_mut(side).conn = conn;
+    navigate(state, side, VfsPath::root())
 }
 
 fn apply_confirm_delete_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
@@ -402,10 +396,17 @@ fn reload(state: &mut AppState, side: Side) -> Vec<AppEffect> {
 
 fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
     match event {
-        AppEvent::Listed { pane, dir, result } => {
+        AppEvent::Listed {
+            pane,
+            conn,
+            dir,
+            result,
+        } => {
             let p = state.pane_mut(pane);
-            // Ignore a stale result for a directory we've since navigated away from.
-            if p.cwd != dir {
+            // Ignore a stale result for a directory/connection we've since navigated away from.
+            // The connection check matters because switching backends resets the pane to `/`, so
+            // `dir` alone cannot distinguish a listing from the previous connection's root.
+            if p.cwd != dir || p.conn != conn {
                 return Vec::new();
             }
             match result {
@@ -487,10 +488,12 @@ mod tests {
 
     fn deliver(s: &mut AppState, side: Side, entries: Vec<Entry>) {
         let dir = s.pane(side).cwd.clone();
+        let conn = s.pane(side).conn;
         let _ = update(
             s,
             Msg::Event(AppEvent::Listed {
                 pane: side,
+                conn,
                 dir,
                 result: Ok(page(entries)),
             }),
@@ -603,11 +606,13 @@ mod tests {
     #[test]
     fn stale_listing_is_ignored() {
         let mut s = state();
+        let conn = s.pane(Side::Left).conn;
         // Deliver a result for a directory the pane is not in.
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::Listed {
                 pane: Side::Left,
+                conn,
                 dir: VfsPath::parse("/elsewhere").unwrap(),
                 result: Ok(page(vec![Entry::new("ghost", EntryKind::File)])),
             }),
@@ -616,13 +621,42 @@ mod tests {
     }
 
     #[test]
-    fn error_listing_is_recorded_redacted() {
+    fn listing_from_a_previous_connection_is_ignored() {
+        // After switching a pane to another connection (also at root `/`), a slow listing from the
+        // old connection's root must not be applied to the new one.
         let mut s = state();
-        let dir = s.pane(Side::Left).cwd.clone();
+        s.connections = vec![crate::state::ConnectionChoice {
+            conn: ConnectionId(9),
+            label: "other".into(),
+        }];
+        let old_conn = s.active().conn;
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        let _ = update(&mut s, Msg::Action(Action::Confirm)); // now on conn 9, cwd "/"
+        assert_eq!(s.active().conn, ConnectionId(9));
+        // The old connection's root listing arrives late — must be ignored.
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::Listed {
                 pane: Side::Left,
+                conn: old_conn,
+                dir: VfsPath::root(),
+                result: Ok(page(vec![Entry::new("ghost", EntryKind::File)])),
+            }),
+        );
+        assert!(s.active().listing.entries().is_empty());
+        assert!(matches!(s.active().listing, Listing::Loading));
+    }
+
+    #[test]
+    fn error_listing_is_recorded_redacted() {
+        let mut s = state();
+        let dir = s.pane(Side::Left).cwd.clone();
+        let conn = s.pane(Side::Left).conn;
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::Listed {
+                pane: Side::Left,
+                conn,
                 dir,
                 result: Err(VfsError::Forbidden(VfsPath::parse("/secret").unwrap())),
             }),
@@ -827,6 +861,39 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("No other connections"));
+    }
+
+    #[test]
+    fn connection_switcher_cursor_clamps_and_quit_quits() {
+        use crate::state::ConnectionChoice;
+        let mut s = state();
+        s.connections = vec![
+            ConnectionChoice {
+                conn: ConnectionId(3),
+                label: "a".into(),
+            },
+            ConnectionChoice {
+                conn: ConnectionId(4),
+                label: "b".into(),
+            },
+        ];
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        // Up at the top clamps; down past the end clamps.
+        let _ = update(&mut s, Msg::Action(Action::CursorUp));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::Connections { cursor: 0 })
+        ));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::Connections { cursor: 1 })
+        ));
+        // Quit from within the overlay quits the app.
+        let _ = update(&mut s, Msg::Action(Action::Quit));
+        assert!(s.should_quit);
+        assert!(s.overlay.is_none());
     }
 
     #[test]
