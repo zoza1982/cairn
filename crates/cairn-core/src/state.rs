@@ -342,23 +342,46 @@ pub struct AppState {
     pub ai_executing: bool,
     /// Connections the switcher can open in a pane (populated from config at startup).
     pub connections: Vec<ConnectionChoice>,
-    /// Cumulative bytes of the **single** in-flight transfer (`Some` while one runs), for the
-    /// progress display. Transfers run one at a time; only a `TransferDone` clears it.
-    pub transfer_bytes: Option<u64>,
-    /// Transfers waiting behind the active one. A copy/move issued while one is running is enqueued
-    /// here and started (FIFO) when the active transfer finishes.
+    /// The in-flight transfers (up to [`concurrency_limit`](AppState::concurrency_limit)). Each carries
+    /// its own progress and pause state, addressed by a stable [`TransferId`]. A `TransferDone`/
+    /// `TransferConflict` for an id removes that entry. The list is tiny (≤ a few), so it is scanned
+    /// linearly rather than indexed by a map.
+    pub active_transfers: Vec<ActiveTransfer>,
+    /// Monotonic id source for [`active_transfers`](AppState::active_transfers). Minted by the pure
+    /// reducer (no clock/RNG); starts at 1 so 0 is an obvious sentinel.
+    pub next_transfer_id: TransferId,
+    /// How many transfers may run at once. From config at startup; `1` reproduces strict FIFO.
+    /// INVARIANT: must be `>= 1` — `0` would queue every transfer and never drain. Clamp at the
+    /// config-load site when wiring this.
+    pub concurrency_limit: usize,
+    /// Transfers waiting for a free slot. A copy/move issued when all slots are busy is enqueued here
+    /// and started (FIFO) when a slot frees.
     pub transfer_queue: VecDeque<QueuedTransfer>,
-    /// Average throughput (bytes/sec) of the active transfer, for the status display. `Some` only
-    /// once at least one progress update has arrived.
-    pub transfer_rate: Option<u64>,
-    /// Total bytes to transfer (from a pre-scan), if known — enables the percentage/ETA display.
-    pub transfer_total: Option<u64>,
-    /// Whether the active transfer is paused. Toggled by the user; reset when the transfer finishes.
-    /// Display-only here — the runtime drives the engine's pause signal in response to the effect.
-    pub transfer_paused: bool,
     /// User-defined shell actions, by index (populated from config at startup, like `connections`).
     /// The index aligns with the keymap's `Action::RunShellAction(idx)` and the runtime's action list.
     pub shell_actions: Vec<ShellActionMeta>,
+}
+
+/// A stable identifier for an in-flight transfer, used to address progress/done events and the
+/// runtime's per-transfer control (cancel token + pause sender). Minted monotonically by the reducer.
+pub type TransferId = u64;
+
+/// One in-flight transfer the reducer tracks for display and control. The full source/destination
+/// detail lives runtime-side; this is the secret-free view the UI renders.
+#[derive(Debug, Clone)]
+pub struct ActiveTransfer {
+    /// Stable identity (never 0).
+    pub id: TransferId,
+    /// Human-readable label, e.g. "Copying 3 item(s)…".
+    pub label: String,
+    /// Cumulative bytes transferred so far.
+    pub bytes: u64,
+    /// Average throughput (bytes/sec); `None` until the first progress update.
+    pub rate: Option<u64>,
+    /// Total bytes to transfer (from a pre-scan), if known — enables the percentage/ETA display.
+    pub total: Option<u64>,
+    /// Whether the user has paused this transfer.
+    pub paused: bool,
 }
 
 /// The reducer's view of a shell action: just what it needs to validate and gate the run. The full
@@ -387,13 +410,18 @@ impl AppState {
             ai_pending: false,
             ai_executing: false,
             connections: Vec::new(),
-            transfer_bytes: None,
+            active_transfers: Vec::new(),
+            next_transfer_id: 1,
+            concurrency_limit: 1,
             transfer_queue: VecDeque::new(),
-            transfer_rate: None,
-            transfer_total: None,
-            transfer_paused: false,
             shell_actions: Vec::new(),
         }
+    }
+
+    /// Whether any transfer is currently running.
+    #[must_use]
+    pub fn has_active_transfer(&self) -> bool {
+        !self.active_transfers.is_empty()
     }
 
     /// The active pane.

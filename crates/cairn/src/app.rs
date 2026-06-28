@@ -4,6 +4,7 @@
 //! backends. The render path is synchronous; all I/O runs as tokio tasks whose results return as
 //! [`AppEvent`]s over a bounded channel — see `docs/LLD.md` §4–§6.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +13,7 @@ use cairn_backend_local::LocalVfs;
 use cairn_config::Config;
 use cairn_core::{
     initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, Msg,
-    ShellActionMeta,
+    ShellActionMeta, TransferId,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
@@ -121,13 +122,13 @@ async fn run_async() -> anyhow::Result<()> {
         initial.iter().all(|e| matches!(e, AppEffect::List { .. })),
         "initial_effects must emit only List effects; a transfer here would be uncancellable"
     );
+    let mut startup_controls = HashMap::new();
     for effect in initial {
         dispatch(
             effect,
             &registry,
             &event_tx,
-            &mut None,
-            &mut None,
+            &mut startup_controls,
             &mut None,
             &shell_action_defs,
         );
@@ -215,15 +216,11 @@ async fn event_loop(
 ) -> anyhow::Result<()> {
     // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
     // matching effect can signal them. Each is cleared when its Done event arrives.
-    // NOTE: `transfer_cancel` and `transfer_pause` are a *control pair* for the one in-flight
-    // transfer — always created together (in `AppEffect::Transfer`) and cleared together (on
-    // `TransferDone`/`TransferConflict`). If a third per-transfer control channel is needed, fold
-    // them into a single `TransferControls { cancel, pause }` so they can't drift apart; likewise
-    // extract a shared slot abstraction if a third independently-controllable operation appears.
-    let mut transfer_cancel: Option<CancellationToken> = None;
+    // Per-transfer control, keyed by `TransferId`: the cancel token + pause sender form a *control
+    // pair* created together (in `AppEffect::Transfer`) and removed together (on that transfer's
+    // `TransferDone`/`TransferConflict`). Multiple transfers run concurrently, so this is a map.
+    let mut transfer_controls: HashMap<TransferId, TransferControls> = HashMap::new();
     let mut ai_cancel: Option<CancellationToken> = None;
-    // Pause signal for the in-flight transfer (if any), driven by a `SetTransferPaused` effect.
-    let mut transfer_pause: Option<watch::Sender<bool>> = None;
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -232,14 +229,14 @@ async fn event_loop(
         };
         let Some(msg) = msg else { continue };
 
-        // Clear before `update`: if `update(TransferDone)` ever emitted a new Transfer, it would get
-        // a fresh slot rather than one cleared right after dispatch. A conflict means no transfer ran.
-        if matches!(
-            msg,
-            Msg::Event(AppEvent::TransferDone { .. } | AppEvent::TransferConflict { .. })
-        ) {
-            transfer_cancel = None;
-            transfer_pause = None;
+        // Clear before `update`: a transfer's Done/Conflict releases its control entry *before*
+        // `update` (which may start a queued transfer via the tail-drain) so the fresh entry the new
+        // transfer's dispatch inserts isn't wiped.
+        if let Msg::Event(
+            AppEvent::TransferDone { id, .. } | AppEvent::TransferConflict { id, .. },
+        ) = &msg
+        {
+            transfer_controls.remove(id);
         }
         if matches!(msg, Msg::Event(AppEvent::AiPlanExecuted { .. })) {
             ai_cancel = None;
@@ -254,14 +251,19 @@ async fn event_loop(
                 effect,
                 registry,
                 event_tx,
-                &mut transfer_cancel,
+                &mut transfer_controls,
                 &mut ai_cancel,
-                &mut transfer_pause,
                 shell_action_defs,
             );
         }
     }
     Ok(())
+}
+
+/// The per-transfer control pair held runtime-side, keyed by [`TransferId`].
+struct TransferControls {
+    cancel: CancellationToken,
+    pause: watch::Sender<bool>,
 }
 
 /// Translate a terminal event into a reducer message (or `None` to ignore).
@@ -283,17 +285,15 @@ fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
     }
 }
 
-/// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s. `transfer_cancel`
-/// holds the in-flight transfer's cancellation token so a [`AppEffect::CancelTransfer`] can fire it,
-/// and `transfer_pause` holds its pause signal so a [`AppEffect::SetTransferPaused`] can drive it.
-#[allow(clippy::too_many_arguments)]
+/// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s. `transfer_controls`
+/// maps each [`TransferId`] to its cancel token + pause sender, so [`AppEffect::CancelTransfer`] and
+/// [`AppEffect::SetTransferPaused`] can target the right transfer task.
 fn dispatch(
     effect: AppEffect,
     registry: &VfsRegistry,
     event_tx: &mpsc::Sender<AppEvent>,
-    transfer_cancel: &mut Option<CancellationToken>,
+    transfer_controls: &mut HashMap<TransferId, TransferControls>,
     ai_cancel: &mut Option<CancellationToken>,
-    transfer_pause: &mut Option<watch::Sender<bool>>,
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
 ) {
     match effect {
@@ -318,6 +318,7 @@ fn dispatch(
             });
         }
         AppEffect::Transfer {
+            id,
             src_conn,
             dst_conn,
             items,
@@ -326,32 +327,38 @@ fn dispatch(
         } => {
             let registry = registry.clone();
             let event_tx = event_tx.clone();
-            // Hand the task a token whose clone we keep, so `CancelTransfer` can abort it.
+            // Keep this transfer's control pair (cancel token clone + pause sender) keyed by id, so
+            // `CancelTransfer`/`SetTransferPaused` can target exactly this transfer; the task gets the
+            // cancel token and the pause receiver. Starts unpaused.
             let cancel = CancellationToken::new();
-            *transfer_cancel = Some(cancel.clone());
-            // Likewise keep the pause sender so `SetTransferPaused` can drive the engine; the task
-            // gets the receiver. Starts unpaused.
             let (pause_tx, paused) = watch::channel(false);
-            *transfer_pause = Some(pause_tx);
+            transfer_controls.insert(
+                id,
+                TransferControls {
+                    cancel: cancel.clone(),
+                    pause: pause_tx,
+                },
+            );
             tokio::spawn(async move {
                 let ev = run_transfer_effect(
-                    &registry, src_conn, dst_conn, items, is_move, overwrite, &event_tx, cancel,
-                    paused,
+                    &registry, id, src_conn, dst_conn, items, is_move, overwrite, &event_tx,
+                    cancel, paused,
                 )
                 .await;
                 let _ = event_tx.send(ev).await;
             });
         }
-        AppEffect::CancelTransfer => {
-            if let Some(token) = transfer_cancel.take() {
-                token.cancel();
+        AppEffect::CancelTransfer { id } => {
+            // Remove + fire. Its Done event also removes the entry (idempotent).
+            if let Some(ctrl) = transfer_controls.remove(&id) {
+                ctrl.cancel.cancel();
             }
         }
-        AppEffect::SetTransferPaused(paused) => {
-            // Ignore if no transfer is running (the sender slot is empty). A send error means the
-            // transfer task already finished and dropped its receiver — also safely ignored.
-            if let Some(tx) = transfer_pause.as_ref() {
-                let _ = tx.send(paused);
+        AppEffect::SetTransferPaused { id, paused } => {
+            // Ignore if that transfer isn't running. A send error means its task already finished and
+            // dropped the receiver — also safely ignored.
+            if let Some(ctrl) = transfer_controls.get(&id) {
+                let _ = ctrl.pause.send(paused);
             }
         }
         AppEffect::RunShellAction {
@@ -551,6 +558,7 @@ async fn scan_total_bytes(src: &Arc<dyn Vfs>, items: &[(VfsPath, VfsPath)]) -> O
 #[allow(clippy::too_many_arguments)]
 async fn run_transfer_effect(
     registry: &VfsRegistry,
+    id: TransferId,
     src_conn: ConnectionId,
     dst_conn: ConnectionId,
     items: Vec<(VfsPath, VfsPath)>,
@@ -567,6 +575,7 @@ async fn run_transfer_effect(
     let (Some(src), Some(dst)) = (registry.get(src_conn).await, registry.get(dst_conn).await)
     else {
         return AppEvent::TransferDone {
+            id,
             status: "connection unavailable".to_owned(),
             error: true,
         };
@@ -581,6 +590,7 @@ async fn run_transfer_effect(
         for (_, to) in &items {
             if cancel.is_cancelled() {
                 return AppEvent::TransferDone {
+                    id,
                     status: "Transfer cancelled".to_owned(),
                     error: false,
                 };
@@ -590,6 +600,7 @@ async fn run_transfer_effect(
                 Err(VfsError::NotFound(_)) => {}
                 Err(e) => {
                     return AppEvent::TransferDone {
+                        id,
                         status: format!("Transfer aborted: {}", e.redacted()),
                         error: true,
                     };
@@ -598,6 +609,7 @@ async fn run_transfer_effect(
         }
         if conflicts > 0 {
             return AppEvent::TransferConflict {
+                id,
                 src_conn,
                 dst_conn,
                 items,
@@ -642,6 +654,7 @@ async fn run_transfer_effect(
         if bytes - last_sent >= TRANSFER_PROGRESS_STEP {
             last_sent = bytes;
             let _ = event_tx.try_send(AppEvent::TransferProgress {
+                id,
                 bytes,
                 rate_bps: rate_bps(bytes),
                 total,
@@ -655,16 +668,19 @@ async fn run_transfer_effect(
             // Flush the exact final total for one frame before `TransferDone` clears the indicator
             // (so a transfer smaller than the coalescing step doesn't only ever show "0 B").
             let _ = event_tx.try_send(AppEvent::TransferProgress {
+                id,
                 bytes: out.bytes,
                 rate_bps: rate_bps(out.bytes),
                 total,
             });
             AppEvent::TransferDone {
+                id,
                 status: format!("{verb} {}", outcome_summary(&out)),
                 error: false,
             }
         }
         Err(cairn_transfer::TransferError::Cancelled(done)) => AppEvent::TransferDone {
+            id,
             // Cancellation is cooperative and mid-flight; report what already completed (a move's
             // earlier sources are already deleted) so the user knows partial changes remain.
             status: if done == cairn_transfer::TransferOutcome::default() {
@@ -678,6 +694,7 @@ async fn run_transfer_effect(
             error: false,
         },
         Err(e) => AppEvent::TransferDone {
+            id,
             status: format!("{} failed: {}", verb.trim_end_matches('d'), e.redacted()),
             error: true,
         },
@@ -1204,6 +1221,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let ev = run_transfer_effect(
             &registry,
+            1, // transfer id
             LEFT,
             RIGHT,
             vec![(
@@ -1218,7 +1236,7 @@ mod tests {
         )
         .await;
         match ev {
-            AppEvent::TransferDone { status, error } => {
+            AppEvent::TransferDone { status, error, .. } => {
                 assert!(!error, "cancellation is user-initiated, not a failure");
                 assert!(status.contains("cancelled"), "got: {status}");
             }
@@ -1241,6 +1259,7 @@ mod tests {
         // overwrite = false → the existing /dst.txt is detected and reported, not clobbered.
         let ev = run_transfer_effect(
             &registry,
+            1, // transfer id
             LEFT,
             LEFT,
             vec![(
