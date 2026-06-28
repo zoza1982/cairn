@@ -196,7 +196,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             Vec::new()
         }
         Action::OpenQueue => {
-            state.overlay = Some(Overlay::TransferQueue);
+            state.overlay = Some(Overlay::TransferQueue { cursor: 0 });
             Vec::new()
         }
         Action::Filter => {
@@ -416,16 +416,46 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::ConfirmOverwrite { .. }) => apply_confirm_overwrite_action(state, action),
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
-        Some(Overlay::TransferQueue) => apply_transfer_queue_action(state, action),
+        Some(Overlay::TransferQueue { .. }) => apply_transfer_queue_action(state, action),
         // A text prompt captures keystrokes as `Msg::Text`; non-quit actions don't reach it.
         Some(Overlay::Prompt { .. }) | None => Vec::new(),
     }
 }
 
-/// Drive the transfer-queue overlay: `Reject` clears the pending queue (the active transfer keeps
-/// running); `Cancel`/`Enter` just closes the view.
+/// Drive the transfer-queue overlay: navigate the pending list, drop the selected pending transfer
+/// (`Delete`), clear all pending (`Reject`), or close (`Cancel`/`Confirm`/`Enter`). The active
+/// transfer is never touched here.
 fn apply_transfer_queue_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    let len = state.transfer_queue.len();
+    let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay else {
+        return Vec::new();
+    };
     match action {
+        Action::CursorUp => {
+            *cursor = cursor.saturating_sub(1);
+            Vec::new()
+        }
+        Action::CursorDown => {
+            if *cursor + 1 < len {
+                *cursor += 1;
+            }
+            Vec::new()
+        }
+        Action::Delete => {
+            // Drop just the selected pending transfer (the active one keeps running).
+            let idx = *cursor;
+            if idx < len {
+                state.transfer_queue.remove(idx);
+                state.status = Some("Removed 1 queued transfer".to_owned());
+                // Re-clamp the cursor and close the view if the queue is now empty.
+                if state.transfer_queue.is_empty() {
+                    state.overlay = None;
+                } else if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
+                    *cursor = (*cursor).min(state.transfer_queue.len() - 1);
+                }
+            }
+            Vec::new()
+        }
         Action::Reject => {
             let n = state.transfer_queue.len();
             state.transfer_queue.clear();
@@ -890,6 +920,11 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                     items,
                     is_move,
                 });
+                // A row was inserted at the front; if the queue view is open, keep the selection on
+                // the same logical item so a subsequent drop targets what the user sees.
+                if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
+                    *cursor += 1;
+                }
                 return Vec::new();
             }
             state.status = None;
@@ -1491,7 +1526,7 @@ mod tests {
         assert_eq!(s.transfer_queue.len(), 1);
         // Open the queue view.
         let _ = update(&mut s, Msg::Action(Action::OpenQueue));
-        assert!(matches!(s.overlay, Some(Overlay::TransferQueue)));
+        assert!(matches!(s.overlay, Some(Overlay::TransferQueue { .. })));
         // Reject clears the pending queue but leaves the active transfer running.
         let _ = update(&mut s, Msg::Action(Action::Reject));
         assert!(s.transfer_queue.is_empty());
@@ -1507,10 +1542,77 @@ mod tests {
     fn queue_overlay_esc_just_closes() {
         let mut s = state();
         let _ = update(&mut s, Msg::Action(Action::OpenQueue));
-        assert!(matches!(s.overlay, Some(Overlay::TransferQueue)));
+        assert!(matches!(s.overlay, Some(Overlay::TransferQueue { .. })));
         let fx = update(&mut s, Msg::Action(Action::Cancel));
         assert!(fx.is_empty());
         assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn queue_overlay_navigates_and_drops_the_selected_pending_transfer() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("a", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active
+        let _ = update(&mut s, Msg::Action(Action::Move)); // queued #1
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // queued #2
+        assert_eq!(s.transfer_queue.len(), 2);
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        // Move the cursor to the second pending entry, then drop it.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 1 })
+        ));
+        let _ = update(&mut s, Msg::Action(Action::Delete));
+        assert_eq!(
+            s.transfer_queue.len(),
+            1,
+            "only the selected one was dropped"
+        );
+        assert_eq!(
+            s.transfer_bytes,
+            Some(0),
+            "the active transfer is untouched"
+        );
+        // The cursor re-clamps to the remaining entry; the view stays open.
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 0 })
+        ));
+        // Dropping the last one closes the view.
+        let _ = update(&mut s, Msg::Action(Action::Delete));
+        assert!(s.transfer_queue.is_empty());
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn queue_cursor_tracks_its_item_when_a_conflict_requeues_at_the_front() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("a", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active
+        let _ = update(&mut s, Msg::Action(Action::Move)); // queued: [B]
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 0 })
+        ));
+        // A conflicts while the queue view is open → A is re-queued at the front: [A, B].
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferConflict {
+                src_conn: ConnectionId(1),
+                dst_conn: ConnectionId(2),
+                items: vec![(VfsPath::root(), VfsPath::root())],
+                is_move: false,
+                conflicts: 1,
+            }),
+        );
+        assert_eq!(s.transfer_queue.len(), 2);
+        // The cursor followed its item (B) from index 0 to index 1, so a drop hits B, not A.
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 1 })
+        ));
     }
 
     #[test]

@@ -90,14 +90,15 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             .alignment(Alignment::Center);
             frame.render_widget(body, area);
         }
-        Overlay::TransferQueue => render_transfer_queue(frame, state),
+        Overlay::TransferQueue { cursor } => render_transfer_queue(frame, state, *cursor),
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
         Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),
     }
 }
 
-/// Draw the transfer-queue view: the active transfer (if any) plus the pending list.
-fn render_transfer_queue(frame: &mut Frame, state: &AppState) {
+/// Draw the transfer-queue view: the active transfer (if any) plus the pending list, with the
+/// selection cursor marked.
+fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     let pending = &state.transfer_queue;
     let h = u16::try_from(pending.len())
         .unwrap_or(u16::MAX)
@@ -116,17 +117,20 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState) {
     }));
     for (i, q) in pending.iter().enumerate() {
         let verb = if q.is_move { "move" } else { "copy" };
-        lines.push(Line::from(format!(
-            "{}. {verb} {} item(s)",
-            i + 1,
-            q.items.len()
-        )));
+        let marker = if i == cursor { "> " } else { "  " };
+        let line = format!("{marker}{}. {verb} {} item(s)", i + 1, q.items.len());
+        let style = if i == cursor {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(line, style));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(if pending.is_empty() {
         "[Esc] Close".to_owned()
     } else {
-        "[x] Clear pending    [Esc] Close".to_owned()
+        "[↑↓] select   [d] drop   [x] clear all   [Esc] close".to_owned()
     }));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -563,12 +567,13 @@ mod tests {
             items: vec![(VfsPath::root(), VfsPath::root())],
             is_move: true,
         });
-        s.overlay = Some(cairn_core::Overlay::TransferQueue);
+        s.overlay = Some(cairn_core::Overlay::TransferQueue { cursor: 0 });
         let text = render_text(&s, 80, 24);
         assert!(text.contains("Transfer queue"));
         assert!(text.contains("active"));
         assert!(text.contains("move"));
-        assert!(text.contains("Clear pending"));
+        assert!(text.contains("drop")); // the [d] drop control
+        assert!(text.contains("clear all"));
     }
 
     #[test]
