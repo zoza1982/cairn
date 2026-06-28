@@ -228,6 +228,20 @@ pub enum Overlay {
         /// The text entered so far.
         input: String,
     },
+    /// Confirm overwriting existing destinations before a copy/move proceeds. Holds the parameters to
+    /// re-issue the transfer with overwrite enabled.
+    ConfirmOverwrite {
+        /// Source connection.
+        src_conn: ConnectionId,
+        /// Destination connection.
+        dst_conn: ConnectionId,
+        /// The `(source, destination)` pairs to transfer.
+        items: Vec<(VfsPath, VfsPath)>,
+        /// Whether the transfer is a move.
+        is_move: bool,
+        /// How many destinations already exist.
+        conflicts: usize,
+    },
 }
 
 /// What submitting a [`Overlay::Prompt`] text field will do.

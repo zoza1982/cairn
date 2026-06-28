@@ -123,6 +123,20 @@ pub enum AppEvent {
         /// Whether the transfer failed.
         error: bool,
     },
+    /// A requested transfer would overwrite existing destinations; carries the parameters needed to
+    /// re-issue it (with `overwrite: true`) once the user confirms.
+    TransferConflict {
+        /// Source connection.
+        src_conn: ConnectionId,
+        /// Destination connection.
+        dst_conn: ConnectionId,
+        /// The `(source, destination)` pairs of the original request.
+        items: Vec<(VfsPath, VfsPath)>,
+        /// Whether the original request was a move.
+        is_move: bool,
+        /// How many destinations already exist.
+        conflicts: usize,
+    },
     /// The assistant proposed a plan, or failed to (carries a redacted message).
     AiPlanProposed(Result<Plan, String>),
 }
@@ -152,6 +166,9 @@ pub enum AppEffect {
         items: Vec<(VfsPath, VfsPath)>,
         /// Whether to move (delete source after copy) rather than copy.
         is_move: bool,
+        /// Overwrite existing destinations. `false` first checks for collisions and asks; `true`
+        /// (after the user confirms) proceeds through them.
+        overwrite: bool,
     },
     /// Cancel the in-flight transfer, if any.
     CancelTransfer,
