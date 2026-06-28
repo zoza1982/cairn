@@ -104,14 +104,21 @@ pub struct PaneState {
     pub cwd: VfsPath,
     /// The current listing.
     pub listing: Listing,
-    /// The cursor index into the (loaded) entries.
+    /// The cursor index into the **visible** (filtered) entries — see [`PaneState::visible`].
     pub cursor: usize,
-    /// Marked (multi-selected) entry indices.
+    /// Marked (multi-selected) entry indices, into the **visible** entries. Cleared whenever the
+    /// filter changes, since filtering re-indexes the view.
     pub marked: BTreeSet<usize>,
     /// How entries are ordered within the pane.
     pub sort: SortMode,
     /// Whether hidden entries (e.g. dotfiles) are listed. Passed to the backend as `ListOpts::all`.
     pub show_hidden: bool,
+    /// The active name filter (case-insensitive substring), or `None` when not filtering.
+    pub filter: Option<String>,
+    /// Whether keystrokes are currently editing the filter live (filter-as-you-type). Editing is
+    /// per-pane and persists across a pane switch: switching away pauses capture (the other pane is
+    /// active), switching back resumes it. Cleared on directory change and when an overlay takes over.
+    pub filter_editing: bool,
 }
 
 impl PaneState {
@@ -126,25 +133,59 @@ impl PaneState {
             marked: BTreeSet::new(),
             sort: SortMode::default(),
             show_hidden: false,
+            filter: None,
+            filter_editing: false,
         }
     }
 
-    /// The number of loaded entries.
+    /// The entries currently visible after applying the active filter (a case-insensitive substring
+    /// match on the name). With no filter this is every loaded entry, in order.
+    ///
+    /// The cursor and marks index into *this* view. Returns borrowed refs into the listing, so it
+    /// allocates only the `Vec` of pointers (cheap); large-list virtualization is deferred (M1-9).
+    #[must_use]
+    pub fn visible(&self) -> Vec<&Entry> {
+        let entries = self.listing.entries();
+        match &self.filter {
+            None => entries.iter().collect(),
+            Some(f) => {
+                let needle = f.to_lowercase();
+                entries
+                    .iter()
+                    .filter(|e| e.name.to_lowercase().contains(&needle))
+                    .collect()
+            }
+        }
+    }
+
+    /// The number of visible (filtered) entries. O(n) and allocates while a filter is active (it goes
+    /// through [`PaneState::visible`]); hoist the value if you need it more than once. Optimizing the
+    /// filtered scan is folded into the deferred large-list virtualization work (M1-9).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.listing.entries().len()
+        self.visible().len()
     }
 
-    /// Whether the loaded listing is empty.
+    /// Whether the visible (filtered) listing is empty. Avoids the `visible()` allocation.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        match &self.filter {
+            None => self.listing.entries().is_empty(),
+            Some(f) => {
+                let needle = f.to_lowercase();
+                !self
+                    .listing
+                    .entries()
+                    .iter()
+                    .any(|e| e.name.to_lowercase().contains(&needle))
+            }
+        }
     }
 
-    /// The entry under the cursor, if any.
+    /// The entry under the cursor (within the visible view), if any.
     #[must_use]
     pub fn current(&self) -> Option<&Entry> {
-        self.listing.entries().get(self.cursor)
+        self.visible().get(self.cursor).copied()
     }
 
     /// Clamp the cursor into the valid range after the listing changes.
@@ -293,10 +334,17 @@ impl AppState {
         &mut self.panes[side.index()]
     }
 
-    /// Whether a text-entry overlay is open and capturing keystrokes (so the input layer routes raw
-    /// keys to the field rather than resolving them as actions).
+    /// Whether keystrokes should be routed to a text field rather than resolved as actions — either a
+    /// text-entry overlay is open, or (with no overlay) the active pane is editing its filter live.
+    ///
+    /// Filter editing yields to *any* open overlay: a non-prompt overlay (e.g. an AI plan that
+    /// arrived asynchronously while the user was filtering) owns input, so its keys aren't swallowed.
     #[must_use]
     pub fn capturing_text(&self) -> bool {
-        matches!(self.overlay, Some(Overlay::Prompt { .. }))
+        match &self.overlay {
+            Some(Overlay::Prompt { .. }) => true,
+            Some(_) => false,
+            None => self.active().filter_editing,
+        }
     }
 }

@@ -109,6 +109,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "refresh" => Action::Refresh,
         "cycle_sort" => Action::CycleSort,
         "toggle_hidden" => Action::ToggleHidden,
+        "filter" => Action::Filter,
         "make_dir" => Action::MakeDir,
         "rename" => Action::Rename,
         "open_connections" => Action::OpenConnections,
@@ -223,6 +224,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         // F7 = make directory, F2 = rename (Total Commander / Norton convention).
         KeyCode::F(7) => Some(Action::MakeDir),
         KeyCode::F(2) => Some(Action::Rename),
+        // '/' starts filter-as-you-type (vim/less convention).
+        KeyCode::Char('/') => Some(Action::Filter),
         // Plan-overlay actions (no-ops when no overlay is open). These letters are safe because while
         // a text prompt is capturing input the event loop routes keys to [`text_edit_for`] instead of
         // resolving actions, so 'a'/'x' type into the field rather than firing here.
@@ -440,6 +443,7 @@ mod tests {
             "refresh",
             "cycle_sort",
             "toggle_hidden",
+            "filter",
             "make_dir",
             "rename",
             "open_connections",
@@ -454,7 +458,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 23);
+        assert_eq!(names.len(), 24);
     }
 
     #[test]

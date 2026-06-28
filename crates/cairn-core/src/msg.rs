@@ -42,6 +42,8 @@ pub enum Action {
     CycleSort,
     /// Toggle whether the active pane lists hidden entries (re-lists with the new `all` flag).
     ToggleHidden,
+    /// Begin filtering the active pane's listing (filter-as-you-type).
+    Filter,
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
     /// Open a prompt to create a new directory in the active pane.
