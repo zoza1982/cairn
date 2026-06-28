@@ -339,6 +339,8 @@ pub struct AppState {
     /// Average throughput (bytes/sec) of the active transfer, for the status display. `Some` only
     /// once at least one progress update has arrived.
     pub transfer_rate: Option<u64>,
+    /// Total bytes to transfer (from a pre-scan), if known — enables the percentage/ETA display.
+    pub transfer_total: Option<u64>,
 }
 
 impl AppState {
@@ -360,6 +362,7 @@ impl AppState {
             transfer_bytes: None,
             transfer_queue: VecDeque::new(),
             transfer_rate: None,
+            transfer_total: None,
         }
     }
 

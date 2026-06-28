@@ -45,7 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the active transfer (or dismissing its overwrite prompt) drains the next one. `Ctrl-T` (config
   `open_queue`) opens a **queue view** showing the active + pending transfers; navigate with the
   cursor, `Shift-K`/`Shift-J` reorder the selected pending transfer, `d` drops it, `x` clears them
-  all. The status line also shows the live **throughput** (`⇅ transferring… 2.0 MiB at 512 KiB/s`).
+  all. The status line shows live **progress, throughput, and ETA** — `⇅ transferring… 3.4 / 10.2 MiB
+  (33%) at 512 KiB/s, ETA 14s` — from a best-effort pre-scan of the source size (it degrades to a
+  byte+rate display when the size can't be determined, and is skipped for instant same-pane moves).
 - **Large-list row virtualization** (M1-9): only the on-screen window of rows is materialized each
   frame (the cursor is kept roughly centred), so browsing a directory with tens of thousands of
   entries costs O(viewport) instead of O(entries) per render.

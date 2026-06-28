@@ -348,11 +348,32 @@ fn list_window(cursor: usize, total: usize, rows: usize) -> usize {
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let pane = state.active();
     let count = pane_count_label(pane);
-    // A live transfer takes over the status line with its running byte total (rate + queue depth).
+    // A live transfer takes over the status line with progress (bytes, %/ETA when the total is
+    // known, rate, and queue depth).
     let line = if let Some(bytes) = state.transfer_bytes {
+        // "X" or "X / Y (Z%)" when a pre-scanned total is available.
+        let amount = match state.transfer_total {
+            Some(total) if total > 0 => {
+                let pct = ((bytes as f64 / total as f64) * 100.0).min(100.0) as u64;
+                format!("{} / {} ({pct}%)", human_bytes(bytes), human_bytes(total))
+            }
+            _ => human_bytes(bytes),
+        };
         let rate = match state.transfer_rate {
             Some(r) => format!(" at {}/s", human_bytes(r)),
             None => String::new(),
+        };
+        // ETA needs both a total and a positive rate; suppress a sub-second "ETA 0s" tail.
+        let eta = match (state.transfer_total, state.transfer_rate) {
+            (Some(total), Some(r)) if r > 0 && total > bytes => {
+                let secs = (total - bytes) / r;
+                if secs > 0 {
+                    format!(", ETA {}", human_duration(secs))
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
         };
         let queued = state.transfer_queue.len();
         let suffix = if queued > 0 {
@@ -361,8 +382,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             String::new()
         };
         Line::from(format!(
-            " {count}   ⇅ transferring… {}{rate}{suffix}",
-            human_bytes(bytes)
+            " {count}   ⇅ transferring… {amount}{rate}{eta}{suffix}"
         ))
     } else {
         let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^T queue · ^A ai";
@@ -372,6 +392,17 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         Paragraph::new(line).style(Style::default().fg(theme.status)),
         area,
     );
+}
+
+/// Format a duration in seconds compactly (`45s`, `3m12s`, `1h05m`).
+fn human_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 /// Format a byte count compactly (`512 B`, `3.4 KiB`, `1.2 GiB`).
@@ -601,6 +632,25 @@ mod tests {
             "expected human-readable byte total"
         );
         assert!(text.contains("512.0 KiB/s"), "expected throughput rate");
+    }
+
+    #[test]
+    fn human_duration_formats_compactly() {
+        assert_eq!(human_duration(0), "0s");
+        assert_eq!(human_duration(45), "45s");
+        assert_eq!(human_duration(192), "3m12s");
+        assert_eq!(human_duration(3900), "1h05m");
+    }
+
+    #[test]
+    fn status_line_shows_percentage_and_eta_when_total_is_known() {
+        let mut s = ready_state();
+        s.transfer_bytes = Some(4 * 1024 * 1024); // 4 MiB done
+        s.transfer_total = Some(8 * 1024 * 1024); // of 8 MiB
+        s.transfer_rate = Some(2 * 1024 * 1024); // 2 MiB/s → 2s remaining
+        let text = render_text(&s, 120, 24);
+        assert!(text.contains("50%"), "expected percentage: {text}");
+        assert!(text.contains("ETA 2s"), "expected ETA: {text}");
     }
 
     #[test]

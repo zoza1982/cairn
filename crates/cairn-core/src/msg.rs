@@ -116,6 +116,8 @@ pub enum AppEvent {
         bytes: u64,
         /// Average throughput so far, in bytes per second.
         rate_bps: u64,
+        /// Total bytes to transfer (from a pre-scan), if known — enables a percentage and ETA.
+        total: Option<u64>,
     },
     /// A delete/mkdir/rename/plan operation finished; carries a status message and whether it failed.
     OpDone {
