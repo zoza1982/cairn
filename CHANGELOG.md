@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses to overwrite an existing destination (and aborts rather than risk a clobber on a non-
   not-found stat error). Completing any mutating op now clears stale positional marks.
 - Per-pane **sort modes & hidden-file toggle** (M1-8): `s` cycles the active pane's sort
-  (name → size → modified) and `.` toggles whether hidden entries (dotfiles) are listed. Directories
+  (name → size → modified → type) and `.` toggles whether hidden entries (dotfiles) are listed. Directories
   always sort first; size/modified order the most-relevant first (largest / newest) with unknown
   values last and a case-insensitive name tiebreak. Cycling re-orders in place (no re-list) and keeps
   the cursor on the same entry; the hidden toggle re-lists via the backend's `ListOpts::all`. The

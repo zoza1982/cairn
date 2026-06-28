@@ -45,16 +45,19 @@ pub enum SortMode {
     Size,
     /// By modification time, newest first. Entries without a known time sort last.
     Modified,
+    /// By file type (extension), grouping like with like; entries with no extension sort first.
+    Type,
 }
 
 impl SortMode {
-    /// The next mode in the cycle (`Name → Size → Modified → Name`).
+    /// The next mode in the cycle (`Name → Size → Modified → Type → Name`).
     #[must_use]
     pub fn next(self) -> Self {
         match self {
             Self::Name => Self::Size,
             Self::Size => Self::Modified,
-            Self::Modified => Self::Name,
+            Self::Modified => Self::Type,
+            Self::Type => Self::Name,
         }
     }
 
@@ -65,6 +68,7 @@ impl SortMode {
             Self::Name => "name",
             Self::Size => "size",
             Self::Modified => "modified",
+            Self::Type => "type",
         }
     }
 }

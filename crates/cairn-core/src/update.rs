@@ -681,6 +681,8 @@ fn sort_entries(entries: &mut [Entry], mode: SortMode) {
             SortMode::Size => b.size.cmp(&a.size).then_with(|| cmp_name(a, b)),
             // Newest first; `None` (unknown time) sorts last, then by name.
             SortMode::Modified => b.modified.cmp(&a.modified).then_with(|| cmp_name(a, b)),
+            // Group by extension (case-insensitive); no-extension entries sort first, then by name.
+            SortMode::Type => extension(a).cmp(&extension(b)).then_with(|| cmp_name(a, b)),
         })
     });
 }
@@ -688,6 +690,22 @@ fn sort_entries(entries: &mut [Entry], mode: SortMode) {
 /// Case-insensitive name comparison — the stable secondary key for every sort mode.
 fn cmp_name(a: &Entry, b: &Entry) -> std::cmp::Ordering {
     a.name.to_lowercase().cmp(&b.name.to_lowercase())
+}
+
+/// The lower-cased file extension used for [`SortMode::Type`] ordering. A leading dot (dotfile with no
+/// further dot, e.g. `.bashrc`) is treated as having no extension, so such files group with the
+/// extensionless entries rather than each forming their own type.
+fn extension(e: &Entry) -> String {
+    e.name
+        .rsplit_once('.')
+        .map(|(stem, ext)| {
+            if stem.is_empty() {
+                String::new() // ".bashrc" → no extension
+            } else {
+                ext.to_lowercase()
+            }
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1011,7 +1029,46 @@ mod tests {
     fn sort_mode_cycles_back_to_name() {
         assert_eq!(SortMode::Name.next(), SortMode::Size);
         assert_eq!(SortMode::Size.next(), SortMode::Modified);
-        assert_eq!(SortMode::Modified.next(), SortMode::Name);
+        assert_eq!(SortMode::Modified.next(), SortMode::Type);
+        assert_eq!(SortMode::Type.next(), SortMode::Name);
+    }
+
+    #[test]
+    fn extension_handles_edge_cases() {
+        let ext = |name: &str| extension(&Entry::new(name, EntryKind::File));
+        assert_eq!(ext("readme"), ""); // no dot
+        assert_eq!(ext(".bashrc"), ""); // leading-dot dotfile → no extension
+        assert_eq!(ext("file."), ""); // trailing dot → empty extension
+        assert_eq!(ext("a.tar.gz"), "gz"); // splits on the last dot
+        assert_eq!(ext("FILE.TXT"), "txt"); // lower-cased
+        assert_eq!(ext(".bashrc.bak"), "bak"); // dotfile with a real extension
+        assert_eq!(ext(""), ""); // empty name
+    }
+
+    #[test]
+    fn sort_type_groups_by_extension_then_name() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("readme", EntryKind::File), // no extension → first
+                Entry::new("b.txt", EntryKind::File),
+                Entry::new("a.rs", EntryKind::File),
+                Entry::new("a.txt", EntryKind::File),
+                Entry::new(".bashrc", EntryKind::File), // dotfile → no extension
+            ],
+        );
+        // Name → Size → Modified → Type.
+        for _ in 0..3 {
+            let _ = update(&mut s, Msg::Action(Action::CycleSort));
+        }
+        assert_eq!(s.active().sort, SortMode::Type);
+        assert_eq!(
+            names(&s, Side::Left),
+            // extensionless (".bashrc", "readme") first by name, then ".rs", then ".txt" by name
+            vec![".bashrc", "readme", "a.rs", "a.txt", "b.txt"]
+        );
     }
 
     #[test]
