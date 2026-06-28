@@ -20,5 +20,6 @@ pub use error::{BoxError, RedactedError, VfsError};
 pub use handle::{ReadHandle, WriteHandle, WriteSink};
 pub use registry::VfsRegistry;
 pub use vfs::{
-    ByteRange, CapabilityProvider, ListOpts, ListPage, PageCursor, Recurse, Vfs, WriteOpts,
+    apply_byte_range, ByteRange, CapabilityProvider, ListOpts, ListPage, PageCursor, Recurse, Vfs,
+    WriteOpts,
 };

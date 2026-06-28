@@ -21,7 +21,7 @@
 | **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0004 |
 | **Current milestone** | **Hermetic milestones delivered; SDK/service backends env-deferred** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
-| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core + M8 runtime + M4 SFTP-mapping ✅ · M6 + cloud providers + SSH-transport ⏭ |
+| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core + M8 runtime + M4 SFTP-mapping + M6 Docker-mapping ✅ · cloud providers + K8s + SSH/Docker live-transport ⏭ |
 | **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 27 / 13 / 0 / 0 / 31 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
@@ -184,8 +184,8 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M6-1 | RFC: **Docker backend** (fs via archive API, image layers, exec/logs) | container-backend-engineer, technical-writer | M1-1 | RFC merged | approved before M6-2 | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
-| M6-2 | `cairn-backend-docker` (`bollard`): list containers+images; browse container fs (tar); image layers RO | container-backend-engineer | M6-1, M3-5 | rustdoc; backend README | against dind: browse fs; copy in/out | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-1 | RFC: **Docker backend** (fs via archive API, image layers, exec/logs) | container-backend-engineer, technical-writer | M1-1 | RFC merged | approved before M6-2 | ✅ (RFC-0004, #20) |
+| M6-2 | `cairn-backend-docker` (`bollard`): list containers+images; browse container fs (tar); image layers RO | container-backend-engineer | M6-1, M3-5 | rustdoc; backend README | against dind: browse fs; copy in/out | 🟡 mapping core (#20): `ContainerOps` seam + `DockerVfs` routing (containers/images/in-container fs) mock-tested; `BollardDocker` lists containers+images live; in-container fs via tar + live daemon = integration step |
 | M6-3 | Docker actions: `exec`, `logs` (Stream), start/stop | container-backend-engineer | M6-2 | rustdoc | exec interactive stream; logs follow | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
 | M6-4 | RFC: **Kubernetes backend** (ctx→ns→pod→container→fs, exec/cp/logs/port-forward, auth) | kube-staff-engineer, technical-writer | M1-1 | RFC merged | approved before M6-5 | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
 | M6-5 | `cairn-backend-k8s` (`kube`): navigable tree, watch strategy, kubeconfig/exec-plugin auth via broker | kube-staff-engineer | M6-4, M3-5 | rustdoc; backend README | against `kind`: browse ns/pods; multi-context | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
