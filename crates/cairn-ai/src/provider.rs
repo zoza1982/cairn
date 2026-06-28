@@ -88,6 +88,22 @@ pub enum ProviderError {
     InvalidResponse,
 }
 
+/// How a provider exposes tool-calling, in descending order of fidelity. The agent layer adapts how
+/// it asks for and parses a plan to the weakest tier a provider supports (see the `degrade` module):
+/// a native tool/function-call API, a JSON-object instruction in the prompt, or a fenced-code-block
+/// instruction for the weakest text-only models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolSupport {
+    /// Native tool/function calling (e.g. Claude, OpenAI tools) — tools go in the request, the
+    /// response comes back as a structured [`LlmResponse::ToolCall`].
+    Native,
+    /// No native tools, but reliable instruction-following — ask for a bare JSON object in the reply.
+    JsonSchema,
+    /// Weakest models — ask for a fenced ```json block and extract it from the text.
+    Text,
+}
+
 /// The provider abstraction. Implemented by cloud, local, and mock providers.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -95,21 +111,27 @@ pub trait LlmProvider: Send + Sync {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, ProviderError>;
     /// The model identifier.
     fn model_id(&self) -> &str;
+    /// The tool-calling tier this provider supports. Defaults to [`ToolSupport::Native`].
+    fn tool_support(&self) -> ToolSupport {
+        ToolSupport::Native
+    }
 }
 
 /// A scripted provider for tests: returns queued responses in order.
 pub struct MockProvider {
     model: String,
     responses: Mutex<VecDeque<LlmResponse>>,
+    support: ToolSupport,
 }
 
 impl MockProvider {
-    /// Create a mock that will return `responses` in order.
+    /// Create a mock that will return `responses` in order (defaults to [`ToolSupport::Native`]).
     #[must_use]
     pub fn new(responses: Vec<LlmResponse>) -> Self {
         Self {
             model: "mock".to_owned(),
             responses: Mutex::new(responses.into()),
+            support: ToolSupport::Native,
         }
     }
 
@@ -120,6 +142,13 @@ impl MockProvider {
             name: "propose_plan".to_owned(),
             input: plan,
         }])
+    }
+
+    /// Set the tool-support tier this mock advertises (to exercise degradation).
+    #[must_use]
+    pub fn with_support(mut self, support: ToolSupport) -> Self {
+        self.support = support;
+        self
     }
 }
 
@@ -135,6 +164,10 @@ impl LlmProvider for MockProvider {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    fn tool_support(&self) -> ToolSupport {
+        self.support
     }
 }
 
