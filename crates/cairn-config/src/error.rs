@@ -19,6 +19,6 @@ pub enum ConfigError {
         supported: u32,
     },
     /// An underlying I/O error.
-    #[error("io error")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

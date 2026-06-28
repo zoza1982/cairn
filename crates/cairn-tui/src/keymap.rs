@@ -18,19 +18,29 @@ impl Keymap {
     /// Build a keymap from `chord → action-name` config overrides. Returns the keymap plus a list of
     /// human-readable warnings for entries that could not be parsed (these are skipped, not fatal).
     #[must_use]
-    pub fn from_overrides<'a, I>(bindings: I) -> (Self, Vec<String>)
+    pub fn from_overrides<K, V, I>(bindings: I) -> (Self, Vec<String>)
     where
-        I: IntoIterator<Item = (&'a str, &'a str)>,
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
     {
         let mut overrides = HashMap::new();
         let mut warnings = Vec::new();
         for (chord, name) in bindings {
+            let (chord, name) = (chord.as_ref(), name.as_ref());
             match (parse_chord(chord), action_from_name(name)) {
-                (Some(key), Some(action)) => {
-                    overrides.insert(key, action);
+                (Some((code, mods)), Some(action)) => {
+                    overrides.insert(chord_key(code, mods), action);
                 }
-                (None, _) => warnings.push(format!("keybinding: unknown chord `{chord}`")),
-                (_, None) => warnings.push(format!("keybinding: unknown action `{name}`")),
+                (chord_res, action_res) => {
+                    // Report each field that failed independently (a both-bad entry warns twice).
+                    if chord_res.is_none() {
+                        warnings.push(format!("keybinding: unknown chord `{chord}`"));
+                    }
+                    if action_res.is_none() {
+                        warnings.push(format!("keybinding: unknown action `{name}`"));
+                    }
+                }
             }
         }
         (Self { overrides }, warnings)
@@ -42,24 +52,46 @@ impl Keymap {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return None;
         }
-        if let Some(action) = self
-            .overrides
-            .get(&(key.code, relevant_mods(key.modifiers)))
-        {
+        // Ctrl-C is reserved — it always quits, even if an override would shadow it, so a user can
+        // never accidentally remove their only way out of the app.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Some(Action::Quit);
+        }
+        if let Some(action) = self.overrides.get(&chord_key(key.code, key.modifiers)) {
             return Some(*action);
         }
         action_for(key)
     }
 }
 
-/// Keep only the modifiers we bind on (Ctrl/Alt/Shift), discarding state bits that vary by terminal.
-fn relevant_mods(m: KeyModifiers) -> KeyModifiers {
-    m & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+/// Canonicalize a `(key, modifiers)` pair for override lookup so the same physical key matches across
+/// terminals. Modifiers are masked to Ctrl/Alt/Shift; for an alphabetic character key, case is folded
+/// into the char and `Shift` is dropped — terminals variously deliver Shift+`g` as `Char('G')+Shift`,
+/// `Char('G')`, or `Char('g')+Shift`, all of which must resolve to the same binding.
+fn chord_key(code: KeyCode, mods: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    let mods = mods & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+    match code {
+        KeyCode::Char(c) if c.is_alphabetic() => {
+            if mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                // Terminals deliver Ctrl/Alt+letter as the lowercase code regardless of case/Shift.
+                (
+                    KeyCode::Char(c.to_ascii_lowercase()),
+                    mods - KeyModifiers::SHIFT,
+                )
+            } else {
+                // Otherwise fold case into the char and drop the (terminal-dependent) Shift bit.
+                let upper = mods.contains(KeyModifiers::SHIFT) || c.is_uppercase();
+                let c = if upper { c.to_ascii_uppercase() } else { c };
+                (KeyCode::Char(c), mods - KeyModifiers::SHIFT)
+            }
+        }
+        _ => (code, mods),
+    }
 }
 
 /// Map a snake_case action name (as used in config) to an [`Action`].
 #[must_use]
-pub fn action_from_name(name: &str) -> Option<Action> {
+pub(crate) fn action_from_name(name: &str) -> Option<Action> {
     Some(match name {
         "cursor_up" => Action::CursorUp,
         "cursor_down" => Action::CursorDown,
@@ -86,8 +118,11 @@ pub fn action_from_name(name: &str) -> Option<Action> {
 /// Parse a key-chord string like `"ctrl+a"`, `"j"`, `"f5"`, `"enter"`, `"space"` into a
 /// `(KeyCode, KeyModifiers)`. Modifier tokens (`ctrl`/`alt`/`shift`) are case-insensitive; the final
 /// token is the key. Returns `None` for anything it can't parse.
+///
+/// For alphabetic keys prefer the bare uppercase form (`"G"`) over `"shift+g"`: terminals differ on
+/// how they report Shift+letter, but the keymap canonicalizes both, so either works.
 #[must_use]
-pub fn parse_chord(chord: &str) -> Option<(KeyCode, KeyModifiers)> {
+pub(crate) fn parse_chord(chord: &str) -> Option<(KeyCode, KeyModifiers)> {
     let chord = chord.trim();
     if chord.is_empty() {
         return None;
@@ -107,6 +142,7 @@ pub fn parse_chord(chord: &str) -> Option<(KeyCode, KeyModifiers)> {
     let code = match key_tok.to_ascii_lowercase().as_str() {
         "enter" | "return" => KeyCode::Enter,
         "tab" => KeyCode::Tab,
+        "backtab" => KeyCode::BackTab,
         "esc" | "escape" => KeyCode::Esc,
         "space" => KeyCode::Char(' '),
         "backspace" => KeyCode::Backspace,
@@ -120,8 +156,15 @@ pub fn parse_chord(chord: &str) -> Option<(KeyCode, KeyModifiers)> {
         "right" => KeyCode::Right,
         "pageup" => KeyCode::PageUp,
         "pagedown" => KeyCode::PageDown,
-        fk if fk.starts_with('f') && fk[1..].parse::<u8>().is_ok() => {
-            KeyCode::F(fk[1..].parse().ok()?)
+        // `f` followed by digits is a function key (bare `"f"` falls through to the char branch).
+        fk if fk.starts_with('f')
+            && fk.len() > 1
+            && fk[1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            match fk[1..].parse::<u8>() {
+                Ok(n @ 1..=24) => KeyCode::F(n),
+                _ => return None,
+            }
         }
         _ => {
             let mut chars = key_tok.chars();
@@ -258,11 +301,115 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_letter_overrides_match_across_terminal_encodings() {
+        // Binding "G" (or "shift+g") must fire regardless of how the terminal encodes Shift+g.
+        for chord in ["G", "shift+g", "shift+G"] {
+            let (km, warnings) = Keymap::from_overrides([(chord, "quit")]);
+            assert!(warnings.is_empty(), "chord {chord} should parse");
+            // Legacy: uppercase char carries SHIFT.
+            assert_eq!(
+                km.action_for(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+                Some(Action::Quit),
+                "legacy encoding for {chord}"
+            );
+            // Kitty alternate-keys: uppercase char, no SHIFT.
+            assert_eq!(
+                km.action_for(press(KeyCode::Char('G'))),
+                Some(Action::Quit),
+                "kitty-uppercase encoding for {chord}"
+            );
+            // Kitty base: lowercase char + SHIFT.
+            assert_eq!(
+                km.action_for(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT)),
+                Some(Action::Quit),
+                "kitty-base encoding for {chord}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_is_reserved_even_when_overridden() {
+        let (km, _) = Keymap::from_overrides([("ctrl+c", "cursor_down")]);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(km.action_for(ctrl_c), Some(Action::Quit));
+    }
+
+    #[test]
+    fn out_of_range_function_keys_are_rejected() {
+        assert!(parse_chord("f0").is_none());
+        assert!(parse_chord("f25").is_none());
+        assert_eq!(
+            parse_chord("f12"),
+            Some((KeyCode::F(12), KeyModifiers::NONE))
+        );
+    }
+
+    #[test]
     fn bad_overrides_are_warned_not_fatal() {
         let (km, warnings) = Keymap::from_overrides([("nope_key", "quit"), ("a", "not_an_action")]);
         assert_eq!(warnings.len(), 2);
         // The keymap still works via defaults.
         assert_eq!(km.action_for(press(KeyCode::Char('q'))), Some(Action::Quit));
+    }
+
+    #[test]
+    fn both_bad_entry_warns_for_each_field() {
+        let (_, warnings) = Keymap::from_overrides([("nope_key", "not_an_action")]);
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_letter_overrides_are_case_insensitive() {
+        // crossterm delivers Ctrl+letter as the lowercase code; "ctrl+A" must still match.
+        let (km, warnings) = Keymap::from_overrides([("ctrl+A", "refresh")]);
+        assert!(warnings.is_empty());
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(km.action_for(ctrl_a), Some(Action::Refresh));
+    }
+
+    #[test]
+    fn parse_chord_handles_multiple_modifiers() {
+        assert_eq!(
+            parse_chord("ctrl+alt+a"),
+            Some((
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ))
+        );
+        assert!(parse_chord("").is_none());
+    }
+
+    #[test]
+    fn action_from_name_covers_every_published_name() {
+        // Keep in sync with the snake_case names documented for `[ui.keybindings]`. `Action` is
+        // `#[non_exhaustive]`; if a variant is added, add its name here and to `action_from_name`.
+        let names = [
+            "cursor_up",
+            "cursor_down",
+            "cursor_top",
+            "cursor_bottom",
+            "enter",
+            "leave",
+            "switch_pane",
+            "toggle_mark",
+            "copy",
+            "move",
+            "delete",
+            "confirm",
+            "cancel",
+            "refresh",
+            "ai_propose",
+            "approve_all",
+            "reject",
+            "quit",
+        ];
+        for name in names {
+            assert!(
+                action_from_name(name).is_some(),
+                "missing mapping for {name}"
+            );
+        }
+        assert_eq!(names.len(), 18);
     }
 
     #[test]

@@ -51,13 +51,7 @@ async fn run_async() -> anyhow::Result<()> {
 
     // Load user config (keybinding overrides, …); fall back to defaults on any problem.
     let config = load_config();
-    let (keymap, warnings) = Keymap::from_overrides(
-        config
-            .ui
-            .keybindings
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str())),
-    );
+    let (keymap, warnings) = Keymap::from_overrides(&config.ui.keybindings);
     for w in warnings {
         tracing::warn!("{w}");
     }
@@ -93,6 +87,7 @@ async fn run_async() -> anyhow::Result<()> {
 /// unreadable (a broken config must never prevent the app from starting).
 fn load_config() -> Config {
     let Some(path) = cairn_config::default_config_path() else {
+        tracing::debug!("no platform config directory; using default config");
         return Config::default();
     };
     match Config::load(&path) {
