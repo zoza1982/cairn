@@ -22,7 +22,10 @@ confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
+# Ban real `*` version requirements on external crates, but allow internal workspace
+# path dependencies (which have no version field) — they are not a supply-chain risk.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
