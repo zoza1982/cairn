@@ -22,12 +22,14 @@
 | **Current milestone** | **M0 — Scaffolding & guardrails** (🟡 in progress) |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones complete** | 0 / 9 |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 1 / 2 / 30 / 0 / 0 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 3 / 3 / 65 / 0 / 0 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows (scaffold) |
 | **Long-pole items** | `M1-1` Vfs trait · `M3-5` broker · all backend RFCs |
 
-**Burn-up note (edit each merge):** _Repo bootstrapped (#1), team/agents (#2), PRD+LLD+ADRs
-(#1–#3). M0 next: split the workspace into the 18 LLD crates and lay `cairn-types`._
+**Burn-up note (edit each merge):** _M0 underway: lint config tuned for velocity, `cairn-types`
+(paths/entries/caps/ids, fully tested) and the binary edge (tracing, panic hook, version/help)
+landed (#5). Crates are created lazily per milestone rather than 18 empty stubs up front. M1 next:
+`Vfs` trait + local backend + core/TUI skeleton._
 
 ### Status legend (used in every work-item table)
 
@@ -96,12 +98,12 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M0-1 | Cargo workspace + the 18 LLD crates with strict acyclic deps; lints; toolchain | software-architect, rust-staff-engineer | — | ADR-0001; rustdoc stubs | empty workspace builds on 3 OSes; dep graph matches LLD §2.1 (cargo-deny ban) | 🟡 bin scaffold #1; library crates pending |
+| M0-1 | Cargo workspace + crates with strict acyclic deps; lints tuned for `-D warnings`; toolchain | software-architect, rust-staff-engineer | — | ADR-0001; rustdoc stubs | workspace builds on 3 OSes; clippy `-D warnings` clean | 🟡 lint tuning + bin/types #5; crates created lazily per milestone |
 | M0-2 | CI matrix (fmt, clippy -D, test, doc, deny) × Linux/macOS/Windows | devops-engineer | — | CI README; PR template; CODEOWNERS | all checks green on 3 OSes; required for merge | ✅ #1 |
-| M0-3 | Branch protection, labels, GitHub Milestones M0–M8+v0.1, issue templates | project-manager, devops-engineer | M0-2 | CONTRIBUTING | `main` rejects direct push; milestones + labels exist | 🟡 protection/labels/templates #1; milestones this PR |
-| M0-4 | Binary edge: bootstrap, anyhow, tracing + redaction skeleton, panic hook restoring terminal, `--help/--version` | rust-staff-engineer, security-engineer | M0-1 | rustdoc; redaction note | launches, prints version, exits 0; panic restores terminal (test) | ☐ |
-| M0-5 | `cairn-types`: `VfsPath` (rejects `..`/control), `Entry`, `Caps`, ids, `VfsError`/`CairnError` | rust-staff-engineer | M0-1 | rustdoc on all public items | path parse/traversal-rejection tests green | ☐ |
-| M0-6 | Test/QA harness: `MockVfs` skeleton, `test-utils` pattern, hermetic-offline policy | qa-engineer | M0-5 | TESTING.md | `cargo test` (no features) hermetic & offline | ☐ |
+| M0-3 | Branch protection, labels, GitHub Milestones M0–M8+v0.1, issue templates | project-manager, devops-engineer | M0-2 | CONTRIBUTING | `main` rejects direct push; milestones + labels exist | ✅ #1, #4 (milestones) |
+| M0-4 | Binary edge: bootstrap, tracing, panic hook, `--help/--version` (redaction layer → M3) | rust-staff-engineer | M0-1 | rustdoc | launches, prints version, exits 0; CLI + panic-hook tests | ✅ #5 |
+| M0-5 | `cairn-types`: `VfsPath` (rejects `..`/control), `Entry`, `Caps`, ids | rust-staff-engineer | M0-1 | rustdoc on all public items | path parse/traversal-rejection tests green | ✅ #5 |
+| M0-6 | Test/QA harness: hermetic-offline policy (MockVfs lands with `cairn-vfs` in M1) | qa-engineer | M0-5 | — | `cargo test` (no features) hermetic & offline | 🟡 policy in force; MockVfs in M1 |
 
 ### M1 — The abstraction, proven (local vertical slice)
 
