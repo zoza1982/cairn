@@ -22,7 +22,7 @@
 | **Current milestone** | **M1 — The abstraction, proven** (🟡 in progress) |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones complete** | 0 / 9 |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 4 / 3 / 64 / 0 / 0 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 6 / 3 / 62 / 0 / 0 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows (scaffold) |
 | **Long-pole items** | `M1-1` Vfs trait · `M3-5` broker · all backend RFCs |
 
@@ -110,8 +110,8 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
 | M1-1 | `Vfs` trait set (async_trait, streaming `list`, Read/Write handles), `CapabilityProvider`, `VfsRegistry`, `MockVfs` | rust-staff-engineer, software-architect | M0-5 | confirm ADR-0001; rustdoc | object-safe (`Arc<dyn Vfs>`); MockVfs read/write/list/remove tests pass | ✅ #6 |
-| M1-2 | RFC: **local backend** deep design (symlinks, perms, watch, Windows paths) | rust-staff-engineer, technical-writer | M1-1 | RFC merged | approved before M1-3 | ☐ |
-| M1-3 | `cairn-backend-local`: streaming list, stat, read/write, mkdir/remove/rename/copy_within/set_perms; correct `Caps` | software-engineer, rust-staff-engineer | M1-2 | rustdoc; backend note | unit + temp-dir + cross-platform path tests green | ☐ |
+| M1-2 | RFC: **local backend** deep design (symlinks, perms, watch, Windows paths) | rust-staff-engineer, technical-writer | M1-1 | RFC merged | approved before M1-3 | ✅ #8 (RFC-0001) |
+| M1-3 | `cairn-backend-local`: list, stat, read/write (ranged), mkdir/remove/rename/set_perms; correct `Caps` | software-engineer, rust-staff-engineer | M1-2 | rustdoc; RFC-0001 | unit + temp-dir tests green (6) | ✅ #8 |
 | M1-4 | `cairn-core` TEA skeleton: `AppState`, `Msg/AppEvent/AppEffect`, pure `update()` | rust-staff-engineer, software-architect | M0-5 | confirm ADR-0001; rustdoc | `update()` unit-tested pure; lint bans `.await` in core | ☐ |
 | M1-5 | Effect runner (binary): tokio rt, `VfsRegistry`, TaskId→(handle,cancel), bounded coalesced `event_tx` | rust-staff-engineer | M1-1, M1-4 | rustdoc | spawns/cancels listing; progress coalescing ~10 Hz test | ☐ |
 | M1-6 | `cairn-tui` render skeleton: ratatui+crossterm loop, dual panes, breadcrumb, status, F-key bar | tui-engineer | M1-4 | rustdoc; theming note | renders a static `AppState`; resize OK; zero I/O in render (review) | ☐ |

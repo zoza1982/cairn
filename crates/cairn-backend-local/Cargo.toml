@@ -1,0 +1,25 @@
+[package]
+name = "cairn-backend-local"
+description = "Local filesystem backend for Cairn, implementing the Vfs trait over tokio::fs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types = { workspace = true }
+cairn-vfs = { workspace = true }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["fs", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }

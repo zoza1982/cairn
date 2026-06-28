@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-backend-local`: the local filesystem backend over `tokio::fs` (list, stat, ranged
+  read/write, mkdir/remove/rename, Unix perms), with RFC-0001 (M1-2/M1-3).
 - Engineering rule: use the Context7 MCP for current library/API docs (CLAUDE.md §10, §13).
 - `cairn-vfs`: the `Vfs` trait (object-safe, `#[async_trait]`, streaming `list`), capability
   provider, `ReadHandle`/`WriteHandle`, `VfsRegistry`, the action interface, and `MockVfs` (M1).
