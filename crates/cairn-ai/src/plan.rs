@@ -52,6 +52,8 @@ pub struct PlanStep {
     pub capability: Capability,
     /// Current status.
     pub status: StepStatus,
+    /// On failure, a redacted message describing why (set by [`Plan::execute`]).
+    pub error: Option<String>,
 }
 
 /// A proposed, then executable, plan.
@@ -130,6 +132,7 @@ impl Plan {
                 description: s.description,
                 capability,
                 status: StepStatus::Pending,
+                error: None,
             });
         }
         Ok(Self {
@@ -227,8 +230,9 @@ impl Plan {
         for i in 0..self.steps.len() {
             match exec.execute(&self.steps[i]).await {
                 Ok(()) => self.steps[i].status = StepStatus::Done,
-                Err(_) => {
+                Err(msg) => {
                     self.steps[i].status = StepStatus::Failed;
+                    self.steps[i].error = Some(msg);
                     self.state = PlanState::Failed;
                     return Ok(());
                 }

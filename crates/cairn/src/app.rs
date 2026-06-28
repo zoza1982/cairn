@@ -228,17 +228,29 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
             let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let exec = crate::executor::BinaryStepExecutor::new(registry);
+                // The assistant may only act on the two pane connections it can see in its
+                // WorldSnapshot — not the switcher backends (which include a root-mounted `/`).
+                // TODO(RFC-0007): thread a plan-level CancellationToken so the UI can abort a
+                // long-running execution.
+                let exec = crate::executor::BinaryStepExecutor::new(registry, vec![LEFT, RIGHT]);
                 let n = plan.steps.len();
                 let ev = match plan.execute(&exec).await {
                     Ok(()) if plan.state == cairn_ai::PlanState::Done => AppEvent::OpDone {
                         status: format!("Plan complete: {n} step(s) executed"),
                         error: false,
                     },
-                    Ok(()) => AppEvent::OpDone {
-                        status: "Plan stopped: a step failed".to_owned(),
-                        error: true,
-                    },
+                    Ok(()) => {
+                        // A step failed; surface its redacted reason (the executor already redacts).
+                        let why = plan
+                            .steps
+                            .iter()
+                            .find_map(|s| s.error.clone())
+                            .unwrap_or_else(|| "a step failed".to_owned());
+                        AppEvent::OpDone {
+                            status: format!("Plan stopped: {why}"),
+                            error: true,
+                        }
+                    }
                     Err(e) => AppEvent::OpDone {
                         status: format!("Plan not executed: {e}"),
                         error: true,
@@ -315,7 +327,7 @@ async fn run_transfer_effect(
             error: false,
         },
         Err(e) => AppEvent::OpDone {
-            status: format!("{} failed: {e}", verb.trim_end_matches('d')),
+            status: format!("{} failed: {}", verb.trim_end_matches('d'), e.redacted()),
             error: true,
         },
     }

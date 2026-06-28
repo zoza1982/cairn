@@ -14,6 +14,17 @@ impl std::fmt::Display for ConnectionId {
     }
 }
 
+impl std::str::FromStr for ConnectionId {
+    type Err = ();
+    /// Parse the `Display` form `"conn:N"` back into a [`ConnectionId`].
+    fn from_str(s: &str) -> Result<Self, ()> {
+        s.strip_prefix("conn:")
+            .and_then(|n| n.parse::<u64>().ok())
+            .map(ConnectionId)
+            .ok_or(())
+    }
+}
+
 /// The backend family a connection addresses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]

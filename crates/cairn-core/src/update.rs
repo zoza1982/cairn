@@ -742,6 +742,7 @@ mod tests {
                 description: format!("{tool} something"),
                 capability: capability_for(tool).expect("known tool"),
                 status: StepStatus::Pending,
+                error: None,
             })
             .collect();
         Plan {

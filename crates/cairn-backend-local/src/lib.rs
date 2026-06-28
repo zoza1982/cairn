@@ -53,8 +53,12 @@ impl LocalVfs {
         }
     }
 
-    /// Resolve a [`VfsPath`] to an absolute OS path under the root. Safe because `VfsPath` contains
-    /// no `..` segments.
+    /// Resolve a [`VfsPath`] to an absolute OS path under the root. `VfsPath` contains no `..`
+    /// segments, so lexical traversal cannot escape the root.
+    ///
+    /// SECURITY (tracked): a pre-existing symlink *inside* the root that points outside it is still
+    /// followed by read/list operations. When this backend is treated as a containment boundary
+    /// (e.g. for AI-driven ops), resolve symlinks and verify the canonical target stays under `root`.
     fn resolve(&self, path: &VfsPath) -> PathBuf {
         let mut pb = self.root.clone();
         for seg in path.segments() {

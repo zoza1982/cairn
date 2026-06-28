@@ -306,6 +306,7 @@ mod tests {
                 description: format!("{t} the things"),
                 capability: capability_for(t).unwrap(),
                 status: StepStatus::Pending,
+                error: None,
             })
             .collect();
         Plan {
