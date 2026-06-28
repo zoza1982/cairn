@@ -14,8 +14,14 @@ With a secure secrets vault and an agentic AI assistant.
 
 </div>
 
-> **Status:** 🚧 Pre-alpha — design phase. The product is being specified before implementation.
-> See [`docs/PRD.md`](docs/PRD.md) for the product requirements.
+> **Status:** 🚧 Alpha. **Working today:** an interactive dual-pane **local** file manager
+> (browse, navigate, sort, mark) with a cross-backend **transfer engine** (copy/move/delete with a
+> confirm dialog), an encrypted **secrets vault** (XChaCha20-Poly1305 + Argon2id) behind a capability
+> **broker**, TOML **config**, the object-store **abstraction** (mock-tested), and the **agentic AI
+> core** (provider/tools/plan→confirm). **Designed, not yet implemented:** the SSH, S3/GCS/Azure,
+> Docker, and Kubernetes backends and the WASM plugin host (they need live services + heavy SDKs).
+> See [`docs/PRD.md`](docs/PRD.md), [`docs/LLD.md`](docs/LLD.md), and the live
+> [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
 
 ---
 

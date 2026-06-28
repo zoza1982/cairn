@@ -1,0 +1,33 @@
+[package]
+name = "cairn-backend-object"
+description = "Object-store backend for Cairn (S3/GCS/Azure): provider-agnostic core + Vfs mapping."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Real cloud providers (S3/GCS/Azure) are added behind these features; they require the official
+# SDKs and live/emulated services and are not built or tested in the default/CI build.
+s3 = []
+gcs = []
+azure = []
+# Exposes the in-memory MockObjectStore to dependent crates' tests.
+test-utils = []
+
+[dependencies]
+cairn-types = { workspace = true }
+cairn-vfs = { workspace = true }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+smol_str = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }

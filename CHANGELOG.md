@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-backend-object`: the provider-agnostic object-store core — the `ObjectStore` trait,
+  prefix/delimiter listing synthesis (object-vs-prefix, directory-marker folding), an
+  `ObjectStoreVfs` mapping onto `Vfs`, and an in-memory `MockObjectStore`. Cloud providers
+  (S3/GCS/Azure) are feature-gated and not yet implemented (M5-1/M5-2).
 - `cairn-ai` context & injection defense: a secrets-free `WorldSnapshot` for the model, an
   `<untrusted_data>` wrapper that neutralizes break-out attempts, an out-of-scope heuristic, and
   the standing system policy (M7-5).

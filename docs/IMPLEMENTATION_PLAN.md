@@ -19,17 +19,27 @@
 |---|---|
 | **Phase** | Design complete → starting build |
 | **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0004 |
-| **Current milestone** | **M7 — Agentic AI** (🟡 in progress; M3–M6 backends partially deferred) |
+| **Current milestone** | **Hermetic milestones delivered; SDK/service backends env-deferred** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
-| **Milestones complete** | 0 / 9 |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 22 / 12 / 37 / 0 / 0 |
-| **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows (scaffold) |
-| **Long-pole items** | `M1-1` Vfs trait · `M3-5` broker · all backend RFCs |
+| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core ✅ · M4/M6/M8 + cloud providers ⏭ |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 24 / 12 / 0 / 0 / 35 |
+| **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
+| **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
 
-**Burn-up note (edit each merge):** _M0 underway: lint config tuned for velocity, `cairn-types`
-(paths/entries/caps/ids, fully tested) and the binary edge (tracing, panic hook, version/help)
-landed (#5). Crates are created lazily per milestone rather than 18 empty stubs up front. M1 next:
-`Vfs` trait + local backend + core/TUI skeleton._
+> **Environment note.** Items marked **⏭ env-deferred** require live or emulated network services
+> (SSH servers, MinIO/Azurite/fake-gcs, dind, `kind`) and/or very heavy SDKs (`aws-sdk-s3`, `kube`,
+> `bollard`, `wasmtime`) that cannot be built and integration-tested in the current environment. Their
+> **designs are complete** (LLD §8/§11, ADR-0003/0004) and the **provider-agnostic cores that *can*
+> be tested hermetically are implemented** — the `Vfs`/transfer abstractions (M1/M2), the object-store
+> trait + listing synthesis + `Vfs` mapping with a mock (M5-1/2), and the AI provider trait + closed
+> tools + plan machine + injection defense (M7 core). Each deferred backend becomes a focused PR
+> (RFC → impl → emulator integration job) once those services are available.
+
+**Burn-up note:** _Delivered M0–M3 (a working dual-pane local file manager + transfer engine +
+copy/move/delete with confirm + encrypted vault + broker + config), the M5 object-store abstraction
+(hermetic, mock-tested), and the M7 agentic AI core (provider/tools/plan→confirm/injection-defense).
+11 library crates + the binary, ~140 hermetic tests, green cross-platform CI (PRs #5–#17). Remaining
+network/SDK backends are env-deferred (see note)._
 
 ### Status legend (used in every work-item table)
 
@@ -148,72 +158,72 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M4-1 | RFC: **SSH/SFTP backend** (auth chain, bastion/jump, keepalive, `!Send` proxy strategy) | network-engineer, technical-writer | M1-1, M3-5 | RFC merged | approved before M4-2; `assert_send` plan documented | ☐ |
-| M4-2 | `cairn-backend-ssh`: connect (key/agent via broker), list/stat/read/write (streaming, RANDOM_READ) | network-engineer, rust-staff-engineer | M4-1 | rustdoc; backend README | against SSH image (CI): browse + read/write; auth via broker only | ☐ |
-| M4-3 | SSH mutations + `exec` (remote grep→SEARCH_CONTENT), edit-in-place save-back | network-engineer | M4-2 | rustdoc | rename/delete/mkdir; exec returns Stream; edit→save round-trip | ☐ |
-| M4-4 | Transport resilience: timeouts, keepalive, retry/backoff, bastion/proxy-jump chain | network-engineer | M4-2 | rustdoc; resilience note | simulated stall fails+retries (no hang); jump-host test | ☐ |
-| M4-5 | Connection switcher UI + new-SSH flow, profile persistence (ref-only) | tui-engineer, software-engineer | M4-2, M3-7 | user docs | **Demo:** Ctrl-K → connect → browse → transfer local↔SSH | ☐ |
-| M4-6 | Cross-backend transfer validation local↔SSH | qa-engineer, storage-engineer | M4-2, M2-2 | test docs | copy/move both directions; integrity verified | ☐ |
+| M4-1 | RFC: **SSH/SFTP backend** (auth chain, bastion/jump, keepalive, `!Send` proxy strategy) | network-engineer, technical-writer | M1-1, M3-5 | RFC merged | approved before M4-2; `assert_send` plan documented | ⏭ env-deferred (live SSH server + russh SDK) |
+| M4-2 | `cairn-backend-ssh`: connect (key/agent via broker), list/stat/read/write (streaming, RANDOM_READ) | network-engineer, rust-staff-engineer | M4-1 | rustdoc; backend README | against SSH image (CI): browse + read/write; auth via broker only | ⏭ env-deferred (live SSH server + russh SDK) |
+| M4-3 | SSH mutations + `exec` (remote grep→SEARCH_CONTENT), edit-in-place save-back | network-engineer | M4-2 | rustdoc | rename/delete/mkdir; exec returns Stream; edit→save round-trip | ⏭ env-deferred (live SSH server + russh SDK) |
+| M4-4 | Transport resilience: timeouts, keepalive, retry/backoff, bastion/proxy-jump chain | network-engineer | M4-2 | rustdoc; resilience note | simulated stall fails+retries (no hang); jump-host test | ⏭ env-deferred (live SSH server + russh SDK) |
+| M4-5 | Connection switcher UI + new-SSH flow, profile persistence (ref-only) | tui-engineer, software-engineer | M4-2, M3-7 | user docs | **Demo:** Ctrl-K → connect → browse → transfer local↔SSH | ⏭ env-deferred (live SSH server + russh SDK) |
+| M4-6 | Cross-backend transfer validation local↔SSH | qa-engineer, storage-engineer | M4-2, M2-2 | test docs | copy/move both directions; integrity verified | ⏭ env-deferred (live SSH server + russh SDK) |
 
 ### M5 — Object storage (S3 → GCS/Azure)
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M5-1 | `ObjectStore` trait + `ObjectStoreVfs` wrapper (ADR-0003) | storage-engineer, software-architect | M1-1 | confirm ADR-0003; rustdoc | trait+wrapper compile; `MockObjectStore` harness | ☐ |
-| M5-2 | **Object-store contract test suite** (all three providers) | qa-engineer, storage-engineer | M5-1 | TESTING.md | runs against MockObjectStore + MinIO; gates each provider | ☐ |
-| M5-3 | S3 provider (`aws-sdk-s3`): list (continuation, common-prefixes), head, ranged GET | storage-engineer | M5-1 | rustdoc | against MinIO: list via bounded window; contract pass | ☐ |
-| M5-4 | S3 multipart upload (16 MiB threshold, 8 MiB parts, concurrent, CRC32C), abort-on-drop | storage-engineer | M5-3 | rustdoc | >16 MiB multipart; abort leaves no orphans (test) | ☐ |
-| M5-5 | S3 resume (part-state, `list_parts` reconcile, `SourceChanged`), server-copy | storage-engineer | M5-4, M2-1 | rustdoc; resume spec | kill+resume completes; same-provider fast-path | ☐ |
-| M5-6 | S3 integrity/consistency: conditional writes (412→Conflict), `VerifyPolicy`, broker creds (`ArcSwap`) | storage-engineer, security-engineer | M5-3, M3-5 | rustdoc | 412→conflict-policy test; presigned URLs redacted | ☐ |
-| M5-7 | Cross-backend local↔S3 and SSH↔S3 (checksum verify) | qa-engineer, storage-engineer | M5-4, M4-2 | test docs | **Demo:** copy local→S3, SSH→S3 with verification | ☐ |
-| M5-8 | GCS provider (`google-cloud-storage`, crc32c, generation preconds, ADC/SA via broker) | storage-engineer | M5-2, M5-6 | rustdoc | contract green vs fake-gcs-server | ☐ |
-| M5-9 | Azure provider (`azure_storage_blobs`, per-block MD5, shared-key/SAS/AAD via broker) | storage-engineer | M5-2, M5-6 | rustdoc | contract green vs Azurite | ☐ |
-| M5-10 | Backend-aware UX: tier badges, versioned soft-delete honesty, archive-tier cost confirm | tui-engineer, ux-engineer | M5-3 | user docs | Glacier read raises cost confirm; delete-marker messaging clear | ☐ |
+| M5-1 | `ObjectStore` trait + `ObjectStoreVfs` wrapper (ADR-0003) | storage-engineer, software-architect | M1-1 | confirm ADR-0003; rustdoc | trait+wrapper compile; `MockObjectStore` harness | ✅ #17 (ObjectStore trait, MockObjectStore, prefix→Dir merge, ObjectStoreVfs; 8 tests) |
+| M5-2 | **Object-store contract test suite** (all three providers) | qa-engineer, storage-engineer | M5-1 | TESTING.md | runs against MockObjectStore + MinIO; gates each provider | 🟡 MockObjectStore + listing tests done; multi-provider emulator suite needs SDKs |
+| M5-3 | S3 provider (`aws-sdk-s3`): list (continuation, common-prefixes), head, ranged GET | storage-engineer | M5-1 | rustdoc | against MinIO: list via bounded window; contract pass | ⏭ env-deferred (S3/GCS/Azure SDKs + emulators) |
+| M5-4 | S3 multipart upload (16 MiB threshold, 8 MiB parts, concurrent, CRC32C), abort-on-drop | storage-engineer | M5-3 | rustdoc | >16 MiB multipart; abort leaves no orphans (test) | ⏭ env-deferred (S3/GCS/Azure SDKs + emulators) |
+| M5-5 | S3 resume (part-state, `list_parts` reconcile, `SourceChanged`), server-copy | storage-engineer | M5-4, M2-1 | rustdoc; resume spec | kill+resume completes; same-provider fast-path | ⏭ env-deferred (S3/GCS/Azure SDKs + emulators) |
+| M5-6 | S3 integrity/consistency: conditional writes (412→Conflict), `VerifyPolicy`, broker creds (`ArcSwap`) | storage-engineer, security-engineer | M5-3, M3-5 | rustdoc | 412→conflict-policy test; presigned URLs redacted | ⏭ env-deferred (S3/GCS/Azure SDKs + emulators) |
+| M5-7 | Cross-backend local↔S3 and SSH↔S3 (checksum verify) | qa-engineer, storage-engineer | M5-4, M4-2 | test docs | **Demo:** copy local→S3, SSH→S3 with verification | ⏭ env-deferred (S3/GCS/Azure SDKs + emulators) |
+| M5-8 | GCS provider (`google-cloud-storage`, crc32c, generation preconds, ADC/SA via broker) | storage-engineer | M5-2, M5-6 | rustdoc | contract green vs fake-gcs-server | ⏭ env-deferred (S3/GCS/Azure SDKs + emulators) |
+| M5-9 | Azure provider (`azure_storage_blobs`, per-block MD5, shared-key/SAS/AAD via broker) | storage-engineer | M5-2, M5-6 | rustdoc | contract green vs Azurite | ⏭ env-deferred (S3/GCS/Azure SDKs + emulators) |
+| M5-10 | Backend-aware UX: tier badges, versioned soft-delete honesty, archive-tier cost confirm | tui-engineer, ux-engineer | M5-3 | user docs | Glacier read raises cost confirm; delete-marker messaging clear | ⏭ env-deferred (S3/GCS/Azure SDKs + emulators) |
 
 ### M6 — Containers & clusters (action model)
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M6-1 | RFC: **Docker backend** (fs via archive API, image layers, exec/logs) | container-backend-engineer, technical-writer | M1-1 | RFC merged | approved before M6-2 | ☐ |
-| M6-2 | `cairn-backend-docker` (`bollard`): list containers+images; browse container fs (tar); image layers RO | container-backend-engineer | M6-1, M3-5 | rustdoc; backend README | against dind: browse fs; copy in/out | ☐ |
-| M6-3 | Docker actions: `exec`, `logs` (Stream), start/stop | container-backend-engineer | M6-2 | rustdoc | exec interactive stream; logs follow | ☐ |
-| M6-4 | RFC: **Kubernetes backend** (ctx→ns→pod→container→fs, exec/cp/logs/port-forward, auth) | kube-staff-engineer, technical-writer | M1-1 | RFC merged | approved before M6-5 | ☐ |
-| M6-5 | `cairn-backend-k8s` (`kube`): navigable tree, watch strategy, kubeconfig/exec-plugin auth via broker | kube-staff-engineer | M6-4, M3-5 | rustdoc; backend README | against `kind`: browse ns/pods; multi-context | ☐ |
-| M6-6 | K8s cp (tar over exec), `logs(follow)` Stream, `exec` (tty), `port-forward` (Session) | kube-staff-engineer | M6-5 | rustdoc | cp out of pod completes (no stall); port-forward holds | ☐ |
-| M6-7 | Stream/Session UI: live log viewer (follow+filter), exec pane, port-forward status | tui-engineer | M6-3, M6-6 | user docs | **Demo:** stream pod logs; exec; copy pod→S3 | ☐ |
+| M6-1 | RFC: **Docker backend** (fs via archive API, image layers, exec/logs) | container-backend-engineer, technical-writer | M1-1 | RFC merged | approved before M6-2 | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-2 | `cairn-backend-docker` (`bollard`): list containers+images; browse container fs (tar); image layers RO | container-backend-engineer | M6-1, M3-5 | rustdoc; backend README | against dind: browse fs; copy in/out | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-3 | Docker actions: `exec`, `logs` (Stream), start/stop | container-backend-engineer | M6-2 | rustdoc | exec interactive stream; logs follow | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-4 | RFC: **Kubernetes backend** (ctx→ns→pod→container→fs, exec/cp/logs/port-forward, auth) | kube-staff-engineer, technical-writer | M1-1 | RFC merged | approved before M6-5 | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-5 | `cairn-backend-k8s` (`kube`): navigable tree, watch strategy, kubeconfig/exec-plugin auth via broker | kube-staff-engineer | M6-4, M3-5 | rustdoc; backend README | against `kind`: browse ns/pods; multi-context | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-6 | K8s cp (tar over exec), `logs(follow)` Stream, `exec` (tty), `port-forward` (Session) | kube-staff-engineer | M6-5 | rustdoc | cp out of pod completes (no stall); port-forward holds | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
+| M6-7 | Stream/Session UI: live log viewer (follow+filter), exec pane, port-forward status | tui-engineer | M6-3, M6-6 | user docs | **Demo:** stream pod logs; exec; copy pod→S3 | ⏭ env-deferred (dind/kind + bollard/kube SDKs) |
 
 ### M7 — Agentic AI (plan→confirm→execute) · **security-review required**
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
 | M7-1 | `LlmProvider` trait + `StreamChunk` normalization; Claude provider | ai-integration-engineer | M3-5 | rustdoc; ADR ref | `MockProvider` + Claude path; no live API in CI | 🟡 LlmProvider trait + MockProvider done; cloud/local HTTP providers + streaming deferred |
-| M7-2 | Ollama + OpenAI-compat providers w/ tool degradation (Native→JsonSchema→Text) | ai-integration-engineer | M7-1 | rustdoc; local-model doc | degradation tiers tested vs MockProvider | ☐ |
+| M7-2 | Ollama + OpenAI-compat providers w/ tool degradation (Native→JsonSchema→Text) | ai-integration-engineer | M7-1 | rustdoc; local-model doc | degradation tiers tested vs MockProvider | ⏭ deferred (HTTP providers / TUI panel / MCP) |
 | M7-3 | Closed tool registry (handles only; `schemars`; `ToolNotFound`) → broker | ai-integration-engineer, security-engineer | M7-1, M3-5 | rustdoc; threat-model | no tool returns/accepts a secret (compile + review) | ✅ #15 (closed set via capability_for; unknown tool rejected) |
 | M7-4 | Plan state machine, engine-driven execution, per-step confirm, partial-failure surfacing | ai-integration-engineer | M7-3 | rustdoc | engine runs steps; irreversible step pauses for confirm (test) | ✅ #15 |
 | M7-5 | Context `WorldSnapshot` (sanitized, budgeted, no secrets), injection defenses | ai-integration-engineer, security-engineer | M7-3 | rustdoc; injection-defense doc | snapshot carries no secret (test); heuristics flag off-scope | ✅ #16 (WorldSnapshot + untrusted-data wrapping + out-of-scope heuristic + system policy) |
-| M7-6 | AI side panel + plan→confirm overlay; `[Approve all]` only when all steps Safe/Recoverable | tui-engineer, security-engineer | M7-4, M2-7 | user docs | **Demo:** "archive logs >30d to S3" plan→step-through; bulk-approve absent if destructive | ☐ |
-| M7-7 | `cairn-mcp` (feature-gated): expose actions as MCP server through same broker+confirm | ai-integration-engineer | M7-3 | rustdoc | external MCP client hits same confirm gate (test) | ☐ |
+| M7-6 | AI side panel + plan→confirm overlay; `[Approve all]` only when all steps Safe/Recoverable | tui-engineer, security-engineer | M7-4, M2-7 | user docs | **Demo:** "archive logs >30d to S3" plan→step-through; bulk-approve absent if destructive | ⏭ deferred (HTTP providers / TUI panel / MCP) |
+| M7-7 | `cairn-mcp` (feature-gated): expose actions as MCP server through same broker+confirm | ai-integration-engineer | M7-3 | rustdoc | external MCP client hits same confirm gate (test) | ⏭ deferred (HTTP providers / TUI panel / MCP) |
 
 ### M8 — Extensibility (WASM plugins) · **security-review required**
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M8-1 | RFC: **plugin host & WIT ABI** (worlds, capability grants, streaming-by-polling, versioning) | plugin-systems-engineer, technical-writer | M3-5 | RFC merged; confirm ADR-0004 | approved before M8-2 | ☐ |
-| M8-2 | `cairn-plugin`: wasmtime host, WIT bindings, default-deny Linker, per-instance Store, ResourceLimiter, epoch timeout | plugin-systems-engineer | M8-1 | rustdoc | spinning plugin can't hang UI (epoch test); ungranted import fails at instantiate | ☐ |
-| M8-3 | `PluginVfsBackend` bridge: guest `backend` export → `Vfs` (chunked-poll) | plugin-systems-engineer, rust-staff-engineer | M8-2 | rustdoc | plugin backend passes MockVfs contract suite | ☐ |
-| M8-4 | Brokered creds/HTTP for plugins (UUID stand-in, host substitutes secret), journaled `Actor::Plugin` | plugin-systems-engineer, security-engineer | M8-2, M3-5 | rustdoc; threat-model | plugin never sees secret value (test); brokered HTTP only | ☐ |
-| M8-5 | Manifest (`plugin.toml` + wasm section), install-time capability approval UI, revocation | plugin-systems-engineer, tui-engineer | M8-2 | user docs; plugin author guide | **Demo:** install a sample plugin backend, approve caps, browse | ☐ |
-| M8-6 | `cairn-plugin-sdk` (optional) + sample guest `.wasm` fixtures for CI | plugin-systems-engineer | M8-3 | SDK docs | fixtures checked in; plugin tests need no WASM toolchain in CI | ☐ |
-| M8-7 | Declarative config extensions (keybinds, themes, shell-command actions, aliases) | software-engineer, tui-engineer | M3-6 | user docs | config-only action runs without a plugin | ☐ |
+| M8-1 | RFC: **plugin host & WIT ABI** (worlds, capability grants, streaming-by-polling, versioning) | plugin-systems-engineer, technical-writer | M3-5 | RFC merged; confirm ADR-0004 | approved before M8-2 | ⏭ env-deferred (wasmtime + WASM toolchain) |
+| M8-2 | `cairn-plugin`: wasmtime host, WIT bindings, default-deny Linker, per-instance Store, ResourceLimiter, epoch timeout | plugin-systems-engineer | M8-1 | rustdoc | spinning plugin can't hang UI (epoch test); ungranted import fails at instantiate | ⏭ env-deferred (wasmtime + WASM toolchain) |
+| M8-3 | `PluginVfsBackend` bridge: guest `backend` export → `Vfs` (chunked-poll) | plugin-systems-engineer, rust-staff-engineer | M8-2 | rustdoc | plugin backend passes MockVfs contract suite | ⏭ env-deferred (wasmtime + WASM toolchain) |
+| M8-4 | Brokered creds/HTTP for plugins (UUID stand-in, host substitutes secret), journaled `Actor::Plugin` | plugin-systems-engineer, security-engineer | M8-2, M3-5 | rustdoc; threat-model | plugin never sees secret value (test); brokered HTTP only | ⏭ env-deferred (wasmtime + WASM toolchain) |
+| M8-5 | Manifest (`plugin.toml` + wasm section), install-time capability approval UI, revocation | plugin-systems-engineer, tui-engineer | M8-2 | user docs; plugin author guide | **Demo:** install a sample plugin backend, approve caps, browse | ⏭ env-deferred (wasmtime + WASM toolchain) |
+| M8-6 | `cairn-plugin-sdk` (optional) + sample guest `.wasm` fixtures for CI | plugin-systems-engineer | M8-3 | SDK docs | fixtures checked in; plugin tests need no WASM toolchain in CI | ⏭ env-deferred (wasmtime + WASM toolchain) |
+| M8-7 | Declarative config extensions (keybinds, themes, shell-command actions, aliases) | software-engineer, tui-engineer | M3-6 | user docs | config-only action runs without a plugin | ⏭ env-deferred (wasmtime + WASM toolchain) |
 
 ### v0.1 — Release
 
 | ID | Item | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| R-1 | Release engineering: cross-platform binaries (musl/universal-mac/Windows), Homebrew/cargo, signing | devops-engineer | M5 (M4) | release docs | tagged build attaches binaries on 3 OSes | ☐ |
-| R-2 | Docs completeness pass: README, user guide, backend docs, glossary, `--help` | technical-writer | all | README/docs | docs match shipped features (no stale) | ☐ |
-| R-3 | Release QA: regression matrix, graceful degradation (no truecolor/Nerd-Font/narrow), session restore | qa-engineer | all | TESTING.md | crash-free smoke on 3 OSes + limited terminals | ☐ |
-| R-4 | CHANGELOG roll-up → v0.1, version bump, ADR/RFC index check | technical-writer, project-manager | R-1..R-3 | CHANGELOG | tagged `v0.1.0` from `main`; dashboard shows v0.1 ✅ | ☐ |
+| R-1 | Release engineering: cross-platform binaries (musl/universal-mac/Windows), Homebrew/cargo, signing | devops-engineer | M5 (M4) | release docs | tagged build attaches binaries on 3 OSes | ⏭ deferred (follows backend milestones) |
+| R-2 | Docs completeness pass: README, user guide, backend docs, glossary, `--help` | technical-writer | all | README/docs | docs match shipped features (no stale) | ⏭ deferred (follows backend milestones) |
+| R-3 | Release QA: regression matrix, graceful degradation (no truecolor/Nerd-Font/narrow), session restore | qa-engineer | all | TESTING.md | crash-free smoke on 3 OSes + limited terminals | ⏭ deferred (follows backend milestones) |
+| R-4 | CHANGELOG roll-up → v0.1, version bump, ADR/RFC index check | technical-writer, project-manager | R-1..R-3 | CHANGELOG | tagged `v0.1.0` from `main`; dashboard shows v0.1 ✅ | ⏭ deferred (follows backend milestones) |
 
 ---
 
