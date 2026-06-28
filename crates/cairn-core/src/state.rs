@@ -292,6 +292,10 @@ pub struct AppState {
     pub ai_pending: bool,
     /// Connections the switcher can open in a pane (populated from config at startup).
     pub connections: Vec<ConnectionChoice>,
+    /// Cumulative bytes of the **single** in-flight transfer (`Some` while one runs), for the
+    /// progress display. The reducer allows at most one active transfer (a second `start_transfer` is
+    /// refused while this is `Some`), so one slot suffices; only a `TransferDone` clears it.
+    pub transfer_bytes: Option<u64>,
 }
 
 impl AppState {
@@ -309,6 +313,7 @@ impl AppState {
             status: None,
             ai_pending: false,
             connections: Vec::new(),
+            transfer_bytes: None,
         }
     }
 

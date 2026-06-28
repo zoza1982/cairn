@@ -274,12 +274,38 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let pane = state.active();
     let count = pane_count_label(pane);
-    let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^A ai";
-    let line = Line::from(format!(" {count}   {help}"));
+    // A live transfer takes over the status line with its running byte total.
+    let line = if let Some(bytes) = state.transfer_bytes {
+        Line::from(format!(" {count}   ⇅ transferring… {}", human_bytes(bytes)))
+    } else {
+        let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^A ai";
+        Line::from(format!(" {count}   {help}"))
+    };
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(theme.status)),
         area,
     );
+}
+
+/// Format a byte count compactly (`512 B`, `3.4 KiB`, `1.2 GiB`).
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    // Guard the unit boundary: `{:.1}` could round e.g. 1023.97 KiB up to "1024.0 KiB"; bump to the
+    // next unit so it reads "1.0 MiB" instead.
+    if unit < UNITS.len() - 1 && (v * 10.0).round() >= 10240.0 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    format!("{v:.1} {}", UNITS[unit])
 }
 
 fn pane_count_label(pane: &PaneState) -> String {
@@ -376,6 +402,30 @@ mod tests {
         assert!(text.contains("AI plan"));
         assert!(text.contains("archive old logs"));
         assert!(text.contains("approve all")); // safe plan → bulk-approve offered
+    }
+
+    #[test]
+    fn human_bytes_scales_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
+        // Unit-boundary rounding must not produce "1024.0 KiB".
+        assert_eq!(human_bytes(1_048_575), "1.0 MiB");
+    }
+
+    #[test]
+    fn status_line_shows_live_transfer_progress() {
+        let mut s = ready_state();
+        s.transfer_bytes = Some(2 * 1024 * 1024);
+        let text = render_text(&s, 100, 24);
+        assert!(text.contains("transferring"), "expected transfer indicator");
+        assert!(
+            text.contains("2.0 MiB"),
+            "expected human-readable byte total"
+        );
     }
 
     #[test]

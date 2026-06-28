@@ -563,6 +563,12 @@ fn op_targets(state: &AppState, side: Side) -> Vec<(VfsPath, String)> {
 }
 
 fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
+    // One transfer at a time: the progress indicator is a single slot, so refuse to start a second
+    // while one runs rather than corrupt the display or have its completion clear the wrong one.
+    if state.transfer_bytes.is_some() {
+        state.status = Some("A transfer is already in progress".to_owned());
+        return Vec::new();
+    }
     let src = state.focus;
     let dst = src.other();
     let targets = op_targets(state, src);
@@ -583,6 +589,8 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
         if is_move { "Moving" } else { "Copying" },
         items.len()
     ));
+    // Begin tracking transfer progress (updated by `TransferProgress`, cleared on `TransferDone`).
+    state.transfer_bytes = Some(0);
     state.pane_mut(src).marked.clear();
     vec![AppEffect::Transfer {
         src_conn,
@@ -707,31 +715,46 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             state.status = Some(format!("assistant error: {msg}"));
             Vec::new()
         }
-        AppEvent::OpDone { status, error } => {
-            state.status = Some(if error {
-                format!("error: {status}")
-            } else {
-                status
-            });
-            // Refresh both panes so the result of the operation is reflected. An op that adds,
-            // removes, or reorders entries (mkdir/rename/delete/move) invalidates the positional
-            // marks, so clear them — a stale mark would make the next copy/move/delete act on the
-            // wrong entry.
-            [Side::Left, Side::Right]
-                .into_iter()
-                .map(|side| {
-                    let p = state.pane_mut(side);
-                    p.marked.clear();
-                    AppEffect::List {
-                        pane: side,
-                        conn: p.conn,
-                        dir: p.cwd.clone(),
-                        all: p.show_hidden,
-                    }
-                })
-                .collect()
+        AppEvent::TransferProgress { bytes } => {
+            // Advisory display only; ignore if no transfer is tracked (a late event after OpDone).
+            if state.transfer_bytes.is_some() {
+                state.transfer_bytes = Some(bytes);
+            }
+            Vec::new()
+        }
+        AppEvent::OpDone { status, error } => finish_op(state, &status, error),
+        AppEvent::TransferDone { status, error } => {
+            // Only a transfer's own completion clears its progress indicator — so an unrelated op
+            // finishing mid-transfer can't wipe it (and a stray late `TransferProgress` is ignored
+            // by its `is_some` guard once this resets the slot).
+            state.transfer_bytes = None;
+            finish_op(state, &status, error)
         }
     }
+}
+
+/// Apply a finished operation: set the status line and refresh both panes. An op that adds, removes,
+/// or reorders entries (mkdir/rename/delete/move) invalidates the positional marks, so clear them —
+/// a stale mark would make the next copy/move/delete act on the wrong entry.
+fn finish_op(state: &mut AppState, status: &str, error: bool) -> Vec<AppEffect> {
+    state.status = Some(if error {
+        format!("error: {status}")
+    } else {
+        status.to_owned()
+    });
+    [Side::Left, Side::Right]
+        .into_iter()
+        .map(|side| {
+            let p = state.pane_mut(side);
+            p.marked.clear();
+            AppEffect::List {
+                pane: side,
+                conn: p.conn,
+                dir: p.cwd.clone(),
+                all: p.show_hidden,
+            }
+        })
+        .collect()
 }
 
 /// Sort entries directories-first, then by the pane's [`SortMode`] within each group.
@@ -1066,6 +1089,81 @@ mod tests {
         let fx = update(&mut s, Msg::Text(TextEdit::Insert('x')));
         assert!(fx.is_empty());
         assert!(matches!(s.overlay, Some(Overlay::ConfirmDelete { .. })));
+    }
+
+    #[test]
+    fn transfer_progress_tracks_then_clears_on_completion() {
+        let mut s = state();
+        // Set up a copy: mark a file on the left, copy to the right.
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        assert!(matches!(&fx[..], [AppEffect::Transfer { .. }]));
+        assert_eq!(s.transfer_bytes, Some(0), "transfer tracking starts");
+        // Progress updates the running total.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress { bytes: 4096 }),
+        );
+        assert_eq!(s.transfer_bytes, Some(4096));
+        // The transfer's own completion clears it.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferDone {
+                status: "Copied 1 file(s)".to_owned(),
+                error: false,
+            }),
+        );
+        assert_eq!(s.transfer_bytes, None);
+    }
+
+    #[test]
+    fn transfer_progress_after_completion_is_ignored() {
+        let mut s = state();
+        // No transfer tracked: a late/stray progress event must not resurrect the indicator.
+        let _ = update(&mut s, Msg::Event(AppEvent::TransferProgress { bytes: 10 }));
+        assert_eq!(s.transfer_bytes, None);
+    }
+
+    #[test]
+    fn an_unrelated_op_completing_does_not_clear_a_live_transfer() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        assert_eq!(s.transfer_bytes, Some(0));
+        // A delete/mkdir/rename finishing (generic OpDone) must NOT wipe the transfer indicator…
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::OpDone {
+                status: "Deleted 1 item(s)".to_owned(),
+                error: false,
+            }),
+        );
+        assert_eq!(s.transfer_bytes, Some(0));
+        // …and subsequent progress still lands.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress { bytes: 8192 }),
+        );
+        assert_eq!(s.transfer_bytes, Some(8192));
+    }
+
+    #[test]
+    fn a_second_transfer_is_refused_while_one_is_in_flight() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        assert!(matches!(&fx[..], [AppEffect::Transfer { .. }]));
+        // A second transfer while the first runs is refused (no effect, status explains).
+        let fx = update(&mut s, Msg::Action(Action::Move));
+        assert!(fx.is_empty());
+        assert!(s.status.as_deref().unwrap().contains("already in progress"));
     }
 
     #[test]

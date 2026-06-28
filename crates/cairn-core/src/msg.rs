@@ -102,11 +102,25 @@ pub enum AppEvent {
         /// The page result.
         result: Result<ListPage, VfsError>,
     },
-    /// A copy/move/delete operation finished; carries a status message and whether it failed.
+    /// Incremental progress for an in-flight transfer: cumulative bytes written so far. Coalesced and
+    /// delivered best-effort (may be dropped under load), so it is advisory display only.
+    TransferProgress {
+        /// Cumulative bytes transferred so far.
+        bytes: u64,
+    },
+    /// A delete/mkdir/rename/plan operation finished; carries a status message and whether it failed.
     OpDone {
         /// Human-readable, secret-free status.
         status: String,
         /// Whether the operation failed.
+        error: bool,
+    },
+    /// A transfer (copy/move) finished — distinct from [`AppEvent::OpDone`] so it (and only it) clears
+    /// the transfer-progress indicator, immune to an unrelated op completing mid-transfer.
+    TransferDone {
+        /// Human-readable, secret-free status.
+        status: String,
+        /// Whether the transfer failed.
         error: bool,
     },
     /// The assistant proposed a plan, or failed to (carries a redacted message).
