@@ -211,10 +211,15 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
     // Bottom-right status: current sort mode, plus a `+hidden` flag when dotfiles are shown.
     let hidden = if pane.show_hidden { " +hidden" } else { "" };
     let status = format!(" sort: {}{hidden} ", pane.sort.label());
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(title)
         .title_bottom(Line::from(status).right_aligned())
         .border_style(Style::default().fg(border));
+    // Bottom-left: the active filter (a trailing `_` marks live editing).
+    if let Some(f) = &pane.filter {
+        let cursor = if pane.filter_editing { "_" } else { "" };
+        block = block.title_bottom(Line::from(format!(" filter: {f}{cursor} ")).left_aligned());
+    }
 
     match &pane.listing {
         Listing::Loading => {
@@ -226,8 +231,10 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
                 .block(block);
             frame.render_widget(p, area);
         }
-        Listing::Ready(entries) => {
-            let items: Vec<ListItem> = entries
+        Listing::Ready(_) => {
+            // Render the visible (filtered) view; cursor and marks index into it.
+            let visible = pane.visible();
+            let items: Vec<ListItem> = visible
                 .iter()
                 .enumerate()
                 .map(|(i, e)| {
@@ -256,8 +263,8 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
                 .highlight_symbol("> ");
 
             let mut list_state = ListState::default();
-            if !entries.is_empty() {
-                list_state.select(Some(pane.cursor.min(entries.len() - 1)));
+            if !visible.is_empty() {
+                list_state.select(Some(pane.cursor.min(visible.len() - 1)));
             }
             frame.render_stateful_widget(list, area, &mut list_state);
         }
@@ -277,11 +284,11 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 
 fn pane_count_label(pane: &PaneState) -> String {
     match &pane.listing {
-        Listing::Ready(_) => format!(
-            "{}/{}",
-            pane.cursor.saturating_add(1).min(pane.len().max(1)),
-            pane.len()
-        ),
+        Listing::Ready(_) => {
+            // Compute the visible count once — `len()` allocates while a filter is active.
+            let n = pane.len();
+            format!("{}/{}", pane.cursor.saturating_add(1).min(n.max(1)), n)
+        }
         Listing::Loading => "…".to_owned(),
         Listing::Error(_) => "!".to_owned(),
     }
@@ -369,6 +376,18 @@ mod tests {
         assert!(text.contains("AI plan"));
         assert!(text.contains("archive old logs"));
         assert!(text.contains("approve all")); // safe plan → bulk-approve offered
+    }
+
+    #[test]
+    fn filter_indicator_appears_in_the_pane_border() {
+        let mut s = ready_state();
+        s.panes[0].filter = Some("src".to_owned());
+        s.panes[0].filter_editing = true;
+        let text = render_text(&s, 80, 24);
+        assert!(
+            text.contains("filter: src_"),
+            "expected live-filter indicator"
+        );
     }
 
     #[test]

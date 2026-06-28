@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open_connection` remains deferred pending the broker-backed opener.
 
 ### Added
+- **Filter-as-you-type** (M1-9): `/` filters the active pane's listing by a case-insensitive name
+  substring, updating live as you type — `Enter` keeps the filter, `Esc` clears it. The cursor and
+  marks index the filtered view, and copy/move/delete/rename/enter act only on visible entries;
+  changing directory resets the filter. The active filter shows in the pane's bottom-left. (Configurable
+  as `filter`.) Large-list virtualization / off-thread filtering remains deferred.
 - **AI freeform prompt** (M7-6): `Ctrl-A` now opens a text prompt for a natural-language request
   instead of sending a hardcoded demo string — the entered text drives the plan → confirm → execute
   flow. The freeform prompt accepts arbitrary input (paths, spaces); while the assistant is preparing

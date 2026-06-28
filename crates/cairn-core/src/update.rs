@@ -149,12 +149,22 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             // Marks are positional; a re-order invalidates them.
             p.marked.clear();
             if let Some(name) = focused {
-                if let Some(idx) = p.listing.entries().iter().position(|e| e.name == name) {
+                // Re-find the focused entry in the (possibly filtered) visible view.
+                if let Some(idx) = p.visible().iter().position(|e| e.name == name) {
                     p.cursor = idx;
                 }
             }
             p.clamp_cursor();
             state.status = Some(format!("Sort: {}", new_sort.label()));
+            Vec::new()
+        }
+        Action::Filter => {
+            // Begin (or re-focus) filter-as-you-type on the active pane. Keystrokes now edit the
+            // filter live via `Msg::Text` until Enter (confirm) or Esc (clear).
+            let p = state.active_mut();
+            p.filter.get_or_insert_with(String::new);
+            p.filter_editing = true;
+            state.status = Some("Filter: (type to filter, Enter to keep, Esc to clear)".to_owned());
             Vec::new()
         }
         Action::ToggleHidden => {
@@ -177,9 +187,21 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     }
 }
 
-/// Handle a text-editing keystroke. Only meaningful while a [`Overlay::Prompt`] is open; otherwise a
-/// no-op (a stray keystroke between closing the prompt and the input layer noticing).
+/// Handle a text-editing keystroke. Routed to the open text prompt, or — if none — to the active
+/// pane's live filter when it is being edited. A stray keystroke with neither active is a no-op.
 fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
+    if matches!(state.overlay, Some(Overlay::Prompt { .. })) {
+        return apply_prompt_text(state, edit);
+    }
+    // Filter editing only owns input when no overlay is open (lock-step with `capturing_text`).
+    if state.overlay.is_none() && state.active().filter_editing {
+        return apply_filter_text(state, edit);
+    }
+    Vec::new()
+}
+
+/// Edit the open text prompt.
+fn apply_prompt_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
     let Some(Overlay::Prompt { input, kind }) = &mut state.overlay else {
         return Vec::new();
     };
@@ -202,6 +224,48 @@ fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
         }
         TextEdit::Submit => submit_prompt(state),
     }
+}
+
+/// Edit the active pane's live filter. Each text change re-indexes the visible view, so marks (which
+/// index that view) are cleared and the cursor is re-clamped.
+fn apply_filter_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
+    let p = state.active_mut();
+    let Some(filter) = &mut p.filter else {
+        p.filter_editing = false;
+        return Vec::new();
+    };
+    match edit {
+        TextEdit::Insert(c) => {
+            if !c.is_control() {
+                filter.push(c);
+                p.marked.clear();
+                p.cursor = 0;
+            }
+        }
+        TextEdit::Backspace => {
+            // Only re-index the view if the filter text actually changed.
+            if filter.pop().is_some() {
+                p.marked.clear();
+                p.cursor = 0;
+            }
+        }
+        TextEdit::Submit => {
+            // Keep the filter applied but stop editing; an empty filter is dropped entirely.
+            if filter.is_empty() {
+                p.filter = None;
+            }
+            p.filter_editing = false;
+        }
+        TextEdit::Cancel => {
+            // Clear the filter and show the full listing again.
+            p.filter = None;
+            p.filter_editing = false;
+            p.marked.clear();
+            p.cursor = 0;
+        }
+    }
+    state.active_mut().clamp_cursor();
+    Vec::new()
 }
 
 /// Dispatch a submitted prompt to its per-kind handler. The single exhaustive match means a new
@@ -474,7 +538,8 @@ fn apply_ai_plan_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
 /// entry under the cursor if nothing is marked.
 fn op_targets(state: &AppState, side: Side) -> Vec<(VfsPath, String)> {
     let pane = state.pane(side);
-    let entries = pane.listing.entries();
+    // Operate on the visible (filtered) view; cursor and marks index into it.
+    let entries = pane.visible();
     let indices: Vec<usize> = if pane.marked.is_empty() {
         if pane.cursor < entries.len() {
             vec![pane.cursor]
@@ -572,6 +637,9 @@ fn navigate(state: &mut AppState, side: Side, dir: cairn_types::VfsPath) -> Vec<
     p.listing = Listing::Loading;
     p.cursor = 0;
     p.marked.clear();
+    // A new directory starts unfiltered.
+    p.filter = None;
+    p.filter_editing = false;
     vec![AppEffect::List {
         pane: side,
         conn: p.conn,
@@ -627,6 +695,9 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 state.status = Some("Assistant proposed no steps".to_owned());
             } else {
                 state.status = Some(format!("Assistant proposed {} step(s)", plan.steps.len()));
+                // Stop any live filter editing so the plan overlay owns input cleanly (its keys
+                // aren't captured by the filter, and the editing indicator doesn't linger).
+                state.active_mut().filter_editing = false;
                 state.overlay = Some(Overlay::AiPlan { plan, cursor: 0 });
             }
             Vec::new()
@@ -779,6 +850,14 @@ mod tests {
         s.pane(side)
             .listing
             .entries()
+            .iter()
+            .map(|e| e.name.to_string())
+            .collect()
+    }
+
+    fn names_visible(s: &AppState, side: Side) -> Vec<String> {
+        s.pane(side)
+            .visible()
             .iter()
             .map(|e| e.name.to_string())
             .collect()
@@ -1031,6 +1110,142 @@ mod tests {
         assert_eq!(SortMode::Size.next(), SortMode::Modified);
         assert_eq!(SortMode::Modified.next(), SortMode::Type);
         assert_eq!(SortMode::Type.next(), SortMode::Name);
+    }
+
+    #[test]
+    fn filter_narrows_the_visible_view_live_and_confirms() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("apple.txt", EntryKind::File),
+                Entry::new("banana.txt", EntryKind::File),
+                Entry::new("apricot.rs", EntryKind::File),
+            ],
+        );
+        // Start filtering — keystrokes now route to the filter.
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        assert!(s.capturing_text());
+        type_text(&mut s, "ap");
+        // "ap" matches apple.txt and apricot.rs (case-insensitive substring).
+        assert_eq!(
+            names_visible(&s, Side::Left),
+            vec!["apple.txt", "apricot.rs"]
+        );
+        // Enter keeps the filter applied but stops editing.
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(!s.capturing_text());
+        assert_eq!(s.pane(Side::Left).filter.as_deref(), Some("ap"));
+        assert_eq!(
+            names_visible(&s, Side::Left),
+            vec!["apple.txt", "apricot.rs"]
+        );
+    }
+
+    #[test]
+    fn filter_is_case_insensitive() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("Apple.txt", EntryKind::File),
+                Entry::new("banana.txt", EntryKind::File),
+            ],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        type_text(&mut s, "AP"); // upper-case needle matches "Apple.txt"
+        assert_eq!(names_visible(&s, Side::Left), vec!["Apple.txt"]);
+    }
+
+    #[test]
+    fn an_arriving_plan_overlay_takes_input_from_a_live_filter() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("a", EntryKind::File)]);
+        // Request a plan, then start filtering during the in-flight window.
+        request_ai(&mut s, "do something");
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        type_text(&mut s, "a");
+        assert!(s.capturing_text()); // filter owns input for now
+                                     // The plan arrives: it opens its overlay and reclaims input.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::AiPlanProposed(Ok(make_plan(&["list"])))),
+        );
+        assert!(matches!(s.overlay, Some(Overlay::AiPlan { .. })));
+        assert!(
+            !s.capturing_text(),
+            "the plan overlay owns input, not the filter"
+        );
+        assert!(!s.active().filter_editing, "filter editing was stopped");
+        // A keystroke now drives the plan overlay (it is not swallowed by the filter).
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        assert!(matches!(s.overlay, Some(Overlay::AiPlan { .. })));
+    }
+
+    #[test]
+    fn filter_cancel_restores_the_full_listing() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        type_text(&mut s, "a");
+        assert_eq!(names_visible(&s, Side::Left), vec!["a"]);
+        let _ = update(&mut s, Msg::Text(TextEdit::Cancel));
+        assert!(s.pane(Side::Left).filter.is_none());
+        assert!(!s.capturing_text());
+        assert_eq!(names_visible(&s, Side::Left), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn empty_filter_on_submit_is_dropped() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("x", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(s.pane(Side::Left).filter.is_none());
+    }
+
+    #[test]
+    fn navigating_clears_an_active_filter() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("sub", EntryKind::Dir)]);
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        type_text(&mut s, "s");
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(s.pane(Side::Left).filter.is_some());
+        // Entering the directory resets the filter.
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        assert!(s.pane(Side::Left).filter.is_none());
+        assert!(!s.pane(Side::Left).filter_editing);
+    }
+
+    #[test]
+    fn op_targets_and_enter_respect_the_filter() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("keep", EntryKind::Dir),
+                Entry::new("zzz", EntryKind::Dir),
+            ],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        type_text(&mut s, "keep");
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        // Only "keep" is visible, so the cursor (index 0) resolves to it.
+        assert_eq!(s.active().current().unwrap().name, "keep");
+        let fx = update(&mut s, Msg::Action(Action::Enter));
+        // Entered "keep" (a new List effect for /keep), filter cleared.
+        assert!(matches!(&fx[..], [AppEffect::List { dir, .. }] if dir.as_str() == "/keep"));
     }
 
     #[test]
