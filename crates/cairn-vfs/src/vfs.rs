@@ -6,6 +6,7 @@ use crate::handle::{ReadHandle, WriteHandle};
 use cairn_types::{Caps, ConnectionId, Entry, Scheme, VfsPath};
 use futures::stream::BoxStream;
 use smol_str::SmolStr;
+use std::path::PathBuf;
 
 /// Provides a backend's capability set, optionally refined per path (k8s/docker vary by depth).
 pub trait CapabilityProvider {
@@ -162,6 +163,37 @@ pub trait Vfs: CapabilityProvider + Send + Sync + 'static {
     /// makes the transfer engine fall back to a stream-through copy.
     async fn copy_within(&self, _from: &VfsPath, _to: &VfsPath) -> Result<(), VfsError> {
         Err(VfsError::Unsupported(Caps::COPY_SERVER))
+    }
+
+    /// The real, canonical OS path backing `path`, if this backend has a local filesystem identity a
+    /// local process can act on. This is the **only** sanctioned virtual→real-path bridge and the
+    /// enforcement point for features that shell out (M8-7 shell-command actions): a `None` result
+    /// means the operation is not permitted. Backends that return `Some` must canonicalize and confine
+    /// the result under their root. Implies [`Caps::LOCAL_PATH`] (a convention, not enforced — a
+    /// backend overriding this should also advertise the cap, and vice-versa).
+    ///
+    /// Returns `None` in two situations the caller **cannot distinguish**: the backend has no local
+    /// filesystem identity (every remote backend — SSH, S3, GCS, Azure, Docker, k8s — via this
+    /// default), *and* the path exists but its canonical target escapes the root (e.g. a symlink
+    /// pointing outside it). Both mean "do not proceed". If a future caller must tell them apart, this
+    /// would become `Result<Option<PathBuf>, VfsError>`.
+    ///
+    /// Semantics for a `Some` result: the returned path is the **canonical target** (symlinks fully
+    /// resolved, so it may differ from the link node), and the entry **must already exist** —
+    /// `canonicalize` requires a real target, so a not-yet-created in-root path yields `None`. The
+    /// target may be any file type (dir, FIFO, device, …), not necessarily a regular file.
+    ///
+    /// # Blocking
+    /// Implementations may perform synchronous filesystem I/O (`canonicalize`). Callers in an async
+    /// context **must** offload this via `tokio::task::spawn_blocking`; it must not run on the render
+    /// path.
+    ///
+    /// # TOCTOU
+    /// Confinement holds only at call time. Between this call and a later process spawn a component
+    /// could be swapped; callers should minimise that window and not cache the result for reuse.
+    #[must_use]
+    fn local_path(&self, _path: &VfsPath) -> Option<PathBuf> {
+        None
     }
 
     /// Discover backend-specific actions available at a path. Defaults to none.

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Vfs::local_path` capability** (M8 groundwork): a new `Vfs` trait method `local_path(&VfsPath) ->
+  Option<PathBuf>` returns the real, canonical OS path backing a virtual path — but only for backends
+  with a local filesystem identity. It defaults to `None` (every remote backend denies it), and
+  `LocalVfs` implements it by canonicalizing and confining the result under its root, so a symlink
+  whose target escapes the root yields `None`. This is the single sanctioned virtual→real-path bridge
+  and the enforcement point for features that shell out (forthcoming shell-command actions). New cap
+  `Caps::LOCAL_PATH` advertises it.
+
 ### Changed
 - **BREAKING** (`cairn-transfer`): `TransferError::Cancelled` now carries the partial
   `TransferOutcome` completed before cancellation (`Cancelled(TransferOutcome)`), so a cancelled

@@ -45,6 +45,9 @@ bitflags! {
         const WATCH = 1 << 15;
         /// Server-side content search (e.g. remote `grep` over SSH).
         const SEARCH_CONTENT = 1 << 16;
+        /// Entries map to a real OS path that local processes can act on (local backend only). Gates
+        /// features that shell out — see `Vfs::local_path` in `cairn-vfs`.
+        const LOCAL_PATH = 1 << 17;
     }
 }
 

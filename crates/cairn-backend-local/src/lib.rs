@@ -26,7 +26,8 @@ const fn platform_caps() -> Caps {
         .union(Caps::RENAME)
         .union(Caps::RENAME_ATOMIC)
         .union(Caps::RANDOM_READ)
-        .union(Caps::APPEND);
+        .union(Caps::APPEND)
+        .union(Caps::LOCAL_PATH);
     #[cfg(unix)]
     {
         base.union(Caps::CHMOD).union(Caps::SYMLINK)
@@ -41,15 +42,23 @@ const fn platform_caps() -> Caps {
 pub struct LocalVfs {
     conn: ConnectionId,
     root: PathBuf,
+    /// The canonical (symlink-resolved) root, computed once at construction. `None` if the root did
+    /// not exist / could not be canonicalized then — in which case [`local_path`](Self::local_path)
+    /// fails closed. Caching it avoids re-`canonicalize`-ing the root on every `local_path` call and
+    /// gives a stable containment reference.
+    canonical_root: Option<PathBuf>,
 }
 
 impl LocalVfs {
     /// Create a backend rooted at `root`. Paths are resolved relative to it.
     #[must_use]
     pub fn new(conn: ConnectionId, root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let canonical_root = std::fs::canonicalize(&root).ok();
         Self {
             conn,
-            root: root.into(),
+            root,
+            canonical_root,
         }
     }
 
@@ -65,6 +74,22 @@ impl LocalVfs {
             pb.push(seg.as_str());
         }
         pb
+    }
+
+    /// Canonicalize `path` and confirm the real target stays under the (canonical) root, returning
+    /// the canonical path or `None` on escape / missing target. This is the security boundary behind
+    /// [`Vfs::local_path`]: by resolving symlinks and checking containment it closes the symlink-escape
+    /// caveat on [`resolve`](Self::resolve) for any code that shells out, and fails closed (a path
+    /// that does not exist, or whose canonical target lies outside the root, yields `None`).
+    fn confined_real_path(&self, path: &VfsPath) -> Option<PathBuf> {
+        // BLOCKING: `canonicalize` is a synchronous `realpath(3)` syscall. Async callers must offload
+        // this via `tokio::task::spawn_blocking` (see the `Vfs::local_path` contract).
+        let root = self.canonical_root.as_ref()?;
+        let real = std::fs::canonicalize(self.resolve(path)).ok()?;
+        // Component-wise containment (not string-prefix, which would treat `/a/bc` as under `/a/b`).
+        // `canonicalize` resolves every component, so an in-root symlink whose target escapes the root
+        // diverges here and is rejected.
+        real.starts_with(root).then_some(real)
     }
 }
 
@@ -128,6 +153,10 @@ impl Vfs for LocalVfs {
 
     fn connection(&self) -> ConnectionId {
         self.conn
+    }
+
+    fn local_path(&self, path: &VfsPath) -> Option<PathBuf> {
+        self.confined_real_path(path)
     }
 
     fn list<'a>(
@@ -400,5 +429,93 @@ mod tests {
         std::fs::write(dir.path().join("exists"), b"x").unwrap();
         let res = vfs.open_write(&p("/exists"), WriteOpts::default()).await;
         assert!(matches!(res, Err(VfsError::AlreadyExists(_))));
+    }
+
+    #[test]
+    fn local_path_resolves_an_in_root_file() {
+        let (dir, vfs) = backend();
+        std::fs::write(dir.path().join("a.txt"), b"hi").unwrap();
+        let real = vfs.local_path(&p("/a.txt")).expect("in-root file resolves");
+        // Canonical, absolute, and under the (canonical) root.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(real.is_absolute());
+        assert!(real.starts_with(&root));
+        assert_eq!(real.file_name().unwrap(), "a.txt");
+    }
+
+    #[test]
+    fn local_path_is_none_for_a_missing_entry() {
+        let (_dir, vfs) = backend();
+        // Fails closed: a path with no real target on disk yields None (cannot be canonicalized).
+        assert!(vfs.local_path(&p("/nope")).is_none());
+    }
+
+    #[test]
+    fn local_path_on_root_returns_canonical_root() {
+        let (dir, vfs) = backend();
+        let root = vfs.local_path(&p("/")).expect("root resolves");
+        assert_eq!(root, std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn local_path_resolves_a_directory() {
+        let (dir, vfs) = backend();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let real = vfs.local_path(&p("/sub")).expect("in-root dir resolves");
+        assert!(real.is_dir());
+    }
+
+    #[test]
+    fn caps_advertise_local_path() {
+        let (_dir, vfs) = backend();
+        assert!(vfs.caps().contains(Caps::LOCAL_PATH));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_path_refuses_a_symlink_escaping_the_root() {
+        // A symlink *inside* the root pointing outside it must not yield a usable real path —
+        // otherwise a shell action could act on files beyond the backend boundary.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"x").unwrap();
+        let (dir, vfs) = backend();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+        // The symlink itself exists in-root, but its canonical target escapes → None.
+        assert!(vfs.local_path(&p("/link")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_path_refuses_a_path_under_an_escaping_directory_symlink() {
+        // An *intermediate* directory component that symlinks outside the root must also be caught —
+        // canonicalize resolves every component, not just the leaf.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("file"), b"x").unwrap();
+        let (dir, vfs) = backend();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).unwrap();
+        assert!(vfs.local_path(&p("/d/file")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_path_is_none_for_a_dangling_symlink() {
+        let (dir, vfs) = backend();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("dangling"))
+            .unwrap();
+        // Target does not exist → canonicalize fails → None (fails closed).
+        assert!(vfs.local_path(&p("/dangling")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_path_follows_an_in_root_symlink() {
+        // A symlink whose target stays under the root is fine — canonicalization keeps it confined.
+        let (dir, vfs) = backend();
+        std::fs::write(dir.path().join("real.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link")).unwrap();
+        let resolved = vfs
+            .local_path(&p("/link"))
+            .expect("in-root symlink resolves");
+        assert_eq!(resolved.file_name().unwrap(), "real.txt");
     }
 }
