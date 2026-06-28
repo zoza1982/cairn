@@ -1,0 +1,18 @@
+[package]
+name = "cairn-types"
+description = "Core leaf types shared across all Cairn crates: paths, entries, capabilities, ids."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitflags = "2"
+smol_str = "0.3"
+thiserror = "2"

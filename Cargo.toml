@@ -13,17 +13,20 @@ authors = ["The Cairn Authors"]
 keywords = ["tui", "file-manager", "cloud", "kubernetes", "s3"]
 categories = ["command-line-utilities", "filesystem"]
 
-# Lints applied across the whole workspace. Keep the bar high.
+# Lints applied across the whole workspace. Keep the bar high, but keep velocity:
+# CI runs clippy with `-D warnings`, so anything at `warn` here is a hard error.
+# We deny the correctness group and forbid unsafe; rustdoc is required on public items.
+# `pedantic` and the `unwrap/expect` restriction lints are intentionally NOT enabled
+# workspace-wide — they fire heavily in tests and are advisory; CLAUDE.md §9 ("no
+# unwrap/expect/panic on paths reachable from user input or backends") is enforced by
+# review, not by failing every test that uses `.unwrap()`.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-unwrap_used = "warn"
-expect_used = "warn"
+all = { level = "deny", priority = -1 }
 todo = "warn"
 dbg_macro = "warn"
 

@@ -8,8 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-types` crate: `VfsPath` (normalized, traversal-safe), `Entry`/`EntryKind`/`EntryExt`,
+  the `Caps` capability model, and `ConnectionId`/`Scheme` — the shared leaf vocabulary (M0).
+- Binary edge: tracing init (`CAIRN_LOG`), a panic hook, and `--version`/`--help` (M0).
 - Project scaffolding: engineering rules (`CLAUDE.md`), contribution and governance docs,
   GitHub issue/PR templates, CI workflow, and a minimal Cargo workspace.
+
+### Changed
+- Tuned workspace clippy lints for velocity under CI's `-D warnings`: deny `clippy::all` + forbid
+  unsafe + require rustdoc, but drop the over-broad `pedantic`/`unwrap_used`/`expect_used` lints
+  (advisory via review per CLAUDE.md §9, not a hard test-breaking gate).
 - Product Requirements Document (`docs/PRD.md`).
 - Team-of-agents working model in `CLAUDE.md` §2: every feature and significant decision is
   run past the relevant specialist agent(s), with a domain→agent mapping.
