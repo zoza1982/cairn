@@ -442,6 +442,32 @@ fn avg_rate(bytes: u64, secs: f64) -> u64 {
     (bytes as f64 / secs) as u64
 }
 
+/// Sum the source file sizes of a transfer's `items` (recursively for directories), for a
+/// percentage/ETA. Best-effort: returns `None` if any stat/listing fails or a size is unknown, so
+/// the caller falls back to a byte+rate display rather than a misleading total.
+async fn scan_total_bytes(src: &Arc<dyn Vfs>, items: &[(VfsPath, VfsPath)]) -> Option<u64> {
+    let mut total: u64 = 0;
+    for (from, _) in items {
+        let mut stack = vec![from.clone()];
+        while let Some(path) = stack.pop() {
+            let meta = src.stat(&path).await.ok()?;
+            if meta.is_dir() {
+                let mut stream = src.list(&path, ListOpts { all: true });
+                while let Some(page) = stream.next().await {
+                    for e in page.ok()?.entries {
+                        stack.push(path.join(&e.name).ok()?);
+                    }
+                }
+            } else if let Some(sz) = meta.size {
+                total = total.saturating_add(sz);
+            }
+            // Entries with no known size (symlinks, special files) contribute nothing rather than
+            // disabling the whole estimate — the total is a lower bound; the % display clamps to 100.
+        }
+    }
+    Some(total)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_transfer_effect(
     registry: &VfsRegistry,
@@ -505,6 +531,18 @@ async fn run_transfer_effect(
         verify: VerifyPolicy::Size,
     };
     let verb = if is_move { "Moved" } else { "Copied" };
+    // Pre-scan the source size for a percentage/ETA. Best-effort: `None` (a backend that can't be
+    // walked, an error, or cancellation) degrades to byte+rate display. Skipped for a same-connection
+    // move — that takes the engine's instant rename fast-path which writes no bytes, so a scan would
+    // be wasted work and the bar would sit at 0%. Cancellable so a big-tree scan doesn't block Esc.
+    let total = if is_move && src_conn == dst_conn {
+        None
+    } else {
+        tokio::select! {
+            t = scan_total_bytes(&src, &items) => t,
+            () = cancel.cancelled() => None,
+        }
+    };
     // Emit coalesced, non-blocking progress: accumulate bytes and notify the UI at most every
     // `TRANSFER_PROGRESS_STEP` bytes via `try_send`, which drops the update if the bounded channel is
     // full rather than stalling the transfer task (the render path must never be blocked here). The
@@ -521,6 +559,7 @@ async fn run_transfer_effect(
             let _ = event_tx.try_send(AppEvent::TransferProgress {
                 bytes,
                 rate_bps: rate_bps(bytes),
+                total,
             });
         }
     };
@@ -531,6 +570,7 @@ async fn run_transfer_effect(
             let _ = event_tx.try_send(AppEvent::TransferProgress {
                 bytes: out.bytes,
                 rate_bps: rate_bps(out.bytes),
+                total,
             });
             AppEvent::TransferDone {
                 status: format!("{verb} {}", outcome_summary(&out)),
@@ -920,6 +960,37 @@ mod tests {
         let ev = run_create_dir_effect(&registry, LEFT, VfsPath::parse("/sub").unwrap()).await;
         assert!(matches!(ev, AppEvent::OpDone { error: false, .. }));
         assert!(dir.path().join("sub").is_dir());
+    }
+
+    #[tokio::test]
+    async fn scan_total_bytes_sums_files_recursively() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap(); // 5
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        std::fs::write(dir.path().join("d/b.txt"), b"world!").unwrap(); // 6
+        let src: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
+        let items = vec![
+            (VfsPath::parse("/a.txt").unwrap(), VfsPath::root()),
+            (VfsPath::parse("/d").unwrap(), VfsPath::root()),
+        ];
+        assert_eq!(scan_total_bytes(&src, &items).await, Some(11));
+    }
+
+    #[tokio::test]
+    async fn scan_total_bytes_skips_unsized_entries_and_degrades_on_error() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap(); // 5
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", dir.path().join("link")).unwrap();
+        let src: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
+        // A symlink (no known size) is skipped, not fatal: the directory total is just the file.
+        assert_eq!(
+            scan_total_bytes(&src, &[(VfsPath::root(), VfsPath::root())]).await,
+            Some(5)
+        );
+        // A missing source degrades to None (best-effort) rather than panicking.
+        let missing = vec![(VfsPath::parse("/nope").unwrap(), VfsPath::root())];
+        assert_eq!(scan_total_bytes(&src, &missing).await, None);
     }
 
     #[test]

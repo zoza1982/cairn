@@ -795,6 +795,7 @@ fn arm_transfer(state: &mut AppState, is_move: bool, count: usize) {
     ));
     state.transfer_bytes = Some(0);
     state.transfer_rate = None;
+    state.transfer_total = None;
 }
 
 fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
@@ -917,11 +918,16 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // Refresh both panes so any filesystem changes the plan made are reflected.
             finish_op(state, &status, error)
         }
-        AppEvent::TransferProgress { bytes, rate_bps } => {
+        AppEvent::TransferProgress {
+            bytes,
+            rate_bps,
+            total,
+        } => {
             // Advisory display only; ignore if no transfer is tracked (a late event after the done).
             if state.transfer_bytes.is_some() {
                 state.transfer_bytes = Some(bytes);
                 state.transfer_rate = Some(rate_bps);
+                state.transfer_total = total;
             }
             Vec::new()
         }
@@ -936,6 +942,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // The transfer didn't run (no overwrite); drop the progress indicator.
             state.transfer_bytes = None;
             state.transfer_rate = None;
+            state.transfer_total = None;
             // Don't clobber an overlay the user already has open (e.g. a delete confirmation): put
             // the transfer back at the front of the queue so the tail-drain retries it (and shows
             // the overwrite prompt) once that overlay closes.
@@ -969,6 +976,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // by its `is_some` guard once this resets the slot).
             state.transfer_bytes = None;
             state.transfer_rate = None;
+            state.transfer_total = None;
             // The queue is drained by the tail call in `update`.
             finish_op(state, &status, error)
         }
@@ -1347,6 +1355,7 @@ mod tests {
             Msg::Event(AppEvent::TransferProgress {
                 bytes: 4096,
                 rate_bps: 2048,
+                total: None,
             }),
         );
         assert_eq!(s.transfer_bytes, Some(4096));
@@ -1372,6 +1381,7 @@ mod tests {
             Msg::Event(AppEvent::TransferProgress {
                 bytes: 10,
                 rate_bps: 0,
+                total: None,
             }),
         );
         assert_eq!(s.transfer_bytes, None);
@@ -1398,6 +1408,7 @@ mod tests {
             Msg::Event(AppEvent::TransferProgress {
                 bytes: 8192,
                 rate_bps: 0,
+                total: None,
             }),
         );
         assert_eq!(s.transfer_bytes, Some(8192));
