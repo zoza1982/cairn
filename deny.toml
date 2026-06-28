@@ -4,6 +4,12 @@
 [advisories]
 version = 2
 yanked = "deny"
+# Triaged unmaintained-crate advisories. Re-evaluate when the upstream tree drops them.
+ignore = [
+    # `paste` (proc-macro) is unmaintained but has no security surface; pulled in transitively
+    # via ratatui. No safe replacement is wired through yet. Low risk; revisit on ratatui bumps.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
