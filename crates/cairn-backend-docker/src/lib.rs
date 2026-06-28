@@ -223,7 +223,7 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
     /// This reflects path *shape*, not existence (it does no I/O, mirroring how the UI calls it on an
     /// already-navigated node); existence is enforced by `stat`/`invoke`. The action surface is
     /// discoverable now; live invocation (streaming over the Docker API) is the integration step, so
-    /// the inherited [`Vfs::invoke`] still returns [`VfsError::Unsupported`].
+    /// the overridden [`Vfs::invoke`] returns `VfsError::Backend { code: "not_implemented" }`.
     fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
         let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
         match segs.as_slice() {
@@ -245,7 +245,12 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
         }
     }
 
-    async fn invoke(&self, action: ActionId, _ctx: ActionCtx) -> Result<ActionOutcome, VfsError> {
+    async fn invoke(
+        &self,
+        _path: &VfsPath,
+        action: ActionId,
+        _ctx: ActionCtx,
+    ) -> Result<ActionOutcome, VfsError> {
         // The actions are advertised by `actions_at`; live invocation over the Docker API (streaming
         // exec/logs) is the integration step — report that distinctly from a truly-unknown action.
         Err(VfsError::Backend {
@@ -424,7 +429,7 @@ mod tests {
         assert!(!vfs.actions_at(&p("/containers/ghost")).is_empty());
         // Invocation is the integration step — advertised but not yet implemented.
         assert!(matches!(
-            vfs.invoke(ActionId::new(action_ids::LOGS), ActionCtx::None)
+            vfs.invoke(&p("/containers/web"), ActionId::new(action_ids::LOGS), ActionCtx::None)
                 .await,
             Err(VfsError::Backend { code, .. }) if code == "not_implemented"
         ));

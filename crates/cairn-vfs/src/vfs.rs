@@ -169,8 +169,20 @@ pub trait Vfs: CapabilityProvider + Send + Sync + 'static {
         Vec::new()
     }
 
-    /// Invoke a discovered action. Defaults to unsupported.
-    async fn invoke(&self, _action: ActionId, _ctx: ActionCtx) -> Result<ActionOutcome, VfsError> {
+    /// Invoke a discovered action **at `path`** (the target the action was discovered on, e.g. a
+    /// container or pod). `path` is *where*; [`ActionCtx`] is *how* (argv, ports, …).
+    ///
+    /// Callers should pass an [`ActionId`] previously returned by [`actions_at`](Vfs::actions_at) for
+    /// `path`. Expected error variants: [`VfsError::Unsupported`] (the backend has no actions),
+    /// [`VfsError::Backend`] with a stable `code` such as `"not_implemented"` (an advertised action
+    /// whose live wiring is deferred), or [`VfsError::NotFound`] (the path does not exist). Defaults
+    /// to unsupported.
+    async fn invoke(
+        &self,
+        _path: &VfsPath,
+        _action: ActionId,
+        _ctx: ActionCtx,
+    ) -> Result<ActionOutcome, VfsError> {
         Err(VfsError::Unsupported(Caps::empty()))
     }
 }
