@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destinations untouched. (The AI executor already refused such overwrites.)
 
 ### Added
+- **Transfer queue** (M2-5): a copy/move issued while one is already running is now **queued** and
+  started automatically (FIFO) when the active transfer finishes, instead of being refused. The
+  status line shows the queue depth (`⇅ transferring… 3.4 MiB (+2 queued)`); cancelling or completing
+  the active transfer (or dismissing its overwrite prompt) drains the next one.
 - **Large-list row virtualization** (M1-9): only the on-screen window of rows is materialized each
   frame (the cursor is kept roughly centred), so browsing a directory with tens of thousands of
   entries costs O(viewport) instead of O(entries) per render.

@@ -308,9 +308,18 @@ fn list_window(cursor: usize, total: usize, rows: usize) -> usize {
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let pane = state.active();
     let count = pane_count_label(pane);
-    // A live transfer takes over the status line with its running byte total.
+    // A live transfer takes over the status line with its running byte total (and queue depth).
     let line = if let Some(bytes) = state.transfer_bytes {
-        Line::from(format!(" {count}   ⇅ transferring… {}", human_bytes(bytes)))
+        let queued = state.transfer_queue.len();
+        let suffix = if queued > 0 {
+            format!(" (+{queued} queued)")
+        } else {
+            String::new()
+        };
+        Line::from(format!(
+            " {count}   ⇅ transferring… {}{suffix}",
+            human_bytes(bytes)
+        ))
     } else {
         let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^A ai";
         Line::from(format!(" {count}   {help}"))
