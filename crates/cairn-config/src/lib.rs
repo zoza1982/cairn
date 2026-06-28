@@ -50,6 +50,12 @@ pub struct UiConfig {
     pub keymap: String,
     /// Theme name.
     pub theme: String,
+    /// User keybinding overrides, applied on top of the preset: a map of key-chord → action name.
+    /// Chords look like `"ctrl+a"`, `"j"`, `"f5"`, `"enter"`, `"space"`; action names are snake_case
+    /// (`"cursor_down"`, `"copy"`, `"ai_propose"`, …). Unparseable entries are ignored with a
+    /// warning rather than rejecting the whole config.
+    #[serde(default)]
+    pub keybindings: BTreeMap<String, String>,
 }
 
 impl Default for UiConfig {
@@ -57,6 +63,7 @@ impl Default for UiConfig {
         Self {
             keymap: "mc".to_owned(),
             theme: "dark".to_owned(),
+            keybindings: BTreeMap::new(),
         }
     }
 }
@@ -187,6 +194,37 @@ mod tests {
         assert!(text.contains("bastion.example"));
         assert!(!text.to_lowercase().contains("password"));
         assert!(!text.to_lowercase().contains("private_key"));
+    }
+
+    #[test]
+    fn keybindings_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.ui
+            .keybindings
+            .insert("ctrl+a".into(), "ai_propose".into());
+        cfg.ui.keybindings.insert("x".into(), "delete".into());
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.ui.keybindings.get("ctrl+a").map(String::as_str),
+            Some("ai_propose")
+        );
+        assert_eq!(
+            loaded.ui.keybindings.get("x").map(String::as_str),
+            Some("delete")
+        );
+    }
+
+    #[test]
+    fn config_without_keybindings_section_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\n[ui]\nkeymap = \"vim\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.ui.keymap, "vim");
+        assert!(cfg.ui.keybindings.is_empty());
     }
 
     #[test]

@@ -9,8 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cairn_backend_local::LocalVfs;
+use cairn_config::Config;
 use cairn_core::{initial_effects, update, AppEffect, AppEvent, AppState, Msg};
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
+use cairn_tui::Keymap;
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
@@ -47,6 +49,19 @@ async fn run_async() -> anyhow::Result<()> {
 
     let mut state = AppState::new(LEFT, RIGHT, VfsPath::root());
 
+    // Load user config (keybinding overrides, …); fall back to defaults on any problem.
+    let config = load_config();
+    let (keymap, warnings) = Keymap::from_overrides(
+        config
+            .ui
+            .keybindings
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    for w in warnings {
+        tracing::warn!("{w}");
+    }
+
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(256);
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
     spawn_input_reader(input_tx);
@@ -63,6 +78,7 @@ async fn run_async() -> anyhow::Result<()> {
         &mut terminal,
         &mut state,
         &registry,
+        &keymap,
         &event_tx,
         &mut event_rx,
         &mut input_rx,
@@ -73,10 +89,26 @@ async fn run_async() -> anyhow::Result<()> {
     result
 }
 
+/// Load the user config from the platform config path, returning defaults if it is missing or
+/// unreadable (a broken config must never prevent the app from starting).
+fn load_config() -> Config {
+    let Some(path) = cairn_config::default_config_path() else {
+        return Config::default();
+    };
+    match Config::load(&path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load config; using defaults");
+            Config::default()
+        }
+    }
+}
+
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     state: &mut AppState,
     registry: &VfsRegistry,
+    keymap: &Keymap,
     event_tx: &mpsc::Sender<AppEvent>,
     event_rx: &mut mpsc::Receiver<AppEvent>,
     input_rx: &mut mpsc::Receiver<Event>,
@@ -84,7 +116,7 @@ async fn event_loop(
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
-            Some(input) = input_rx.recv() => map_input(input),
+            Some(input) = input_rx.recv() => map_input(input, keymap),
             else => break,
         };
         let Some(msg) = msg else { continue };
@@ -102,9 +134,9 @@ async fn event_loop(
 }
 
 /// Translate a terminal event into a reducer message (or `None` to ignore).
-fn map_input(input: Event) -> Option<Msg> {
+fn map_input(input: Event, keymap: &Keymap) -> Option<Msg> {
     match input {
-        Event::Key(key) => cairn_tui::action_for(key).map(Msg::Action),
+        Event::Key(key) => keymap.action_for(key).map(Msg::Action),
         // A resize triggers a redraw via the no-op tick.
         Event::Resize(_, _) => Some(Msg::Tick),
         _ => None,
@@ -351,9 +383,13 @@ mod tests {
 
     #[test]
     fn map_input_translates_keys_and_resize() {
+        let km = Keymap::default();
         let q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert!(matches!(map_input(q), Some(Msg::Action(_))));
-        assert!(matches!(map_input(Event::Resize(80, 24)), Some(Msg::Tick)));
+        assert!(matches!(map_input(q, &km), Some(Msg::Action(_))));
+        assert!(matches!(
+            map_input(Event::Resize(80, 24), &km),
+            Some(Msg::Tick)
+        ));
     }
 
     fn tempfile_dir() -> tempfile::TempDir {

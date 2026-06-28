@@ -7,5 +7,5 @@
 pub mod keymap;
 mod render;
 
-pub use keymap::action_for;
+pub use keymap::{action_for, Keymap};
 pub use render::render;
