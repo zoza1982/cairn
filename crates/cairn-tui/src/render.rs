@@ -90,6 +90,22 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             .alignment(Alignment::Center);
             frame.render_widget(body, area);
         }
+        Overlay::ConfirmShellAction { name, target, .. } => {
+            let area = centered(frame.area(), 56, 7);
+            frame.render_widget(Clear, area);
+            let block = Block::bordered()
+                .title(" Run shell action? ")
+                .border_style(Style::default().fg(Color::Yellow));
+            let body = Paragraph::new(vec![
+                Line::from(format!("Run '{name}' on")),
+                Line::from(target.as_str()),
+                Line::from(""),
+                Line::from("[y] Run    [n] Cancel"),
+            ])
+            .block(block)
+            .alignment(Alignment::Center);
+            frame.render_widget(body, area);
+        }
         Overlay::TransferQueue { cursor } => render_transfer_queue(frame, state, *cursor),
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
         Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),

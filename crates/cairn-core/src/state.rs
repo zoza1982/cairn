@@ -264,6 +264,18 @@ pub enum Overlay {
         /// How many destinations already exist.
         conflicts: usize,
     },
+    /// Confirm running a user-defined shell action before it executes (security gate — shell actions
+    /// run a local program). Holds what's needed to dispatch on confirm.
+    ConfirmShellAction {
+        /// Index into the validated shell-action list.
+        index: usize,
+        /// The action's name, for display.
+        name: String,
+        /// Connection the target lives on.
+        conn: ConnectionId,
+        /// The entry the action will run against.
+        target: VfsPath,
+    },
 }
 
 /// What submitting a [`Overlay::Prompt`] text field will do.
@@ -344,6 +356,19 @@ pub struct AppState {
     /// Whether the active transfer is paused. Toggled by the user; reset when the transfer finishes.
     /// Display-only here — the runtime drives the engine's pause signal in response to the effect.
     pub transfer_paused: bool,
+    /// User-defined shell actions, by index (populated from config at startup, like `connections`).
+    /// The index aligns with the keymap's `Action::RunShellAction(idx)` and the runtime's action list.
+    pub shell_actions: Vec<ShellActionMeta>,
+}
+
+/// The reducer's view of a shell action: just what it needs to validate and gate the run. The full
+/// definition (command, args) lives runtime-side so the pure core never holds executable details.
+#[derive(Debug, Clone)]
+pub struct ShellActionMeta {
+    /// Display name, shown in the confirm prompt and status line.
+    pub name: String,
+    /// Whether to confirm before running (mirrors the config `confirm` field).
+    pub confirm: bool,
 }
 
 impl AppState {
@@ -367,6 +392,7 @@ impl AppState {
             transfer_rate: None,
             transfer_total: None,
             transfer_paused: false,
+            shell_actions: Vec::new(),
         }
     }
 

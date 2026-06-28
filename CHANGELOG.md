@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Shell-command actions** (M8-7): bind a key in config to run a local program against the entry
+  under the cursor — e.g. `[[shell_actions]]` with `name`/`key`/`command`/`args` (placeholders
+  `{path}`/`{dir}`/`{name}`). **Security-first** (see ADR-0005): argv-only with **no shell**
+  interpretation, **local backends only** (via `Vfs::local_path`, which canonicalizes and confines the
+  path), a **confirm prompt** before each run (opt-out per action), a **scrubbed environment** (no
+  secrets reach the child), explicit cwd, closed stdin, captured+capped output, and a wall-clock
+  timeout that kills the process group. The `[[shell_actions]]` section is ignored when `config.toml`
+  is writable by other users or not owned by you (Unix). Non-interactive only for now; output is
+  summarized to the status line (never echoed or sent to the AI). Interactive/TUI-suspending programs
+  are deferred.
 - **`Vfs::local_path` capability** (M8 groundwork): a new `Vfs` trait method `local_path(&VfsPath) ->
   Option<PathBuf>` returns the real, canonical OS path backing a virtual path — but only for backends
   with a local filesystem identity. It defaults to `None` (every remote backend denies it), and

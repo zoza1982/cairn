@@ -52,6 +52,10 @@ pub enum Action {
     QueueMoveDown,
     /// Toggle pause/resume of the active transfer (no-op when none is running).
     TogglePause,
+    /// Run the user-defined shell action at the given index (a config `[[shell_actions]]` entry, bound
+    /// to a key). The index is into the validated action list shared by the keymap, [`AppState`], and
+    /// the runtime — see [`AppState::shell_actions`](crate::AppState::shell_actions).
+    RunShellAction(usize),
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
     /// Open a prompt to create a new directory in the active pane.
@@ -160,6 +164,14 @@ pub enum AppEvent {
         /// Whether execution ended in failure.
         error: bool,
     },
+    /// A user-defined shell action finished. Routes through the normal op-completion path (status +
+    /// pane refresh, since the command may have changed the filesystem).
+    ShellActionDone {
+        /// Human-readable, redacted status (e.g. `"Checksum: exit 0"`).
+        status: String,
+        /// Whether it ended in failure (non-zero exit, timeout, or refusal).
+        error: bool,
+    },
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -196,6 +208,18 @@ pub enum AppEffect {
     /// Set the paused state of the in-flight transfer (`true` = pause, `false` = resume). No-op when
     /// no transfer is running.
     SetTransferPaused(bool),
+    /// Run a user-defined shell action (M8-7). The runtime resolves `index` to its definition, maps
+    /// `target` to a real OS path via [`Vfs::local_path`] (refusing non-local backends), expands the
+    /// argument templates, and spawns the program with no shell. Result returns as
+    /// [`AppEvent::ShellActionDone`].
+    RunShellAction {
+        /// Index into the validated shell-action list.
+        index: usize,
+        /// Connection the target lives on (must be a local backend).
+        conn: ConnectionId,
+        /// The entry the action runs against.
+        target: VfsPath,
+    },
     /// Delete entries on a connection.
     Delete {
         /// The connection.

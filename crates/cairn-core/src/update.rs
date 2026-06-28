@@ -53,6 +53,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 | Action::Delete
                 | Action::OpenConnections
                 | Action::OpenQueue
+                | Action::RunShellAction(_)
         )
     {
         state.status = Some("The assistant is preparing a plan…".to_owned());
@@ -72,6 +73,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 | Action::Rename
                 | Action::OpenConnections
                 | Action::OpenQueue
+                | Action::RunShellAction(_)
         )
     {
         state.status = Some("A plan is executing — press Esc to cancel it first".to_owned());
@@ -181,6 +183,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             });
             vec![AppEffect::SetTransferPaused(state.transfer_paused)]
         }
+        Action::RunShellAction(index) => run_shell_action(state, index),
         // No overlay open: confirm/cancel and the plan-only actions are otherwise no-ops.
         // Queue reorder only acts inside the queue overlay; a no-op with no overlay open.
         Action::Confirm
@@ -434,6 +437,7 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
     match &state.overlay {
         Some(Overlay::ConfirmDelete { .. }) => apply_confirm_delete_action(state, action),
         Some(Overlay::ConfirmOverwrite { .. }) => apply_confirm_overwrite_action(state, action),
+        Some(Overlay::ConfirmShellAction { .. }) => apply_confirm_shell_action(state, action),
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
         Some(Overlay::TransferQueue { .. }) => apply_transfer_queue_action(state, action),
@@ -541,6 +545,35 @@ fn apply_confirm_overwrite_action(state: &mut AppState, action: Action) -> Vec<A
             state.overlay = None;
             state.status = Some("Transfer cancelled".to_owned());
             // The queue is drained by the tail call in `update` now that the overlay is closed.
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Drive the shell-action confirm dialog: `Confirm`/`Enter` runs it, `Cancel` abandons it.
+fn apply_confirm_shell_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        Action::Confirm | Action::Enter => {
+            let Some(Overlay::ConfirmShellAction {
+                index,
+                name,
+                conn,
+                target,
+            }) = state.overlay.take()
+            else {
+                return Vec::new();
+            };
+            state.status = Some(format!("Running '{name}'…"));
+            vec![AppEffect::RunShellAction {
+                index,
+                conn,
+                target,
+            }]
+        }
+        Action::Cancel => {
+            state.overlay = None;
+            state.status = Some("Action cancelled".to_owned());
             Vec::new()
         }
         _ => Vec::new(),
@@ -732,6 +765,46 @@ fn op_targets(state: &AppState, side: Side) -> Vec<(VfsPath, String)> {
             pane.cwd.join(&name).ok().map(|full| (full, name))
         })
         .collect()
+}
+
+/// Begin a user-defined shell action against the entry under the cursor. If the action requires
+/// confirmation (the default), open the confirm overlay; otherwise emit the run effect directly. A
+/// no-op (with a hint) when the index is unknown or nothing is selected. The reducer stays pure — it
+/// never resolves real paths or command details; the runtime does, gating on a local backend.
+fn run_shell_action(state: &mut AppState, index: usize) -> Vec<AppEffect> {
+    let Some(meta) = state.shell_actions.get(index) else {
+        // An out-of-range index means the keymap and the action list drifted — a wiring bug, not user
+        // error. Assert in debug to catch it in tests; in release, no-op rather than panic.
+        debug_assert!(false, "RunShellAction index {index} out of range");
+        return Vec::new();
+    };
+    let (name, confirm) = (meta.name.clone(), meta.confirm);
+    let pane = state.active();
+    let Some(entry) = pane.current() else {
+        state.status = Some(format!("'{name}': nothing selected"));
+        return Vec::new();
+    };
+    let Ok(target) = pane.cwd.join(entry.name.as_ref()) else {
+        state.status = Some(format!("'{name}': cannot resolve the selected entry"));
+        return Vec::new();
+    };
+    let conn = pane.conn;
+    if confirm {
+        state.overlay = Some(Overlay::ConfirmShellAction {
+            index,
+            name,
+            conn,
+            target,
+        });
+        Vec::new()
+    } else {
+        state.status = Some(format!("Running '{name}'…"));
+        vec![AppEffect::RunShellAction {
+            index,
+            conn,
+            target,
+        }]
+    }
 }
 
 fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
@@ -1002,6 +1075,11 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // The queue is drained by the tail call in `update`.
             finish_op(state, &status, error)
         }
+        AppEvent::ShellActionDone { status, error } => {
+            // A shell action may have changed the filesystem (created/removed files), so refresh both
+            // panes via the normal op-completion path.
+            finish_op(state, &status, error)
+        }
     }
 }
 
@@ -1077,6 +1155,7 @@ fn extension(e: &Entry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ShellActionMeta;
     use cairn_types::{ConnectionId, Entry, EntryKind, VfsPath};
     use cairn_vfs::{ListPage, VfsError};
 
@@ -1510,6 +1589,110 @@ mod tests {
             }),
         );
         assert!(!s.transfer_paused, "completion clears the paused flag");
+    }
+
+    fn with_action(s: &mut AppState, confirm: bool) {
+        s.shell_actions = vec![ShellActionMeta {
+            name: "Checksum".to_owned(),
+            confirm,
+        }];
+    }
+
+    #[test]
+    fn shell_action_with_confirm_opens_the_confirm_overlay() {
+        let mut s = state();
+        with_action(&mut s, true);
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::RunShellAction(0)));
+        assert!(fx.is_empty(), "confirm defers the run");
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::ConfirmShellAction { index: 0, .. })
+        ));
+        // Confirming dispatches the run effect against the selected entry.
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::RunShellAction { index: 0, .. }]
+        ));
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn shell_action_confirm_cancel_abandons_it() {
+        let mut s = state();
+        with_action(&mut s, true);
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let _ = update(&mut s, Msg::Action(Action::RunShellAction(0)));
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none(), "cancel closes the overlay");
+    }
+
+    #[test]
+    fn shell_action_without_confirm_runs_directly() {
+        let mut s = state();
+        with_action(&mut s, false);
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::RunShellAction(0)));
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::RunShellAction { index: 0, .. }]
+        ));
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn shell_action_with_nothing_selected_is_a_no_op() {
+        let mut s = state();
+        with_action(&mut s, false);
+        // No `deliver` → the pane is empty / Loading, nothing under the cursor.
+        let fx = update(&mut s, Msg::Action(Action::RunShellAction(0)));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        assert!(s.status.as_deref().unwrap().contains("nothing selected"));
+    }
+
+    #[test]
+    fn shell_action_done_refreshes_panes() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::ShellActionDone {
+                status: "Checksum: exit 0".to_owned(),
+                error: false,
+            }),
+        );
+        // finish_op re-lists both panes.
+        assert_eq!(fx.len(), 2);
+        assert!(fx.iter().all(|e| matches!(e, AppEffect::List { .. })));
+        assert_eq!(s.status.as_deref(), Some("Checksum: exit 0"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn shell_action_out_of_range_index_asserts_in_debug() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        // No actions registered → index 0 is out of range (a keymap/list wiring bug).
+        let _ = update(&mut s, Msg::Action(Action::RunShellAction(0)));
     }
 
     #[test]
