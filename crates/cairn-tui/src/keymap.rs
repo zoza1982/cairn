@@ -46,6 +46,42 @@ impl Keymap {
         (Self { overrides }, warnings)
     }
 
+    /// Build a keymap from `bindings` (as [`from_overrides`](Self::from_overrides)) and then register
+    /// user-defined shell actions: each `(index, chord)` maps its key to `Action::RunShellAction(index)`.
+    /// The index must be the action's position in the validated action list the runtime also holds, so
+    /// the keymap, `AppState::shell_actions`, and the runner stay aligned. Shell-action chords win over
+    /// built-ins (an explicit `key` is intentional); an unparseable chord is skipped with a warning, and
+    /// shadowing another binding warns but proceeds. Returns the keymap plus warnings.
+    #[must_use]
+    pub fn with_shell_actions<K, V, I, S, C>(bindings: I, shell_actions: S) -> (Self, Vec<String>)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+        S: IntoIterator<Item = (usize, C)>,
+        C: AsRef<str>,
+    {
+        let (mut km, mut warnings) = Self::from_overrides(bindings);
+        for (index, chord) in shell_actions {
+            let chord = chord.as_ref();
+            let Some((code, mods)) = parse_chord(chord) else {
+                warnings.push(format!("shell action: unknown chord `{chord}`"));
+                continue;
+            };
+            let key = chord_key(code, mods);
+            // Warn if the chord already does something — a prior override/shell action, or a built-in
+            // default (resolved via `action_for`) — so repurposing e.g. `c` (copy) is never silent.
+            let shadows_builtin = action_for(KeyEvent::new(code, mods)).is_some();
+            if km.overrides.contains_key(&key) || shadows_builtin {
+                warnings.push(format!(
+                    "shell action: chord `{chord}` shadows another binding"
+                ));
+            }
+            km.overrides.insert(key, Action::RunShellAction(index));
+        }
+        (km, warnings)
+    }
+
     /// Resolve a key event: a user override wins, otherwise the built-in default applies.
     #[must_use]
     pub fn action_for(&self, key: KeyEvent) -> Option<Action> {
@@ -356,6 +392,37 @@ mod tests {
         assert_eq!(km.action_for(press(KeyCode::Char('z'))), Some(Action::Quit));
         assert_eq!(km.action_for(press(KeyCode::Enter)), Some(Action::Refresh));
         // A key with no override still falls back to the default.
+        assert_eq!(
+            km.action_for(press(KeyCode::Char('j'))),
+            Some(Action::CursorDown)
+        );
+    }
+
+    #[test]
+    fn shell_actions_register_by_index_and_override_builtins() {
+        let no_bindings: [(&str, &str); 0] = [];
+        let (km, warnings) =
+            Keymap::with_shell_actions(no_bindings, [(0usize, "ctrl+h"), (1usize, "c")]);
+        // 'c' is Copy by default; a shell action bound to it wins.
+        assert_eq!(
+            km.action_for(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            Some(Action::RunShellAction(0))
+        );
+        assert_eq!(
+            km.action_for(press(KeyCode::Char('c'))),
+            Some(Action::RunShellAction(1)),
+            "shell action overrides the built-in copy binding"
+        );
+        // The shadow of 'c' is reported.
+        assert!(warnings.iter().any(|w| w.contains("shadows")));
+    }
+
+    #[test]
+    fn shell_action_with_bad_chord_is_skipped_with_warning() {
+        let no_bindings: [(&str, &str); 0] = [];
+        let (km, warnings) = Keymap::with_shell_actions(no_bindings, [(0usize, "bogus_key")]);
+        assert!(warnings.iter().any(|w| w.contains("unknown chord")));
+        // Nothing registered for index 0; defaults are intact.
         assert_eq!(
             km.action_for(press(KeyCode::Char('j'))),
             Some(Action::CursorDown)

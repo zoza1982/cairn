@@ -12,6 +12,7 @@ use cairn_backend_local::LocalVfs;
 use cairn_config::Config;
 use cairn_core::{
     initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, Msg,
+    ShellActionMeta,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
@@ -64,7 +65,33 @@ async fn run_async() -> anyhow::Result<()> {
 
     // Load user config (keybinding overrides, connection profiles, …); fall back to defaults.
     let config = load_config();
-    let (keymap, warnings) = Keymap::from_overrides(&config.ui.keybindings);
+
+    // Validate the (file-trusted) shell actions, dropping any malformed entry with a warning. The
+    // surviving list, in order, is the single source of index alignment shared by the keymap,
+    // `AppState::shell_actions`, and the runtime's `shell_action_defs`.
+    let mut shell_action_defs = Vec::new();
+    for def in &config.shell_actions {
+        match def.validate() {
+            Ok(()) => shell_action_defs.push(def.clone()),
+            Err(reason) => tracing::warn!("ignoring shell action: {reason}"),
+        }
+    }
+    state.shell_actions = shell_action_defs
+        .iter()
+        .map(|d| ShellActionMeta {
+            name: d.name.clone(),
+            confirm: d.confirm,
+        })
+        .collect();
+    let shell_action_defs: Arc<[cairn_config::ShellActionDef]> = shell_action_defs.into();
+
+    let (keymap, warnings) = Keymap::with_shell_actions(
+        &config.ui.keybindings,
+        shell_action_defs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i, d.key.clone())),
+    );
     for w in warnings {
         tracing::warn!("{w}");
     }
@@ -96,7 +123,13 @@ async fn run_async() -> anyhow::Result<()> {
     );
     for effect in initial {
         dispatch(
-            effect, &registry, &event_tx, &mut None, &mut None, &mut None,
+            effect,
+            &registry,
+            &event_tx,
+            &mut None,
+            &mut None,
+            &mut None,
+            &shell_action_defs,
         );
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
@@ -109,6 +142,7 @@ async fn run_async() -> anyhow::Result<()> {
         &event_tx,
         &mut event_rx,
         &mut input_rx,
+        &shell_action_defs,
     )
     .await;
 
@@ -123,13 +157,18 @@ fn load_config() -> Config {
         tracing::debug!("no platform config directory; using default config");
         return Config::default();
     };
-    match Config::load(&path) {
+    let mut cfg = match Config::load(&path) {
         Ok(cfg) => cfg,
         Err(e) => {
             tracing::warn!(error = %e, "failed to load config; using defaults");
             Config::default()
         }
+    };
+    // Gate the executable shell-actions section on file trust (drops them from an untrusted file).
+    if let Some(warning) = cfg.secure_shell_actions(&path) {
+        tracing::warn!("{warning}");
     }
+    cfg
 }
 
 /// Register the connections offered by the switcher and return their UI choices. Built-in local
@@ -163,6 +202,7 @@ async fn register_connections(registry: &VfsRegistry, config: &Config) -> Vec<Co
     choices
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     state: &mut AppState,
@@ -171,6 +211,7 @@ async fn event_loop(
     event_tx: &mpsc::Sender<AppEvent>,
     event_rx: &mut mpsc::Receiver<AppEvent>,
     input_rx: &mut mpsc::Receiver<Event>,
+    shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
 ) -> anyhow::Result<()> {
     // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
     // matching effect can signal them. Each is cleared when its Done event arrives.
@@ -216,6 +257,7 @@ async fn event_loop(
                 &mut transfer_cancel,
                 &mut ai_cancel,
                 &mut transfer_pause,
+                shell_action_defs,
             );
         }
     }
@@ -244,6 +286,7 @@ fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
 /// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s. `transfer_cancel`
 /// holds the in-flight transfer's cancellation token so a [`AppEffect::CancelTransfer`] can fire it,
 /// and `transfer_pause` holds its pause signal so a [`AppEffect::SetTransferPaused`] can drive it.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     effect: AppEffect,
     registry: &VfsRegistry,
@@ -251,6 +294,7 @@ fn dispatch(
     transfer_cancel: &mut Option<CancellationToken>,
     ai_cancel: &mut Option<CancellationToken>,
     transfer_pause: &mut Option<watch::Sender<bool>>,
+    shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
 ) {
     match effect {
         AppEffect::List {
@@ -309,6 +353,19 @@ fn dispatch(
             if let Some(tx) = transfer_pause.as_ref() {
                 let _ = tx.send(paused);
             }
+        }
+        AppEffect::RunShellAction {
+            index,
+            conn,
+            target,
+        } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            let defs = shell_action_defs.clone();
+            tokio::spawn(async move {
+                let ev = run_shell_action_effect(&registry, &defs, index, conn, target).await;
+                let _ = event_tx.send(ev).await;
+            });
         }
         AppEffect::Delete { conn, paths } => {
             let registry = registry.clone();
@@ -625,6 +682,232 @@ async fn run_transfer_effect(
             error: true,
         },
     }
+}
+
+/// Wall-clock limit for a shell action before it is killed.
+const SHELL_ACTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-stream output cap captured from a shell action (the rest is dropped, marked truncated).
+const SHELL_ACTION_OUTPUT_CAP: usize = 64 * 1024;
+
+/// Run a user-defined shell action (M8-7) against `target`, returning a redacted [`AppEvent`].
+///
+/// SECURITY (see `docs/adr/0005-shell-command-actions.md`): the program is run with **no shell**
+/// (argv vector, never `sh -c`), only against a **local** backend (via [`Vfs::local_path`], which
+/// canonicalizes and confines the path), with a **scrubbed environment** (no secrets/vault material),
+/// an explicit cwd, stdin closed, output captured (not inherited) and capped, and a wall-clock timeout
+/// after which the whole process group is killed.
+async fn run_shell_action_effect(
+    registry: &VfsRegistry,
+    defs: &[cairn_config::ShellActionDef],
+    index: usize,
+    conn: ConnectionId,
+    target: VfsPath,
+) -> AppEvent {
+    let Some(def) = defs.get(index) else {
+        // Index/keymap drift — a wiring bug, surfaced rather than panicking.
+        return shell_done("shell action unavailable", true);
+    };
+    let name = def.name.clone();
+    // Defensive re-validation (already validated at startup; cheap and keeps the boundary local).
+    if let Err(reason) = def.validate() {
+        return shell_done(&format!("'{name}': {reason}"), true);
+    }
+    let Some(vfs) = registry.get(conn).await else {
+        return shell_done(&format!("'{name}': connection unavailable"), true);
+    };
+    // Resolve the real, confined OS path off the async runtime (local_path does blocking canonicalize).
+    // `None` ⇒ a non-local backend or a path escaping the root ⇒ refuse.
+    let real = {
+        let (vfs, target) = (vfs.clone(), target.clone());
+        match tokio::task::spawn_blocking(move || vfs.local_path(&target)).await {
+            Ok(Some(p)) => p,
+            _ => return shell_done(&format!("'{name}': requires a local file"), true),
+        }
+    };
+    let dir = real
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| real.clone());
+    let file_name = real
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let path_str = real.to_string_lossy();
+    let dir_str = dir.to_string_lossy();
+    // Expand each arg into exactly one argv element — placeholders only, never re-split or shell-parsed.
+    let argv: Vec<String> = def
+        .args
+        .iter()
+        .map(|a| expand_placeholders(a, &path_str, &dir_str, &file_name))
+        .collect();
+
+    match spawn_shell_action(&def.command, &argv, &dir, &name).await {
+        Ok(summary) => shell_done(&format!("'{name}': {summary}"), false),
+        Err(reason) => shell_done(&format!("'{name}': {reason}"), true),
+    }
+}
+
+/// Drain an optional child stream to EOF, returning the total byte count. Output is **discarded**
+/// (read into a small reusable buffer, never retained) — it may contain secrets and is never surfaced
+/// beyond a summary. We drain past [`SHELL_ACTION_OUTPUT_CAP`] rather than stopping at it so a
+/// well-behaved verbose program isn't killed by `EPIPE`; memory stays O(chunk) regardless of size,
+/// and total runtime is bounded by the caller's timeout. The returned count lets the caller report
+/// truncation (`>= cap`).
+async fn drain_capped<R>(stream: Option<R>) -> usize
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut s) = stream else { return 0 };
+    let mut total = 0usize;
+    let mut buf = [0u8; 8192];
+    loop {
+        match s.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total = total.saturating_add(n),
+        }
+    }
+    total
+}
+
+/// Substitute `{path}`/`{dir}`/`{name}` in `arg` in a **single left-to-right pass**, so a value
+/// inserted for one placeholder is never rescanned for another (a filename literally containing
+/// `{name}` cannot corrupt an already-expanded `{path}`). Unknown `{...}` tokens are left verbatim
+/// (config validation already rejected them at startup).
+fn expand_placeholders(arg: &str, path: &str, dir: &str, name: &str) -> String {
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open..];
+        if let Some(close) = after.find('}') {
+            match &after[1..close] {
+                "path" => out.push_str(path),
+                "dir" => out.push_str(dir),
+                "name" => out.push_str(name),
+                _ => out.push_str(&after[..=close]), // unknown token: emit verbatim
+            }
+            rest = &after[close + 1..];
+        } else {
+            // No closing brace: emit the rest verbatim and stop.
+            out.push_str(after);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Build an [`AppEvent::ShellActionDone`]. `status` is already secret-free (counts/exit codes only).
+fn shell_done(status: &str, error: bool) -> AppEvent {
+    AppEvent::ShellActionDone {
+        status: status.to_owned(),
+        error,
+    }
+}
+
+/// Spawn the hardened child and return a short status (`"exit 0"`, `"exit 2"`, `"timed out"`). On
+/// success/failure the captured output is summarized to a byte count — never echoed (it may contain
+/// secrets), and never forwarded to the AI layer.
+async fn spawn_shell_action(
+    program: &str,
+    argv: &[String],
+    cwd: &std::path::Path,
+    action_name: &str,
+) -> Result<String, String> {
+    let mut std_cmd = std::process::Command::new(program);
+    std_cmd
+        .args(argv)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Scrub the environment: start empty, then re-add a minimal, non-secret allow-list with a
+    // sanitized PATH (no `.`/empty entries). This keeps tokens like AWS_*/GITHUB_TOKEN out of the
+    // child — secrets must never reach a shell action.
+    std_cmd.env_clear();
+    if let Some(path) = sanitized_path() {
+        std_cmd.env("PATH", path);
+    }
+    for key in ["HOME", "USER", "LOGNAME", "LANG", "TZ", "TMPDIR"] {
+        if let Some(v) = std::env::var_os(key) {
+            std_cmd.env(key, v);
+        }
+    }
+    for (k, v) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("LC_") {
+            std_cmd.env(k, v);
+        }
+    }
+    // Let the program know it was launched as a Cairn action (non-secret, analogous to `$EDITOR`).
+    std_cmd.env("CAIRN_ACTION", action_name);
+    // Unix: put the child in its own process group so a timeout can kill it *and* its descendants.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        std_cmd.process_group(0);
+    }
+
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| format!("could not start: {e}"))?;
+    let pid = child.id();
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Drain both pipes *concurrently* with the wait. Reading stdout fully and only then stderr would
+    // deadlock: a child that fills the (~64 KiB) stderr pipe blocks on write while we block reading
+    // stdout. Each stream is independently capped; we track whether either hit the cap.
+    let capture = async {
+        let (out_len, err_len, status) =
+            tokio::join!(drain_capped(stdout), drain_capped(stderr), child.wait());
+        let truncated = out_len >= SHELL_ACTION_OUTPUT_CAP || err_len >= SHELL_ACTION_OUTPUT_CAP;
+        (status, truncated)
+    };
+
+    match tokio::time::timeout(SHELL_ACTION_TIMEOUT, capture).await {
+        Ok((Ok(status), truncated)) => {
+            let out = if truncated { " (output truncated)" } else { "" };
+            match status.code() {
+                Some(0) => Ok(format!("done{out}")),
+                Some(c) => Err(format!("exit {c}{out}")),
+                None => Err(format!("killed by signal{out}")),
+            }
+        }
+        Ok((Err(e), _)) => Err(format!("wait failed: {e}")),
+        Err(_) => {
+            // Timed out: kill the whole process group (Unix) or just the child (otherwise), then reap.
+            kill_process_tree(pid);
+            Err("timed out".to_owned())
+        }
+    }
+}
+
+/// Best-effort kill of a timed-out child and its descendants. On Unix the child leads its own process
+/// group (`process_group(0)`), so signalling the group reaps grandchildren too; elsewhere only the
+/// child is killed (the `kill_on_drop` guard still applies when the handle drops).
+#[cfg(unix)]
+fn kill_process_tree(pid: Option<u32>) {
+    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+        if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(_pid: Option<u32>) {
+    // The `kill_on_drop(true)` guard kills the child when its handle is dropped.
+}
+
+/// The current `PATH` with `.` and empty entries removed, so a shell action can't resolve a bare
+/// program name against the directory being browsed. `None` if `PATH` is unset.
+fn sanitized_path() -> Option<std::ffi::OsString> {
+    let path = std::env::var_os("PATH")?;
+    let kept: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|p| !p.as_os_str().is_empty() && p != std::path::Path::new("."))
+        .collect();
+    std::env::join_paths(kept).ok()
 }
 
 async fn run_delete_effect(
@@ -1038,5 +1321,157 @@ mod tests {
 
     fn tempfile_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    fn shell_action(command: &str, args: &[&str]) -> cairn_config::ShellActionDef {
+        cairn_config::ShellActionDef {
+            name: "Test".to_owned(),
+            key: "f9".to_owned(),
+            command: command.to_owned(),
+            args: args.iter().map(|s| (*s).to_owned()).collect(),
+            confirm: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_action_unknown_index_is_an_error() {
+        let registry = VfsRegistry::new();
+        let ev = run_shell_action_effect(&registry, &[], 0, LEFT, VfsPath::root()).await;
+        assert!(matches!(ev, AppEvent::ShellActionDone { error: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn shell_action_refuses_a_non_local_or_missing_target() {
+        // A LocalVfs whose target does not exist → `local_path` returns None → refusal (same branch a
+        // non-local backend hits). Proves the local-only gate without spawning anything.
+        let dir = tempfile_dir();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let defs = [shell_action("true", &[])];
+        let ev = run_shell_action_effect(
+            &registry,
+            &defs,
+            0,
+            LEFT,
+            VfsPath::parse("/nope.txt").unwrap(),
+        )
+        .await;
+        match ev {
+            AppEvent::ShellActionDone { status, error } => {
+                assert!(error);
+                assert!(status.contains("requires a local file"), "got: {status}");
+            }
+            _ => panic!("expected ShellActionDone"),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_one(
+        dir: &std::path::Path,
+        def: cairn_config::ShellActionDef,
+        target: &str,
+    ) -> AppEvent {
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir)))
+            .await;
+        run_shell_action_effect(&registry, &[def], 0, LEFT, VfsPath::parse(target).unwrap()).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_action_true_succeeds() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+        let ev = run_one(dir.path(), shell_action("true", &["{path}"]), "/f.txt").await;
+        assert!(matches!(ev, AppEvent::ShellActionDone { error: false, .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_action_false_reports_nonzero_exit() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+        let ev = run_one(dir.path(), shell_action("false", &[]), "/f.txt").await;
+        match ev {
+            AppEvent::ShellActionDone { status, error } => {
+                assert!(error);
+                assert!(status.contains("exit 1"), "got: {status}");
+            }
+            _ => panic!("expected ShellActionDone"),
+        }
+    }
+
+    #[test]
+    fn expand_placeholders_is_single_pass() {
+        // A path that itself contains the literal `{name}` must NOT be re-expanded by the later
+        // `{name}` substitution — argv must receive exactly the resolved path.
+        let path = "/home/u/{name}/report.txt";
+        assert_eq!(
+            expand_placeholders("{path}", path, "/home/u/{name}", "report.txt"),
+            path
+        );
+        // Embedded placeholders in surrounding text still work; unknown tokens pass through verbatim.
+        assert_eq!(expand_placeholders("{name}.tgz", "/p", "/d", "f"), "f.tgz");
+        assert_eq!(
+            expand_placeholders("{unknown}", "/p", "/d", "f"),
+            "{unknown}"
+        );
+        assert_eq!(
+            expand_placeholders("a{path}b{dir}", "/p", "/d", "f"),
+            "a/pb/d"
+        );
+        // Unbalanced brace is emitted verbatim (config validation rejects it upstream anyway).
+        assert_eq!(expand_placeholders("{path", "/p", "/d", "f"), "{path");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_action_with_large_stderr_does_not_deadlock() {
+        // A child that writes far more than the pipe buffer to stderr while stdout stays open must
+        // not deadlock the sequential-then-concurrent capture; it should complete well under the
+        // 10s timeout. `head -c` bounds the write so the test is fast and hermetic.
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+        // /bin/sh is fine *as the program here* (we're testing our capture, not shell-injection):
+        // it writes 200 KiB to stderr (no pipeline, so no SIGPIPE) and exits 0. Our runner still
+        // execs argv with no shell of its own.
+        let def = shell_action("/bin/sh", &["-c", "head -c 200000 /dev/zero 1>&2"]);
+        let ev = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_one(dir.path(), def, "/f.txt"),
+        )
+        .await
+        .expect("must finish well under the action timeout");
+        // Exit 0; output exceeded the cap so it's marked truncated.
+        match ev {
+            AppEvent::ShellActionDone { status, error } => {
+                assert!(!error, "got: {status}");
+                assert!(status.contains("truncated"), "got: {status}");
+            }
+            _ => panic!("expected ShellActionDone"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_action_does_not_invoke_a_shell() {
+        // Args that a shell would treat as `; touch pwned` must reach `true` as inert literal argv,
+        // so no `pwned` file is created. Proves there is no shell interpretation layer.
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+        let ev = run_one(
+            dir.path(),
+            shell_action("true", &["{path}", ";", "touch", "pwned"]),
+            "/f.txt",
+        )
+        .await;
+        assert!(matches!(ev, AppEvent::ShellActionDone { error: false, .. }));
+        assert!(
+            !dir.path().join("pwned").exists(),
+            "a shell would have created 'pwned'; argv exec must not"
+        );
     }
 }

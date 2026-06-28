@@ -106,6 +106,27 @@ focused_border = "magenta"
 dir            = "#5fafff"
 ```
 
+### Shell-command actions
+
+Bind a key to run a local program against the entry under the cursor. Each `[[shell_actions]]` entry
+has a `name`, a `key` (same chord syntax as keybindings), a `command`, and `args` with the
+placeholders `{path}` (the file's real path), `{dir}` (its directory), and `{name}` (its file name):
+
+```toml
+[[shell_actions]]
+name    = "Checksum"
+key     = "ctrl+h"
+command = "/usr/bin/sha256sum"
+args    = ["--", "{path}"]
+# confirm = false   # skip the confirm prompt for a trusted action (default: true)
+```
+
+**Security:** actions run only on **local** panes, with **no shell** (so filenames can't inject
+commands — prefer `--` before a `{path}`/`{name}` argument), in a scrubbed environment (no secrets are
+passed to the program), with a confirm prompt and a timeout. For this reason the `[[shell_actions]]`
+section is ignored if `config.toml` is writable by other users or not owned by you. Interactive
+programs (editors) are not yet supported. See `docs/adr/0005-shell-command-actions.md`.
+
 ## Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) and our

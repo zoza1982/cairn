@@ -3,8 +3,13 @@
 //! Stored as TOML. Holds UI preferences and **connection profiles**. By construction a
 //! [`ConnectionProfile`] cannot hold a secret — it carries only non-secret endpoint fields and an
 //! optional [`secret_ref`](ConnectionProfile::secret_ref) (a vault credential id). Credentials live
-//! only in the encrypted vault; config files, bookmarks, and session state are therefore always
-//! safe to read or share. See `docs/LLD.md` §13.
+//! only in the encrypted vault. See `docs/LLD.md` §13.
+//!
+//! SECURITY: the optional [`shell_actions`](Config::shell_actions) section defines programs Cairn can
+//! execute, so a config carrying it is **no longer safe to import from an untrusted source** — a
+//! hostile file would otherwise run arbitrary commands. [`Config::secure_shell_actions`] gates loading
+//! that section on file ownership/permissions (Unix), and the binary confirms before each run. The
+//! rest of the config (UI, connections) remains secret-free and safe to share.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -30,6 +35,11 @@ pub struct Config {
     pub ui: UiConfig,
     /// Saved connection profiles.
     pub connections: Vec<ConnectionProfile>,
+    /// User-defined shell-command actions (M8-7). **Security-sensitive**: each entry can run a local
+    /// program. Gated by [`secure_shell_actions`](Config::secure_shell_actions) (file-trust) and an
+    /// on-run confirm. Empty by default.
+    #[serde(default)]
+    pub shell_actions: Vec<ShellActionDef>,
 }
 
 impl Default for Config {
@@ -38,8 +48,110 @@ impl Default for Config {
             version: SCHEMA_VERSION,
             ui: UiConfig::default(),
             connections: Vec::new(),
+            shell_actions: Vec::new(),
         }
     }
+}
+
+/// A user-defined shell-command action: bind a key to run a local program against the entry under the
+/// cursor. **Security-sensitive** — see the module docs and [`validate`](ShellActionDef::validate).
+///
+/// Example:
+/// ```toml
+/// [[shell_actions]]
+/// name = "Checksum"
+/// key = "ctrl+h"
+/// command = "/usr/bin/sha256sum"
+/// args = ["--", "{path}"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellActionDef {
+    /// Human-readable name, shown in the confirm prompt and status line.
+    pub name: String,
+    /// Key chord that triggers it (same syntax as `[ui.keybindings]`, e.g. `"ctrl+h"`).
+    pub key: String,
+    /// The program to run: an absolute path, or a bare name resolved via `PATH`. Relative paths with
+    /// a separator (`./x`, `bin/x`) and `.bat`/`.cmd` are rejected.
+    pub command: String,
+    /// Argument templates. Each element is one argv element (never re-split / shell-parsed). The
+    /// placeholders `{path}` (canonical OS path of the entry), `{dir}` (its parent), and `{name}`
+    /// (file name) are expanded; any other `{...}` token is a config error.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Whether to confirm before running. Defaults to `true` (security default); set `false` per
+    /// action to skip the prompt for a trusted, benign command.
+    #[serde(default = "default_true")]
+    pub confirm: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl ShellActionDef {
+    /// Validate the static (path-independent) shape of the action. Returns a human-readable reason on
+    /// rejection. Called at startup so a bad entry is dropped with a warning rather than failing later.
+    ///
+    /// # Errors
+    /// Empty name/command; a relative command containing a path separator; a `.bat`/`.cmd` command; or
+    /// an arg containing an unknown `{...}` placeholder.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("action has an empty name".to_owned());
+        }
+        if self.command.is_empty() {
+            return Err(format!("action '{}' has an empty command", self.name));
+        }
+        // Program must be absolute or a bare name (resolved via PATH). A relative path *with* a
+        // separator (`./tool`, `bin/tool`) could execute a binary from the browsed directory.
+        let p = Path::new(&self.command);
+        let has_sep = self.command.contains('/') || self.command.contains('\\');
+        if has_sep && !p.is_absolute() {
+            return Err(format!(
+                "action '{}': command must be an absolute path or a bare name, not a relative path",
+                self.name
+            ));
+        }
+        // Windows batch files route through cmd.exe with hazardous quoting — reject on every platform.
+        let lower = self.command.to_ascii_lowercase();
+        if lower.ends_with(".bat") || lower.ends_with(".cmd") {
+            return Err(format!(
+                "action '{}': .bat/.cmd commands are not allowed",
+                self.name
+            ));
+        }
+        for arg in &self.args {
+            if let Some(bad) = unknown_placeholder(arg) {
+                return Err(format!(
+                    "action '{}': unknown placeholder '{{{bad}}}' in argument",
+                    self.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The placeholders an argument may contain. Anything else inside `{...}` is rejected at validation.
+pub const SHELL_ACTION_PLACEHOLDERS: [&str; 3] = ["path", "dir", "name"];
+
+/// Return the first invalid placeholder token inside `{...}` in `arg`, if any — either an unknown name
+/// or an unbalanced `{` with no closing `}`. The string is reported back in the validation error.
+fn unknown_placeholder(arg: &str) -> Option<String> {
+    let mut rest = arg;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            // Unbalanced `{` — a typo/truncated placeholder; reject rather than passing it literally.
+            return Some(rest[open..].to_owned());
+        };
+        let name = &after[..close];
+        if !SHELL_ACTION_PLACEHOLDERS.contains(&name) {
+            return Some(name.to_owned());
+        }
+        rest = &after[close + 1..];
+    }
+    None
 }
 
 /// UI preferences.
@@ -130,6 +242,37 @@ impl Config {
         Ok(config)
     }
 
+    /// Gate the executable [`shell_actions`](Config::shell_actions) on the trust of the file they came
+    /// from. Because that section can run programs, loading it from a file other users can modify would
+    /// be a privilege-escalation vector. On Unix, if `path` is owned by another user or is group-/
+    /// world-writable, the actions are dropped and a warning is returned (the rest of the config is
+    /// kept). Returns `None` when the actions are trusted (or there are none). No-op on non-Unix for
+    /// now (returns a warning if any actions are present so the gap is visible).
+    ///
+    /// Call this immediately after [`load`](Config::load), before using `shell_actions`.
+    #[must_use]
+    pub fn secure_shell_actions(&mut self, path: &Path) -> Option<String> {
+        if self.shell_actions.is_empty() {
+            return None;
+        }
+        match shell_actions_file_trusted(path) {
+            Ok(true) => None,
+            Ok(false) => {
+                let n = self.shell_actions.len();
+                self.shell_actions.clear();
+                Some(format!(
+                    "ignoring {n} shell action(s): {} is writable by other users or not owned by you",
+                    path.display()
+                ))
+            }
+            Err(reason) => {
+                let n = self.shell_actions.len();
+                self.shell_actions.clear();
+                Some(format!("ignoring {n} shell action(s): {reason}"))
+            }
+        }
+    }
+
     /// Serialize and write the config to `path` (creating parent directories).
     ///
     /// # Errors
@@ -142,6 +285,30 @@ impl Config {
         std::fs::write(path, text)?;
         Ok(())
     }
+}
+
+/// Whether `path` is trusted to define executable shell actions: owned by the current user and not
+/// writable by group or others. Unix only; on other platforms returns `Err` so the caller surfaces
+/// that the gate is not yet enforced there.
+#[cfg(unix)]
+fn shell_actions_file_trusted(path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat config: {e}"))?;
+    let mode = meta.mode();
+    // Reject group- or world-writable (0o022). Owner-writable (0o200) is expected.
+    if mode & 0o022 != 0 {
+        return Ok(false);
+    }
+    // Reject files not owned by the current user.
+    if meta.uid() != rustix::process::getuid().as_raw() {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn shell_actions_file_trusted(_path: &Path) -> Result<bool, String> {
+    Err("shell-action file-trust check is not implemented on this platform".to_owned())
 }
 
 /// The default config file path for this platform (`…/cairn/config.toml`), if it can be determined.
@@ -263,5 +430,117 @@ mod tests {
             Config::load(&path),
             Err(ConfigError::Version { .. })
         ));
+    }
+
+    fn action(name: &str, command: &str, args: &[&str]) -> ShellActionDef {
+        ShellActionDef {
+            name: name.to_owned(),
+            key: "ctrl+h".to_owned(),
+            command: command.to_owned(),
+            args: args.iter().map(|s| (*s).to_owned()).collect(),
+            confirm: true,
+        }
+    }
+
+    #[test]
+    fn shell_action_validation() {
+        // A bare program name (PATH-resolved) is valid on every platform.
+        assert!(action("ok-bare", "sha256sum", &["{name}", "--", "{path}"])
+            .validate()
+            .is_ok());
+        // A platform-appropriate *absolute* path is valid (Unix `/usr/...` is not absolute on Windows).
+        #[cfg(unix)]
+        assert!(action("ok-abs", "/usr/bin/sha256sum", &["{path}"])
+            .validate()
+            .is_ok());
+        #[cfg(windows)]
+        assert!(
+            action("ok-abs", r"C:\Windows\System32\where.exe", &["{path}"])
+                .validate()
+                .is_ok()
+        );
+        // empty name / command
+        assert!(action("", "x", &[]).validate().is_err());
+        assert!(action("n", "", &[]).validate().is_err());
+        // relative-with-separator program
+        assert!(action("n", "./tool", &[]).validate().is_err());
+        assert!(action("n", "bin/tool", &[]).validate().is_err());
+        // batch files
+        assert!(action("n", "evil.bat", &[]).validate().is_err());
+        assert!(action("n", "EVIL.CMD", &[]).validate().is_err());
+        // unknown placeholder
+        assert!(action("n", "echo", &["{oops}"]).validate().is_err());
+        // unbalanced brace (no closing `}`) is rejected, not silently accepted
+        assert!(action("n", "echo", &["{path"]).validate().is_err());
+        // known placeholders embedded in text are fine
+        assert!(action("n", "tar", &["{name}.tgz", "{dir}"])
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn shell_actions_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.shell_actions
+            .push(action("Checksum", "/usr/bin/sha256sum", &["--", "{path}"]));
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.shell_actions.len(), 1);
+        assert_eq!(loaded.shell_actions[0].name, "Checksum");
+        assert!(loaded.shell_actions[0].confirm, "confirm defaults to true");
+    }
+
+    #[test]
+    fn confirm_defaults_to_true_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "version = 1\n[[shell_actions]]\nname = \"x\"\nkey = \"f9\"\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.shell_actions[0].confirm);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_shell_actions_drops_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.shell_actions.push(action("x", "true", &[]));
+        cfg.save(&path).unwrap();
+        // World-writable config → actions dropped with a warning.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let warn = cfg.secure_shell_actions(&path);
+        assert!(warn.is_some(), "expected a warning");
+        assert!(cfg.shell_actions.is_empty(), "actions must be dropped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_shell_actions_keeps_owner_only_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.shell_actions.push(action("x", "true", &[]));
+        cfg.save(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let warn = cfg.secure_shell_actions(&path);
+        assert!(warn.is_none(), "owner-only config is trusted: {warn:?}");
+        assert_eq!(cfg.shell_actions.len(), 1);
+    }
+
+    #[test]
+    fn secure_shell_actions_noop_without_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        assert!(cfg.secure_shell_actions(&path).is_none());
     }
 }
