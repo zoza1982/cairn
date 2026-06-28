@@ -4,7 +4,7 @@
 |----------|--------|---------|
 | [PRD.md](PRD.md) | Draft | Product requirements — *what* we build and *why* (high-level) |
 | [LLD.md](LLD.md) | Draft | Low-Level Design — architecture, VFS abstraction, async/TEA model, transfer engine, vault crypto, AI layer, plugin sandbox |
-| Implementation Plan | Planned | Milestones, per-backend sequencing, testing & release strategy |
+| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Draft | Milestones, sequencing, dependency graph, RFC ordering — **and the living progress tracker** |
 
 ## Subdirectories
 
