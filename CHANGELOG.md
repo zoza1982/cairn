@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AI **plan execution** (M7-6): a `BinaryStepExecutor` (RFC-0007) runs an approved plan's steps
+  against the registered backends — the safe/local tools (`list`/`stat`/`read`/`copy`/`move`/
+  `delete`) execute now via the VFS/transfer engine, resolving the model's opaque `conn:N` handles to
+  backends; `exec`/`logs`/`port_forward`/`open_connection` report "not yet available" until the live
+  invoke path (RFC-0007 Gap 1) lands. `Ctrl-A` now drives the full plan → confirm → **execute** loop.
 - RFC-0007 (action invocation & agent-execution routing): resolves the two routing design gaps the
   review gates flagged — adds `path` to `Vfs::invoke` and defines `ActionOutcome::Session`/
   `SessionHandle` (Gap 1), and a typed per-tool input schema plus a `BinaryStepExecutor` that maps

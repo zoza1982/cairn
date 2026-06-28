@@ -6,6 +6,7 @@
 
 mod app;
 mod cli;
+mod executor;
 mod logging;
 mod panic;
 

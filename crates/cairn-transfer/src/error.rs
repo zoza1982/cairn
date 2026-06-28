@@ -23,3 +23,19 @@ pub enum TransferError {
     #[error("cancelled")]
     Cancelled,
 }
+
+impl TransferError {
+    /// A secret-free, path-free message safe to show in the UI or feed back to the AI layer. The
+    /// `Display` impls embed `VfsPath`s and backend messages; this drops them (delegating to
+    /// [`VfsError::redacted`] for the backend arm).
+    #[must_use]
+    pub fn redacted(&self) -> String {
+        match self {
+            TransferError::Vfs(e) => e.redacted().to_string(),
+            TransferError::Path(_) => "invalid path".to_owned(),
+            TransferError::Conflict(_) => "destination already exists".to_owned(),
+            TransferError::VerifyFailed(_) => "verification failed".to_owned(),
+            TransferError::Cancelled => "cancelled".to_owned(),
+        }
+    }
+}
