@@ -17,6 +17,24 @@ impl ActionId {
     pub fn new(s: &str) -> Self {
         Self(SmolStr::new(s))
     }
+
+    /// The id as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// Canonical ids for the built-in backend actions — a single source of truth shared by the backends
+/// that advertise them ([`crate::Vfs::actions_at`]) and the code that will dispatch them
+/// ([`crate::Vfs::invoke`]), so advertisement and dispatch can never drift on a typo.
+pub mod action_ids {
+    /// Run a command in a container/pod.
+    pub const EXEC: &str = "exec";
+    /// Stream logs from a container/pod.
+    pub const LOGS: &str = "logs";
+    /// Forward a local port to a pod port.
+    pub const PORT_FORWARD: &str = "port-forward";
 }
 
 /// Describes an action available at a path, for rendering in the action menu.

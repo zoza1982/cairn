@@ -16,9 +16,9 @@ pub use ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteM
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryExt, EntryKind, Scheme, VfsPath};
 use cairn_vfs::{
-    apply_byte_range, join_abs_path, ActionDescriptor, ActionId, ActionKind, ByteRange,
-    CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs, VfsError, WriteHandle,
-    WriteOpts,
+    action_ids, apply_byte_range, join_abs_path, ActionCtx, ActionDescriptor, ActionId, ActionKind,
+    ActionOutcome, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs,
+    VfsError, WriteHandle, WriteOpts,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -256,31 +256,34 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
     }
 
     /// Advertise the action surface by depth: a pod offers `logs` and `port-forward`; a container
-    /// offers `logs` and `exec`. Actions are discoverable now; live invocation (log/exec streams and
-    /// port-forward sessions over the cluster API) is the integration step, so the inherited
+    /// offers `logs` and `exec`. This reflects path *shape*, not existence (it does no I/O); existence
+    /// is enforced by `stat`/`invoke`. Actions are discoverable now; live invocation (log/exec streams
+    /// and port-forward sessions over the cluster API) is the integration step, so the inherited
     /// [`Vfs::invoke`] still returns [`VfsError::Unsupported`].
     fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
         let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
         let logs = || ActionDescriptor {
-            id: ActionId::new("logs"),
+            id: ActionId::new(action_ids::LOGS),
             label: SmolStr::new("Stream logs"),
             kind: ActionKind::Stream,
             destructive: false,
         };
         match segs.as_slice() {
+            // depth == CONTAINER_LEVEL - 1: a pod.
             [_ctx, _ns, _pod] => vec![
                 logs(),
                 ActionDescriptor {
-                    id: ActionId::new("port-forward"),
+                    id: ActionId::new(action_ids::PORT_FORWARD),
                     label: SmolStr::new("Port-forward"),
                     kind: ActionKind::Session,
                     destructive: false,
                 },
             ],
+            // depth >= CONTAINER_LEVEL: a container, or a path inside its filesystem.
             [_ctx, _ns, _pod, _container, ..] => vec![
                 logs(),
                 ActionDescriptor {
-                    id: ActionId::new("exec"),
+                    id: ActionId::new(action_ids::EXEC),
                     label: SmolStr::new("Exec"),
                     kind: ActionKind::Interactive,
                     destructive: false,
@@ -288,6 +291,16 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
             ],
             _ => Vec::new(),
         }
+    }
+
+    async fn invoke(&self, action: ActionId, _ctx: ActionCtx) -> Result<ActionOutcome, VfsError> {
+        // Advertised by `actions_at`; live invocation (log/exec streams, port-forward sessions over
+        // the cluster API) is the integration step — reported distinctly from an unknown action.
+        Err(VfsError::Backend {
+            code: "not_implemented".to_owned(),
+            msg: format!("action '{}' is not yet available", action.as_str()),
+            retryable: false,
+        })
     }
 }
 
@@ -485,20 +498,24 @@ mod tests {
         let ids = |path: &str| -> Vec<String> {
             vfs.actions_at(&p(path))
                 .iter()
-                .map(|a| a.id.0.to_string())
+                .map(|a| a.id.as_str().to_owned())
                 .collect()
         };
-        // Pod: logs + port-forward. Container: logs + exec.
+        // Pod: logs + port-forward. Container (and deeper in its fs): logs + exec.
         assert_eq!(ids("/prod/default/web-0"), vec!["logs", "port-forward"]);
         assert_eq!(ids("/prod/default/web-0/app"), vec!["logs", "exec"]);
+        assert_eq!(
+            ids("/prod/default/web-0/app/etc/hostname"),
+            vec!["logs", "exec"]
+        );
         // The navigation tree above a pod has no actions.
         assert!(vfs.actions_at(&p("/prod/default")).is_empty());
         assert!(vfs.actions_at(&p("/")).is_empty());
-        // Invocation is the integration step — still unsupported.
+        // Invocation is the integration step — advertised but not yet implemented.
         assert!(matches!(
-            vfs.invoke(ActionId::new("logs"), cairn_vfs::ActionCtx::None)
+            vfs.invoke(ActionId::new(action_ids::LOGS), ActionCtx::None)
                 .await,
-            Err(VfsError::Unsupported(_))
+            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
         ));
     }
 }

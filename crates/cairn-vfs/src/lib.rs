@@ -15,7 +15,7 @@ mod vfs;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
 
-pub use action::{ActionCtx, ActionDescriptor, ActionId, ActionKind, ActionOutcome};
+pub use action::{action_ids, ActionCtx, ActionDescriptor, ActionId, ActionKind, ActionOutcome};
 pub use error::{BoxError, RedactedError, VfsError};
 pub use handle::{ReadHandle, WriteHandle, WriteSink};
 pub use registry::VfsRegistry;
