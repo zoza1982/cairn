@@ -2098,6 +2098,7 @@ mod tests {
                 capability: capability_for(tool).expect("known tool"),
                 status: StepStatus::Pending,
                 error: None,
+                output: None,
             })
             .collect();
         Plan {

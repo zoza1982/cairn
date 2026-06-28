@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destinations untouched. (The AI executor already refused such overwrites.)
 
 ### Added
+- **AI step output** (M7-6 / RFC-0007 Gap 1): an executed plan's read-style steps now surface a
+  short, secret-free summary instead of being validate-only — `list → 12 entries`, `stat → file,
+  1.2 KiB`, `read → 1.2 KiB`, `delete → removed 3`. The summaries appear in the plan-complete status;
+  they are shown to the **user only** and never fed back to the model (no file contents, just counts/
+  sizes/kinds).
 - **AI plan-execution cancellation** (M7-4/M7-6): `Esc` aborts an approved plan that is executing —
   the runtime polls a cancellation token between steps, so already-run steps stay applied and the
   remainder is skipped (`Plan cancelled after N step(s)`). While a plan executes, competing
