@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destinations untouched. (The AI executor already refused such overwrites.)
 
 ### Added
+- **Transfer pause/resume — engine plumbing** (M2): the transfer engine now takes a
+  `paused: &watch::Receiver<bool>` and blocks at the next check-point (between items, tree nodes, and
+  mid-file between chunks) while it holds `true`, resuming when it flips back to `false`. Waiting is
+  deadlock-safe (cloned receiver + `borrow_and_update` + `select!` on `changed()` vs cancel) and
+  cancellation takes priority over a pause, so `Esc` aborts a paused transfer immediately. The UI does
+  not yet drive the pause signal — callers feed a never-paused channel — so behaviour is unchanged for
+  now; the `watch::Sender` is wired into the event loop in a follow-up.
 - **AI step output** (M7-6 / RFC-0007 Gap 1): an executed plan's read-style steps now surface a
   short, secret-free summary instead of being validate-only — `list → 12 entries`, `stat → file,
   1.2 KiB`, `read → 1.2 KiB`, `delete → removed 3`. The summaries appear in the plan-complete status;

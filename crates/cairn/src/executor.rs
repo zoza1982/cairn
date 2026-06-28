@@ -191,7 +191,9 @@ impl StepExecutor for BinaryStepExecutor {
                     verify: VerifyPolicy::Size,
                 };
                 let cancel = CancellationToken::new();
-                run_transfer(&src, &dst, &items, spec, &cancel, &mut |_| {})
+                // AI-driven transfers are not pausable from the UI, so feed a never-paused channel.
+                let (_pause_tx, paused) = tokio::sync::watch::channel(false);
+                run_transfer(&src, &dst, &items, spec, &cancel, &paused, &mut |_| {})
                     .await
                     .map(|_| None)
                     .map_err(|e| e.redacted())

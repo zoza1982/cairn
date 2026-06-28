@@ -563,7 +563,12 @@ async fn run_transfer_effect(
             });
         }
     };
-    match cairn_transfer::run_transfer(&src, &dst, &items, spec, &cancel, &mut on_progress).await {
+    // Pause/resume is plumbed through the engine but not yet driven from the UI, so feed a
+    // never-paused channel here. The event loop will own the real `watch::Sender` in a follow-up.
+    let (_pause_tx, paused) = tokio::sync::watch::channel(false);
+    match cairn_transfer::run_transfer(&src, &dst, &items, spec, &cancel, &paused, &mut on_progress)
+        .await
+    {
         Ok(out) => {
             // Flush the exact final total for one frame before `TransferDone` clears the indicator
             // (so a transfer smaller than the coalescing step doesn't only ever show "0 B").
