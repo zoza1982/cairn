@@ -14,13 +14,16 @@ With a secure secrets vault and an agentic AI assistant.
 
 </div>
 
-> **Status:** 🚧 Alpha. **Working today:** an interactive dual-pane **local** file manager
-> (browse, navigate, sort, mark) with a cross-backend **transfer engine** (copy/move/delete with a
-> confirm dialog), an encrypted **secrets vault** (XChaCha20-Poly1305 + Argon2id) behind a capability
-> **broker**, TOML **config**, the object-store **abstraction** (mock-tested), and the **agentic AI
-> core** (provider/tools/plan→confirm). **Designed, not yet implemented:** the SSH, S3/GCS/Azure,
-> Docker, and Kubernetes backends and the WASM plugin host (they need live services + heavy SDKs).
-> See [`docs/PRD.md`](docs/PRD.md), [`docs/LLD.md`](docs/LLD.md), and the live
+> **Status:** 🚧 Alpha. **Working today:** an interactive dual-pane **local** file manager (browse,
+> navigate, sort, mark) with **configurable keybindings**, a cross-backend **transfer engine**
+> (copy/move/delete with a confirm dialog), an encrypted **secrets vault** (XChaCha20-Poly1305 +
+> Argon2id) behind a capability **broker**, TOML **config**, and an **AI plan → confirm** overlay.
+> **Backend mapping cores** for **SSH/SFTP**, **object stores** (S3/GCS/Azure-shaped), **Docker**, and
+> **Kubernetes** are implemented against a transport seam and fully unit-tested with in-memory mocks,
+> and the **WASM plugin host** (wasmtime, resource-limited, default-deny) runs sandboxed modules.
+> **Still integration-bound** (need live services + heavy SDKs/TLS): the live SSH/cloud/cluster
+> transports, the HTTP LLM providers, and the WASM component-model bridge. See
+> [`docs/PRD.md`](docs/PRD.md), [`docs/LLD.md`](docs/LLD.md), and the live
 > [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
 
 ---
@@ -53,7 +56,6 @@ credentials handled safely and an AI layer that turns intent into reviewed, exec
 | [PRD](docs/PRD.md) | Product requirements — *what* and *why* (high-level) |
 | [LLD](docs/LLD.md) | Low-Level Design — architecture & technical design |
 | [Implementation Plan](docs/IMPLEMENTATION_PLAN.md) | Milestones, sequencing, and the living progress tracker |
-| Implementation Plan | Milestones & sequencing *(planned)* |
 | [ADRs](docs/adr/) | Architecture Decision Records |
 | [RFCs](docs/rfcs/) | Design proposals for non-trivial work |
 | [Contributing](CONTRIBUTING.md) | How to build, branch, and submit changes |
@@ -65,6 +67,24 @@ credentials handled safely and an AI layer that turns intent into reviewed, exec
 ```sh
 cargo build --workspace
 cargo run -p cairn
+```
+
+## Configuration
+
+Cairn reads an optional TOML config from the platform config directory (e.g.
+`~/.config/cairn/config.toml` on Linux); a missing or unreadable file falls back to defaults.
+
+Keys can be remapped under `[ui.keybindings]` — a map of key-chord → action, layered over the
+built-in scheme. Chords combine optional `ctrl+`/`alt+`/`shift+` modifiers with a key (a single
+character, a named key like `enter`/`space`/`esc`/`tab`/arrows, or `f1`–`f24`); actions are
+snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `quit`, …). Unrecognized entries
+are ignored with a warning, and `Ctrl-C` always quits.
+
+```toml
+[ui.keybindings]
+"ctrl+a" = "ai_propose"   # ask the AI assistant for a plan
+"G"      = "cursor_bottom"
+"f5"     = "copy"
 ```
 
 ## Contributing
