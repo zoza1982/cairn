@@ -21,8 +21,8 @@
 | **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0004 |
 | **Current milestone** | **Hermetic milestones delivered; SDK/service backends env-deferred** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
-| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core ✅ · M4/M6/M8 + cloud providers ⏭ |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 24 / 12 / 0 / 0 / 35 |
+| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core + M8 runtime core ✅ · M4/M6 + cloud providers ⏭ |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 25 / 12 / 0 / 0 / 34 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
 
@@ -208,13 +208,13 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M8-1 | RFC: **plugin host & WIT ABI** (worlds, capability grants, streaming-by-polling, versioning) | plugin-systems-engineer, technical-writer | M3-5 | RFC merged; confirm ADR-0004 | approved before M8-2 | ⏭ env-deferred (wasmtime + WASM toolchain) |
-| M8-2 | `cairn-plugin`: wasmtime host, WIT bindings, default-deny Linker, per-instance Store, ResourceLimiter, epoch timeout | plugin-systems-engineer | M8-1 | rustdoc | spinning plugin can't hang UI (epoch test); ungranted import fails at instantiate | ⏭ env-deferred (wasmtime + WASM toolchain) |
-| M8-3 | `PluginVfsBackend` bridge: guest `backend` export → `Vfs` (chunked-poll) | plugin-systems-engineer, rust-staff-engineer | M8-2 | rustdoc | plugin backend passes MockVfs contract suite | ⏭ env-deferred (wasmtime + WASM toolchain) |
-| M8-4 | Brokered creds/HTTP for plugins (UUID stand-in, host substitutes secret), journaled `Actor::Plugin` | plugin-systems-engineer, security-engineer | M8-2, M3-5 | rustdoc; threat-model | plugin never sees secret value (test); brokered HTTP only | ⏭ env-deferred (wasmtime + WASM toolchain) |
-| M8-5 | Manifest (`plugin.toml` + wasm section), install-time capability approval UI, revocation | plugin-systems-engineer, tui-engineer | M8-2 | user docs; plugin author guide | **Demo:** install a sample plugin backend, approve caps, browse | ⏭ env-deferred (wasmtime + WASM toolchain) |
-| M8-6 | `cairn-plugin-sdk` (optional) + sample guest `.wasm` fixtures for CI | plugin-systems-engineer | M8-3 | SDK docs | fixtures checked in; plugin tests need no WASM toolchain in CI | ⏭ env-deferred (wasmtime + WASM toolchain) |
-| M8-7 | Declarative config extensions (keybinds, themes, shell-command actions, aliases) | software-engineer, tui-engineer | M3-6 | user docs | config-only action runs without a plugin | ⏭ env-deferred (wasmtime + WASM toolchain) |
+| M8-1 | RFC: **plugin host & WIT ABI** (worlds, capability grants, streaming-by-polling, versioning) | plugin-systems-engineer, technical-writer | M3-5 | RFC merged; confirm ADR-0004 | approved before M8-2 | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |
+| M8-2 | `cairn-plugin`: wasmtime host, WIT bindings, default-deny Linker, per-instance Store, ResourceLimiter, epoch timeout | plugin-systems-engineer | M8-1 | rustdoc | spinning plugin can't hang UI (epoch test); ungranted import fails at instantiate | ✅ #18 (wasmtime host: fuel limit traps runaway guest, memory cap, default-deny imports; 6 tests) |
+| M8-3 | `PluginVfsBackend` bridge: guest `backend` export → `Vfs` (chunked-poll) | plugin-systems-engineer, rust-staff-engineer | M8-2 | rustdoc | plugin backend passes MockVfs contract suite | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |
+| M8-4 | Brokered creds/HTTP for plugins (UUID stand-in, host substitutes secret), journaled `Actor::Plugin` | plugin-systems-engineer, security-engineer | M8-2, M3-5 | rustdoc; threat-model | plugin never sees secret value (test); brokered HTTP only | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |
+| M8-5 | Manifest (`plugin.toml` + wasm section), install-time capability approval UI, revocation | plugin-systems-engineer, tui-engineer | M8-2 | user docs; plugin author guide | **Demo:** install a sample plugin backend, approve caps, browse | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |
+| M8-6 | `cairn-plugin-sdk` (optional) + sample guest `.wasm` fixtures for CI | plugin-systems-engineer | M8-3 | SDK docs | fixtures checked in; plugin tests need no WASM toolchain in CI | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |
+| M8-7 | Declarative config extensions (keybinds, themes, shell-command actions, aliases) | software-engineer, tui-engineer | M3-6 | user docs | config-only action runs without a plugin | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |
 
 ### v0.1 — Release
 

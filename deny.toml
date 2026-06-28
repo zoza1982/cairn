@@ -19,6 +19,8 @@ version = 2
 # Only permissive licenses compatible with Apache-2.0 OR MIT.
 allow = [
     "Apache-2.0",
+    # wasmtime / cranelift and several Bytecode Alliance crates use this; still permissive.
+    "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
