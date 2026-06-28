@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-integration-engineer`, `plugin-systems-engineer`, `container-backend-engineer`,
   `technical-writer`, plus client-backend-focused `kube-staff-engineer`, `network-engineer`,
   `storage-engineer`, and a Rust-focused `code-reviewer`.
+- Low-Level Design (`docs/LLD.md`): architecture, the core async VFS abstraction + capability
+  model, tokio/TEA app model, transfer engine, object-store backends, secrets vault + AI/plugin
+  broker boundary, AI agentic layer, and WASM plugin system.
+- ADRs recording the load-bearing decisions: core architecture (ADR-0001), vault crypto + broker
+  boundary (ADR-0002), object-store SDKs (ADR-0003), WASM plugin runtime (ADR-0004).
 
 ### Changed
 - Renumbered `CLAUDE.md` sections to accommodate the new team-of-agents model (§2).
