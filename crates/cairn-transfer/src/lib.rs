@@ -13,6 +13,7 @@ use futures::StreamExt;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 mod error;
@@ -93,24 +94,41 @@ pub struct TransferOutcome {
 /// `progress` is called with the number of bytes written by each chunk. Cancellation is cooperative:
 /// the token is checked between chunks and between items; an in-flight write is aborted.
 ///
+/// While `paused` holds `true` the transfer blocks at the next check-point (between items, tree
+/// nodes, and chunks) until it flips back to `false` or the token is cancelled. If the `paused`
+/// sender is dropped, the transfer treats it as resumed and proceeds.
+///
 /// # Errors
 /// Returns [`TransferError`] on the first failing item (I/O, conflict under `Prompt`, or cancellation).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_transfer(
     src: &Arc<dyn Vfs>,
     dst: &Arc<dyn Vfs>,
     items: &[(VfsPath, VfsPath)],
     spec: TransferSpec,
     cancel: &CancellationToken,
+    paused: &watch::Receiver<bool>,
     progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<TransferOutcome, TransferError> {
     let mut outcome = TransferOutcome::default();
     for (from, to) in items {
-        if cancel.is_cancelled() {
+        if !wait_while_paused(paused, cancel).await {
             return Err(TransferError::Cancelled(outcome));
         }
         // On cancellation, report the work actually completed so far (the nested marker carries a
         // placeholder outcome; the accumulated `outcome` here is the real one).
-        if let Err(e) = transfer_one(src, dst, from, to, spec, cancel, progress, &mut outcome).await
+        if let Err(e) = transfer_one(
+            src,
+            dst,
+            from,
+            to,
+            spec,
+            cancel,
+            paused,
+            progress,
+            &mut outcome,
+        )
+        .await
         {
             return match e {
                 TransferError::Cancelled(_) => Err(TransferError::Cancelled(outcome)),
@@ -121,6 +139,35 @@ pub async fn run_transfer(
     Ok(outcome)
 }
 
+/// Block while the transfer is paused, returning when it resumes. Returns `false` if cancelled (so
+/// the caller aborts), `true` to proceed. Deadlock-safe: a cloned `watch` receiver tracks versions,
+/// so a resume that races the wait is never lost.
+async fn wait_while_paused(paused: &watch::Receiver<bool>, cancel: &CancellationToken) -> bool {
+    let mut rx = paused.clone();
+    loop {
+        // Cancellation always wins, even on the not-paused fast path: this helper replaces the bare
+        // `cancel.is_cancelled()` guards at the loop tops, so it must honour the token whether or not
+        // a pause is active (otherwise an Esc during a same-connection rename/server-copy — which have
+        // no inner chunk loop to re-check — would be ignored).
+        if cancel.is_cancelled() {
+            return false;
+        }
+        // `borrow_and_update` reads the latest value and marks it seen, so the next `changed()`
+        // waits for the *next* toggle — closing the lost-wakeup window.
+        if !*rx.borrow_and_update() {
+            return true;
+        }
+        tokio::select! {
+            res = rx.changed() => {
+                if res.is_err() {
+                    return true; // sender dropped → treat as unpaused
+                }
+            }
+            () = cancel.cancelled() => return false,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn transfer_one(
     src: &Arc<dyn Vfs>,
@@ -129,6 +176,7 @@ async fn transfer_one(
     to: &VfsPath,
     spec: TransferSpec,
     cancel: &CancellationToken,
+    paused: &watch::Receiver<bool>,
     progress: &mut (dyn FnMut(u64) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
@@ -142,7 +190,7 @@ async fn transfer_one(
         return Ok(());
     }
 
-    copy_tree(src, dst, from, to, spec, cancel, progress, outcome).await?;
+    copy_tree(src, dst, from, to, spec, cancel, paused, progress, outcome).await?;
 
     if spec.op == TransferOp::Move {
         src.remove(from, Recurse::Yes).await?;
@@ -158,6 +206,7 @@ async fn copy_tree(
     to: &VfsPath,
     spec: TransferSpec,
     cancel: &CancellationToken,
+    paused: &watch::Receiver<bool>,
     progress: &mut (dyn FnMut(u64) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
@@ -165,7 +214,7 @@ async fn copy_tree(
     stack.push_back((from.clone(), to.clone()));
 
     while let Some((f, t)) = stack.pop_back() {
-        if cancel.is_cancelled() {
+        if !wait_while_paused(paused, cancel).await {
             // INVARIANT: this placeholder outcome is always replaced by `run_transfer` with the
             // real accumulated outcome; these private helpers never surface `Cancelled` to callers.
             return Err(TransferError::Cancelled(TransferOutcome::default()));
@@ -184,7 +233,7 @@ async fn copy_tree(
                 }
             }
         } else {
-            copy_file(src, dst, &f, &t, spec, cancel, progress, outcome).await?;
+            copy_file(src, dst, &f, &t, spec, cancel, paused, progress, outcome).await?;
         }
     }
     Ok(())
@@ -198,6 +247,7 @@ async fn copy_file(
     to: &VfsPath,
     spec: TransferSpec,
     cancel: &CancellationToken,
+    paused: &watch::Receiver<bool>,
     progress: &mut (dyn FnMut(u64) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
@@ -236,7 +286,10 @@ async fn copy_file(
     let mut buf = vec![0u8; CHUNK];
     let mut written: u64 = 0;
     loop {
-        if cancel.is_cancelled() {
+        // Pause is checked between chunks (mid-file): block here until resumed or cancelled.
+        // `wait_while_paused` checks the token itself (cancel wins even when not paused), so a
+        // separate `is_cancelled()` here would be redundant.
+        if !wait_while_paused(paused, cancel).await {
             writer.abort().await;
             // INVARIANT: this placeholder outcome is always replaced by `run_transfer` with the
             // real accumulated outcome; these private helpers never surface `Cancelled` to callers.
@@ -342,6 +395,12 @@ mod tests {
 
     fn noop(_b: u64) {}
 
+    /// A receiver that is never paused. The sender is dropped immediately, which is fine: while the
+    /// value is `false`, `wait_while_paused` returns before it ever awaits `changed()`.
+    fn never_paused() -> watch::Receiver<bool> {
+        watch::channel(false).1
+    }
+
     async fn read_file(vfs: &Arc<dyn Vfs>, path: &str) -> String {
         use tokio::io::AsyncReadExt;
         let mut rh = vfs.open_read(&p(path), None).await.unwrap();
@@ -362,6 +421,51 @@ mod tests {
         (src, dst)
     }
 
+    /// A single backend used as both source and destination, so a `Move` takes the same-connection
+    /// rename fast-path (no chunk loop) — the path where a missed cancellation check would matter.
+    fn same_conn() -> Arc<dyn Vfs> {
+        Arc::new(
+            MockVfs::new(ConnectionId(7))
+                .with_file("/a.txt", b"aaa")
+                .with_file("/b.txt", b"bbb"),
+        )
+    }
+
+    #[tokio::test]
+    async fn cancel_before_same_connection_move_does_nothing() {
+        // Regression: the per-item cancel check lives in `wait_while_paused`, which must honour a
+        // pre-cancelled token even on the not-paused fast path. The rename fast-path has no inner
+        // chunk loop, so without that check a cancelled bulk move would still rename every item.
+        let vfs = same_conn();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let spec = TransferSpec {
+            op: TransferOp::Move,
+            ..TransferSpec::default()
+        };
+        let res = run_transfer(
+            &vfs,
+            &vfs,
+            &[
+                (p("/a.txt"), p("/moved-a.txt")),
+                (p("/b.txt"), p("/moved-b.txt")),
+            ],
+            spec,
+            &cancel,
+            &never_paused(),
+            &mut noop,
+        )
+        .await;
+        assert!(matches!(
+            res,
+            Err(TransferError::Cancelled(o)) if o.files == 0
+        ));
+        // Neither source was renamed away.
+        assert!(vfs.stat(&p("/a.txt")).await.is_ok());
+        assert!(vfs.stat(&p("/b.txt")).await.is_ok());
+        assert!(vfs.stat(&p("/moved-a.txt")).await.is_err());
+    }
+
     #[tokio::test]
     async fn copy_single_file_cross_backend() {
         let (src, dst) = cross();
@@ -373,6 +477,7 @@ mod tests {
             &[(p("/top.txt"), p("/top.txt"))],
             TransferSpec::default(),
             &cancel,
+            &never_paused(),
             &mut |b| bytes += b,
         )
         .await
@@ -393,6 +498,7 @@ mod tests {
             &[(p("/d"), p("/d"))],
             TransferSpec::default(),
             &cancel,
+            &never_paused(),
             &mut noop,
         )
         .await
@@ -416,6 +522,7 @@ mod tests {
             &[(p("/top.txt"), p("/top.txt"))],
             spec,
             &cancel,
+            &never_paused(),
             &mut noop,
         )
         .await
@@ -438,6 +545,7 @@ mod tests {
             &[(p("/top.txt"), p("/x.txt"))],
             TransferSpec::default(),
             &CancellationToken::new(),
+            &never_paused(),
             &mut noop,
         )
         .await
@@ -454,6 +562,7 @@ mod tests {
             &[(p("/d/a.txt"), p("/x.txt"))],
             spec,
             &CancellationToken::new(),
+            &never_paused(),
             &mut noop,
         )
         .await
@@ -472,6 +581,7 @@ mod tests {
             &[(p("/d/a.txt"), p("/x.txt"))],
             spec,
             &CancellationToken::new(),
+            &never_paused(),
             &mut noop,
         )
         .await;
@@ -487,6 +597,7 @@ mod tests {
             &[(p("/top.txt"), p("/x.txt"))],
             TransferSpec::default(),
             &CancellationToken::new(),
+            &never_paused(),
             &mut noop,
         )
         .await
@@ -501,6 +612,7 @@ mod tests {
             &[(p("/d/a.txt"), p("/x.txt"))],
             spec,
             &CancellationToken::new(),
+            &never_paused(),
             &mut noop,
         )
         .await
@@ -520,6 +632,7 @@ mod tests {
             &[(p("/top.txt"), p("/top.txt"))],
             TransferSpec::default(),
             &cancel,
+            &never_paused(),
             &mut noop,
         )
         .await;
@@ -550,6 +663,7 @@ mod tests {
             &[(p("/top.txt"), p("/a.txt")), (p("/top.txt"), p("/b.txt"))],
             TransferSpec::default(),
             &cancel,
+            &never_paused(),
             &mut on_progress,
         )
         .await;
@@ -587,6 +701,7 @@ mod tests {
             &[(p("/d/a.txt"), p("/a.txt")), (p("/d/b.txt"), p("/b.txt"))],
             spec,
             &cancel,
+            &never_paused(),
             &mut on_progress,
         )
         .await;
@@ -600,5 +715,76 @@ mod tests {
         // Item 2 was cancelled mid-copy: source still intact (no data lost), dest aborted.
         assert!(src.stat(&p("/d/b.txt")).await.is_ok());
         assert!(dst.stat(&p("/b.txt")).await.is_err());
+    }
+
+    // Current-thread flavor is required: the `yield_now` below deterministically hands control to the
+    // spawned transfer, which runs until it parks on the paused watch and no further.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pause_holds_then_resume_completes() {
+        // Start paused: the engine must block before writing anything, then complete once resumed.
+        // The default current-thread runtime makes this deterministic — `yield_now` lets the spawned
+        // transfer run up to the point where it parks on the paused watch, and no further.
+        let (src, dst) = cross();
+        let cancel = CancellationToken::new();
+        let (pause_tx, paused) = watch::channel(true);
+        let task = {
+            let (src, dst) = (src.clone(), dst.clone());
+            tokio::spawn(async move {
+                run_transfer(
+                    &src,
+                    &dst,
+                    &[(p("/top.txt"), p("/top.txt"))],
+                    TransferSpec::default(),
+                    &cancel,
+                    &paused,
+                    &mut noop,
+                )
+                .await
+            })
+        };
+        // Give the transfer a chance to run; while paused it must not touch the destination.
+        tokio::task::yield_now().await;
+        assert!(
+            dst.stat(&p("/top.txt")).await.is_err(),
+            "destination must not be written while paused"
+        );
+        // Resume → the transfer proceeds to completion.
+        pause_tx.send(false).unwrap();
+        let out = task.await.unwrap().unwrap();
+        assert_eq!(out.files, 1);
+        assert_eq!(read_file(&dst, "/top.txt").await, "top");
+    }
+
+    // Current-thread flavor: see `pause_holds_then_resume_completes` — `yield_now` parks the spawned
+    // transfer on the paused watch before we cancel it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pause_then_cancel_aborts() {
+        // A paused transfer that is then cancelled must abort with a partial (here, empty) outcome
+        // rather than hang — `wait_while_paused` selects on cancellation too.
+        let (src, dst) = cross();
+        let cancel = CancellationToken::new();
+        let (_pause_tx, paused) = watch::channel(true);
+        let res = {
+            let c = cancel.clone();
+            let task = tokio::spawn(async move {
+                run_transfer(
+                    &src,
+                    &dst,
+                    &[(p("/top.txt"), p("/top.txt"))],
+                    TransferSpec::default(),
+                    &c,
+                    &paused,
+                    &mut noop,
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+            cancel.cancel();
+            task.await.unwrap()
+        };
+        assert!(matches!(
+            res,
+            Err(TransferError::Cancelled(o)) if o == TransferOutcome::default()
+        ));
     }
 }
