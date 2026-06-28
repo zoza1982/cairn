@@ -66,6 +66,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-core"
+version = "0.0.0"
+dependencies = [
+ "cairn-types",
+ "cairn-vfs",
+]
+
+[[package]]
 name = "cairn-types"
 version = "0.0.0"
 dependencies = [
