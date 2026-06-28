@@ -13,6 +13,12 @@ authors = ["The Cairn Authors"]
 keywords = ["tui", "file-manager", "cloud", "kubernetes", "s3"]
 categories = ["command-line-utilities", "filesystem"]
 
+# Internal crates are referenced via the workspace so their (path + version) is declared once.
+# The version makes them non-wildcard for cargo-deny and keeps them publishable later.
+[workspace.dependencies]
+cairn-types = { path = "crates/cairn-types", version = "0.0.0" }
+cairn-vfs = { path = "crates/cairn-vfs", version = "0.0.0" }
+
 # Lints applied across the whole workspace. Keep the bar high, but keep velocity:
 # CI runs clippy with `-D warnings`, so anything at `warn` here is a hard error.
 # We deny the correctness group and forbid unsafe; rustdoc is required on public items.
