@@ -15,8 +15,10 @@ workspace = true
 [dependencies]
 cairn-secrets = { workspace = true }
 argon2 = "0.5"
-chacha20poly1305 = "0.10"
-getrandom = "0.2"
+# `zeroize` is opt-in since 0.11 (it was default in 0.10); keep it so the cipher's internal key copy
+# is wiped on drop (CLAUDE.md §9 — don't drop this feature when trimming).
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+getrandom = "0.4"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"

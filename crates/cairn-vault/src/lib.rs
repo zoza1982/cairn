@@ -142,10 +142,12 @@ impl Vault {
         let bytes = std::fs::read(&path)?;
         let parsed = parse(&bytes)?;
         let kek = derive_kek(passphrase, &parsed.params)?;
-        let cipher = XChaCha20Poly1305::new(kek.as_ref().into());
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(kek.as_ref()).map_err(|_| VaultError::Decrypt)?;
+        let nonce = XNonce::try_from(&parsed.nonce[..]).map_err(|_| VaultError::Decrypt)?;
         let plaintext = cipher
             .decrypt(
-                XNonce::from_slice(&parsed.nonce),
+                &nonce,
                 Payload {
                     msg: parsed.ciphertext,
                     aad: parsed.header,
@@ -219,10 +221,12 @@ impl Vault {
             Zeroizing::new(postcard::to_allocvec(&self.store).map_err(|_| VaultError::Format)?);
         let nonce: [u8; NONCE_LEN] = rand_array();
         let header = build_header(&self.params, &nonce);
-        let cipher = XChaCha20Poly1305::new(self.kek.as_ref().into());
+        let cipher = XChaCha20Poly1305::new_from_slice(self.kek.as_ref())
+            .map_err(|_| VaultError::Decrypt)?;
+        let xnonce = XNonce::try_from(&nonce[..]).map_err(|_| VaultError::Decrypt)?;
         let ciphertext = cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &xnonce,
                 Payload {
                     msg: &plaintext,
                     aad: &header,
@@ -321,7 +325,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
 
 fn rand_array<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
-    getrandom::getrandom(&mut b).expect("OS RNG unavailable");
+    getrandom::fill(&mut b).expect("OS RNG unavailable");
     b
 }
 

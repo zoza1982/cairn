@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Caps::LOCAL_PATH` advertises it.
 
 ### Changed
+- Dependencies: adopted the pending breaking bumps — `chacha20poly1305` 0.10→0.11 and `getrandom`
+  0.2→0.4 (cairn-vault) and `rustix` 0.38→1 (config/binary). The vault migration is API-only (same
+  XChaCha20-Poly1305 algorithm; `new_from_slice`/`XNonce::try_from`), so existing vault files remain
+  readable — covered by the round-trip and tamper-detection tests.
 - Internal: the transfer model moved from a single in-flight transfer to a collection keyed by a
   stable `TransferId` (`AppState::active_transfers`, per-transfer cancel/pause, a `concurrency_limit`
   defaulting to 1), groundwork for concurrent transfers. No user-visible behaviour change yet.
