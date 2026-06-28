@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use cairn_backend_local::LocalVfs;
 use cairn_config::Config;
-use cairn_core::{initial_effects, update, AppEffect, AppEvent, AppState, Msg};
+use cairn_core::{initial_effects, update, AppEffect, AppEvent, AppState, ConnectionChoice, Msg};
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::Keymap;
 use cairn_types::{ConnectionId, VfsPath};
@@ -49,12 +49,17 @@ async fn run_async() -> anyhow::Result<()> {
 
     let mut state = AppState::new(LEFT, RIGHT, VfsPath::root());
 
-    // Load user config (keybinding overrides, …); fall back to defaults on any problem.
+    // Load user config (keybinding overrides, connection profiles, …); fall back to defaults.
     let config = load_config();
     let (keymap, warnings) = Keymap::from_overrides(&config.ui.keybindings);
     for w in warnings {
         tracing::warn!("{w}");
     }
+
+    // Register the switchable connections (Ctrl-O) and record their labels: built-in local roots
+    // plus any `scheme = "local"` profiles from config. Non-local profiles need live transport and
+    // are not yet connectable.
+    state.connections = register_connections(&registry, &config).await;
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(256);
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
@@ -97,6 +102,37 @@ fn load_config() -> Config {
             Config::default()
         }
     }
+}
+
+/// Register the connections offered by the switcher and return their UI choices. Built-in local
+/// roots (`/` and `$HOME` when set) plus each `scheme = "local"` config profile (using its
+/// `endpoint.path`). Non-local profiles require live transport and are skipped for now.
+async fn register_connections(registry: &VfsRegistry, config: &Config) -> Vec<ConnectionChoice> {
+    // Build the (path, label) targets: built-in roots first, then local config profiles.
+    let mut targets: Vec<(PathBuf, String)> = vec![(PathBuf::from("/"), "local: /".to_owned())];
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        targets.push((
+            PathBuf::from(&home),
+            format!("local: {}", home.to_string_lossy()),
+        ));
+    }
+    for prof in &config.connections {
+        if prof.scheme == "local" {
+            if let Some(path) = prof.endpoint.get("path") {
+                targets.push((PathBuf::from(path), format!("local: {}", prof.display_name)));
+            }
+        }
+    }
+
+    // Switcher connection ids follow the startup panes (LEFT/RIGHT) so they never collide.
+    let base = RIGHT.0 + 1;
+    let mut choices = Vec::with_capacity(targets.len());
+    for (i, (path, label)) in targets.into_iter().enumerate() {
+        let id = ConnectionId(base + i as u64);
+        registry.insert(id, Arc::new(LocalVfs::new(id, path))).await;
+        choices.push(ConnectionChoice { conn: id, label });
+    }
+    choices
 }
 
 async fn event_loop(
@@ -146,7 +182,14 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
                 let result = list_dir(&registry, conn, &dir).await;
-                let _ = event_tx.send(AppEvent::Listed { pane, dir, result }).await;
+                let _ = event_tx
+                    .send(AppEvent::Listed {
+                        pane,
+                        conn,
+                        dir,
+                        result,
+                    })
+                    .await;
             });
         }
         AppEffect::Transfer {

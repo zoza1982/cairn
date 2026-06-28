@@ -107,6 +107,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "confirm" => Action::Confirm,
         "cancel" => Action::Cancel,
         "refresh" => Action::Refresh,
+        "open_connections" => Action::OpenConnections,
         "ai_propose" => Action::AiPropose,
         "approve_all" => Action::ApproveAll,
         "reject" => Action::Reject,
@@ -191,6 +192,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
             KeyCode::Char('c') => Some(Action::Quit),
             // Ctrl-A asks the AI assistant to propose a plan.
             KeyCode::Char('a') => Some(Action::AiPropose),
+            // Ctrl-O opens the connection switcher.
+            KeyCode::Char('o') => Some(Action::OpenConnections),
             _ => None,
         };
     }
@@ -250,6 +253,8 @@ mod tests {
     fn ai_keys() {
         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
         assert_eq!(action_for(ctrl_a), Some(Action::AiPropose));
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(action_for(ctrl_o), Some(Action::OpenConnections));
         // Plain 'a'/'x' drive the plan overlay (no-ops elsewhere).
         assert_eq!(
             action_for(press(KeyCode::Char('a'))),
@@ -398,6 +403,7 @@ mod tests {
             "confirm",
             "cancel",
             "refresh",
+            "open_connections",
             "ai_propose",
             "approve_all",
             "reject",
@@ -409,7 +415,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
     }
 
     #[test]

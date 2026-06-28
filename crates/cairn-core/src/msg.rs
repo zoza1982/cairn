@@ -42,6 +42,8 @@ pub enum Action {
     Cancel,
     /// Reload the active pane.
     Refresh,
+    /// Open the connection switcher (pick a backend to open in the active pane).
+    OpenConnections,
     /// Ask the AI assistant to propose a plan (opens the plan → confirm overlay when it arrives).
     AiPropose,
     /// In the plan overlay: approve every step at once (only honored when no step is irreversible).
@@ -70,6 +72,8 @@ pub enum AppEvent {
     Listed {
         /// Which pane requested it.
         pane: Side,
+        /// The connection it was listed on (ignored if the pane has since switched connection).
+        conn: ConnectionId,
         /// The directory that was listed (ignored if it no longer matches the pane's cwd).
         dir: VfsPath,
         /// The page result.
