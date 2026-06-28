@@ -14,8 +14,9 @@ pub use real::BollardDocker;
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryExt, EntryKind, Scheme, VfsPath};
 use cairn_vfs::{
-    apply_byte_range, join_abs_path, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle,
-    Recurse, Vfs, VfsError, WriteHandle, WriteOpts,
+    action_ids, apply_byte_range, join_abs_path, ActionCtx, ActionDescriptor, ActionId, ActionKind,
+    ActionOutcome, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs,
+    VfsError, WriteHandle, WriteOpts,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -217,6 +218,42 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
     async fn remove(&self, _path: &VfsPath, _recurse: Recurse) -> Result<(), VfsError> {
         Err(VfsError::Unsupported(Caps::DELETE))
     }
+
+    /// Advertise the per-container actions (`logs`, `exec`) anywhere within a container's subtree.
+    /// This reflects path *shape*, not existence (it does no I/O, mirroring how the UI calls it on an
+    /// already-navigated node); existence is enforced by `stat`/`invoke`. The action surface is
+    /// discoverable now; live invocation (streaming over the Docker API) is the integration step, so
+    /// the inherited [`Vfs::invoke`] still returns [`VfsError::Unsupported`].
+    fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
+        let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
+        match segs.as_slice() {
+            ["containers", _name, ..] => vec![
+                ActionDescriptor {
+                    id: ActionId::new(action_ids::LOGS),
+                    label: SmolStr::new("Stream logs"),
+                    kind: ActionKind::Stream,
+                    destructive: false,
+                },
+                ActionDescriptor {
+                    id: ActionId::new(action_ids::EXEC),
+                    label: SmolStr::new("Exec"),
+                    kind: ActionKind::Interactive,
+                    destructive: false,
+                },
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    async fn invoke(&self, action: ActionId, _ctx: ActionCtx) -> Result<ActionOutcome, VfsError> {
+        // The actions are advertised by `actions_at`; live invocation over the Docker API (streaming
+        // exec/logs) is the integration step — report that distinctly from a truly-unknown action.
+        Err(VfsError::Backend {
+            code: "not_implemented".to_owned(),
+            msg: format!("action '{}' is not yet available", action.as_str()),
+            retryable: false,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +404,29 @@ mod tests {
             vfs.open_write(&p("/containers/web/x"), WriteOpts::default())
                 .await,
             Err(VfsError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn containers_advertise_exec_and_logs_actions() {
+        let vfs = backend();
+        // Containers (and their subtree) expose exec + logs; the top-level tree does not.
+        let ids: Vec<String> = vfs
+            .actions_at(&p("/containers/web"))
+            .iter()
+            .map(|a| a.id.as_str().to_owned())
+            .collect();
+        assert_eq!(ids, vec!["logs", "exec"]);
+        assert!(!vfs.actions_at(&p("/containers/web/etc")).is_empty());
+        assert!(vfs.actions_at(&p("/containers")).is_empty());
+        assert!(vfs.actions_at(&p("/images/nginx:latest")).is_empty());
+        // Reflects path shape, not existence (a phantom container still lists actions).
+        assert!(!vfs.actions_at(&p("/containers/ghost")).is_empty());
+        // Invocation is the integration step — advertised but not yet implemented.
+        assert!(matches!(
+            vfs.invoke(ActionId::new(action_ids::LOGS), ActionCtx::None)
+                .await,
+            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
         ));
     }
 }
