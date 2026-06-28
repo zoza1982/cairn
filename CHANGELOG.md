@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- RFC-0007 (action invocation & agent-execution routing): resolves the two routing design gaps the
+  review gates flagged — adds `path` to `Vfs::invoke` and defines `ActionOutcome::Session`/
+  `SessionHandle` (Gap 1), and a typed per-tool input schema plus a `BinaryStepExecutor` that maps
+  approved AI plan steps to `VfsRegistry`/transfer/`invoke` calls using opaque `conn:N` references
+  (Gap 2). Unblocks the live invoke (M6-3/M6-6) and agent-execution (M7-6) work.
 - **Connection switcher** (M4-5): `Ctrl-O` opens an overlay listing the available connections — the
   built-in local roots (`/`, `$HOME`) plus any `scheme = "local"` profiles from config — and selecting
   one re-points the active pane to it at its root. The reducer (`Overlay::Connections`) and overlay
