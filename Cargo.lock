@@ -219,6 +219,7 @@ name = "cairn"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "cairn-ai",
  "cairn-backend-local",
  "cairn-config",
@@ -229,6 +230,7 @@ dependencies = [
  "cairn-vfs",
  "futures",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

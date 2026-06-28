@@ -221,20 +221,30 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
                     .await;
             });
         }
-        AppEffect::ExecutePlan { plan } => {
-            // Step execution against real backends is the next integration step (it needs the
-            // tool→backend dispatch and live providers); for now we acknowledge approval honestly.
+        AppEffect::ExecutePlan { mut plan } => {
+            // Run the approved plan's steps against the registered backends (RFC-0007). Safe/local
+            // tools execute now; exec/logs/port-forward report not-yet-available until the live
+            // invoke path lands.
+            let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let _ = event_tx
-                    .send(AppEvent::OpDone {
-                        status: format!(
-                            "Approved {} step(s); execution wiring is the next step",
-                            plan.steps.len()
-                        ),
+                let exec = crate::executor::BinaryStepExecutor::new(registry);
+                let n = plan.steps.len();
+                let ev = match plan.execute(&exec).await {
+                    Ok(()) if plan.state == cairn_ai::PlanState::Done => AppEvent::OpDone {
+                        status: format!("Plan complete: {n} step(s) executed"),
                         error: false,
-                    })
-                    .await;
+                    },
+                    Ok(()) => AppEvent::OpDone {
+                        status: "Plan stopped: a step failed".to_owned(),
+                        error: true,
+                    },
+                    Err(e) => AppEvent::OpDone {
+                        status: format!("Plan not executed: {e}"),
+                        error: true,
+                    },
+                };
+                let _ = event_tx.send(ev).await;
             });
         }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
@@ -246,13 +256,15 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
 /// `MockProvider`; the plan → confirm flow it drives in the UI is the real thing.
 async fn propose_plan(prompt: &str) -> Result<cairn_ai::Plan, String> {
     use cairn_ai::{request_plan, LlmRequest, Message, MockProvider, Role};
-    // A representative proposal that exercises the plan → confirm UI (mixed reversibility).
+    // A representative, executable proposal (safe/local tools) that exercises the full
+    // plan → confirm → execute loop against the left pane's connection (RFC-0007 input schema).
     let provider = MockProvider::proposing(serde_json::json!({
         "summary": format!("Plan for: {prompt}"),
         "steps": [
-            {"tool": "list",   "input": {"path": "/logs"}, "description": "scan logs"},
-            {"tool": "copy",   "input": {}, "description": "copy matches to the other pane"},
-            {"tool": "delete", "input": {}, "description": "remove the originals"}
+            {"tool": "list", "input": {"conn": "conn:1", "path": "/"},
+             "description": "list the current directory"},
+            {"tool": "stat", "input": {"conn": "conn:1", "path": "/"},
+             "description": "confirm the directory exists"}
         ]
     }));
     let req = LlmRequest {
