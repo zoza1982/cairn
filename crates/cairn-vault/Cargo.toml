@@ -1,0 +1,28 @@
+[package]
+name = "cairn-vault"
+description = "Cairn's encrypted secrets vault: XChaCha20-Poly1305 at rest, Argon2id-derived keys."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-secrets = { workspace = true }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
