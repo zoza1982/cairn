@@ -127,8 +127,8 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
         .border_style(Style::default().fg(Color::Cyan));
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(match state.transfer_bytes {
-        Some(b) => format!("active: transferring… {}", human_bytes(b)),
+    lines.push(Line::from(match state.active_transfers.first() {
+        Some(t) => format!("active: transferring… {}", human_bytes(t.bytes)),
         None => "active: (none)".to_owned(),
     }));
     for (i, q) in pending.iter().enumerate() {
@@ -365,10 +365,12 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let pane = state.active();
     let count = pane_count_label(pane);
     // A live transfer takes over the status line with progress (bytes, %/ETA when the total is
-    // known, rate, and queue depth).
-    let line = if let Some(bytes) = state.transfer_bytes {
+    // known, rate, and queue depth). At concurrency 1 there is at most one; the N>1 aggregate view
+    // is a follow-up.
+    let line = if let Some(t) = state.active_transfers.first() {
+        let bytes = t.bytes;
         // "X" or "X / Y (Z%)" when a pre-scanned total is available.
-        let amount = match state.transfer_total {
+        let amount = match t.total {
             Some(total) if total > 0 => {
                 let pct = ((bytes as f64 / total as f64) * 100.0).min(100.0) as u64;
                 format!("{} / {} ({pct}%)", human_bytes(bytes), human_bytes(total))
@@ -376,15 +378,15 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             _ => human_bytes(bytes),
         };
         // While paused, drop the rate/ETA (they're meaningless when stopped) and show a paused label.
-        let (rate, eta) = if state.transfer_paused {
+        let (rate, eta) = if t.paused {
             (String::new(), String::new())
         } else {
-            let rate = match state.transfer_rate {
+            let rate = match t.rate {
                 Some(r) => format!(" at {}/s", human_bytes(r)),
                 None => String::new(),
             };
             // ETA needs both a total and a positive rate; suppress a sub-second "ETA 0s" tail.
-            let eta = match (state.transfer_total, state.transfer_rate) {
+            let eta = match (t.total, t.rate) {
                 (Some(total), Some(r)) if r > 0 && total > bytes => {
                     let secs = (total - bytes) / r;
                     if secs > 0 {
@@ -397,13 +399,14 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             };
             (rate, eta)
         };
+        let paused = t.paused;
         let queued = state.transfer_queue.len();
         let suffix = if queued > 0 {
             format!(" (+{queued} queued)")
         } else {
             String::new()
         };
-        let label = if state.transfer_paused {
+        let label = if paused {
             "⏸ paused"
         } else {
             "⇅ transferring…"
@@ -479,6 +482,24 @@ mod tests {
         ]);
         s.panes[0].listing = Listing::Ready(entries);
         s
+    }
+
+    /// Push a single active transfer with the given progress, for status-line/overlay render tests.
+    fn set_transfer(
+        s: &mut AppState,
+        bytes: u64,
+        rate: Option<u64>,
+        total: Option<u64>,
+        paused: bool,
+    ) {
+        s.active_transfers.push(cairn_core::ActiveTransfer {
+            id: 1,
+            label: "Copying 1 item(s)…".to_owned(),
+            bytes,
+            rate,
+            total,
+            paused,
+        });
     }
 
     #[test]
@@ -616,7 +637,7 @@ mod tests {
     #[test]
     fn transfer_queue_overlay_lists_pending() {
         let mut s = ready_state();
-        s.transfer_bytes = Some(1024);
+        set_transfer(&mut s, 1024, None, None, false);
         s.transfer_queue.push_back(cairn_core::QueuedTransfer {
             src_conn: ConnectionId(1),
             dst_conn: ConnectionId(2),
@@ -648,8 +669,7 @@ mod tests {
     #[test]
     fn status_line_shows_live_transfer_progress() {
         let mut s = ready_state();
-        s.transfer_bytes = Some(2 * 1024 * 1024);
-        s.transfer_rate = Some(512 * 1024);
+        set_transfer(&mut s, 2 * 1024 * 1024, Some(512 * 1024), None, false);
         let text = render_text(&s, 100, 24);
         assert!(text.contains("transferring"), "expected transfer indicator");
         assert!(
@@ -662,10 +682,13 @@ mod tests {
     #[test]
     fn status_line_shows_paused_and_drops_rate_eta() {
         let mut s = ready_state();
-        s.transfer_bytes = Some(4 * 1024 * 1024);
-        s.transfer_total = Some(8 * 1024 * 1024);
-        s.transfer_rate = Some(2 * 1024 * 1024);
-        s.transfer_paused = true;
+        set_transfer(
+            &mut s,
+            4 * 1024 * 1024,
+            Some(2 * 1024 * 1024),
+            Some(8 * 1024 * 1024),
+            true,
+        );
         let text = render_text(&s, 120, 24);
         assert!(text.contains("paused"), "expected paused label: {text}");
         assert!(text.contains("50%"), "still shows progress: {text}");
@@ -687,9 +710,14 @@ mod tests {
     #[test]
     fn status_line_shows_percentage_and_eta_when_total_is_known() {
         let mut s = ready_state();
-        s.transfer_bytes = Some(4 * 1024 * 1024); // 4 MiB done
-        s.transfer_total = Some(8 * 1024 * 1024); // of 8 MiB
-        s.transfer_rate = Some(2 * 1024 * 1024); // 2 MiB/s → 2s remaining
+        // 4 MiB of 8 MiB at 2 MiB/s → 50%, ETA 2s.
+        set_transfer(
+            &mut s,
+            4 * 1024 * 1024,
+            Some(2 * 1024 * 1024),
+            Some(8 * 1024 * 1024),
+            false,
+        );
         let text = render_text(&s, 120, 24);
         assert!(text.contains("50%"), "expected percentage: {text}");
         assert!(text.contains("ETA 2s"), "expected ETA: {text}");

@@ -1,6 +1,6 @@
 //! Messages, events, and effects — the three families of the TEA loop.
 
-use crate::state::Side;
+use crate::state::{Side, TransferId};
 use cairn_ai::Plan;
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{ListPage, VfsError};
@@ -118,6 +118,8 @@ pub enum AppEvent {
     /// average rate. Coalesced and delivered best-effort (may be dropped under load), so it is
     /// advisory display only.
     TransferProgress {
+        /// Which transfer this update is for.
+        id: TransferId,
         /// Cumulative bytes transferred so far.
         bytes: u64,
         /// Average throughput so far, in bytes per second.
@@ -135,6 +137,8 @@ pub enum AppEvent {
     /// A transfer (copy/move) finished — distinct from [`AppEvent::OpDone`] so it (and only it) clears
     /// the transfer-progress indicator, immune to an unrelated op completing mid-transfer.
     TransferDone {
+        /// Which transfer finished.
+        id: TransferId,
         /// Human-readable, secret-free status.
         status: String,
         /// Whether the transfer failed.
@@ -143,6 +147,8 @@ pub enum AppEvent {
     /// A requested transfer would overwrite existing destinations; carries the parameters needed to
     /// re-issue it (with `overwrite: true`) once the user confirms.
     TransferConflict {
+        /// The id of the transfer that bounced (so the runtime can release its slot).
+        id: TransferId,
         /// Source connection.
         src_conn: ConnectionId,
         /// Destination connection.
@@ -191,6 +197,9 @@ pub enum AppEffect {
     },
     /// Copy or move entries from one connection to another.
     Transfer {
+        /// Stable id minted by the reducer; addresses this transfer's progress/done events and its
+        /// runtime control (cancel token + pause sender).
+        id: TransferId,
         /// Source connection.
         src_conn: ConnectionId,
         /// Destination connection.
@@ -203,11 +212,19 @@ pub enum AppEffect {
         /// (after the user confirms) proceeds through them.
         overwrite: bool,
     },
-    /// Cancel the in-flight transfer, if any.
-    CancelTransfer,
-    /// Set the paused state of the in-flight transfer (`true` = pause, `false` = resume). No-op when
-    /// no transfer is running.
-    SetTransferPaused(bool),
+    /// Cancel the in-flight transfer with this id, if it is still running.
+    CancelTransfer {
+        /// Which transfer to cancel.
+        id: TransferId,
+    },
+    /// Set the paused state of the transfer with this id (`true` = pause, `false` = resume). No-op if
+    /// it is no longer running.
+    SetTransferPaused {
+        /// Which transfer to pause/resume.
+        id: TransferId,
+        /// Target paused state.
+        paused: bool,
+    },
     /// Run a user-defined shell action (M8-7). The runtime resolves `index` to its definition, maps
     /// `target` to a real OS path via `Vfs::local_path` (refusing non-local backends), expands the
     /// argument templates, and spawns the program with no shell. Result returns as

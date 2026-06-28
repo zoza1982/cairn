@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Caps::LOCAL_PATH` advertises it.
 
 ### Changed
+- Internal: the transfer model moved from a single in-flight transfer to a collection keyed by a
+  stable `TransferId` (`AppState::active_transfers`, per-transfer cancel/pause, a `concurrency_limit`
+  defaulting to 1), groundwork for concurrent transfers. No user-visible behaviour change yet.
 - **BREAKING** (`cairn-transfer`): `TransferError::Cancelled` now carries the partial
   `TransferOutcome` completed before cancellation (`Cancelled(TransferOutcome)`), so a cancelled
   transfer reports how much already happened (e.g. "Transfer cancelled after 3 file(s), 1 dir(s);

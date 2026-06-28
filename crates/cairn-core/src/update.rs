@@ -1,7 +1,10 @@
 //! The pure reducer: `update(&mut AppState, Msg) -> Vec<AppEffect>`. No I/O, no `.await`.
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
-use crate::state::{AppState, Listing, Overlay, PromptKind, QueuedTransfer, Side, SortMode};
+use crate::state::{
+    ActiveTransfer, AppState, Listing, Overlay, PromptKind, QueuedTransfer, Side, SortMode,
+    TransferId,
+};
 use cairn_types::{Entry, VfsPath};
 use std::sync::Arc;
 
@@ -14,9 +17,9 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<AppEffect> {
         Msg::Event(event) => apply_event(state, event),
         Msg::Tick => Vec::new(),
     };
-    // Drain the transfer queue whenever nothing blocks it — covers the case where an overlay that was
-    // open when the active transfer finished has since closed. `advance_queue` is a no-op while a
-    // transfer is running, an overlay is open, or the queue is empty, so this is safe after any msg.
+    // Drain the transfer queue whenever a slot is free — covers the case where an overlay that was
+    // open when a transfer finished has since closed. `advance_queue` is a no-op while all slots are
+    // full, an overlay is open, or the queue is empty, so this is safe after any msg.
     effects.extend(advance_queue(state));
     effects
 }
@@ -165,23 +168,47 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             state.status = Some("Cancelling plan…".to_owned());
             vec![AppEffect::CancelAiPlan]
         }
-        Action::Cancel if state.transfer_bytes.is_some() => {
-            state.status = Some("Cancelling transfer…".to_owned());
-            vec![AppEffect::CancelTransfer]
+        // Esc cancels *all* active transfers (with N>1 there's no cursor to pick one; per-transfer
+        // cancel is in the queue overlay). Degenerates to "cancel the one" at concurrency 1.
+        Action::Cancel if state.has_active_transfer() => {
+            let n = state.active_transfers.len();
+            state.status = Some(if n == 1 {
+                "Cancelling transfer…".to_owned()
+            } else {
+                format!("Cancelling {n} transfers…")
+            });
+            state
+                .active_transfers
+                .iter()
+                .map(|t| AppEffect::CancelTransfer { id: t.id })
+                .collect()
         }
-        // Pause/resume the active transfer. No-op (with a hint) when none is running.
+        // Pause/resume *all* active transfers: pause if any is running, else resume. No-op (with a
+        // hint) when none is running. Per-transfer pause is in the queue overlay.
         Action::TogglePause => {
-            if state.transfer_bytes.is_none() {
+            if !state.has_active_transfer() {
                 state.status = Some("No transfer to pause".to_owned());
                 return Vec::new();
             }
-            state.transfer_paused = !state.transfer_paused;
-            state.status = Some(if state.transfer_paused {
-                "Transfer paused".to_owned()
-            } else {
-                "Transfer resumed".to_owned()
+            let new_paused = state.active_transfers.iter().any(|t| !t.paused);
+            for t in &mut state.active_transfers {
+                t.paused = new_paused;
+            }
+            let n = state.active_transfers.len();
+            state.status = Some(match (new_paused, n) {
+                (true, 1) => "Transfer paused".to_owned(),
+                (true, n) => format!("{n} transfers paused"),
+                (false, 1) => "Transfer resumed".to_owned(),
+                (false, n) => format!("{n} transfers resumed"),
             });
-            vec![AppEffect::SetTransferPaused(state.transfer_paused)]
+            state
+                .active_transfers
+                .iter()
+                .map(|t| AppEffect::SetTransferPaused {
+                    id: t.id,
+                    paused: new_paused,
+                })
+                .collect()
         }
         Action::RunShellAction(index) => run_shell_action(state, index),
         // No overlay open: confirm/cancel and the plan-only actions are otherwise no-ops.
@@ -532,8 +559,9 @@ fn apply_confirm_overwrite_action(state: &mut AppState, action: Action) -> Vec<A
             else {
                 return Vec::new();
             };
-            arm_transfer(state, is_move, items.len());
+            let id = arm_transfer(state, is_move, items.len());
             vec![AppEffect::Transfer {
+                id,
                 src_conn,
                 dst_conn,
                 items,
@@ -826,10 +854,9 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
     if items.is_empty() {
         return Vec::new();
     }
-    // One transfer at a time: if one is already running, queue this one and start it (FIFO) when the
-    // active transfer finishes. (`start_transfer` only runs with no overlay open; a transfer paused
-    // on an overwrite prompt has `transfer_bytes` cleared, and its queue drains on cancel.)
-    if state.transfer_bytes.is_some() {
+    // Up to `concurrency_limit` transfers run at once: if every slot is busy, queue this one and
+    // start it (FIFO) when a slot frees. (`start_transfer` only runs with no overlay open.)
+    if state.active_transfers.len() >= state.concurrency_limit {
         state.transfer_queue.push_back(QueuedTransfer {
             src_conn,
             dst_conn,
@@ -842,10 +869,11 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
     // Marks are NOT cleared here: if the pre-check finds a conflict and the user cancels the
     // overwrite prompt, nothing was transferred and the selection must survive. `finish_op` clears
     // marks on actual completion (`TransferDone`).
-    arm_transfer(state, is_move, items.len());
+    let id = arm_transfer(state, is_move, items.len());
     // First pass does not overwrite: the effect runner checks for collisions and reports
     // `TransferConflict` (→ confirm overlay) instead of clobbering existing destinations.
     vec![AppEffect::Transfer {
+        id,
         src_conn,
         dst_conn,
         items,
@@ -854,36 +882,52 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
     }]
 }
 
-/// Start the next queued transfer when nothing is running or awaiting a decision. Called when the
-/// active transfer finishes and when an overwrite prompt is dismissed, so the queue keeps draining.
+/// Start queued transfers into any free slots (up to `concurrency_limit`). Called as a tail step of
+/// `update` so the queue keeps draining when a transfer finishes or an overwrite prompt is dismissed.
+/// While a modal overlay is open we start nothing new (a `ConfirmOverwrite` is a question about
+/// existing work) — already-running transfers in other slots are untouched.
 fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
-    if state.transfer_bytes.is_some() || state.overlay.is_some() {
+    if state.overlay.is_some() {
         return Vec::new();
     }
-    let Some(next) = state.transfer_queue.pop_front() else {
-        return Vec::new();
-    };
-    arm_transfer(state, next.is_move, next.items.len());
-    vec![AppEffect::Transfer {
-        src_conn: next.src_conn,
-        dst_conn: next.dst_conn,
-        items: next.items,
-        is_move: next.is_move,
-        overwrite: false,
-    }]
+    let mut effects = Vec::new();
+    while state.active_transfers.len() < state.concurrency_limit {
+        let Some(next) = state.transfer_queue.pop_front() else {
+            break;
+        };
+        let id = arm_transfer(state, next.is_move, next.items.len());
+        effects.push(AppEffect::Transfer {
+            id,
+            src_conn: next.src_conn,
+            dst_conn: next.dst_conn,
+            items: next.items,
+            is_move: next.is_move,
+            overwrite: false,
+        });
+    }
+    effects
 }
 
-/// Set the "Moving/Copying N item(s)…" status and begin tracking transfer progress. Shared by the
-/// initial attempt and the post-confirm re-issue so the two can't drift.
-fn arm_transfer(state: &mut AppState, is_move: bool, count: usize) {
-    state.status = Some(format!(
+/// Mint a transfer id, push a fresh [`ActiveTransfer`] tracking it, set the status line, and return
+/// the id. Shared by the initial attempt, the queue drain, and the post-confirm re-issue so they
+/// can't drift. The id is monotonic (no clock/RNG — keeps the reducer pure and tests deterministic).
+fn arm_transfer(state: &mut AppState, is_move: bool, count: usize) -> TransferId {
+    let id = state.next_transfer_id;
+    state.next_transfer_id += 1;
+    let label = format!(
         "{} {count} item(s)…",
         if is_move { "Moving" } else { "Copying" },
-    ));
-    state.transfer_bytes = Some(0);
-    state.transfer_rate = None;
-    state.transfer_total = None;
-    state.transfer_paused = false;
+    );
+    state.status = Some(label.clone());
+    state.active_transfers.push(ActiveTransfer {
+        id,
+        label,
+        bytes: 0,
+        rate: None,
+        total: None,
+        paused: false,
+    });
+    id
 }
 
 fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
@@ -1007,34 +1051,30 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             finish_op(state, &status, error)
         }
         AppEvent::TransferProgress {
+            id,
             bytes,
             rate_bps,
             total,
         } => {
-            // Advisory display only; ignore if no transfer is tracked (a late event after the done).
-            if state.transfer_bytes.is_some() {
-                state.transfer_bytes = Some(bytes);
-                state.transfer_rate = Some(rate_bps);
-                state.transfer_total = total;
+            // Advisory display only; ignore an update for a transfer that already finished.
+            if let Some(t) = state.active_transfers.iter_mut().find(|t| t.id == id) {
+                t.bytes = bytes;
+                t.rate = Some(rate_bps);
+                t.total = total;
             }
             Vec::new()
         }
         AppEvent::OpDone { status, error } => finish_op(state, &status, error),
         AppEvent::TransferConflict {
+            id,
             src_conn,
             dst_conn,
             items,
             is_move,
             conflicts,
         } => {
-            // The transfer didn't run (no overwrite); drop the progress indicator.
-            state.transfer_bytes = None;
-            state.transfer_rate = None;
-            state.transfer_total = None;
-            // Keep `transfer_paused` reset symmetric with `TransferDone`: a `p` pressed during the
-            // pre-flight check (while `transfer_bytes` was briefly `Some`) must not leave a stale
-            // paused flag once the transfer bounces back as a conflict.
-            state.transfer_paused = false;
+            // The transfer didn't run (no overwrite); release its slot.
+            state.active_transfers.retain(|t| t.id != id);
             // Don't clobber an overlay the user already has open (e.g. a delete confirmation): put
             // the transfer back at the front of the queue so the tail-drain retries it (and shows
             // the overwrite prompt) once that overlay closes.
@@ -1062,17 +1102,10 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             });
             Vec::new()
         }
-        AppEvent::TransferDone { status, error } => {
-            // Only a transfer's own completion clears its progress indicator — so an unrelated op
-            // finishing mid-transfer can't wipe it (and a stray late `TransferProgress` is ignored
-            // by its `is_some` guard once this resets the slot).
-            state.transfer_bytes = None;
-            state.transfer_rate = None;
-            state.transfer_total = None;
-            // A new transfer always starts running; clear any leftover paused flag so the queued
-            // one (auto-started by the tail drain) and its status display aren't shown as paused.
-            state.transfer_paused = false;
-            // The queue is drained by the tail call in `update`.
+        AppEvent::TransferDone { id, status, error } => {
+            // Release this transfer's slot — addressed by id so an unrelated op or another transfer
+            // finishing can't clear the wrong one. The queue tail-drain then fills the freed slot.
+            state.active_transfers.retain(|t| t.id != id);
             finish_op(state, &status, error)
         }
         AppEvent::ShellActionDone { status, error } => {
@@ -1161,6 +1194,18 @@ mod tests {
 
     fn state() -> AppState {
         AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root())
+    }
+
+    // Single-transfer accessors mirroring the old scalar fields (concurrency is 1 in these tests):
+    // `Some(bytes)`/`None` exactly as `transfer_bytes` was, so existing assertions read naturally.
+    fn t_bytes(s: &AppState) -> Option<u64> {
+        s.active_transfers.first().map(|t| t.bytes)
+    }
+    fn t_rate(s: &AppState) -> Option<u64> {
+        s.active_transfers.first().and_then(|t| t.rate)
+    }
+    fn t_paused(s: &AppState) -> bool {
+        s.active_transfers.first().is_some_and(|t| t.paused)
     }
 
     fn page(entries: Vec<Entry>) -> ListPage {
@@ -1449,28 +1494,30 @@ mod tests {
         deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
         let fx = update(&mut s, Msg::Action(Action::Copy));
         assert!(matches!(&fx[..], [AppEffect::Transfer { .. }]));
-        assert_eq!(s.transfer_bytes, Some(0), "transfer tracking starts");
+        assert_eq!(t_bytes(&s), Some(0), "transfer tracking starts");
         // Progress updates the running total and the rate.
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferProgress {
+                id: 1,
                 bytes: 4096,
                 rate_bps: 2048,
                 total: None,
             }),
         );
-        assert_eq!(s.transfer_bytes, Some(4096));
-        assert_eq!(s.transfer_rate, Some(2048));
+        assert_eq!(t_bytes(&s), Some(4096));
+        assert_eq!(t_rate(&s), Some(2048));
         // The transfer's own completion clears it.
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferDone {
+                id: 1,
                 status: "Copied 1 file(s)".to_owned(),
                 error: false,
             }),
         );
-        assert_eq!(s.transfer_bytes, None);
-        assert_eq!(s.transfer_rate, None, "rate cleared on completion");
+        assert_eq!(t_bytes(&s), None);
+        assert_eq!(t_rate(&s), None, "rate cleared on completion");
     }
 
     #[test]
@@ -1480,12 +1527,13 @@ mod tests {
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferProgress {
+                id: 1,
                 bytes: 10,
                 rate_bps: 0,
                 total: None,
             }),
         );
-        assert_eq!(s.transfer_bytes, None);
+        assert_eq!(t_bytes(&s), None);
     }
 
     #[test]
@@ -1493,7 +1541,7 @@ mod tests {
         let mut s = state();
         deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
         let _ = update(&mut s, Msg::Action(Action::Copy));
-        assert_eq!(s.transfer_bytes, Some(0));
+        assert_eq!(t_bytes(&s), Some(0));
         // A delete/mkdir/rename finishing (generic OpDone) must NOT wipe the transfer indicator…
         let _ = update(
             &mut s,
@@ -1502,17 +1550,18 @@ mod tests {
                 error: false,
             }),
         );
-        assert_eq!(s.transfer_bytes, Some(0));
+        assert_eq!(t_bytes(&s), Some(0));
         // …and subsequent progress still lands.
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferProgress {
+                id: 1,
                 bytes: 8192,
                 rate_bps: 0,
                 total: None,
             }),
         );
-        assert_eq!(s.transfer_bytes, Some(8192));
+        assert_eq!(t_bytes(&s), Some(8192));
     }
 
     #[test]
@@ -1526,8 +1575,9 @@ mod tests {
         deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
         let _ = update(&mut s, Msg::Action(Action::Copy));
         let fx = update(&mut s, Msg::Action(Action::Cancel));
-        assert!(matches!(&fx[..], [AppEffect::CancelTransfer]));
-        assert!(s.status.as_deref().unwrap().contains("Cancelling"));
+        assert!(matches!(&fx[..], [AppEffect::CancelTransfer { .. }]));
+        // Exact wording preserved from the single-transfer era (singular at n == 1).
+        assert_eq!(s.status.as_deref(), Some("Cancelling transfer…"));
     }
 
     #[test]
@@ -1536,20 +1586,76 @@ mod tests {
         // No transfer running: TogglePause is a no-op (with a hint) and leaves the flag clear.
         let fx = update(&mut s, Msg::Action(Action::TogglePause));
         assert!(fx.is_empty());
-        assert!(!s.transfer_paused);
+        assert!(!t_paused(&s));
         assert!(s.status.as_deref().unwrap().contains("No transfer"));
         // Start a transfer, then pause: flag set, SetTransferPaused(true) emitted.
         deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
         let _ = update(&mut s, Msg::Action(Action::Copy));
         let fx = update(&mut s, Msg::Action(Action::TogglePause));
-        assert!(matches!(&fx[..], [AppEffect::SetTransferPaused(true)]));
-        assert!(s.transfer_paused);
-        assert!(s.status.as_deref().unwrap().contains("paused"));
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::SetTransferPaused { paused: true, .. }]
+        ));
+        assert!(t_paused(&s));
+        assert_eq!(s.status.as_deref(), Some("Transfer paused"));
         // Toggle again: resume.
         let fx = update(&mut s, Msg::Action(Action::TogglePause));
-        assert!(matches!(&fx[..], [AppEffect::SetTransferPaused(false)]));
-        assert!(!s.transfer_paused);
-        assert!(s.status.as_deref().unwrap().contains("resumed"));
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::SetTransferPaused { paused: false, .. }]
+        ));
+        assert!(!t_paused(&s));
+        assert_eq!(s.status.as_deref(), Some("Transfer resumed"));
+    }
+
+    #[test]
+    fn concurrent_transfers_run_together_and_are_addressed_by_id() {
+        // With concurrency 2, a second transfer runs alongside the first (not queued); progress and
+        // completion are addressed by id, so they never touch the wrong transfer.
+        let mut s = state();
+        s.concurrency_limit = 2;
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        // First copy (cursor on "a") → active id 1.
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        // Second copy (cursor on "b") → active id 2, runs concurrently (not queued).
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        assert!(matches!(&fx[..], [AppEffect::Transfer { .. }]));
+        assert_eq!(s.active_transfers.len(), 2, "both run; nothing queued");
+        assert!(s.transfer_queue.is_empty());
+        let ids: Vec<_> = s.active_transfers.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![1, 2], "monotonic, distinct ids");
+        // Progress for id 2 updates only the second transfer.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress {
+                id: 2,
+                bytes: 4096,
+                rate_bps: 1024,
+                total: None,
+            }),
+        );
+        assert_eq!(s.active_transfers[0].bytes, 0, "id 1 untouched");
+        assert_eq!(s.active_transfers[1].bytes, 4096, "id 2 updated");
+        // Completing id 1 removes only it; id 2 keeps running.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferDone {
+                id: 1,
+                status: "Copied".to_owned(),
+                error: false,
+            }),
+        );
+        assert_eq!(s.active_transfers.len(), 1);
+        assert_eq!(s.active_transfers[0].id, 2);
+        assert_eq!(s.active_transfers[0].bytes, 4096);
     }
 
     #[test]
@@ -1560,10 +1666,11 @@ mod tests {
         deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
         let _ = update(&mut s, Msg::Action(Action::Copy));
         let _ = update(&mut s, Msg::Action(Action::TogglePause));
-        assert!(s.transfer_paused);
+        assert!(t_paused(&s));
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferConflict {
+                id: 1,
                 src_conn: ConnectionId(1),
                 dst_conn: ConnectionId(2),
                 items: vec![(VfsPath::root(), VfsPath::root())],
@@ -1571,7 +1678,7 @@ mod tests {
                 conflicts: 1,
             }),
         );
-        assert!(!s.transfer_paused, "a conflict clears the paused flag");
+        assert!(!t_paused(&s), "a conflict clears the paused flag");
     }
 
     #[test]
@@ -1580,15 +1687,16 @@ mod tests {
         deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
         let _ = update(&mut s, Msg::Action(Action::Copy));
         let _ = update(&mut s, Msg::Action(Action::TogglePause));
-        assert!(s.transfer_paused);
+        assert!(t_paused(&s));
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferDone {
+                id: 1,
                 status: "Copied 1 file(s)".to_owned(),
                 error: false,
             }),
         );
-        assert!(!s.transfer_paused, "completion clears the paused flag");
+        assert!(!t_paused(&s), "completion clears the paused flag");
     }
 
     fn with_action(s: &mut AppState, confirm: bool) {
@@ -1704,6 +1812,7 @@ mod tests {
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferConflict {
+                id: 1,
                 src_conn: ConnectionId(1),
                 dst_conn: ConnectionId(2),
                 items: vec![(VfsPath::root(), VfsPath::root())],
@@ -1712,11 +1821,11 @@ mod tests {
             }),
         );
         assert!(matches!(s.overlay, Some(Overlay::ConfirmOverwrite { .. })));
-        assert_eq!(s.transfer_bytes, None, "no transfer is running yet");
+        assert_eq!(t_bytes(&s), None, "no transfer is running yet");
         // Confirming re-issues the transfer with overwrite enabled.
         let fx = update(&mut s, Msg::Action(Action::Confirm));
         assert!(s.overlay.is_none());
-        assert_eq!(s.transfer_bytes, Some(0));
+        assert_eq!(t_bytes(&s), Some(0));
         assert!(matches!(
             &fx[..],
             [AppEffect::Transfer {
@@ -1747,6 +1856,7 @@ mod tests {
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferConflict {
+                id: 1,
                 src_conn: ConnectionId(1),
                 dst_conn: ConnectionId(2),
                 items: vec![(VfsPath::root(), VfsPath::root())],
@@ -1800,16 +1910,13 @@ mod tests {
         let fx = update(
             &mut s,
             Msg::Event(AppEvent::TransferDone {
+                id: 1,
                 status: "Copied".to_owned(),
                 error: false,
             }),
         );
         assert!(s.transfer_queue.is_empty());
-        assert_eq!(
-            s.transfer_bytes,
-            Some(0),
-            "the queued transfer is now active"
-        );
+        assert_eq!(t_bytes(&s), Some(0), "the queued transfer is now active");
         assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
     }
 
@@ -1833,11 +1940,7 @@ mod tests {
         // Reject clears the pending queue but leaves the active transfer running.
         let _ = update(&mut s, Msg::Action(Action::Reject));
         assert!(s.transfer_queue.is_empty());
-        assert_eq!(
-            s.transfer_bytes,
-            Some(0),
-            "the active transfer is untouched"
-        );
+        assert_eq!(t_bytes(&s), Some(0), "the active transfer is untouched");
         assert!(s.overlay.is_none());
     }
 
@@ -1872,11 +1975,7 @@ mod tests {
             1,
             "only the selected one was dropped"
         );
-        assert_eq!(
-            s.transfer_bytes,
-            Some(0),
-            "the active transfer is untouched"
-        );
+        assert_eq!(t_bytes(&s), Some(0), "the active transfer is untouched");
         // The cursor re-clamps to the remaining entry; the view stays open.
         assert!(matches!(
             s.overlay,
@@ -1948,6 +2047,7 @@ mod tests {
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferConflict {
+                id: 1,
                 src_conn: ConnectionId(1),
                 dst_conn: ConnectionId(2),
                 items: vec![(VfsPath::root(), VfsPath::root())],
@@ -2008,6 +2108,7 @@ mod tests {
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferDone {
+                id: 1,
                 status: "Copied".to_owned(),
                 error: false,
             }),
@@ -2023,7 +2124,7 @@ mod tests {
             s.transfer_queue.is_empty(),
             "B starts once the overlay closes"
         );
-        assert_eq!(s.transfer_bytes, Some(0));
+        assert_eq!(t_bytes(&s), Some(0));
         assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
     }
 
@@ -2039,6 +2140,7 @@ mod tests {
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferConflict {
+                id: 1,
                 src_conn: ConnectionId(1),
                 dst_conn: ConnectionId(2),
                 items: vec![(VfsPath::root(), VfsPath::root())],
@@ -2059,7 +2161,7 @@ mod tests {
         // effect; the effect runner then re-detects the conflict and shows the overwrite prompt).
         let fx = update(&mut s, Msg::Action(Action::Cancel));
         assert!(s.transfer_queue.is_empty());
-        assert_eq!(s.transfer_bytes, Some(0));
+        assert_eq!(t_bytes(&s), Some(0));
         assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
     }
 
@@ -2082,6 +2184,7 @@ mod tests {
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferConflict {
+                id: 1,
                 src_conn: ConnectionId(1),
                 dst_conn: ConnectionId(2),
                 items: vec![(VfsPath::root(), VfsPath::root())],
@@ -2094,7 +2197,7 @@ mod tests {
         let fx = update(&mut s, Msg::Action(Action::Cancel));
         assert!(s.overlay.is_none());
         assert!(s.transfer_queue.is_empty());
-        assert_eq!(s.transfer_bytes, Some(0));
+        assert_eq!(t_bytes(&s), Some(0));
         assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
     }
 
@@ -2700,7 +2803,7 @@ mod tests {
         assert!(s.overlay.is_none(), "no second AI prompt opens");
         let fx = update(&mut s, Msg::Action(Action::Copy));
         assert!(fx.is_empty(), "no competing transfer starts");
-        assert!(s.transfer_bytes.is_none());
+        assert!(t_bytes(&s).is_none());
     }
 
     #[test]
