@@ -1,7 +1,7 @@
 //! The pure reducer: `update(&mut AppState, Msg) -> Vec<AppEffect>`. No I/O, no `.await`.
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, DEMO_AI_PROMPT};
-use crate::state::{AppState, Listing, Overlay, Side};
+use crate::state::{AppState, Listing, Overlay, Side, SortMode};
 use cairn_types::{Entry, VfsPath};
 use std::sync::Arc;
 
@@ -26,6 +26,7 @@ pub fn initial_effects(state: &AppState) -> Vec<AppEffect> {
                 pane: side,
                 conn: pane.conn,
                 dir: pane.cwd.clone(),
+                all: pane.show_hidden,
             }
         })
         .collect()
@@ -94,6 +95,43 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         // No overlay open: confirm/cancel and the plan-only actions are no-ops.
         Action::Confirm | Action::Cancel | Action::ApproveAll | Action::Reject => Vec::new(),
         Action::Refresh => reload(state, state.focus),
+        Action::CycleSort => {
+            let p = state.active_mut();
+            let new_sort = p.sort.next();
+            p.sort = new_sort;
+            // Keep the cursor on the same entry across the re-order (MC convention).
+            let focused = p.current().map(|e| e.name.clone());
+            // Re-order the already-loaded entries in place — no re-list needed. `Arc::make_mut`
+            // mutates without cloning while the listing isn't shared (the render path only borrows
+            // it transiently between frames), so a 100k-entry pane isn't copied on every keypress.
+            if let Listing::Ready(entries) = &mut p.listing {
+                let v: &mut Vec<Entry> = Arc::make_mut(entries);
+                sort_entries(v, new_sort);
+            }
+            // Marks are positional; a re-order invalidates them.
+            p.marked.clear();
+            if let Some(name) = focused {
+                if let Some(idx) = p.listing.entries().iter().position(|e| e.name == name) {
+                    p.cursor = idx;
+                }
+            }
+            p.clamp_cursor();
+            state.status = Some(format!("Sort: {}", new_sort.label()));
+            Vec::new()
+        }
+        Action::ToggleHidden => {
+            let p = state.active_mut();
+            p.show_hidden = !p.show_hidden;
+            let shown = p.show_hidden;
+            // Hidden entries come from the backend (`ListOpts::all`), so re-list to fetch/drop them.
+            let fx = reload(state, state.focus);
+            state.status = Some(if shown {
+                "Hidden files: on".to_owned()
+            } else {
+                "Hidden files: off".to_owned()
+            });
+            fx
+        }
         Action::Quit => {
             state.should_quit = true;
             Vec::new()
@@ -379,6 +417,7 @@ fn navigate(state: &mut AppState, side: Side, dir: cairn_types::VfsPath) -> Vec<
         pane: side,
         conn: p.conn,
         dir,
+        all: p.show_hidden,
     }]
 }
 
@@ -391,6 +430,7 @@ fn reload(state: &mut AppState, side: Side) -> Vec<AppEffect> {
         pane: side,
         conn: p.conn,
         dir,
+        all: p.show_hidden,
     }]
 }
 
@@ -412,7 +452,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             match result {
                 Ok(page) => {
                     let mut entries = page.entries;
-                    sort_entries(&mut entries);
+                    sort_entries(&mut entries, p.sort);
                     p.listing = Listing::Ready(Arc::new(entries));
                     p.clamp_cursor();
                 }
@@ -452,6 +492,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                         pane: side,
                         conn: p.conn,
                         dir: p.cwd.clone(),
+                        all: p.show_hidden,
                     }
                 })
                 .collect()
@@ -459,13 +500,31 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
     }
 }
 
-/// Sort entries directories-first, then case-insensitively by name.
-fn sort_entries(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| {
-        b.is_dir()
-            .cmp(&a.is_dir())
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+/// Sort entries directories-first, then by the pane's [`SortMode`] within each group.
+///
+/// Directories always precede files regardless of mode. Ties (and the secondary key for every mode)
+/// fall back to case-insensitive name order, so the result is deterministic. `Size`/`Modified` order
+/// the most-relevant first (largest / newest); entries missing that field sort after those that have
+/// it, then by name.
+fn sort_entries(entries: &mut [Entry], mode: SortMode) {
+    // Every mode has `cmp_name` as a total secondary key, so the comparator is a total order and
+    // stability is unobservable — `sort_unstable_by` is the cheaper choice.
+    entries.sort_unstable_by(|a, b| {
+        // Directories first.
+        b.is_dir().cmp(&a.is_dir()).then_with(|| match mode {
+            SortMode::Name => cmp_name(a, b),
+            // Largest first; `Option`'s natural order puts `None` (unknown size) last — and keeps a
+            // known empty file (`Some(0)`) ahead of an unknown one. Ties fall back to name.
+            SortMode::Size => b.size.cmp(&a.size).then_with(|| cmp_name(a, b)),
+            // Newest first; `None` (unknown time) sorts last, then by name.
+            SortMode::Modified => b.modified.cmp(&a.modified).then_with(|| cmp_name(a, b)),
+        })
     });
+}
+
+/// Case-insensitive name comparison — the stable secondary key for every sort mode.
+fn cmp_name(a: &Entry, b: &Entry) -> std::cmp::Ordering {
+    a.name.to_lowercase().cmp(&b.name.to_lowercase())
 }
 
 #[cfg(test)]
@@ -527,6 +586,143 @@ mod tests {
             .map(|e| e.name.to_string())
             .collect();
         assert_eq!(names, vec!["apple", "banana.txt", "zebra.txt"]);
+    }
+
+    fn file_sized(name: &str, size: u64) -> Entry {
+        let mut e = Entry::new(name, EntryKind::File);
+        e.size = Some(size);
+        e
+    }
+
+    fn names(s: &AppState, side: Side) -> Vec<String> {
+        s.pane(side)
+            .listing
+            .entries()
+            .iter()
+            .map(|e| e.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn sort_size_orders_largest_first_within_files_dirs_still_first() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                file_sized("small.txt", 10),
+                Entry::new("adir", EntryKind::Dir),
+                file_sized("big.txt", 9000),
+                file_sized("mid.txt", 500),
+            ],
+        );
+        // Cycle Name -> Size.
+        let _ = update(&mut s, Msg::Action(Action::CycleSort));
+        assert_eq!(s.active().sort, SortMode::Size);
+        assert_eq!(
+            names(&s, Side::Left),
+            vec!["adir", "big.txt", "mid.txt", "small.txt"]
+        );
+    }
+
+    #[test]
+    fn sort_modified_orders_newest_first_with_unknown_times_last() {
+        use std::time::{Duration, SystemTime};
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000);
+        let mut a = Entry::new("old.txt", EntryKind::File);
+        a.modified = Some(older);
+        let mut b = Entry::new("new.txt", EntryKind::File);
+        b.modified = Some(newer);
+        let none = Entry::new("undated.txt", EntryKind::File); // modified: None
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![a, none, b]);
+        // Name -> Size -> Modified.
+        let _ = update(&mut s, Msg::Action(Action::CycleSort));
+        let _ = update(&mut s, Msg::Action(Action::CycleSort));
+        assert_eq!(s.active().sort, SortMode::Modified);
+        assert_eq!(
+            names(&s, Side::Left),
+            vec!["new.txt", "old.txt", "undated.txt"]
+        );
+    }
+
+    #[test]
+    fn cycle_sort_reorders_in_place_without_a_list_effect_and_clears_marks() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![file_sized("a.txt", 1), file_sized("z.txt", 9000)],
+        );
+        // Mark an entry, then cycle to Size — marks must clear and no re-list is needed.
+        let _ = update(&mut s, Msg::Action(Action::ToggleMark));
+        assert!(!s.active().marked.is_empty());
+        let fx = update(&mut s, Msg::Action(Action::CycleSort));
+        assert!(fx.is_empty(), "cycling sort must not trigger I/O");
+        assert!(s.active().marked.is_empty(), "marks clear on re-sort");
+        assert_eq!(names(&s, Side::Left), vec!["z.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn cycle_sort_keeps_the_cursor_on_the_same_entry() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                file_sized("a.txt", 1),
+                file_sized("m.txt", 50),
+                file_sized("z.txt", 9000),
+            ],
+        );
+        // Put the cursor on "a.txt" (smallest, first by name).
+        assert_eq!(s.active().current().unwrap().name, "a.txt");
+        // Cycle to Size: order becomes z, m, a — the cursor must follow "a.txt" to its new index.
+        let _ = update(&mut s, Msg::Action(Action::CycleSort));
+        assert_eq!(s.active().current().unwrap().name, "a.txt");
+        assert_eq!(s.active().cursor, 2);
+    }
+
+    #[test]
+    fn sort_set_while_loading_applies_to_the_arriving_listing() {
+        let mut s = state();
+        // Pane starts Loading; cycle to Size before any listing arrives (no re-sort happens yet).
+        let fx = update(&mut s, Msg::Action(Action::CycleSort));
+        assert!(fx.is_empty());
+        assert_eq!(s.active().sort, SortMode::Size);
+        // When the listing arrives it is sorted with the pane's current mode.
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![file_sized("small", 1), file_sized("big", 9000)],
+        );
+        assert_eq!(names(&s, Side::Left), vec!["big", "small"]);
+    }
+
+    #[test]
+    fn sort_mode_cycles_back_to_name() {
+        assert_eq!(SortMode::Name.next(), SortMode::Size);
+        assert_eq!(SortMode::Size.next(), SortMode::Modified);
+        assert_eq!(SortMode::Modified.next(), SortMode::Name);
+    }
+
+    #[test]
+    fn toggle_hidden_flips_flag_and_relists_with_the_all_flag() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("a", EntryKind::File)]);
+        assert!(!s.active().show_hidden);
+        let fx = update(&mut s, Msg::Action(Action::ToggleHidden));
+        assert!(s.active().show_hidden);
+        // Re-lists the active pane with the new flag.
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::List { pane, all: true, .. }] if *pane == Side::Left
+        ));
+        // Toggling back clears it and re-lists with all=false.
+        let fx = update(&mut s, Msg::Action(Action::ToggleHidden));
+        assert!(!s.active().show_hidden);
+        assert!(matches!(&fx[..], [AppEffect::List { all: false, .. }]));
     }
 
     #[test]

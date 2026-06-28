@@ -190,11 +190,16 @@ fn map_input(input: Event, keymap: &Keymap) -> Option<Msg> {
 /// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s.
 fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<AppEvent>) {
     match effect {
-        AppEffect::List { pane, conn, dir } => {
+        AppEffect::List {
+            pane,
+            conn,
+            dir,
+            all,
+        } => {
             let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let result = list_dir(&registry, conn, &dir).await;
+                let result = list_dir(&registry, conn, &dir, all).await;
                 let _ = event_tx
                     .send(AppEvent::Listed {
                         pane,
@@ -377,18 +382,19 @@ async fn list_dir(
     registry: &VfsRegistry,
     conn: ConnectionId,
     dir: &VfsPath,
+    all: bool,
 ) -> Result<ListPage, VfsError> {
     let Some(vfs) = registry.get(conn).await else {
         return Err(VfsError::NotFound(dir.clone()));
     };
-    collect_pages(vfs, dir).await
+    collect_pages(vfs, dir, all).await
 }
 
 /// Drain a backend's listing stream into a single page (sufficient for backends that paginate; the
 /// UI virtualizes either way).
-async fn collect_pages(vfs: Arc<dyn Vfs>, dir: &VfsPath) -> Result<ListPage, VfsError> {
+async fn collect_pages(vfs: Arc<dyn Vfs>, dir: &VfsPath, all: bool) -> Result<ListPage, VfsError> {
     let mut entries = Vec::new();
-    let mut stream = vfs.list(dir, ListOpts::default());
+    let mut stream = vfs.list(dir, ListOpts { all });
     while let Some(page) = stream.next().await {
         let page = page?;
         entries.extend(page.entries);
@@ -440,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn list_dir_unknown_connection_is_not_found() {
         let registry = VfsRegistry::new();
-        let res = list_dir(&registry, ConnectionId(99), &VfsPath::root()).await;
+        let res = list_dir(&registry, ConnectionId(99), &VfsPath::root(), false).await;
         assert!(matches!(res, Err(VfsError::NotFound(_))));
     }
 
@@ -452,8 +458,31 @@ mod tests {
         registry
             .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
             .await;
-        let page = list_dir(&registry, LEFT, &VfsPath::root()).await.unwrap();
+        let page = list_dir(&registry, LEFT, &VfsPath::root(), false)
+            .await
+            .unwrap();
         assert!(page.entries.iter().any(|e| e.name == "hello.txt"));
+    }
+
+    #[tokio::test]
+    async fn list_dir_all_flag_controls_hidden_entries() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("visible.txt"), b"hi").unwrap();
+        std::fs::write(dir.path().join(".secret"), b"shh").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        // all = false hides dotfiles.
+        let hidden = list_dir(&registry, LEFT, &VfsPath::root(), false)
+            .await
+            .unwrap();
+        assert!(hidden.entries.iter().all(|e| e.name != ".secret"));
+        // all = true reveals them.
+        let shown = list_dir(&registry, LEFT, &VfsPath::root(), true)
+            .await
+            .unwrap();
+        assert!(shown.entries.iter().any(|e| e.name == ".secret"));
     }
 
     #[test]

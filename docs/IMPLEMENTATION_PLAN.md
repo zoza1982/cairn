@@ -128,7 +128,7 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 | M1-7 | Input + keymap: blocking-thread reader, MC/vim default keymap (chords/presets later) | tui-engineer | M1-6 | rustdoc | nav/quit keys mapped (tests); input off the async runtime | ✅ #10 |
 | M1-8 | Wire-up: TEA event loop in the binary; browse local FS in both panes, nav in/out, non-blocking | tui-engineer, software-engineer | M1-3, M1-5, M1-7 | rustdoc | **Demo:** `cairn` opens cwd dual-pane, navigate, Tab, marks, quit | ✅ #10 |
 | M1-9 | Large-list virtualization + off-thread sort/filter, filter-as-you-type | tui-engineer, performance-tuning-engineer | M1-8 | perf note | 100k dir smooth; first page <100 ms | 🟡 ratatui scrolls selection into view; true windowing + off-thread sort/filter deferred |
-| M1-10 | Multi-select, sort (name/size/date/type), show/hide hidden | software-engineer, tui-engineer | M1-8 | user docs | selection + sort unit tests | 🟡 marks + dirs-first/name sort done; size/date sort + hidden toggle deferred |
+| M1-10 | Multi-select, sort (name/size/date/type), show/hide hidden | software-engineer, tui-engineer | M1-8 | user docs | selection + sort unit tests | 🟡 marks + name/size/modified sort (`s`) + hidden toggle (`.`) done (#35): cursor follows its entry across re-sort, modes configurable via `[ui.keybindings]`, status shown per pane; **type** sort the only remaining mode |
 
 ### M2 — Operations & transfer engine
 

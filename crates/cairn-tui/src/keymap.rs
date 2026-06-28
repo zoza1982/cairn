@@ -107,6 +107,8 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "confirm" => Action::Confirm,
         "cancel" => Action::Cancel,
         "refresh" => Action::Refresh,
+        "cycle_sort" => Action::CycleSort,
+        "toggle_hidden" => Action::ToggleHidden,
         "open_connections" => Action::OpenConnections,
         "ai_propose" => Action::AiPropose,
         "approve_all" => Action::ApproveAll,
@@ -213,6 +215,9 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Char('r') => Some(Action::Refresh),
+        // 's' cycles the sort mode; '.' toggles hidden entries (ranger/vim convention).
+        KeyCode::Char('s') => Some(Action::CycleSort),
+        KeyCode::Char('.') => Some(Action::ToggleHidden),
         // Plan-overlay actions (no-ops when no overlay is open).
         // NOTE: revisit when text-input overlays land — 'a'/'x' must not fire while a text field
         // is capturing input.
@@ -403,6 +408,8 @@ mod tests {
             "confirm",
             "cancel",
             "refresh",
+            "cycle_sort",
+            "toggle_hidden",
             "open_connections",
             "ai_propose",
             "approve_all",
@@ -415,7 +422,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 21);
     }
 
     #[test]

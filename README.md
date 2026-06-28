@@ -77,14 +77,20 @@ Cairn reads an optional TOML config from the platform config directory (e.g.
 Keys can be remapped under `[ui.keybindings]` — a map of key-chord → action, layered over the
 built-in scheme. Chords combine optional `ctrl+`/`alt+`/`shift+` modifiers with a key (a single
 character, a named key like `enter`/`space`/`esc`/`tab`/arrows, or `f1`–`f24`); actions are
-snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `quit`, …). Unrecognized entries
-are ignored with a warning, and `Ctrl-C` always quits.
+snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `cycle_sort`, `toggle_hidden`,
+`quit`, …). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
+
+By default `s` cycles the active pane's sort order (name → size → modified) and `.` toggles whether
+hidden entries (dotfiles) are listed; the current sort mode and hidden state show in each pane's
+bottom-right corner.
 
 ```toml
 [ui.keybindings]
 "ctrl+a" = "ai_propose"   # ask the AI assistant for a plan
 "G"      = "cursor_bottom"
 "f5"     = "copy"
+"s"      = "cycle_sort"   # name → size → modified
+"."      = "toggle_hidden"
 ```
 
 Colors can be themed under `[ui.colors]` — override individual roles

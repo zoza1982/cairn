@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open_connection` remains deferred pending the broker-backed opener.
 
 ### Added
+- Per-pane **sort modes & hidden-file toggle** (M1-8): `s` cycles the active pane's sort
+  (name → size → modified) and `.` toggles whether hidden entries (dotfiles) are listed. Directories
+  always sort first; size/modified order the most-relevant first (largest / newest) with unknown
+  values last and a case-insensitive name tiebreak. Cycling re-orders in place (no re-list) and keeps
+  the cursor on the same entry; the hidden toggle re-lists via the backend's `ListOpts::all`. The
+  active mode and hidden state show bottom-right in each pane. Both actions are configurable under
+  `[ui.keybindings]` as `cycle_sort` / `toggle_hidden`.
 - Config-driven **theme colors** (M8-7): `[ui.colors]` overrides individual render roles
   (`focused_border`/`unfocused_border`/`dir`/`error`/`status`/`selection_bg`/`selection_fg`) over the
   built-in `dark` preset, using color names or `#rrggbb`. A `Theme` is resolved from config and
