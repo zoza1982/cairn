@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-ai`: the agentic AI core — a provider-agnostic `LlmProvider` trait + `MockProvider`, the
+  closed tool surface (capability per tool; unknown tools rejected), and the plan→confirm→execute
+  state machine (bulk-approve only when every step is safe/recoverable; failure aborts the rest).
+  Hermetic (M7-3/M7-4; trait+mock for M7-1).
 - `cairn-broker`: the capability broker — the sole mediator that resolves a credential id to a
   secret (journaled), with a secret-free world view for untrusted actors (M3-5).
 - `cairn-config`: TOML configuration with connection profiles that reference a vault credential

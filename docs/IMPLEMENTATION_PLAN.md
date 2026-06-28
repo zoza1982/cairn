@@ -19,10 +19,10 @@
 |---|---|
 | **Phase** | Design complete → starting build |
 | **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0004 |
-| **Current milestone** | **M3 — Secrets foundation (vault + broker)** (🟡 in progress) |
+| **Current milestone** | **M7 — Agentic AI** (🟡 in progress; M3–M6 backends partially deferred) |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones complete** | 0 / 9 |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 19 / 11 / 41 / 0 / 0 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 21 / 12 / 38 / 0 / 0 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows (scaffold) |
 | **Long-pole items** | `M1-1` Vfs trait · `M3-5` broker · all backend RFCs |
 
@@ -186,10 +186,10 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M7-1 | `LlmProvider` trait + `StreamChunk` normalization; Claude provider | ai-integration-engineer | M3-5 | rustdoc; ADR ref | `MockProvider` + Claude path; no live API in CI | ☐ |
+| M7-1 | `LlmProvider` trait + `StreamChunk` normalization; Claude provider | ai-integration-engineer | M3-5 | rustdoc; ADR ref | `MockProvider` + Claude path; no live API in CI | 🟡 LlmProvider trait + MockProvider done; cloud/local HTTP providers + streaming deferred |
 | M7-2 | Ollama + OpenAI-compat providers w/ tool degradation (Native→JsonSchema→Text) | ai-integration-engineer | M7-1 | rustdoc; local-model doc | degradation tiers tested vs MockProvider | ☐ |
-| M7-3 | Closed tool registry (handles only; `schemars`; `ToolNotFound`) → broker | ai-integration-engineer, security-engineer | M7-1, M3-5 | rustdoc; threat-model | no tool returns/accepts a secret (compile + review) | ☐ |
-| M7-4 | Plan state machine, engine-driven execution, per-step confirm, partial-failure surfacing | ai-integration-engineer | M7-3 | rustdoc | engine runs steps; irreversible step pauses for confirm (test) | ☐ |
+| M7-3 | Closed tool registry (handles only; `schemars`; `ToolNotFound`) → broker | ai-integration-engineer, security-engineer | M7-1, M3-5 | rustdoc; threat-model | no tool returns/accepts a secret (compile + review) | ✅ #15 (closed set via capability_for; unknown tool rejected) |
+| M7-4 | Plan state machine, engine-driven execution, per-step confirm, partial-failure surfacing | ai-integration-engineer | M7-3 | rustdoc | engine runs steps; irreversible step pauses for confirm (test) | ✅ #15 |
 | M7-5 | Context `WorldSnapshot` (sanitized, budgeted, no secrets), injection defenses | ai-integration-engineer, security-engineer | M7-3 | rustdoc; injection-defense doc | snapshot carries no secret (test); heuristics flag off-scope | ☐ |
 | M7-6 | AI side panel + plan→confirm overlay; `[Approve all]` only when all steps Safe/Recoverable | tui-engineer, security-engineer | M7-4, M2-7 | user docs | **Demo:** "archive logs >30d to S3" plan→step-through; bulk-approve absent if destructive | ☐ |
 | M7-7 | `cairn-mcp` (feature-gated): expose actions as MCP server through same broker+confirm | ai-integration-engineer | M7-3 | rustdoc | external MCP client hits same confirm gate (test) | ☐ |
