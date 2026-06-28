@@ -56,15 +56,20 @@ the human maintainer makes the final call and owns it.
 |-------------------|---------|
 | System architecture, cross-cutting design | `software-architect`, `systems-design-engineer` |
 | Rust implementation, idioms, `unsafe`, perf-critical code | `rust-staff-engineer` |
+| General implementation | `software-engineer` |
 | Object-store backends (S3/GCS/Azure), transfer engine | `storage-engineer` |
 | Kubernetes backend (pods, exec, logs, port-forward) | `kube-staff-engineer` |
-| SSH/SFTP, connections, networking | `network-engineer` |
-| Docker / container backends, CI/CD, packaging, releases | `devops-engineer` |
+| Docker/OCI container & image backend | `container-backend-engineer` |
+| SSH/SFTP, connections, networking, transport resilience | `network-engineer` |
+| CI/CD, packaging, releases, container dev workflows | `devops-engineer` |
 | Secrets vault, crypto, auth, command-execution safety | `security-engineer` (+ `security-review`) |
-| TUI layout, interaction, accessibility | `ux-engineer`, `ui-engineer` |
-| AI / agentic assistant design & integration | `software-architect` + `rust-staff-engineer` + `security-engineer` (use the `claude-api` skill for provider/model specifics) |
+| AI / agentic assistant (LLM providers, tools, plan→confirm) | `ai-integration-engineer` (use the `claude-api` skill for provider/model specifics) |
+| TUI rendering, layout, input, theming, keybindings | `tui-engineer` |
+| Interaction / UX design | `ux-engineer`, `ui-engineer` |
+| WASM plugin system & extensibility | `plugin-systems-engineer` |
 | Performance analysis & optimization | `performance-tuning-engineer` |
 | Test strategy & quality | `qa-engineer` |
+| Documentation, ADRs/RFCs, rustdoc, changelog | `technical-writer` |
 | Naming, branding, messaging | `product-branding-expert` |
 | Planning, sequencing, multi-step coordination | `project-manager`, `workflow-orchestrator` |
 | Bug / edge-case / security analysis of a diff (gate) | `bug-bot` |
