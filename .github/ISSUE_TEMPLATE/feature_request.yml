@@ -1,0 +1,37 @@
+name: ✨ Feature request
+description: Suggest an idea or enhancement for Cairn
+title: "feat: "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem would this solve? Who benefits?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you'd like to happen. Mockups/ASCII welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - VFS / backends
+        - TUI / UX
+        - Secrets / vault
+        - AI / assistant
+        - Transfers
+        - Plugins
+        - Other
+    validations:
+      required: true

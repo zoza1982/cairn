@@ -1,0 +1,42 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock.orig
+
+# We commit Cargo.lock for the binary (reproducible builds).
+# (Default: keep Cargo.lock tracked.)
+
+# Editors / IDEs
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Env / secrets — NEVER commit these
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+kubeconfig
+*.kubeconfig
+credentials
+.aws/
+.gcloud/
+.azure/
+secrets/
+*.secret
+
+# Build / coverage artifacts
+/coverage
+*.profraw
+lcov.info
+
+# Local scratch
+/scratch
+/tmp

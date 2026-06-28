@@ -1,0 +1,50 @@
+name: 🐛 Bug report
+description: Report a defect in Cairn
+title: "fix: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please do **not** include secrets, tokens, or credentials.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: When I copy from a k8s pod to S3, the transfer hangs at 100%...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Connect to '...'
+        2. Select '...'
+        3. Press '...'
+        4. See error
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Backend(s) involved
+      placeholder: "e.g. local, s3, k8s"
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Cairn version, OS, terminal emulator.
+      placeholder: |
+        - Cairn: 0.x.y
+        - OS: Ubuntu 24.04 / macOS 15 / Windows 11
+        - Terminal: kitty / wezterm / Windows Terminal
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant logs (with secrets redacted).
+      render: shell
