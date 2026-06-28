@@ -17,12 +17,12 @@
 
 | Field | Value |
 |---|---|
-| **Phase** | Design complete → starting build |
-| **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0004 |
-| **Current milestone** | **Hermetic milestones delivered; SDK/service backends env-deferred** |
+| **Phase** | Build in progress — the hermetic core of every milestone has landed |
+| **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0004 · ✅ RFC-0001..0006 |
+| **Current milestone** | **Hermetic cores delivered across M0–M8; SDK/service integration env-deferred** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
-| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core + M8 runtime + M4 SFTP-mapping + M6 Docker- & K8s-mapping ✅ · cloud providers + live-transport (SSH/Docker/K8s) ⏭ |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 27 / 13 / 0 / 0 / 31 |
+| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core & plan→confirm UI + M8 runtime, WIT RFC & keybindings + M4 SFTP-mapping + M6 Docker- & K8s-mapping ✅ · cloud providers + live-transport (SSH/Docker/K8s) + LLM HTTP providers + WASM component bridge ⏭ |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 30 / 17 / 0 / 0 / 24 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
 
