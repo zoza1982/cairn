@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open_connection` remains deferred pending the broker-backed opener.
 
 ### Added
+- **Transfer cancellation** (M2-4): `Esc` aborts an in-flight copy/move — the engine's cooperative
+  `CancellationToken` is now held on the runtime side and signalled by a `CancelTransfer` effect.
+  Cancellation reports a non-error completion warning that partial changes may remain (a mid-flight
+  move may have already moved earlier items).
 - **Live transfer progress** (M2-5): the copy/move engine's progress is now surfaced — the status
   line shows a running byte total (`⇅ transferring… 3.4 MiB`) while a transfer runs. Progress is
   coalesced and delivered best-effort (non-blocking `try_send`, so it never stalls the transfer), and

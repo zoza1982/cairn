@@ -88,8 +88,14 @@ async fn run_async() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     install_terminal_panic_hook();
 
-    for effect in initial_effects(&state) {
-        dispatch(effect, &registry, &event_tx);
+    // Initial effects are only directory listings — no transfer, so no token slot needed.
+    let initial = initial_effects(&state);
+    debug_assert!(
+        initial.iter().all(|e| matches!(e, AppEffect::List { .. })),
+        "initial_effects must emit only List effects; a transfer here would be uncancellable"
+    );
+    for effect in initial {
+        dispatch(effect, &registry, &event_tx, &mut None);
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
 
@@ -164,6 +170,9 @@ async fn event_loop(
     event_rx: &mut mpsc::Receiver<AppEvent>,
     input_rx: &mut mpsc::Receiver<Event>,
 ) -> anyhow::Result<()> {
+    // The cancellation token of the in-flight transfer (if any), held here on the runtime side so a
+    // `CancelTransfer` effect can signal it. Cleared when the transfer's `TransferDone` arrives.
+    let mut transfer_cancel: Option<CancellationToken> = None;
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -172,13 +181,18 @@ async fn event_loop(
         };
         let Some(msg) = msg else { continue };
 
+        // Clear before `update`: if `update(TransferDone)` ever emitted a new Transfer, it would get
+        // a fresh slot rather than one cleared right after dispatch.
+        if matches!(msg, Msg::Event(AppEvent::TransferDone { .. })) {
+            transfer_cancel = None;
+        }
         let effects = update(state, msg);
         if state.should_quit {
             break;
         }
         terminal.draw(|f| cairn_tui::render(f, state, &ui.theme))?;
         for effect in effects {
-            dispatch(effect, registry, event_tx);
+            dispatch(effect, registry, event_tx, &mut transfer_cancel);
         }
     }
     Ok(())
@@ -203,8 +217,14 @@ fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
     }
 }
 
-/// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s.
-fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<AppEvent>) {
+/// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s. `transfer_cancel`
+/// holds the in-flight transfer's cancellation token so a [`AppEffect::CancelTransfer`] can fire it.
+fn dispatch(
+    effect: AppEffect,
+    registry: &VfsRegistry,
+    event_tx: &mpsc::Sender<AppEvent>,
+    transfer_cancel: &mut Option<CancellationToken>,
+) {
     match effect {
         AppEffect::List {
             pane,
@@ -234,12 +254,21 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
         } => {
             let registry = registry.clone();
             let event_tx = event_tx.clone();
+            // Hand the task a token whose clone we keep, so `CancelTransfer` can abort it.
+            let cancel = CancellationToken::new();
+            *transfer_cancel = Some(cancel.clone());
             tokio::spawn(async move {
-                let ev =
-                    run_transfer_effect(&registry, src_conn, dst_conn, items, is_move, &event_tx)
-                        .await;
+                let ev = run_transfer_effect(
+                    &registry, src_conn, dst_conn, items, is_move, &event_tx, cancel,
+                )
+                .await;
                 let _ = event_tx.send(ev).await;
             });
+        }
+        AppEffect::CancelTransfer => {
+            if let Some(token) = transfer_cancel.take() {
+                token.cancel();
+            }
         }
         AppEffect::Delete { conn, paths } => {
             let registry = registry.clone();
@@ -353,6 +382,7 @@ async fn run_transfer_effect(
     items: Vec<(VfsPath, VfsPath)>,
     is_move: bool,
     event_tx: &mpsc::Sender<AppEvent>,
+    cancel: CancellationToken,
 ) -> AppEvent {
     let (Some(src), Some(dst)) = (registry.get(src_conn).await, registry.get(dst_conn).await)
     else {
@@ -370,7 +400,6 @@ async fn run_transfer_effect(
         conflict: ConflictPolicy::Overwrite,
         verify: VerifyPolicy::Size,
     };
-    let cancel = CancellationToken::new();
     let verb = if is_move { "Moved" } else { "Copied" };
     // Emit coalesced, non-blocking progress: accumulate bytes and notify the UI at most every
     // `TRANSFER_PROGRESS_STEP` bytes via `try_send`, which drops the update if the bounded channel is
@@ -395,6 +424,14 @@ async fn run_transfer_effect(
                 error: false,
             }
         }
+        Err(cairn_transfer::TransferError::Cancelled) => AppEvent::TransferDone {
+            // Cancellation is cooperative and mid-flight: items already processed are done (a move's
+            // earlier sources are already deleted), so warn that partial changes may remain rather
+            // than imply nothing happened. (Reporting the exact partial count needs the engine to
+            // carry its `TransferOutcome` through `Cancelled` — tracked follow-up.)
+            status: "Transfer cancelled (partial changes may remain)".to_owned(),
+            error: false,
+        },
         Err(e) => AppEvent::TransferDone {
             status: format!("{} failed: {}", verb.trim_end_matches('d'), e.redacted()),
             error: true,
@@ -677,6 +714,45 @@ mod tests {
         assert!(matches!(ev, AppEvent::OpDone { error: false, .. }));
         assert!(!dir.path().join("a.txt").exists());
         assert_eq!(std::fs::read(dir.path().join("c.txt")).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn cancelled_transfer_reports_a_non_error_completion() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("src.txt"), b"data").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        registry
+            .insert(RIGHT, Arc::new(LocalVfs::new(RIGHT, dir.path())))
+            .await;
+        // A token already fired before the first cancellation check short-circuits the transfer.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (tx, _rx) = mpsc::channel(8);
+        let ev = run_transfer_effect(
+            &registry,
+            LEFT,
+            RIGHT,
+            vec![(
+                VfsPath::parse("/src.txt").unwrap(),
+                VfsPath::parse("/dst.txt").unwrap(),
+            )],
+            false,
+            &tx,
+            cancel,
+        )
+        .await;
+        match ev {
+            AppEvent::TransferDone { status, error } => {
+                assert!(!error, "cancellation is user-initiated, not a failure");
+                assert!(status.contains("cancelled"), "got: {status}");
+            }
+            _ => panic!("expected TransferDone"),
+        }
+        // The destination was never written.
+        assert!(!dir.path().join("dst.txt").exists());
     }
 
     #[tokio::test]
