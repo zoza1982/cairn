@@ -52,10 +52,12 @@ impl Theme {
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
-        // Only `dark` exists today; any other name falls back to it (warned by the caller's config).
+        // Only `dark` exists today; an unrecognized preset falls back to it with a warning.
         let mut theme = Self::DARK;
-        let _ = preset;
         let mut warnings = Vec::new();
+        if !matches!(preset, "dark" | "default" | "") {
+            warnings.push(format!("theme: unknown preset `{preset}`, using `dark`"));
+        }
         for (role, value) in overrides {
             let Ok(color) = Color::from_str(value) else {
                 warnings.push(format!("theme: unparseable color `{value}` for `{role}`"));
@@ -83,6 +85,17 @@ mod tests {
     #[test]
     fn default_is_the_dark_preset() {
         assert_eq!(Theme::default().focused_border, Color::Cyan);
+    }
+
+    #[test]
+    fn unknown_preset_warns_and_falls_back() {
+        let (theme, warnings) = Theme::resolve("solarized", std::iter::empty());
+        assert_eq!(theme.focused_border, Theme::DARK.focused_border);
+        assert_eq!(warnings.len(), 1);
+        // The known presets and the empty default do not warn.
+        for ok in ["dark", "default", ""] {
+            assert!(Theme::resolve(ok, std::iter::empty()).1.is_empty());
+        }
     }
 
     #[test]
