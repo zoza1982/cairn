@@ -1,0 +1,21 @@
+[package]
+name = "cairn-broker"
+description = "Cairn's capability broker: the sole mediator that resolves credential references to secrets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-secrets = { workspace = true }
+cairn-vault = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

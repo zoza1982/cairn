@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-broker`: the capability broker — the sole mediator that resolves a credential id to a
+  secret (journaled), with a secret-free world view for untrusted actors (M3-5).
+- `cairn-config`: TOML configuration with connection profiles that reference a vault credential
+  by id and cannot hold a secret by construction (M3-6).
 - `cairn-secrets`: zeroizing secret types and a log-redaction helper.
 - `cairn-vault`: encrypted secrets vault (XChaCha20-Poly1305 + Argon2id, header bound as AAD,
   atomic writes); passphrase unlock; 7 hermetic crypto tests (M3-1/M3-2).
