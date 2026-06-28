@@ -171,6 +171,13 @@ pub(crate) mod mock {
                 .files
                 .get(container)
                 .ok_or_else(|| Self::nf(container))?;
+            // The container root is always a directory (even when empty).
+            if path == "/" {
+                return Ok(RemoteMeta {
+                    kind: EntryKind::Dir,
+                    size: None,
+                });
+            }
             if let Some(data) = tree.get(path) {
                 return Ok(RemoteMeta {
                     kind: EntryKind::File,

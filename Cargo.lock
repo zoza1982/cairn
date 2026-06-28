@@ -260,6 +260,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-backend-k8s"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "cairn-types",
+ "cairn-vfs",
+ "futures",
+ "smol_str",
+ "tokio",
+]
+
+[[package]]
 name = "cairn-backend-local"
 version = "0.0.0"
 dependencies = [

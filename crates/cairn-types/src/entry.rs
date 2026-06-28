@@ -129,6 +129,13 @@ pub enum EntryExt {
         /// Node the pod is scheduled on, if any.
         node: Option<SmolStr>,
     },
+    /// A container within a Kubernetes pod.
+    KubeContainer {
+        /// Whether this is an init container.
+        is_init: bool,
+        /// Whether this is an ephemeral (debug) container.
+        is_ephemeral: bool,
+    },
     /// A generic Kubernetes resource.
     K8sResource {
         /// Resource kind (e.g. `Service`).

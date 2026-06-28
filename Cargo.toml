@@ -31,6 +31,7 @@ cairn-backend-object = { path = "crates/cairn-backend-object", version = "0.0.0"
 cairn-plugin = { path = "crates/cairn-plugin", version = "0.0.0" }
 cairn-backend-ssh = { path = "crates/cairn-backend-ssh", version = "0.0.0" }
 cairn-backend-docker = { path = "crates/cairn-backend-docker", version = "0.0.0" }
+cairn-backend-k8s = { path = "crates/cairn-backend-k8s", version = "0.0.0" }
 
 
 # Lints applied across the whole workspace. Keep the bar high, but keep velocity:
