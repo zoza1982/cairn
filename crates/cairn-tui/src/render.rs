@@ -130,7 +130,7 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     lines.push(Line::from(if pending.is_empty() {
         "[Esc] Close".to_owned()
     } else {
-        "[↑↓] select   [d] drop   [x] clear all   [Esc] close".to_owned()
+        "[↑↓] select  [K/J] move  [d] drop  [x] clear all  [Esc] close".to_owned()
     }));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -573,6 +573,7 @@ mod tests {
         assert!(text.contains("active"));
         assert!(text.contains("move"));
         assert!(text.contains("drop")); // the [d] drop control
+        assert!(text.contains("move")); // the [K/J] reorder control
         assert!(text.contains("clear all"));
     }
 
