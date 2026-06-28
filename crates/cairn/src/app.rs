@@ -10,11 +10,13 @@ use std::time::Duration;
 
 use cairn_backend_local::LocalVfs;
 use cairn_core::{initial_effects, update, AppEffect, AppEvent, AppState, Msg};
+use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_types::{ConnectionId, VfsPath};
-use cairn_vfs::{ListOpts, ListPage, Vfs, VfsError, VfsRegistry};
+use cairn_vfs::{ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
 use ratatui::crossterm::event::{self, Event};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const LEFT: ConnectionId = ConnectionId(1);
 const RIGHT: ConnectionId = ConnectionId(2);
@@ -120,8 +122,95 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
                 let _ = event_tx.send(AppEvent::Listed { pane, dir, result }).await;
             });
         }
+        AppEffect::Transfer {
+            src_conn,
+            dst_conn,
+            items,
+            is_move,
+        } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_transfer_effect(&registry, src_conn, dst_conn, items, is_move).await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::Delete { conn, paths } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_delete_effect(&registry, conn, paths).await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
         other => tracing::warn!(effect = ?other, "unhandled effect"),
+    }
+}
+
+async fn run_transfer_effect(
+    registry: &VfsRegistry,
+    src_conn: ConnectionId,
+    dst_conn: ConnectionId,
+    items: Vec<(VfsPath, VfsPath)>,
+    is_move: bool,
+) -> AppEvent {
+    let (Some(src), Some(dst)) = (registry.get(src_conn).await, registry.get(dst_conn).await)
+    else {
+        return AppEvent::OpDone {
+            status: "connection unavailable".to_owned(),
+            error: true,
+        };
+    };
+    let spec = TransferSpec {
+        op: if is_move {
+            TransferOp::Move
+        } else {
+            TransferOp::Copy
+        },
+        conflict: ConflictPolicy::Overwrite,
+        verify: VerifyPolicy::Size,
+    };
+    let cancel = CancellationToken::new();
+    let mut bytes = 0u64;
+    let verb = if is_move { "Moved" } else { "Copied" };
+    match cairn_transfer::run_transfer(&src, &dst, &items, spec, &cancel, &mut |b| bytes += b).await
+    {
+        Ok(out) => AppEvent::OpDone {
+            status: format!("{verb} {} file(s), {} dir(s)", out.files, out.dirs),
+            error: false,
+        },
+        Err(e) => AppEvent::OpDone {
+            status: format!("{} failed: {e}", verb.trim_end_matches('d')),
+            error: true,
+        },
+    }
+}
+
+async fn run_delete_effect(
+    registry: &VfsRegistry,
+    conn: ConnectionId,
+    paths: Vec<VfsPath>,
+) -> AppEvent {
+    let Some(vfs) = registry.get(conn).await else {
+        return AppEvent::OpDone {
+            status: "connection unavailable".to_owned(),
+            error: true,
+        };
+    };
+    let mut deleted = 0u64;
+    for path in &paths {
+        if let Err(e) = vfs.remove(path, Recurse::Yes).await {
+            return AppEvent::OpDone {
+                status: format!("Delete failed: {}", e.redacted()),
+                error: true,
+            };
+        }
+        deleted += 1;
+    }
+    AppEvent::OpDone {
+        status: format!("Deleted {deleted} item(s)"),
+        error: false,
     }
 }
 

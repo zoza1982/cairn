@@ -101,7 +101,7 @@ pub async fn run_transfer(
     items: &[(VfsPath, VfsPath)],
     spec: TransferSpec,
     cancel: &CancellationToken,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<TransferOutcome, TransferError> {
     let mut outcome = TransferOutcome::default();
     for (from, to) in items {
@@ -121,7 +121,7 @@ async fn transfer_one(
     to: &VfsPath,
     spec: TransferSpec,
     cancel: &CancellationToken,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut (dyn FnMut(u64) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
     // Same-connection move with rename support: a single atomic rename.
@@ -150,7 +150,7 @@ async fn copy_tree(
     to: &VfsPath,
     spec: TransferSpec,
     cancel: &CancellationToken,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut (dyn FnMut(u64) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
     let mut stack: VecDeque<(VfsPath, VfsPath)> = VecDeque::new();
@@ -188,7 +188,7 @@ async fn copy_file(
     to: &VfsPath,
     spec: TransferSpec,
     cancel: &CancellationToken,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut (dyn FnMut(u64) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
     // Resolve conflicts against the destination before writing.

@@ -112,6 +112,18 @@ impl PaneState {
     }
 }
 
+/// A modal overlay awaiting user input.
+#[derive(Debug, Clone)]
+pub enum Overlay {
+    /// Confirm deletion of the listed paths on a connection.
+    ConfirmDelete {
+        /// The connection the paths live on.
+        conn: ConnectionId,
+        /// The paths to delete.
+        paths: Vec<VfsPath>,
+    },
+}
+
 /// The whole application state. Holds plain data only — no service handles, no I/O.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -119,6 +131,8 @@ pub struct AppState {
     pub panes: [PaneState; 2],
     /// Which pane is focused.
     pub focus: Side,
+    /// A modal overlay, if one is open (captures input).
+    pub overlay: Option<Overlay>,
     /// Set when the user has asked to quit.
     pub should_quit: bool,
     /// A transient status/notification line.
@@ -135,6 +149,7 @@ impl AppState {
                 PaneState::new(right, cwd),
             ],
             focus: Side::Left,
+            overlay: None,
             should_quit: false,
             status: None,
         }

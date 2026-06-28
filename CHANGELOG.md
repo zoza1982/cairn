@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- File operations in the TUI: copy (`c`/F5), move (`m`/F6), and delete (`d`/F8, with a confirm
+  dialog) of the marked/current entries between panes, via the transfer engine; status feedback
+  and auto-refresh (M2-6/M2-7).
 - `cairn-transfer`: the transfer engine — stream-through copy/move across any two backends,
   directory-tree walk, server-side-copy fast path, conflict policies, size verification, and
   cooperative cancellation; RFC-0002. 6 hermetic tests (M2-1..4).

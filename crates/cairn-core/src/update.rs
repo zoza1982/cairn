@@ -1,8 +1,8 @@
 //! The pure reducer: `update(&mut AppState, Msg) -> Vec<AppEffect>`. No I/O, no `.await`.
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg};
-use crate::state::{AppState, Listing, Side};
-use cairn_types::Entry;
+use crate::state::{AppState, Listing, Overlay, Side};
+use cairn_types::{Entry, VfsPath};
 use std::sync::Arc;
 
 /// Apply a message to the state, returning any effects to run. Deterministic and side-effect-free.
@@ -32,6 +32,9 @@ pub fn initial_effects(state: &AppState) -> Vec<AppEffect> {
 }
 
 fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    if state.overlay.is_some() {
+        return apply_overlay_action(state, action);
+    }
     match action {
         Action::CursorUp => {
             let p = state.active_mut();
@@ -67,12 +70,106 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         }
         Action::Enter => enter_dir(state),
         Action::Leave => leave_dir(state),
+        Action::Copy => start_transfer(state, false),
+        Action::Move => start_transfer(state, true),
+        Action::Delete => confirm_delete(state),
+        // No overlay open: confirm/cancel are no-ops.
+        Action::Confirm | Action::Cancel => Vec::new(),
         Action::Refresh => reload(state, state.focus),
         Action::Quit => {
             state.should_quit = true;
             Vec::new()
         }
     }
+}
+
+/// Handle an action while a modal overlay is open.
+fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        Action::Confirm | Action::Enter => match state.overlay.take() {
+            Some(Overlay::ConfirmDelete { conn, paths }) => {
+                state.status = Some(format!("Deleting {} item(s)…", paths.len()));
+                let focus = state.focus;
+                state.pane_mut(focus).marked.clear();
+                vec![AppEffect::Delete { conn, paths }]
+            }
+            None => Vec::new(),
+        },
+        Action::Cancel | Action::Quit => {
+            state.overlay = None;
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The `(source-full-path, leaf-name)` pairs targeted by an operation: the marked entries, or the
+/// entry under the cursor if nothing is marked.
+fn op_targets(state: &AppState, side: Side) -> Vec<(VfsPath, String)> {
+    let pane = state.pane(side);
+    let entries = pane.listing.entries();
+    let indices: Vec<usize> = if pane.marked.is_empty() {
+        if pane.cursor < entries.len() {
+            vec![pane.cursor]
+        } else {
+            vec![]
+        }
+    } else {
+        pane.marked
+            .iter()
+            .copied()
+            .filter(|&i| i < entries.len())
+            .collect()
+    };
+    indices
+        .into_iter()
+        .filter_map(|i| {
+            let name = entries[i].name.to_string();
+            pane.cwd.join(&name).ok().map(|full| (full, name))
+        })
+        .collect()
+}
+
+fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
+    let src = state.focus;
+    let dst = src.other();
+    let targets = op_targets(state, src);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let dst_cwd = state.pane(dst).cwd.clone();
+    let src_conn = state.pane(src).conn;
+    let dst_conn = state.pane(dst).conn;
+    let mut items = Vec::new();
+    for (from, name) in &targets {
+        if let Ok(to) = dst_cwd.join(name) {
+            items.push((from.clone(), to));
+        }
+    }
+    state.status = Some(format!(
+        "{} {} item(s)…",
+        if is_move { "Moving" } else { "Copying" },
+        items.len()
+    ));
+    state.pane_mut(src).marked.clear();
+    vec![AppEffect::Transfer {
+        src_conn,
+        dst_conn,
+        items,
+        is_move,
+    }]
+}
+
+fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
+    let side = state.focus;
+    let targets = op_targets(state, side);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let conn = state.pane(side).conn;
+    let paths = targets.into_iter().map(|(full, _)| full).collect();
+    state.overlay = Some(Overlay::ConfirmDelete { conn, paths });
+    Vec::new()
 }
 
 fn enter_dir(state: &mut AppState) -> Vec<AppEffect> {
@@ -147,6 +244,25 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 }
             }
             Vec::new()
+        }
+        AppEvent::OpDone { status, error } => {
+            state.status = Some(if error {
+                format!("error: {status}")
+            } else {
+                status
+            });
+            // Refresh both panes so the result of the operation is reflected.
+            [Side::Left, Side::Right]
+                .into_iter()
+                .map(|side| {
+                    let p = state.pane(side);
+                    AppEffect::List {
+                        pane: side,
+                        conn: p.conn,
+                        dir: p.cwd.clone(),
+                    }
+                })
+                .collect()
         }
     }
 }
@@ -331,5 +447,76 @@ mod tests {
         let mut s = state();
         let _ = update(&mut s, Msg::Action(Action::Quit));
         assert!(s.should_quit);
+    }
+
+    #[test]
+    fn copy_emits_transfer_effect_for_current_entry() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        assert_eq!(fx.len(), 1);
+        match &fx[0] {
+            AppEffect::Transfer { items, is_move, .. } => {
+                assert!(!is_move);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].0.as_str(), "/f.txt");
+            }
+            other => panic!("expected Transfer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_confirm_flow() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("doomed", EntryKind::File)],
+        );
+        // First Delete opens the confirm overlay, emits nothing.
+        let fx = update(&mut s, Msg::Action(Action::Delete));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_some());
+        // Confirm emits the Delete effect and closes the overlay.
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert_eq!(fx.len(), 1);
+        assert!(matches!(fx[0], AppEffect::Delete { .. }));
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn delete_cancel_closes_overlay_without_effect() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("safe", EntryKind::File)],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Delete));
+        assert!(s.overlay.is_some());
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        // The entry was not deleted (no effect emitted); cursor navigation still works.
+        let fx = update(&mut s, Msg::Action(Action::CursorDown));
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn op_done_refreshes_both_panes() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::OpDone {
+                status: "Copied 1 item".into(),
+                error: false,
+            }),
+        );
+        assert_eq!(fx.len(), 2);
+        assert_eq!(s.status.as_deref(), Some("Copied 1 item"));
     }
 }

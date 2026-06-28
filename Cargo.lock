@@ -63,6 +63,7 @@ dependencies = [
  "anyhow",
  "cairn-backend-local",
  "cairn-core",
+ "cairn-transfer",
  "cairn-tui",
  "cairn-types",
  "cairn-vfs",
@@ -70,6 +71,7 @@ dependencies = [
  "ratatui",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
