@@ -4,15 +4,19 @@
 //! op through the VFS / transfer engine.
 //!
 //! The safe/local tools (`list`/`stat`/`read`/`copy`/`move`/`delete`) execute against any registered
-//! backend. The container/cluster action tools (`exec`/`logs`/`port_forward`) and `open_connection`
-//! need live transport / the `Vfs::invoke` path-routing change (RFC-0007 Gap 1) and return a clear
-//! "not yet available" error until that integration lands.
+//! backend. The `exec` action tool routes through [`cairn_vfs::Vfs::invoke`] (RFC-0007 Gap 1), so it
+//! reaches whichever backend the connection resolves to — local backends report Unsupported and the
+//! container/cluster backends report `not_implemented` until their live transport lands, but the
+//! routing itself is real. `open_connection` still returns a clear "not yet available" error pending
+//! the broker-backed connection opener (M5/M7 auth).
 
 use async_trait::async_trait;
 use cairn_ai::{PlanStep, StepExecutor};
 use cairn_transfer::{run_transfer, ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_types::{ConnectionId, VfsPath};
-use cairn_vfs::{ListOpts, Recurse, Vfs, VfsRegistry};
+use cairn_vfs::{
+    action_ids, ActionCtx, ActionId, ActionOutcome, ListOpts, Recurse, Vfs, VfsRegistry,
+};
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -67,6 +71,16 @@ struct DeleteInput {
     paths: Vec<String>,
     #[serde(default)]
     recursive: bool,
+}
+
+#[derive(Deserialize)]
+struct ExecInput {
+    conn: String,
+    path: String,
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    tty: bool,
 }
 
 /// Parse a `"conn:N"` handle into a [`ConnectionId`] (the inverse of its `Display`).
@@ -164,13 +178,34 @@ impl StepExecutor for BinaryStepExecutor {
                 }
                 Ok(())
             }
-            // In the closed set but needing live transport / the `Vfs::invoke` path-routing change
-            // (RFC-0007 Gap 1). `logs`/`port_forward` are not yet in the tool set, so they route to
-            // the `unroutable` arm below until they are added.
-            "exec" | "open_connection" => Err(format!(
-                "'{}' is not yet available (needs live transport)",
-                step.tool
-            )),
+            "exec" => {
+                // Route through the backend's `Vfs::invoke` (RFC-0007 Gap 1). The local backends
+                // return Unsupported and the container backends return `not_implemented` until the
+                // live exec streams land; either way the executor delegates rather than hardcoding.
+                let i: ExecInput = parse_input(step)?;
+                let vfs = self.vfs(&i.conn).await?;
+                let ctx = ActionCtx::Exec {
+                    argv: i.argv,
+                    tty: i.tty,
+                };
+                match vfs
+                    .invoke(&vpath(&i.path)?, ActionId::new(action_ids::EXEC), ctx)
+                    .await
+                {
+                    Ok(ActionOutcome::Done | ActionOutcome::Text(_)) => Ok(()),
+                    // `Stream`/`Session` outcomes carry live I/O (follow-mode output, an interactive
+                    // TTY, a port-forward) that this fire-and-forget executor has no channel to
+                    // surface — dropping the handle would cancel the session and falsely report
+                    // success. Fail loudly until step output is first-class (RFC-0007 Gap 1).
+                    Ok(_) => Err(
+                        "exec produced a live session/stream the assistant cannot yet surface"
+                            .to_owned(),
+                    ),
+                    Err(e) => Err(e.redacted().to_string()),
+                }
+            }
+            // The broker-backed connection opener is the integration step (M7/M5 auth).
+            "open_connection" => Err("'open_connection' is not yet available".to_owned()),
             other => Err(format!("unroutable tool '{other}'")),
         }
     }
@@ -291,22 +326,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_tools_and_bad_refs_error_cleanly() {
+    async fn exec_routes_through_invoke_and_errors_on_a_non_action_backend() {
+        // `exec` now delegates to `Vfs::invoke`; the local backend has no action surface, so it
+        // returns an error (not a panic, not a silent success) — proving the routing is live.
         let dir = tempfile::tempdir().unwrap();
         let exec = exec_for(dir.path()).await;
         let e = exec
             .execute(&step(
                 "exec",
-                serde_json::json!({"conn":"conn:1","path":"/x","argv":[]}),
+                serde_json::json!({"conn":"conn:1","path":"/x","argv":["sh"]}),
+            ))
+            .await
+            .unwrap_err();
+        // Assert on the backend's redacted `Unsupported` message, not just `is_err()`, so a failure
+        // *before* reaching `invoke` (bad conn/path) can't masquerade as a passing routing test.
+        assert!(e.contains("operation not supported"), "unexpected: {e}");
+    }
+
+    #[tokio::test]
+    async fn open_connection_is_deferred_and_bad_refs_error_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec = exec_for(dir.path()).await;
+        let e = exec
+            .execute(&step(
+                "open_connection",
+                serde_json::json!({"profile": "prod"}),
             ))
             .await
             .unwrap_err();
         assert!(e.contains("not yet available"));
-        // An unknown (but allowed-range) connection is a clean error — and carries no path.
-        let dir2 = tempfile::tempdir().unwrap();
+        // An unknown connection is a clean error — and carries no path.
         let reg = VfsRegistry::new();
         let exec = BinaryStepExecutor::new(reg, vec![ConnectionId(1)]);
-        let _ = dir2;
         let e = exec
             .execute(&step(
                 "stat",

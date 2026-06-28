@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- AI executor **`exec` routing** (M7-6 / RFC-0007 Gap 1): the `exec` tool no longer returns a
+  hardcoded "not yet available" stub — it now resolves its `conn:N` handle (allow-list enforced) and
+  routes through `Vfs::invoke(path, ActionId::EXEC, ActionCtx::Exec{argv,tty})`, reaching whichever
+  backend the connection maps to. Local backends still report `Unsupported` and the container/cluster
+  backends `not_implemented` (no live process spawns yet), but the routing is real and errors are
+  redacted. A live `Stream`/`Session` outcome is rejected loudly rather than silently dropped, so an
+  interactive/streaming exec can't masquerade as success before its output channel exists.
+  `open_connection` remains deferred pending the broker-backed opener.
+
 ### Added
 - Config-driven **theme colors** (M8-7): `[ui.colors]` overrides individual render roles
   (`focused_border`/`unfocused_border`/`dir`/`error`/`status`/`selection_bg`/`selection_fg`) over the
