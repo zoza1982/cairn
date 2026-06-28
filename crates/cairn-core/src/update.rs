@@ -58,6 +58,25 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         state.status = Some("The assistant is preparing a plan…".to_owned());
         return Vec::new();
     }
+    // While an approved plan executes, refuse to start a competing operation or plan — that would
+    // mutate the filesystem concurrently and (for a second plan) orphan the first's cancel token.
+    // `Esc`/Cancel is intentionally excluded so it still aborts the running plan.
+    if state.ai_executing
+        && matches!(
+            action,
+            Action::AiPropose
+                | Action::Copy
+                | Action::Move
+                | Action::Delete
+                | Action::MakeDir
+                | Action::Rename
+                | Action::OpenConnections
+                | Action::OpenQueue
+        )
+    {
+        state.status = Some("A plan is executing — press Esc to cancel it first".to_owned());
+        return Vec::new();
+    }
     match action {
         Action::CursorUp => {
             let p = state.active_mut();
@@ -139,7 +158,11 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             });
             Vec::new()
         }
-        // With no overlay, Cancel (Esc) aborts an in-flight transfer if one is running.
+        // With no overlay, Cancel (Esc) aborts an executing AI plan, else an in-flight transfer.
+        Action::Cancel if state.ai_executing => {
+            state.status = Some("Cancelling plan…".to_owned());
+            vec![AppEffect::CancelAiPlan]
+        }
         Action::Cancel if state.transfer_bytes.is_some() => {
             state.status = Some("Cancelling transfer…".to_owned());
             vec![AppEffect::CancelTransfer]
@@ -603,7 +626,11 @@ fn apply_ai_plan_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
             let Some(Overlay::AiPlan { plan, .. }) = state.overlay.take() else {
                 return Vec::new();
             };
-            state.status = Some(format!("Executing {} step(s)…", plan.steps.len()));
+            state.status = Some(format!(
+                "Executing {} step(s)… (Esc to cancel)",
+                plan.steps.len()
+            ));
+            state.ai_executing = true;
             vec![AppEffect::ExecutePlan { plan }]
         }
     }
@@ -827,6 +854,11 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             state.ai_pending = false;
             state.status = Some(format!("assistant error: {msg}"));
             Vec::new()
+        }
+        AppEvent::AiPlanExecuted { status, error } => {
+            state.ai_executing = false;
+            // Refresh both panes so any filesystem changes the plan made are reflected.
+            finish_op(state, &status, error)
         }
         AppEvent::TransferProgress { bytes } => {
             // Advisory display only; ignore if no transfer is tracked (a late event after OpDone).
@@ -2152,6 +2184,54 @@ mod tests {
         let mut s = state();
         open_plan(&mut s, &["list", "copy"]);
         assert!(matches!(s.overlay, Some(Overlay::AiPlan { .. })));
+    }
+
+    #[test]
+    fn executing_plan_can_be_cancelled_with_esc_and_clears_on_done() {
+        let mut s = state();
+        open_plan(&mut s, &["list", "copy"]); // both safe → bulk-approvable
+        let fx = update(&mut s, Msg::Action(Action::ApproveAll));
+        assert!(matches!(&fx[..], [AppEffect::ExecutePlan { .. }]));
+        assert!(s.ai_executing, "execution is in progress");
+        // Esc while executing requests cancellation.
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(matches!(&fx[..], [AppEffect::CancelAiPlan]));
+        assert!(
+            s.ai_executing,
+            "flag stays until the execution actually ends"
+        );
+        // The execution's completion event clears the flag.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::AiPlanExecuted {
+                status: "Plan cancelled after 1 step(s)".to_owned(),
+                error: false,
+            }),
+        );
+        assert!(!s.ai_executing);
+    }
+
+    #[test]
+    fn esc_with_nothing_running_is_a_no_op() {
+        let mut s = state();
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn competing_ops_are_refused_while_a_plan_executes() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        open_plan(&mut s, &["list", "copy"]);
+        let _ = update(&mut s, Msg::Action(Action::ApproveAll)); // ai_executing = true
+        assert!(s.ai_executing);
+        // A second plan request and a manual copy must both be refused (no effect, no new state).
+        let fx = update(&mut s, Msg::Action(Action::AiPropose));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none(), "no second AI prompt opens");
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        assert!(fx.is_empty(), "no competing transfer starts");
+        assert!(s.transfer_bytes.is_none());
     }
 
     #[test]

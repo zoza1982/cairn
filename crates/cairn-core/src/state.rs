@@ -322,6 +322,8 @@ pub struct AppState {
     pub status: Option<String>,
     /// Whether an AI plan request is in flight (suppresses duplicate requests).
     pub ai_pending: bool,
+    /// Whether an approved AI plan is currently executing (so `Esc` can cancel it).
+    pub ai_executing: bool,
     /// Connections the switcher can open in a pane (populated from config at startup).
     pub connections: Vec<ConnectionChoice>,
     /// Cumulative bytes of the **single** in-flight transfer (`Some` while one runs), for the
@@ -346,6 +348,7 @@ impl AppState {
             should_quit: false,
             status: None,
             ai_pending: false,
+            ai_executing: false,
             connections: Vec::new(),
             transfer_bytes: None,
             transfer_queue: VecDeque::new(),

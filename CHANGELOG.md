@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destinations untouched. (The AI executor already refused such overwrites.)
 
 ### Added
+- **AI plan-execution cancellation** (M7-4/M7-6): `Esc` aborts an approved plan that is executing —
+  the runtime polls a cancellation token between steps, so already-run steps stay applied and the
+  remainder is skipped (`Plan cancelled after N step(s)`). While a plan executes, competing
+  operations (a second plan, copy/move/delete, overlays) are refused so nothing mutates the
+  filesystem concurrently or orphans the cancel token. Cancellation only *stops* execution — it
+  cannot bypass the approval/allow-list/redaction model.
 - **Transfer queue** (M2-5): a copy/move issued while one is already running is now **queued** and
   started automatically (FIFO) when the active transfer finishes, instead of being refused. The
   status line shows the queue depth (`⇅ transferring… 3.4 MiB (+2 queued)`); cancelling or completing

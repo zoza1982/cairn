@@ -95,7 +95,7 @@ async fn run_async() -> anyhow::Result<()> {
         "initial_effects must emit only List effects; a transfer here would be uncancellable"
     );
     for effect in initial {
-        dispatch(effect, &registry, &event_tx, &mut None);
+        dispatch(effect, &registry, &event_tx, &mut None, &mut None);
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
 
@@ -170,9 +170,12 @@ async fn event_loop(
     event_rx: &mut mpsc::Receiver<AppEvent>,
     input_rx: &mut mpsc::Receiver<Event>,
 ) -> anyhow::Result<()> {
-    // The cancellation token of the in-flight transfer (if any), held here on the runtime side so a
-    // `CancelTransfer` effect can signal it. Cleared when the transfer's `TransferDone` arrives.
+    // Cancellation tokens of the in-flight transfer / AI plan (if any), held runtime-side so the
+    // matching Cancel effect can signal them. Each is cleared when its Done event arrives.
+    // NOTE: if a third independently-cancellable operation appears, extract a shared cancel-slot
+    // abstraction rather than repeating this pattern again.
     let mut transfer_cancel: Option<CancellationToken> = None;
+    let mut ai_cancel: Option<CancellationToken> = None;
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -189,13 +192,22 @@ async fn event_loop(
         ) {
             transfer_cancel = None;
         }
+        if matches!(msg, Msg::Event(AppEvent::AiPlanExecuted { .. })) {
+            ai_cancel = None;
+        }
         let effects = update(state, msg);
         if state.should_quit {
             break;
         }
         terminal.draw(|f| cairn_tui::render(f, state, &ui.theme))?;
         for effect in effects {
-            dispatch(effect, registry, event_tx, &mut transfer_cancel);
+            dispatch(
+                effect,
+                registry,
+                event_tx,
+                &mut transfer_cancel,
+                &mut ai_cancel,
+            );
         }
     }
     Ok(())
@@ -227,6 +239,7 @@ fn dispatch(
     registry: &VfsRegistry,
     event_tx: &mpsc::Sender<AppEvent>,
     transfer_cancel: &mut Option<CancellationToken>,
+    ai_cancel: &mut Option<CancellationToken>,
 ) {
     match effect {
         AppEffect::List {
@@ -312,37 +325,61 @@ fn dispatch(
             // invoke path lands.
             let registry = registry.clone();
             let event_tx = event_tx.clone();
+            // Hand the execution a token (cancellation is checked between steps) and keep a clone so
+            // a `CancelAiPlan` effect can abort it. Only one plan executes at a time (the reducer
+            // refuses a second while `ai_executing`), so the slot is never live here.
+            debug_assert!(
+                ai_cancel.is_none(),
+                "overwriting a live AI-plan cancel token"
+            );
+            let cancel = CancellationToken::new();
+            *ai_cancel = Some(cancel.clone());
             tokio::spawn(async move {
                 // The assistant may only act on the two pane connections it can see in its
                 // WorldSnapshot — not the switcher backends (which include a root-mounted `/`).
-                // TODO(RFC-0007): thread a plan-level CancellationToken so the UI can abort a
-                // long-running execution.
                 let exec = crate::executor::BinaryStepExecutor::new(registry, vec![LEFT, RIGHT]);
                 let n = plan.steps.len();
-                let ev = match plan.execute(&exec).await {
-                    Ok(()) if plan.state == cairn_ai::PlanState::Done => AppEvent::OpDone {
+                let ev = match plan.execute(&exec, &|| cancel.is_cancelled()).await {
+                    Ok(()) if plan.state == cairn_ai::PlanState::Done => AppEvent::AiPlanExecuted {
                         status: format!("Plan complete: {n} step(s) executed"),
                         error: false,
                     },
+                    Ok(()) if plan.state == cairn_ai::PlanState::Aborted => {
+                        let done = plan
+                            .steps
+                            .iter()
+                            .filter(|s| s.status == cairn_ai::StepStatus::Done)
+                            .count();
+                        AppEvent::AiPlanExecuted {
+                            status: format!("Plan cancelled after {done} step(s)"),
+                            error: false,
+                        }
+                    }
                     Ok(()) => {
-                        // A step failed; surface its redacted reason (the executor already redacts).
+                        // The only remaining Ok state is Failed; surface the step's redacted reason.
+                        debug_assert_eq!(plan.state, cairn_ai::PlanState::Failed);
                         let why = plan
                             .steps
                             .iter()
                             .find_map(|s| s.error.clone())
                             .unwrap_or_else(|| "a step failed".to_owned());
-                        AppEvent::OpDone {
+                        AppEvent::AiPlanExecuted {
                             status: format!("Plan stopped: {why}"),
                             error: true,
                         }
                     }
-                    Err(e) => AppEvent::OpDone {
+                    Err(e) => AppEvent::AiPlanExecuted {
                         status: format!("Plan not executed: {e}"),
                         error: true,
                     },
                 };
                 let _ = event_tx.send(ev).await;
             });
+        }
+        AppEffect::CancelAiPlan => {
+            if let Some(token) = ai_cancel.take() {
+                token.cancel();
+            }
         }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
         other => tracing::warn!(effect = ?other, "unhandled effect"),
