@@ -208,7 +208,7 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 
 | ID | Item (crate) | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| M8-1 | RFC: **plugin host & WIT ABI** (worlds, capability grants, streaming-by-polling, versioning) | plugin-systems-engineer, technical-writer | M3-5 | RFC merged; confirm ADR-0004 | approved before M8-2 | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |
+| M8-1 | RFC: **plugin host & WIT ABI** (worlds, capability grants, streaming-by-polling, versioning) | plugin-systems-engineer, technical-writer | M3-5 | RFC merged; confirm ADR-0004 | approved before M8-2 | ✅ (RFC-0006, #22) |
 | M8-2 | `cairn-plugin`: wasmtime host, WIT bindings, default-deny Linker, per-instance Store, ResourceLimiter, epoch timeout | plugin-systems-engineer | M8-1 | rustdoc | spinning plugin can't hang UI (epoch test); ungranted import fails at instantiate | ✅ #18 (wasmtime host: fuel limit traps runaway guest, memory cap, default-deny imports; 6 tests) |
 | M8-3 | `PluginVfsBackend` bridge: guest `backend` export → `Vfs` (chunked-poll) | plugin-systems-engineer, rust-staff-engineer | M8-2 | rustdoc | plugin backend passes MockVfs contract suite | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |
 | M8-4 | Brokered creds/HTTP for plugins (UUID stand-in, host substitutes secret), journaled `Actor::Plugin` | plugin-systems-engineer, security-engineer | M8-2, M3-5 | rustdoc; threat-model | plugin never sees secret value (test); brokered HTTP only | ⏭ deferred (Component Model/WIT + Vfs bridge — next layer; runtime core done in M8-2) |

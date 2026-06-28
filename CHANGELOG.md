@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- RFC-0006 (plugin host & WIT ABI): the `cairn:plugin@1.0.0` WIT package (`types`/`host`/`backend`
+  interfaces, `backend-plugin` world), the host↔guest mapping onto the `Vfs` trait, the
+  capability-grant and credential-brokering model, resource limits/cancellation, and WIT semver
+  rules — building on ADR-0004 and the M8-2 runtime core (M8-1).
 - `cairn-backend-k8s`: the Kubernetes backend's `Vfs` mapping over a `KubeOps` transport seam — a
   navigable cluster tree (`/<context>/<namespace>/<pod>/<container>/<path…>`) with capabilities that
   vary by depth (list-only navigation; file read inside a container), fully unit-tested against an
