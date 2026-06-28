@@ -245,7 +245,12 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
         }
     }
 
-    async fn invoke(&self, action: ActionId, _ctx: ActionCtx) -> Result<ActionOutcome, VfsError> {
+    async fn invoke(
+        &self,
+        _path: &VfsPath,
+        action: ActionId,
+        _ctx: ActionCtx,
+    ) -> Result<ActionOutcome, VfsError> {
         // The actions are advertised by `actions_at`; live invocation over the Docker API (streaming
         // exec/logs) is the integration step — report that distinctly from a truly-unknown action.
         Err(VfsError::Backend {
@@ -424,7 +429,7 @@ mod tests {
         assert!(!vfs.actions_at(&p("/containers/ghost")).is_empty());
         // Invocation is the integration step — advertised but not yet implemented.
         assert!(matches!(
-            vfs.invoke(ActionId::new(action_ids::LOGS), ActionCtx::None)
+            vfs.invoke(&p("/containers/web"), ActionId::new(action_ids::LOGS), ActionCtx::None)
                 .await,
             Err(VfsError::Backend { code, .. }) if code == "not_implemented"
         ));

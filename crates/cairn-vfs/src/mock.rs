@@ -222,7 +222,12 @@ impl Vfs for MockVfs {
         Ok(())
     }
 
-    async fn invoke(&self, _action: ActionId, _ctx: ActionCtx) -> Result<ActionOutcome, VfsError> {
+    async fn invoke(
+        &self,
+        _path: &VfsPath,
+        _action: ActionId,
+        _ctx: ActionCtx,
+    ) -> Result<ActionOutcome, VfsError> {
         Ok(ActionOutcome::Done)
     }
 }

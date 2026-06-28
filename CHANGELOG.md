@@ -121,6 +121,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub issue/PR templates, CI workflow, and a minimal Cargo workspace.
 
 ### Changed
+- `cairn-vfs`: `Vfs::invoke` now takes the target `path` (RFC-0007 Gap 1) so path-routed backends
+  (Docker/Kubernetes) can identify the container/pod an action targets, and a new
+  `ActionOutcome::Session` + `SessionHandle` model long-lived sessions (port-forward / interactive
+  exec). The API is ready; the live engine/cluster streams remain the integration step.
 - Tuned workspace clippy lints for velocity under CI's `-D warnings`: deny `clippy::all` + forbid
   unsafe + require rustdoc, but drop the over-broad `pedantic`/`unwrap_used`/`expect_used` lints
   (advisory via review per CLAUDE.md §9, not a hard test-breaking gate).

@@ -94,10 +94,23 @@ pub enum ActionCtx {
     },
 }
 
-/// The result of invoking an action.
+/// A handle to a long-lived action session (port-forward or interactive exec), per RFC-0007.
 ///
-/// `#[non_exhaustive]`: a `Session` variant (for port-forward / interactive exec) is added with the
-/// M6 container/cluster backends.
+/// The caller (the TUI) holds it for the session's lifetime: send on `cancel` (or drop the sender)
+/// to terminate; await `done` for the exit result. `local_port` is set for a port-forward; `stdin`
+/// feeds an interactive TTY exec.
+pub struct SessionHandle {
+    /// Send `()` (or drop) to cancel the session.
+    pub cancel: tokio::sync::oneshot::Sender<()>,
+    /// Resolves when the session exits cleanly or with a redacted error message.
+    pub done: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    /// The local TCP port a port-forward bound; `None` for exec sessions.
+    pub local_port: Option<u16>,
+    /// Writer for an interactive exec's stdin; `None` for port-forward / non-interactive exec.
+    pub stdin: Option<tokio::sync::mpsc::Sender<Bytes>>,
+}
+
+/// The result of invoking an action.
 #[non_exhaustive]
 pub enum ActionOutcome {
     /// Completed with no payload.
@@ -106,6 +119,8 @@ pub enum ActionOutcome {
     Text(String),
     /// A live byte stream (e.g. follow-mode logs, exec output).
     Stream(BoxStream<'static, Result<Bytes, VfsError>>),
+    /// A long-lived session (port-forward, interactive exec) — see [`SessionHandle`].
+    Session(SessionHandle),
 }
 
 #[cfg(test)]

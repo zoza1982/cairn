@@ -293,7 +293,12 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
         }
     }
 
-    async fn invoke(&self, action: ActionId, _ctx: ActionCtx) -> Result<ActionOutcome, VfsError> {
+    async fn invoke(
+        &self,
+        _path: &VfsPath,
+        action: ActionId,
+        _ctx: ActionCtx,
+    ) -> Result<ActionOutcome, VfsError> {
         // Advertised by `actions_at`; live invocation (log/exec streams, port-forward sessions over
         // the cluster API) is the integration step — reported distinctly from an unknown action.
         Err(VfsError::Backend {
@@ -513,7 +518,7 @@ mod tests {
         assert!(vfs.actions_at(&p("/")).is_empty());
         // Invocation is the integration step — advertised but not yet implemented.
         assert!(matches!(
-            vfs.invoke(ActionId::new(action_ids::LOGS), ActionCtx::None)
+            vfs.invoke(&p("/prod/default/web-0"), ActionId::new(action_ids::LOGS), ActionCtx::None)
                 .await,
             Err(VfsError::Backend { code, .. }) if code == "not_implemented"
         ));
