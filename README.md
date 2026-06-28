@@ -80,7 +80,7 @@ character, a named key like `enter`/`space`/`esc`/`tab`/arrows, or `f1`–`f24`)
 snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `cycle_sort`, `toggle_hidden`,
 `quit`, …). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
 
-By default `s` cycles the active pane's sort order (name → size → modified) and `.` toggles whether
+By default `s` cycles the active pane's sort order (name → size → modified → type) and `.` toggles whether
 hidden entries (dotfiles) are listed; the current sort mode and hidden state show in each pane's
 bottom-right corner. `F7` creates a new directory and `F2` renames the entry under the cursor (both
 open a text prompt; `Enter` confirms, `Esc` cancels).
@@ -90,7 +90,7 @@ open a text prompt; `Enter` confirms, `Esc` cancels).
 "ctrl+a" = "ai_propose"   # ask the AI assistant for a plan
 "G"      = "cursor_bottom"
 "f5"     = "copy"
-"s"      = "cycle_sort"   # name → size → modified
+"s"      = "cycle_sort"   # name → size → modified → type
 "."      = "toggle_hidden"
 ```
 
