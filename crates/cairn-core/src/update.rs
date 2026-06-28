@@ -1,7 +1,7 @@
 //! The pure reducer: `update(&mut AppState, Msg) -> Vec<AppEffect>`. No I/O, no `.await`.
 
-use crate::msg::{Action, AppEffect, AppEvent, Msg, DEMO_AI_PROMPT};
-use crate::state::{AppState, Listing, Overlay, Side, SortMode};
+use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit, DEMO_AI_PROMPT};
+use crate::state::{AppState, Listing, Overlay, PromptKind, Side, SortMode};
 use cairn_types::{Entry, VfsPath};
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use std::sync::Arc;
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<AppEffect> {
     match msg {
         Msg::Action(action) => apply_action(state, action),
+        Msg::Text(edit) => apply_text(state, edit),
         Msg::Event(event) => apply_event(state, event),
         Msg::Tick => Vec::new(),
     }
@@ -92,6 +93,30 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             }
             Vec::new()
         }
+        Action::MakeDir => {
+            state.overlay = Some(Overlay::Prompt {
+                kind: PromptKind::MakeDir,
+                input: String::new(),
+            });
+            Vec::new()
+        }
+        Action::Rename => {
+            // Rename targets the entry under the cursor; pre-fill its current name.
+            let Some(entry) = state.active().current() else {
+                state.status = Some("Nothing to rename".to_owned());
+                return Vec::new();
+            };
+            let name = entry.name.to_string();
+            let Ok(from) = state.active().cwd.join(&name) else {
+                state.status = Some("Cannot rename this entry".to_owned());
+                return Vec::new();
+            };
+            state.overlay = Some(Overlay::Prompt {
+                kind: PromptKind::Rename { from },
+                input: name,
+            });
+            Vec::new()
+        }
         // No overlay open: confirm/cancel and the plan-only actions are no-ops.
         Action::Confirm | Action::Cancel | Action::ApproveAll | Action::Reject => Vec::new(),
         Action::Refresh => reload(state, state.focus),
@@ -139,6 +164,93 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     }
 }
 
+/// Handle a text-editing keystroke. Only meaningful while a [`Overlay::Prompt`] is open; otherwise a
+/// no-op (a stray keystroke between closing the prompt and the input layer noticing).
+fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
+    let Some(Overlay::Prompt { input, .. }) = &mut state.overlay else {
+        return Vec::new();
+    };
+    match edit {
+        TextEdit::Insert(c) => {
+            // Reject path separators and control characters at the source — the name is a single
+            // path component, validated again on submit.
+            if !c.is_control() && c != '/' {
+                input.push(c);
+            }
+            Vec::new()
+        }
+        TextEdit::Backspace => {
+            input.pop();
+            Vec::new()
+        }
+        TextEdit::Cancel => {
+            state.overlay = None;
+            Vec::new()
+        }
+        TextEdit::Submit => submit_prompt(state),
+    }
+}
+
+/// Validate the prompt's text and turn it into the corresponding effect, then close the overlay. On
+/// an invalid name the prompt stays open and a status message explains why.
+fn submit_prompt(state: &mut AppState) -> Vec<AppEffect> {
+    let Some(Overlay::Prompt { kind, input }) = &state.overlay else {
+        return Vec::new();
+    };
+    let name = input.trim();
+    if let Err(why) = validate_name(name) {
+        state.status = Some(why.to_owned());
+        return Vec::new();
+    }
+    let side = state.focus;
+    let conn = state.pane(side).conn;
+    let effect = match kind {
+        PromptKind::MakeDir => {
+            let Ok(path) = state.pane(side).cwd.join(name) else {
+                state.status = Some("Invalid directory name".to_owned());
+                return Vec::new();
+            };
+            state.status = Some(format!("Creating {name}…"));
+            AppEffect::CreateDir { conn, path }
+        }
+        PromptKind::Rename { from } => {
+            // The new path lives in the same directory as the original.
+            let parent = from.parent().unwrap_or_else(VfsPath::root);
+            let Ok(to) = parent.join(name) else {
+                state.status = Some("Invalid name".to_owned());
+                return Vec::new();
+            };
+            if &to == from {
+                // No change — just close the prompt without an effect.
+                state.overlay = None;
+                return Vec::new();
+            }
+            state.status = Some(format!("Renaming to {name}…"));
+            AppEffect::Rename {
+                conn,
+                from: from.clone(),
+                to,
+            }
+        }
+    };
+    state.overlay = None;
+    vec![effect]
+}
+
+/// Validate a single-component entry name (new directory / rename target).
+fn validate_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Name cannot be empty");
+    }
+    if name == "." || name == ".." {
+        return Err("Name cannot be '.' or '..'");
+    }
+    if name.contains('/') {
+        return Err("Name cannot contain '/'");
+    }
+    Ok(())
+}
+
 /// Handle an action while a modal overlay is open. Routes to the handler for the open overlay.
 fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     // Quit (q / Ctrl-C) always quits immediately, even from within an overlay — close it first so
@@ -152,7 +264,8 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::ConfirmDelete { .. }) => apply_confirm_delete_action(state, action),
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
-        None => Vec::new(),
+        // A text prompt captures keystrokes as `Msg::Text`; non-quit actions don't reach it.
+        Some(Overlay::Prompt { .. }) | None => Vec::new(),
     }
 }
 
@@ -483,11 +596,15 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             } else {
                 status
             });
-            // Refresh both panes so the result of the operation is reflected.
+            // Refresh both panes so the result of the operation is reflected. An op that adds,
+            // removes, or reorders entries (mkdir/rename/delete/move) invalidates the positional
+            // marks, so clear them — a stale mark would make the next copy/move/delete act on the
+            // wrong entry.
             [Side::Left, Side::Right]
                 .into_iter()
                 .map(|side| {
-                    let p = state.pane(side);
+                    let p = state.pane_mut(side);
+                    p.marked.clear();
                     AppEffect::List {
                         pane: side,
                         conn: p.conn,
@@ -698,6 +815,150 @@ mod tests {
             vec![file_sized("small", 1), file_sized("big", 9000)],
         );
         assert_eq!(names(&s, Side::Left), vec!["big", "small"]);
+    }
+
+    fn type_text(s: &mut AppState, text: &str) {
+        for c in text.chars() {
+            let _ = update(s, Msg::Text(TextEdit::Insert(c)));
+        }
+    }
+
+    #[test]
+    fn make_dir_prompt_submits_a_create_dir_effect() {
+        let mut s = state();
+        let fx = update(&mut s, Msg::Action(Action::MakeDir));
+        assert!(fx.is_empty());
+        assert!(s.capturing_text());
+        type_text(&mut s, "newdir");
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(s.overlay.is_none(), "prompt closes on submit");
+        match &fx[..] {
+            [AppEffect::CreateDir { conn, path }] => {
+                assert_eq!(*conn, ConnectionId(1));
+                assert_eq!(path.as_str(), "/newdir");
+            }
+            other => panic!("expected CreateDir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_rejects_slash_and_invalid_names() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::MakeDir));
+        // '/' is rejected at the keystroke level.
+        type_text(&mut s, "a/b");
+        let Some(Overlay::Prompt { input, .. }) = &s.overlay else {
+            panic!("prompt should still be open");
+        };
+        assert_eq!(input, "ab");
+        // Submitting an empty name keeps the prompt open with a status.
+        for _ in 0..2 {
+            let _ = update(&mut s, Msg::Text(TextEdit::Backspace));
+        }
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_some(), "stays open on invalid name");
+        assert!(s.status.as_deref().unwrap().contains("empty"));
+    }
+
+    #[test]
+    fn rename_prompt_prefills_name_and_renames_to_a_sibling_path() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("old.txt", EntryKind::File)],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Rename));
+        let Some(Overlay::Prompt { input, .. }) = &s.overlay else {
+            panic!("rename prompt should be open");
+        };
+        assert_eq!(input, "old.txt"); // pre-filled with the current name
+                                      // Replace with a new name.
+        for _ in 0.."old.txt".len() {
+            let _ = update(&mut s, Msg::Text(TextEdit::Backspace));
+        }
+        type_text(&mut s, "new.txt");
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        match &fx[..] {
+            [AppEffect::Rename { from, to, .. }] => {
+                assert_eq!(from.as_str(), "/old.txt");
+                assert_eq!(to.as_str(), "/new.txt");
+            }
+            other => panic!("expected Rename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_to_the_same_name_closes_without_an_effect() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("keep", EntryKind::Dir)]);
+        let _ = update(&mut s, Msg::Action(Action::Rename));
+        // Submit unchanged.
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn prompt_rejects_dot_names() {
+        for bad in [".", ".."] {
+            let mut s = state();
+            let _ = update(&mut s, Msg::Action(Action::MakeDir));
+            type_text(&mut s, bad);
+            let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+            assert!(fx.is_empty(), "{bad} should not submit");
+            assert!(s.overlay.is_some(), "{bad} keeps the prompt open");
+        }
+    }
+
+    #[test]
+    fn apply_text_is_a_no_op_without_a_prompt_overlay() {
+        let mut s = state();
+        // A confirm-delete overlay is open, not a prompt: text edits are ignored.
+        s.overlay = Some(Overlay::ConfirmDelete {
+            conn: ConnectionId(1),
+            paths: vec![VfsPath::root()],
+        });
+        let fx = update(&mut s, Msg::Text(TextEdit::Insert('x')));
+        assert!(fx.is_empty());
+        assert!(matches!(s.overlay, Some(Overlay::ConfirmDelete { .. })));
+    }
+
+    #[test]
+    fn op_done_clears_stale_marks_on_both_panes() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        let _ = update(&mut s, Msg::Action(Action::ToggleMark));
+        assert!(!s.pane(Side::Left).marked.is_empty());
+        // An operation completes; the refresh must drop the now-stale positional marks.
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::OpDone {
+                status: "done".to_owned(),
+                error: false,
+            }),
+        );
+        assert_eq!(fx.len(), 2, "refreshes both panes");
+        assert!(s.pane(Side::Left).marked.is_empty());
+        assert!(s.pane(Side::Right).marked.is_empty());
+    }
+
+    #[test]
+    fn prompt_cancel_closes_without_an_effect() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::MakeDir));
+        type_text(&mut s, "discard");
+        let fx = update(&mut s, Msg::Text(TextEdit::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
     }
 
     #[test]

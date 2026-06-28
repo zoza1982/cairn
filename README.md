@@ -82,7 +82,8 @@ snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `cycle_sort`,
 
 By default `s` cycles the active pane's sort order (name → size → modified) and `.` toggles whether
 hidden entries (dotfiles) are listed; the current sort mode and hidden state show in each pane's
-bottom-right corner.
+bottom-right corner. `F7` creates a new directory and `F2` renames the entry under the cursor (both
+open a text prompt; `Enter` confirms, `Esc` cancels).
 
 ```toml
 [ui.keybindings]

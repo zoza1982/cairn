@@ -10,6 +10,8 @@ mod msg;
 mod state;
 mod update;
 
-pub use msg::{Action, AppEffect, AppEvent, Msg};
-pub use state::{AppState, ConnectionChoice, Listing, Overlay, PaneState, Side};
+pub use msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
+pub use state::{
+    AppState, ConnectionChoice, Listing, Overlay, PaneState, PromptKind, Side, SortMode,
+};
 pub use update::{initial_effects, update};

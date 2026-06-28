@@ -48,6 +48,10 @@ pub enum Action {
     ToggleHidden,
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
+    /// Open a prompt to create a new directory in the active pane.
+    MakeDir,
+    /// Open a prompt to rename the entry under the cursor.
+    Rename,
     /// Ask the AI assistant to propose a plan (opens the plan → confirm overlay when it arrives).
     AiPropose,
     /// In the plan overlay: approve every step at once (only honored when no step is irreversible).
@@ -63,10 +67,27 @@ pub enum Action {
 pub enum Msg {
     /// A resolved user action.
     Action(Action),
+    /// A text-editing keystroke, routed to an open text prompt.
+    Text(TextEdit),
     /// An asynchronous result coming back from the effect runner.
     Event(AppEvent),
     /// A periodic tick (animations, timeouts).
     Tick,
+}
+
+/// A single edit to a text field, kept terminal-agnostic so the core stays UI-independent (the TUI
+/// layer maps key events to these).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TextEdit {
+    /// Append a character.
+    Insert(char),
+    /// Delete the last character.
+    Backspace,
+    /// Accept the field (act on the entered text).
+    Submit,
+    /// Discard the prompt.
+    Cancel,
 }
 
 /// Results flowing back from the async world.
@@ -126,6 +147,22 @@ pub enum AppEffect {
         conn: ConnectionId,
         /// Paths to delete.
         paths: Vec<VfsPath>,
+    },
+    /// Create a directory on a connection.
+    CreateDir {
+        /// The connection.
+        conn: ConnectionId,
+        /// The directory path to create.
+        path: VfsPath,
+    },
+    /// Rename an entry within a connection.
+    Rename {
+        /// The connection.
+        conn: ConnectionId,
+        /// The current path.
+        from: VfsPath,
+        /// The new path (same directory, new leaf name).
+        to: VfsPath,
     },
     /// Ask the AI assistant to propose a plan for a natural-language request.
     RequestAiPlan {
