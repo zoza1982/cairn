@@ -195,6 +195,8 @@ pub enum PromptKind {
         /// The path being renamed.
         from: VfsPath,
     },
+    /// Enter a freeform natural-language request for the AI assistant.
+    AiPrompt,
 }
 
 impl PromptKind {
@@ -204,7 +206,18 @@ impl PromptKind {
         match self {
             Self::MakeDir => "New directory",
             Self::Rename { .. } => "Rename",
+            Self::AiPrompt => "Ask the assistant",
         }
+    }
+
+    /// Whether the entered text is a single filename component (so `/` and control chars are rejected
+    /// as you type). Freeform prompts accept arbitrary text.
+    ///
+    /// Maintainer note: keep this in sync with [`PromptKind`] — a new filename-style variant must be
+    /// added here explicitly (the `matches!` will not warn if the list is incomplete).
+    #[must_use]
+    pub fn is_filename(&self) -> bool {
+        matches!(self, Self::MakeDir | Self::Rename { .. })
     }
 }
 
