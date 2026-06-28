@@ -169,6 +169,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-backend-object"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cairn-types",
+ "cairn-vfs",
+ "futures",
+ "smol_str",
+ "tokio",
+]
+
+[[package]]
 name = "cairn-broker"
 version = "0.0.0"
 dependencies = [
