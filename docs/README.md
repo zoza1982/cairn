@@ -15,5 +15,5 @@
 
 ## Documentation discipline
 
-Documentation is part of the definition of done. See [`../CLAUDE.md`](../CLAUDE.md) §4 for the
-per-change documentation requirements.
+Documentation is part of the definition of done. See [`../CLAUDE.md`](../CLAUDE.md) §5 for the
+per-change documentation requirements, and §2 for the team-of-agents working model.
