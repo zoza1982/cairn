@@ -22,7 +22,7 @@
 | **Current milestone** | **M3 — Secrets foundation (vault + broker)** (🟡 in progress) |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones complete** | 0 / 9 |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 17 / 10 / 44 / 0 / 0 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 19 / 11 / 41 / 0 / 0 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows (scaffold) |
 | **Long-pole items** | `M1-1` Vfs trait · `M3-5` broker · all backend RFCs |
 
@@ -140,9 +140,9 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 | M3-2 | Vault at rest (ADR-0002): XChaCha20-Poly1305, header-AAD, encrypted index, per-entry DEKs, postcard, atomic write+`.bak`+lock | security-engineer | M3-1 | confirm ADR-0002; format spec | seal/open round-trip; tamper/rollback tests; refuse unknown version | ✅ #13 |
 | M3-3 | Key hierarchy + unlock: KEK in OS keychain (`keyring`), Argon2id fallback, auto-lock | security-engineer | M3-2 | rustdoc; SECURITY.md update | keychain + passphrase paths tested; auto-lock zeroizes | 🟡 passphrase unlock + zeroizing keys; keychain/auto-lock deferred |
 | M3-4 | Credential model: typed `CredentialSecret` + delegation variants; `TokenCache` | security-engineer | M3-2 | rustdoc | variants seal; delegation stores no secret (test) | 🟡 generic Credential done; typed variants/delegation/TokenCache deferred |
-| M3-5 | `cairn-broker`: `authorize`/`execute` split, capability+scope, resolve `CredentialId`→secret inside execute, journal `Actor` | security-engineer, software-architect | M3-3, M3-4 | confirm ADR-0002; rustdoc | secret never leaves `execute`; no API returns a secret (compile + review) | ☐ |
-| M3-6 | `cairn-config`: TOML, `ConnectionProfile` (ref only, type-enforced no-secret), state dir, schema+migration | software-engineer | M0-5 | rustdoc; config docs | config↔vault boundary compile-enforced; migration round-trip | ☐ |
-| M3-7 | Vault TUI: create/unlock, list (labels only), add credential; on-screen redaction | tui-engineer, security-engineer | M3-3, M2-7 | user docs | **Demo:** create vault, store cred, relock — nothing plaintext | ☐ |
+| M3-5 | `cairn-broker`: `authorize`/`execute` split, capability+scope, resolve `CredentialId`→secret inside execute, journal `Actor` | security-engineer, software-architect | M3-3, M3-4 | confirm ADR-0002; rustdoc | secret never leaves `execute`; no API returns a secret (compile + review) | ✅ #14 (broker: resolve + journal; full authorize/confirm in M7) |
+| M3-6 | `cairn-config`: TOML, `ConnectionProfile` (ref only, type-enforced no-secret), state dir, schema+migration | software-engineer | M0-5 | rustdoc; config docs | config↔vault boundary compile-enforced; migration round-trip | ✅ #14 |
+| M3-7 | Vault TUI: create/unlock, list (labels only), add credential; on-screen redaction | tui-engineer, security-engineer | M3-3, M2-7 | user docs | **Demo:** create vault, store cred, relock — nothing plaintext | 🟡 deferred — vault-in-app UI lands when wiring credentialed backends (M4) |
 
 ### M4 — First remote (SSH/SFTP)
 

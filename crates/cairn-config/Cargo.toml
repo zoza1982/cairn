@@ -1,0 +1,23 @@
+[package]
+name = "cairn-config"
+description = "Cairn configuration: human-editable TOML for UI prefs and connection profiles (no secrets)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+directories = "5"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
