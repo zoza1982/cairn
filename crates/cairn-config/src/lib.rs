@@ -444,12 +444,21 @@ mod tests {
 
     #[test]
     fn shell_action_validation() {
-        assert!(action("ok", "/usr/bin/sha256sum", &["--", "{path}"])
+        // A bare program name (PATH-resolved) is valid on every platform.
+        assert!(action("ok-bare", "sha256sum", &["{name}", "--", "{path}"])
             .validate()
             .is_ok());
-        assert!(action("ok-bare", "sha256sum", &["{name}"])
+        // A platform-appropriate *absolute* path is valid (Unix `/usr/...` is not absolute on Windows).
+        #[cfg(unix)]
+        assert!(action("ok-abs", "/usr/bin/sha256sum", &["{path}"])
             .validate()
             .is_ok());
+        #[cfg(windows)]
+        assert!(
+            action("ok-abs", r"C:\Windows\System32\where.exe", &["{path}"])
+                .validate()
+                .is_ok()
+        );
         // empty name / command
         assert!(action("", "x", &[]).validate().is_err());
         assert!(action("n", "", &[]).validate().is_err());

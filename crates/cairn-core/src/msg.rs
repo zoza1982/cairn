@@ -53,8 +53,8 @@ pub enum Action {
     /// Toggle pause/resume of the active transfer (no-op when none is running).
     TogglePause,
     /// Run the user-defined shell action at the given index (a config `[[shell_actions]]` entry, bound
-    /// to a key). The index is into the validated action list shared by the keymap, [`AppState`], and
-    /// the runtime — see [`AppState::shell_actions`](crate::AppState::shell_actions).
+    /// to a key). The index is into the validated action list shared by the keymap,
+    /// `AppState::shell_actions`, and the runtime.
     RunShellAction(usize),
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
@@ -209,7 +209,7 @@ pub enum AppEffect {
     /// no transfer is running.
     SetTransferPaused(bool),
     /// Run a user-defined shell action (M8-7). The runtime resolves `index` to its definition, maps
-    /// `target` to a real OS path via [`Vfs::local_path`] (refusing non-local backends), expands the
+    /// `target` to a real OS path via `Vfs::local_path` (refusing non-local backends), expands the
     /// argument templates, and spawns the program with no shell. Result returns as
     /// [`AppEvent::ShellActionDone`].
     RunShellAction {
