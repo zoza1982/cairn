@@ -1,0 +1,26 @@
+# Standalone (its own `[workspace]`) so the parent workspace never tries to build it for host
+# targets. Built locally with `cargo component build --release` (wasm32-wasip2); the resulting
+# component is committed at ../fixtures/backend.wasm so CI needs no WASM toolchain. See RFC-0006.
+[workspace]
+
+[package]
+name = "cairn-plugin-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "cairn:plugin-fixture"
+
+[package.metadata.component.target]
+world = "backend-plugin"
+
+[profile.release]
+opt-level = "s"
+strip = true

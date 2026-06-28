@@ -13,8 +13,19 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+cairn-types = { workspace = true }
 thiserror = "2"
-wasmtime = { version = "46.0.1", default-features = false, features = ["cranelift", "wat", "runtime"] }
+wasmtime = { version = "46.0.1", default-features = false, features = [
+    "cranelift",
+    "wat",
+    "runtime",
+    "component-model",
+] }
+# Provides the WASI 0.2 imports a std-built guest component references. The host grants an EMPTY,
+# ambient-authority-free context (no preopened dirs, no env, null stdio, no network) — no ambient
+# filesystem/secret/network access; finer capability gating per manifest grant is M8-4/M8-5. (NB:
+# default-features=false does not shrink the dep tree — wasmtime-wasi's cap-std/etc. are mandatory.)
+wasmtime-wasi = { version = "46.0.1", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["macros", "rt"] }
