@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vary by depth (list-only navigation; file read inside a container), fully unit-tested against an
   in-memory mock. Read-only mapping core; the live `kube-rs` adapter (auth via the broker,
   tar-over-`exec` filesystem) and the action surface (logs/exec/port-forward) are the integration
-  step. RFC-0005 (M6-4/M6-5).
+  step. RFC-0005 (M6-4/M6-5). Surfaces init/ephemeral containers via the new
+  `EntryExt::KubeContainer` variant (`cairn-types`).
+- `cairn-vfs`: `join_abs_path`, a shared helper for backends that map a subtree onto a remote
+  filesystem (used by the Docker and Kubernetes backends).
 - `cairn-backend-docker`: the Docker/OCI backend's `Vfs` mapping over a `ContainerOps` transport
   seam — a navigable tree (`/containers/<name>/…` browses a container's filesystem, `/images/<tag>`
   lists images), read-only, fully unit-tested against an in-memory mock, plus a `bollard` adapter

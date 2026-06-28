@@ -16,16 +16,17 @@ pub use ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteM
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryExt, EntryKind, Scheme, VfsPath};
 use cairn_vfs::{
-    apply_byte_range, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs,
-    VfsError, WriteHandle, WriteOpts,
+    apply_byte_range, join_abs_path, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle,
+    Recurse, Vfs, VfsError, WriteHandle, WriteOpts,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use smol_str::SmolStr;
 use std::sync::Arc;
 
-/// The path depth at which a container's filesystem begins: `[ctx, ns, pod, container]`.
-const CONTAINER_DEPTH: usize = 4;
+/// Depth of the container node `[ctx, ns, pod, container]`. Paths strictly deeper than this are
+/// inside the container's filesystem.
+const CONTAINER_LEVEL: usize = 4;
 
 /// A [`Vfs`] over a Kubernetes cluster. Read-only browse of contexts, namespaces, pods, containers,
 /// and (via the real adapter) container filesystems.
@@ -80,11 +81,18 @@ impl<O: KubeOps> KubeVfs<O> {
                 .list_containers(ctx, ns, pod)
                 .await?
                 .into_iter()
-                .map(|c| Entry::new(c.name, EntryKind::Dir))
+                .map(|c| {
+                    let mut e = Entry::new(c.name, EntryKind::Dir);
+                    e.ext = EntryExt::KubeContainer {
+                        is_init: c.is_init,
+                        is_ephemeral: c.is_ephemeral,
+                    };
+                    e
+                })
                 .collect(),
             [ctx, ns, pod, container, rest @ ..] => self
                 .ops
-                .list_dir(ctx, ns, pod, container, &join_in_container(rest))
+                .list_dir(ctx, ns, pod, container, &join_abs_path(rest))
                 .await?
                 .into_iter()
                 .map(|r| {
@@ -104,15 +112,6 @@ impl<O: KubeOps> KubeVfs<O> {
     }
 }
 
-/// Build the in-container absolute path from the trailing segments below the container root.
-fn join_in_container(rest: &[&str]) -> String {
-    if rest.is_empty() {
-        "/".to_owned()
-    } else {
-        format!("/{}", rest.join("/"))
-    }
-}
-
 impl<O: KubeOps> CapabilityProvider for KubeVfs<O> {
     fn caps(&self) -> Caps {
         // Baseline: listing the cluster tree. File read is refined in per-path `caps_at`.
@@ -120,9 +119,11 @@ impl<O: KubeOps> CapabilityProvider for KubeVfs<O> {
     }
 
     fn caps_at(&self, path: &VfsPath) -> Caps {
-        // A container's filesystem (depth >= 4) supports reads; the navigation tree above it
-        // (contexts/namespaces/pods/containers) is list-only. Writes/exec/logs are M6-6 actions.
-        if path.segments().len() >= CONTAINER_DEPTH {
+        // Reads are served only strictly inside a container's filesystem (depth > 4). The container
+        // node itself (depth 4) and the navigation tree above it (contexts/namespaces/pods/
+        // containers) are list-only — matching `open_read`, which serves a read only when there is
+        // an in-container path below the container. Writes/exec/logs are M6-6 actions.
+        if path.segments().len() > CONTAINER_LEVEL {
             Caps::LIST | Caps::READ | Caps::RANDOM_READ
         } else {
             Caps::LIST
@@ -190,22 +191,24 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
                 Ok(e)
             }
             [ctx, ns, pod, container] => {
-                if self
+                let info = self
                     .ops
                     .list_containers(ctx, ns, pod)
                     .await?
-                    .iter()
-                    .any(|c| c.name == *container)
-                {
-                    Ok(Entry::new(*container, EntryKind::Dir))
-                } else {
-                    Err(VfsError::NotFound(path.clone()))
-                }
+                    .into_iter()
+                    .find(|c| c.name == *container)
+                    .ok_or_else(|| VfsError::NotFound(path.clone()))?;
+                let mut e = Entry::new(*container, EntryKind::Dir);
+                e.ext = EntryExt::KubeContainer {
+                    is_init: info.is_init,
+                    is_ephemeral: info.is_ephemeral,
+                };
+                Ok(e)
             }
             [ctx, ns, pod, container, rest @ ..] => {
                 let m = self
                     .ops
-                    .stat(ctx, ns, pod, container, &join_in_container(rest))
+                    .stat(ctx, ns, pod, container, &join_abs_path(rest))
                     .await?;
                 let mut e = Entry::new(path.file_name().unwrap_or(""), m.kind);
                 if m.kind == EntryKind::File {
@@ -225,7 +228,7 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
         let data = match segs.as_slice() {
             [ctx, ns, pod, container, rest @ ..] if !rest.is_empty() => {
                 self.ops
-                    .read(ctx, ns, pod, container, &join_in_container(rest))
+                    .read(ctx, ns, pod, container, &join_abs_path(rest))
                     .await?
             }
             _ => return Err(VfsError::Unsupported(Caps::READ)),
@@ -360,6 +363,74 @@ mod tests {
             vfs.caps_at(&p("/prod/default/web-0/app/etc/hostname")),
             Caps::LIST | Caps::READ | Caps::RANDOM_READ
         );
+    }
+
+    #[tokio::test]
+    async fn empty_container_root_lists_empty_not_not_found() {
+        // `sidecar` exists but has no files: its root must list empty, never NotFound.
+        let vfs = backend();
+        assert_eq!(
+            names(&vfs, "/prod/default/web-0/sidecar").await,
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn container_root_is_list_only_and_not_readable() {
+        // The container node (depth 4) is a directory: caps_at and open_read agree it is not
+        // readable; reads begin strictly inside the container's filesystem (depth > 4).
+        let vfs = backend();
+        let path = p("/prod/default/web-0/app");
+        assert_eq!(vfs.caps_at(&path), Caps::LIST);
+        assert!(matches!(
+            vfs.open_read(&path, None).await,
+            Err(VfsError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stat_and_list_in_container_edge_cases() {
+        let vfs = backend();
+        // A subdirectory deep in the container is a Dir.
+        assert!(vfs
+            .stat(&p("/prod/default/web-0/app/etc"))
+            .await
+            .unwrap()
+            .is_dir());
+        // A file's size is reported.
+        assert_eq!(
+            vfs.stat(&p("/prod/default/web-0/app/etc/hostname"))
+                .await
+                .unwrap()
+                .size,
+            Some(6)
+        );
+        // Listing a file path, or a missing directory, is NotFound.
+        assert!(matches!(
+            vfs.list(
+                &p("/prod/default/web-0/app/etc/hostname"),
+                ListOpts::default()
+            )
+            .next()
+            .await
+            .unwrap(),
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.list(&p("/prod/default/web-0/app/missing"), ListOpts::default())
+                .next()
+                .await
+                .unwrap(),
+            Err(VfsError::NotFound(_))
+        ));
+        // An unknown context lists as NotFound.
+        assert!(matches!(
+            vfs.list(&p("/nope"), ListOpts::default())
+                .next()
+                .await
+                .unwrap(),
+            Err(VfsError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

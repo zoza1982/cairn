@@ -85,6 +85,10 @@ pub trait KubeOps: Send + Sync + 'static {
         pod: &str,
     ) -> Result<Vec<ContainerInfo>, VfsError>;
     /// List a directory inside a container's filesystem.
+    ///
+    /// An existing container's root (`"/"`) must list as `Ok(vec![])` when empty — never
+    /// [`VfsError::NotFound`]; `NotFound` is reserved for a missing directory or a path that is a
+    /// file. (The live adapter must preserve this so an empty/just-started container still browses.)
     async fn list_dir(
         &self,
         ctx: &str,
@@ -154,6 +158,16 @@ pub(crate) mod mock {
             tree.insert("/app/main.rs".to_owned(), b"fn main() {}\n".to_vec());
             let mut files = BTreeMap::new();
             files.insert(key, tree);
+            // `sidecar` exists but has an empty filesystem: its root must list empty, not NotFound.
+            files.insert(
+                (
+                    "prod".to_owned(),
+                    "default".to_owned(),
+                    "web-0".to_owned(),
+                    "sidecar".to_owned(),
+                ),
+                BTreeMap::new(),
+            );
 
             let mut namespaces = BTreeMap::new();
             namespaces.insert("prod".to_owned(), vec!["default".to_owned()]);
@@ -198,8 +212,15 @@ pub(crate) mod mock {
             }
         }
 
-        fn nf(path: &str) -> VfsError {
-            VfsError::NotFound(VfsPath::parse(path).unwrap_or_else(|_| VfsPath::root()))
+        fn nf(name: &str) -> VfsError {
+            // `name` may be a bare segment (e.g. a container name); root it so the error path is
+            // meaningful in test output rather than collapsing to `/`.
+            let rooted = if name.starts_with('/') {
+                name.to_owned()
+            } else {
+                format!("/{name}")
+            };
+            VfsError::NotFound(VfsPath::parse(&rooted).unwrap_or_else(|_| VfsPath::root()))
         }
     }
 
@@ -309,6 +330,13 @@ pub(crate) mod mock {
                     container.to_owned(),
                 ))
                 .ok_or_else(|| Self::nf(container))?;
+            // The container root is always a directory (even when empty).
+            if path == "/" {
+                return Ok(RemoteMeta {
+                    kind: EntryKind::Dir,
+                    size: None,
+                });
+            }
             if let Some(data) = tree.get(path) {
                 return Ok(RemoteMeta {
                     kind: EntryKind::File,

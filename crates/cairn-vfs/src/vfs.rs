@@ -64,6 +64,20 @@ pub fn apply_byte_range(data: &[u8], range: ByteRange) -> &[u8] {
     &data[start..end]
 }
 
+/// Build an absolute path from VFS path segments below some root (e.g. a container/pod filesystem).
+///
+/// An empty slice yields `"/"` (the root itself). Segments have already passed [`VfsPath`] parsing,
+/// which rejects `..` and control characters, so the result cannot traverse out of the root. Shared
+/// by the container backends (Docker, Kubernetes) that map a subtree onto a remote filesystem.
+#[must_use]
+pub fn join_abs_path(rest: &[&str]) -> String {
+    if rest.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", rest.join("/"))
+    }
+}
+
 /// Options controlling a write.
 #[derive(Debug, Clone, Default)]
 pub struct WriteOpts {
@@ -163,7 +177,14 @@ pub trait Vfs: CapabilityProvider + Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_byte_range, ByteRange};
+    use super::{apply_byte_range, join_abs_path, ByteRange};
+
+    #[test]
+    fn join_abs_path_builds_rooted_paths() {
+        assert_eq!(join_abs_path(&[]), "/");
+        assert_eq!(join_abs_path(&["etc"]), "/etc");
+        assert_eq!(join_abs_path(&["etc", "hostname"]), "/etc/hostname");
+    }
 
     #[test]
     fn byte_range_clamps_and_saturates() {

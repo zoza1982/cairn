@@ -14,8 +14,8 @@ pub use real::BollardDocker;
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryExt, EntryKind, Scheme, VfsPath};
 use cairn_vfs::{
-    apply_byte_range, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs,
-    VfsError, WriteHandle, WriteOpts,
+    apply_byte_range, join_abs_path, ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle,
+    Recurse, Vfs, VfsError, WriteHandle, WriteOpts,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -90,7 +90,7 @@ impl<O: ContainerOps> DockerVfs<O> {
                 }
             }
             ["containers", name, rest @ ..] => {
-                let in_path = join_in_container(rest);
+                let in_path = join_abs_path(rest);
                 self.ops
                     .list_dir(name, &in_path)
                     .await?
@@ -111,15 +111,6 @@ impl<O: ContainerOps> DockerVfs<O> {
             cursor: None,
             done: true,
         })
-    }
-}
-
-/// Build the in-container absolute path from the trailing segments.
-fn join_in_container(rest: &[&str]) -> String {
-    if rest.is_empty() {
-        "/".to_owned()
-    } else {
-        format!("/{}", rest.join("/"))
     }
 }
 
@@ -183,7 +174,7 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
                 }
             }
             ["containers", name, rest @ ..] => {
-                let m = self.ops.stat(name, &join_in_container(rest)).await?;
+                let m = self.ops.stat(name, &join_abs_path(rest)).await?;
                 let mut e = Entry::new(path.file_name().unwrap_or(""), m.kind);
                 if m.kind == EntryKind::File {
                     e.size = m.size;
@@ -202,7 +193,7 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
         let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
         let data = match segs.as_slice() {
             ["containers", name, rest @ ..] if !rest.is_empty() => {
-                self.ops.read(name, &join_in_container(rest)).await?
+                self.ops.read(name, &join_abs_path(rest)).await?
             }
             _ => return Err(VfsError::Unsupported(Caps::READ)),
         };
