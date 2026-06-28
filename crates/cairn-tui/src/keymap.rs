@@ -110,6 +110,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "cycle_sort" => Action::CycleSort,
         "toggle_hidden" => Action::ToggleHidden,
         "filter" => Action::Filter,
+        "open_queue" => Action::OpenQueue,
         "make_dir" => Action::MakeDir,
         "rename" => Action::Rename,
         "open_connections" => Action::OpenConnections,
@@ -199,6 +200,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
             KeyCode::Char('a') => Some(Action::AiPropose),
             // Ctrl-O opens the connection switcher.
             KeyCode::Char('o') => Some(Action::OpenConnections),
+            // Ctrl-T opens the transfer-queue view.
+            KeyCode::Char('t') => Some(Action::OpenQueue),
             _ => None,
         };
     }
@@ -444,6 +447,7 @@ mod tests {
             "cycle_sort",
             "toggle_hidden",
             "filter",
+            "open_queue",
             "make_dir",
             "rename",
             "open_connections",
@@ -458,7 +462,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 24);
+        assert_eq!(names.len(), 25);
     }
 
     #[test]

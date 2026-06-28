@@ -78,7 +78,7 @@ Keys can be remapped under `[ui.keybindings]` — a map of key-chord → action,
 built-in scheme. Chords combine optional `ctrl+`/`alt+`/`shift+` modifiers with a key (a single
 character, a named key like `enter`/`space`/`esc`/`tab`/arrows, or `f1`–`f24`); actions are
 snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `cycle_sort`, `toggle_hidden`,
-`filter`, `make_dir`, `rename`, `quit`, …). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
+`filter`, `make_dir`, `rename`, `open_queue`, `quit`, …). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
 
 By default `s` cycles the active pane's sort order (name → size → modified → type) and `.` toggles whether
 hidden entries (dotfiles) are listed; the current sort mode and hidden state show in each pane's

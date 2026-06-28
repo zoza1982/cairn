@@ -44,6 +44,8 @@ pub enum Action {
     ToggleHidden,
     /// Begin filtering the active pane's listing (filter-as-you-type).
     Filter,
+    /// Open the transfer-queue overlay (view active + pending transfers).
+    OpenQueue,
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
     /// Open a prompt to create a new directory in the active pane.

@@ -48,7 +48,11 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     if state.ai_pending
         && matches!(
             action,
-            Action::MakeDir | Action::Rename | Action::Delete | Action::OpenConnections
+            Action::MakeDir
+                | Action::Rename
+                | Action::Delete
+                | Action::OpenConnections
+                | Action::OpenQueue
         )
     {
         state.status = Some("The assistant is preparing a plan…".to_owned());
@@ -166,6 +170,10 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             }
             p.clamp_cursor();
             state.status = Some(format!("Sort: {}", new_sort.label()));
+            Vec::new()
+        }
+        Action::OpenQueue => {
+            state.overlay = Some(Overlay::TransferQueue);
             Vec::new()
         }
         Action::Filter => {
@@ -385,8 +393,30 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::ConfirmOverwrite { .. }) => apply_confirm_overwrite_action(state, action),
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
+        Some(Overlay::TransferQueue) => apply_transfer_queue_action(state, action),
         // A text prompt captures keystrokes as `Msg::Text`; non-quit actions don't reach it.
         Some(Overlay::Prompt { .. }) | None => Vec::new(),
+    }
+}
+
+/// Drive the transfer-queue overlay: `Reject` clears the pending queue (the active transfer keeps
+/// running); `Cancel`/`Enter` just closes the view.
+fn apply_transfer_queue_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        Action::Reject => {
+            let n = state.transfer_queue.len();
+            state.transfer_queue.clear();
+            if n > 0 {
+                state.status = Some(format!("Cleared {n} queued transfer(s)"));
+            }
+            state.overlay = None;
+            Vec::new()
+        }
+        Action::Cancel | Action::Confirm | Action::Enter => {
+            state.overlay = None;
+            Vec::new()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1393,6 +1423,68 @@ mod tests {
             "the queued transfer is now active"
         );
         assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
+    }
+
+    #[test]
+    fn queue_overlay_opens_and_clears_pending_without_touching_the_active_transfer() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active
+        let _ = update(&mut s, Msg::Action(Action::Move)); // B queued
+        assert_eq!(s.transfer_queue.len(), 1);
+        // Open the queue view.
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        assert!(matches!(s.overlay, Some(Overlay::TransferQueue)));
+        // Reject clears the pending queue but leaves the active transfer running.
+        let _ = update(&mut s, Msg::Action(Action::Reject));
+        assert!(s.transfer_queue.is_empty());
+        assert_eq!(
+            s.transfer_bytes,
+            Some(0),
+            "the active transfer is untouched"
+        );
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn queue_overlay_esc_just_closes() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        assert!(matches!(s.overlay, Some(Overlay::TransferQueue)));
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn clearing_an_empty_queue_shows_no_misleading_status() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        let _ = update(&mut s, Msg::Action(Action::Reject));
+        assert!(s.overlay.is_none());
+        assert!(
+            s.status.is_none(),
+            "no 'Cleared 0' message on an empty queue"
+        );
+    }
+
+    #[test]
+    fn open_queue_is_suppressed_while_a_plan_is_pending() {
+        let mut s = state();
+        request_ai(&mut s, "do something"); // ai_pending = true
+        let fx = update(&mut s, Msg::Action(Action::OpenQueue));
+        assert!(fx.is_empty());
+        assert!(
+            s.overlay.is_none(),
+            "queue view must not clobber an arriving plan overlay"
+        );
     }
 
     #[test]

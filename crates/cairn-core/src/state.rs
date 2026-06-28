@@ -244,6 +244,8 @@ pub enum Overlay {
         /// The text entered so far.
         input: String,
     },
+    /// View the transfer queue (the active transfer plus pending ones); offers cancel-all-pending.
+    TransferQueue,
     /// Confirm overwriting existing destinations before a copy/move proceeds. Holds the parameters to
     /// re-issue the transfer with overwrite enabled.
     ConfirmOverwrite {
