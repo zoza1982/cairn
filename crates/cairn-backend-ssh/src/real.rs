@@ -8,7 +8,7 @@
 use crate::ops::{RemoteEntry, RemoteMeta, SftpOps};
 use async_trait::async_trait;
 use cairn_types::{EntryKind, VfsPath};
-use cairn_vfs::{ByteRange, VfsError};
+use cairn_vfs::{ByteRange, RetryPolicy, VfsError};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -36,17 +36,29 @@ fn kind_of(md: &russh_sftp::protocol::FileAttributes) -> EntryKind {
     }
 }
 
-/// Map a transport error to a `VfsError`, distinguishing not-found from other failures.
+/// Map a transport error to a `VfsError`: not-found, a *transient* (retryable) transport failure, or
+/// a generic backend error. Classifying transient failures as retryable is what lets the read-only
+/// ops actually benefit from [`cairn_vfs::retry`].
 fn map_err(e: impl std::fmt::Display, path: &str) -> VfsError {
     let msg = e.to_string();
     let low = msg.to_lowercase();
     if low.contains("no such file") || low.contains("not found") || low.contains("nosuchfile") {
         VfsError::NotFound(VfsPath::parse(path).unwrap_or_else(|_| VfsPath::root()))
     } else {
+        let transient = [
+            "timeout",
+            "timed out",
+            "connection",
+            "reset",
+            "broken pipe",
+            "eof",
+        ]
+        .iter()
+        .any(|m| low.contains(m));
         VfsError::Backend {
             code: "sftp".to_owned(),
             msg,
-            retryable: false,
+            retryable: transient,
         }
     }
 }
@@ -58,17 +70,47 @@ fn io_err(e: std::io::Error) -> VfsError {
 #[async_trait]
 impl SftpOps for RealSftp {
     async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, VfsError> {
-        let dir = self
-            .session
-            .read_dir(path)
-            .await
-            .map_err(|e| map_err(e, path))?;
-        let mut out = Vec::new();
-        for entry in dir {
-            let md = entry.metadata();
+        // Idempotent read: retried on a transient transport failure (see `stat` for the policy).
+        cairn_vfs::retry(RetryPolicy::default(), || async {
+            let dir = self
+                .session
+                .read_dir(path)
+                .await
+                .map_err(|e| map_err(e, path))?;
+            let mut out = Vec::new();
+            for entry in dir {
+                let md = entry.metadata();
+                let kind = kind_of(&md);
+                out.push(RemoteEntry {
+                    name: entry.file_name(),
+                    kind,
+                    size: if kind == EntryKind::File {
+                        Some(md.len())
+                    } else {
+                        None
+                    },
+                    modified: md.modified().ok(),
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn stat(&self, path: &str) -> Result<RemoteMeta, VfsError> {
+        // `stat` is idempotent, so retry it with backoff on a *transient* failure (server-side
+        // timeout/throttle, classified retryable by `map_err`). This does not re-establish a dropped
+        // session — connection recovery is a higher-level concern (M4-4 keepalive/reconnect).
+        // Mutating ops (write/remove/rename) are intentionally NOT auto-retried — a retried partial
+        // mutation could double-apply.
+        cairn_vfs::retry(RetryPolicy::default(), || async {
+            let md = self
+                .session
+                .metadata(path)
+                .await
+                .map_err(|e| map_err(e, path))?;
             let kind = kind_of(&md);
-            out.push(RemoteEntry {
-                name: entry.file_name(),
+            Ok(RemoteMeta {
                 kind,
                 size: if kind == EntryKind::File {
                     Some(md.len())
@@ -76,55 +118,42 @@ impl SftpOps for RealSftp {
                     None
                 },
                 modified: md.modified().ok(),
-            });
-        }
-        Ok(out)
-    }
-
-    async fn stat(&self, path: &str) -> Result<RemoteMeta, VfsError> {
-        let md = self
-            .session
-            .metadata(path)
-            .await
-            .map_err(|e| map_err(e, path))?;
-        let kind = kind_of(&md);
-        Ok(RemoteMeta {
-            kind,
-            size: if kind == EntryKind::File {
-                Some(md.len())
-            } else {
-                None
-            },
-            modified: md.modified().ok(),
+            })
         })
+        .await
     }
 
     async fn read(&self, path: &str, range: Option<ByteRange>) -> Result<Vec<u8>, VfsError> {
-        let mut file = self
-            .session
-            .open_with_flags(path, OpenFlags::READ)
-            .await
-            .map_err(|e| map_err(e, path))?;
-        let mut buf = Vec::new();
-        match range {
-            None => {
-                file.read_to_end(&mut buf).await.map_err(io_err)?;
-            }
-            Some(r) => {
-                file.seek(std::io::SeekFrom::Start(r.offset))
-                    .await
-                    .map_err(io_err)?;
-                match r.len {
-                    Some(l) => {
-                        file.take(l).read_to_end(&mut buf).await.map_err(io_err)?;
-                    }
-                    None => {
-                        file.read_to_end(&mut buf).await.map_err(io_err)?;
+        // Idempotent read: retried on a transient failure. A retry re-opens and re-reads the whole
+        // range from the start (the returned bytes are correct; only the in-flight read is repeated).
+        cairn_vfs::retry(RetryPolicy::default(), || async {
+            let mut file = self
+                .session
+                .open_with_flags(path, OpenFlags::READ)
+                .await
+                .map_err(|e| map_err(e, path))?;
+            let mut buf = Vec::new();
+            match range {
+                None => {
+                    file.read_to_end(&mut buf).await.map_err(io_err)?;
+                }
+                Some(r) => {
+                    file.seek(std::io::SeekFrom::Start(r.offset))
+                        .await
+                        .map_err(io_err)?;
+                    match r.len {
+                        Some(l) => {
+                            file.take(l).read_to_end(&mut buf).await.map_err(io_err)?;
+                        }
+                        None => {
+                            file.read_to_end(&mut buf).await.map_err(io_err)?;
+                        }
                     }
                 }
             }
-        }
-        Ok(buf)
+            Ok(buf)
+        })
+        .await
     }
 
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
@@ -168,5 +197,25 @@ impl SftpOps for RealSftp {
             .rename(from, to)
             .await
             .map_err(|e| map_err(e, from))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_err;
+    use cairn_vfs::VfsError;
+
+    #[test]
+    fn map_err_classifies_transient_failures_as_retryable() {
+        // A transport timeout/connection drop is retryable…
+        assert!(map_err("Connection reset by peer", "/x").is_retryable());
+        assert!(map_err("operation timed out", "/x").is_retryable());
+        // …a not-found is a distinct, non-retryable error…
+        assert!(matches!(
+            map_err("No such file", "/x"),
+            VfsError::NotFound(_)
+        ));
+        // …and a generic protocol error is not retried.
+        assert!(!map_err("permission denied", "/x").is_retryable());
     }
 }

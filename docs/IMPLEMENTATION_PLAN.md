@@ -22,7 +22,7 @@
 | **Current milestone** | **Hermetic cores delivered across M0–M8; SDK/service integration env-deferred** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core & plan→confirm UI + M8 runtime, WIT RFC & keybindings + M4 SFTP-mapping + M6 Docker- & K8s-mapping ✅ · cloud providers + live-transport (SSH/Docker/K8s) + LLM HTTP providers + WASM component bridge ⏭ |
-| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 30 / 21 / 0 / 0 / 20 |
+| **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 30 / 22 / 0 / 0 / 19 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
 
@@ -161,7 +161,7 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 | M4-1 | RFC: **SSH/SFTP backend** (auth chain, bastion/jump, keepalive, `!Send` proxy strategy) | network-engineer, technical-writer | M1-1, M3-5 | RFC merged | approved before M4-2; `assert_send` plan documented | ✅ #19 (RFC-0003) |
 | M4-2 | `cairn-backend-ssh`: connect (key/agent via broker), list/stat/read/write (streaming, RANDOM_READ) | network-engineer, rust-staff-engineer | M4-1 | rustdoc; backend README | against SSH image (CI): browse + read/write; auth via broker only | ✅ #19 SFTP→Vfs mapping + russh-sftp adapter (mock-tested); live transport connect = integration step |
 | M4-3 | SSH mutations + `exec` (remote grep→SEARCH_CONTENT), edit-in-place save-back | network-engineer | M4-2 | rustdoc | rename/delete/mkdir; exec returns Stream; edit→save round-trip | 🟡 rename/remove/mkdir done; exec + edit-save + live transport deferred |
-| M4-4 | Transport resilience: timeouts, keepalive, retry/backoff, bastion/proxy-jump chain | network-engineer | M4-2 | rustdoc; resilience note | simulated stall fails+retries (no hang); jump-host test | ⏭ env-deferred (live SSH server + russh SDK) |
+| M4-4 | Transport resilience: timeouts, keepalive, retry/backoff, bastion/proxy-jump chain | network-engineer | M4-2 | rustdoc; resilience note | simulated stall fails+retries (no hang); jump-host test | 🟡 retry/backoff core (#31): `cairn_vfs::retry` + `RetryPolicy` (capped exponential backoff, retries only `VfsError::is_retryable`, mutations excluded), unit-tested against a flaky op; adopted on the SFTP adapter's idempotent `stat`. Keepalive, bastion/jump-host chain, and live timeouts = integration step |
 | M4-5 | Connection switcher UI + new-SSH flow, profile persistence (ref-only) | tui-engineer, software-engineer | M4-2, M3-7 | user docs | **Demo:** Ctrl-K → connect → browse → transfer local↔SSH | 🟡 switcher UI (#28): `Ctrl-O` overlay lists registered connections (built-in local roots + `scheme="local"` config profiles) and re-points the active pane; reducer + render mock-tested. New-remote-connection flow (SSH/cloud connect) = integration step |
 | M4-6 | Cross-backend transfer validation local↔SSH | qa-engineer, storage-engineer | M4-2, M2-2 | test docs | copy/move both directions; integrity verified | ⏭ env-deferred (live SSH server + russh SDK) |
 

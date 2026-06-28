@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-vfs` **retry/backoff** (M4-4): `retry` + `RetryPolicy` re-run an operation while its
+  `VfsError` is retryable, with capped exponential backoff (`backoff_delay`); the schedule is a pure,
+  unit-tested function and non-retryable errors fail fast. Adopted on the SFTP adapter's idempotent
+  `stat` (mutating ops are intentionally not auto-retried). Keepalive, bastion/jump-host chains, and
+  live timeouts remain the integration step.
 - AI **plan execution** (M7-6): a `BinaryStepExecutor` (RFC-0007) runs an approved plan's steps
   against the registered backends — the safe/local tools (`list`/`stat`/`read`/`copy`/`move`/
   `delete`) execute now via the VFS/transfer engine, resolving the model's opaque `conn:N` handles to
