@@ -12,7 +12,7 @@ use cairn_backend_local::LocalVfs;
 use cairn_config::Config;
 use cairn_core::{initial_effects, update, AppEffect, AppEvent, AppState, ConnectionChoice, Msg};
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
-use cairn_tui::Keymap;
+use cairn_tui::{Keymap, Theme};
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
@@ -22,6 +22,12 @@ use tokio_util::sync::CancellationToken;
 
 const LEFT: ConnectionId = ConnectionId(1);
 const RIGHT: ConnectionId = ConnectionId(2);
+
+/// The resolved UI configuration threaded through the event loop (input mapping + colors).
+struct Ui {
+    keymap: Keymap,
+    theme: Theme,
+}
 
 /// Build the runtime and run the application to completion.
 pub(crate) fn run() -> anyhow::Result<()> {
@@ -61,6 +67,20 @@ async fn run_async() -> anyhow::Result<()> {
     // are not yet connectable.
     state.connections = register_connections(&registry, &config).await;
 
+    // Resolve the color theme from the preset + per-role config overrides.
+    let (theme, theme_warnings) = Theme::resolve(
+        &config.ui.theme,
+        config
+            .ui
+            .colors
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    for w in theme_warnings {
+        tracing::warn!("{w}");
+    }
+    let ui = Ui { keymap, theme };
+
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(256);
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
     spawn_input_reader(input_tx);
@@ -71,13 +91,13 @@ async fn run_async() -> anyhow::Result<()> {
     for effect in initial_effects(&state) {
         dispatch(effect, &registry, &event_tx);
     }
-    terminal.draw(|f| cairn_tui::render(f, &state))?;
+    terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
 
     let result = event_loop(
         &mut terminal,
         &mut state,
         &registry,
-        &keymap,
+        &ui,
         &event_tx,
         &mut event_rx,
         &mut input_rx,
@@ -139,7 +159,7 @@ async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     state: &mut AppState,
     registry: &VfsRegistry,
-    keymap: &Keymap,
+    ui: &Ui,
     event_tx: &mpsc::Sender<AppEvent>,
     event_rx: &mut mpsc::Receiver<AppEvent>,
     input_rx: &mut mpsc::Receiver<Event>,
@@ -147,7 +167,7 @@ async fn event_loop(
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
-            Some(input) = input_rx.recv() => map_input(input, keymap),
+            Some(input) = input_rx.recv() => map_input(input, &ui.keymap),
             else => break,
         };
         let Some(msg) = msg else { continue };
@@ -156,7 +176,7 @@ async fn event_loop(
         if state.should_quit {
             break;
         }
-        terminal.draw(|f| cairn_tui::render(f, state))?;
+        terminal.draw(|f| cairn_tui::render(f, state, &ui.theme))?;
         for effect in effects {
             dispatch(effect, registry, event_tx);
         }

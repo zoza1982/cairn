@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Config-driven **theme colors** (M8-7): `[ui.colors]` overrides individual render roles
+  (`focused_border`/`unfocused_border`/`dir`/`error`/`status`/`selection_bg`/`selection_fg`) over the
+  built-in `dark` preset, using color names or `#rrggbb`. A `Theme` is resolved from config and
+  threaded through the renderer; unknown roles / unparseable colors are skipped with a warning.
 - `cairn-vfs` **retry/backoff** (M4-4): `retry` + `RetryPolicy` re-run an operation while its
   `VfsError` is retryable, with capped exponential backoff (`backoff_delay`); the schedule is a pure,
   unit-tested function and non-retryable errors fail fast. Adopted on the SFTP adapter's idempotent

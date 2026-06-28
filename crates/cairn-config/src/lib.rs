@@ -56,6 +56,12 @@ pub struct UiConfig {
     /// warning rather than rejecting the whole config.
     #[serde(default)]
     pub keybindings: BTreeMap<String, String>,
+    /// Theme color overrides on top of the [`theme`](UiConfig::theme) preset: a map of role →
+    /// color. Roles are `focused_border`/`unfocused_border`/`dir`/`error`/`status`/`selection_bg`/
+    /// `selection_fg`; colors are names (`"cyan"`, `"bright-blue"`) or `#rrggbb`. Unknown roles or
+    /// unparseable colors are ignored with a warning.
+    #[serde(default)]
+    pub colors: BTreeMap<String, String>,
 }
 
 impl Default for UiConfig {
@@ -64,6 +70,7 @@ impl Default for UiConfig {
             keymap: "mc".to_owned(),
             theme: "dark".to_owned(),
             keybindings: BTreeMap::new(),
+            colors: BTreeMap::new(),
         }
     }
 }
@@ -194,6 +201,23 @@ mod tests {
         assert!(text.contains("bastion.example"));
         assert!(!text.to_lowercase().contains("password"));
         assert!(!text.to_lowercase().contains("private_key"));
+    }
+
+    #[test]
+    fn theme_colors_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.ui.theme = "dark".into();
+        cfg.ui
+            .colors
+            .insert("focused_border".into(), "magenta".into());
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.ui.colors.get("focused_border").map(String::as_str),
+            Some("magenta")
+        );
     }
 
     #[test]

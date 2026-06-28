@@ -87,6 +87,16 @@ are ignored with a warning, and `Ctrl-C` always quits.
 "f5"     = "copy"
 ```
 
+Colors can be themed under `[ui.colors]` — override individual roles
+(`focused_border`, `unfocused_border`, `dir`, `error`, `status`, `selection_bg`, `selection_fg`) over
+the built-in `dark` preset, using color names or `#rrggbb`:
+
+```toml
+[ui.colors]
+focused_border = "magenta"
+dir            = "#5fafff"
+```
+
 ## Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) and our
