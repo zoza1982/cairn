@@ -113,6 +113,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "open_queue" => Action::OpenQueue,
         "queue_move_up" => Action::QueueMoveUp,
         "queue_move_down" => Action::QueueMoveDown,
+        "toggle_pause" => Action::TogglePause,
         "make_dir" => Action::MakeDir,
         "rename" => Action::Rename,
         "open_connections" => Action::OpenConnections,
@@ -229,6 +230,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         // 's' cycles the sort mode; '.' toggles hidden entries (ranger/vim convention).
         KeyCode::Char('s') => Some(Action::CycleSort),
         KeyCode::Char('.') => Some(Action::ToggleHidden),
+        // 'p' pauses/resumes the active transfer (no-op when none is running).
+        KeyCode::Char('p') => Some(Action::TogglePause),
         // F7 = make directory, F2 = rename (Total Commander / Norton convention).
         KeyCode::F(7) => Some(Action::MakeDir),
         KeyCode::F(2) => Some(Action::Rename),
@@ -312,6 +315,14 @@ mod tests {
     #[test]
     fn unbound_key_is_none() {
         assert_eq!(action_for(press(KeyCode::Char('z'))), None);
+    }
+
+    #[test]
+    fn pause_key() {
+        assert_eq!(
+            action_for(press(KeyCode::Char('p'))),
+            Some(Action::TogglePause)
+        );
     }
 
     #[test]
@@ -455,6 +466,7 @@ mod tests {
             "open_queue",
             "queue_move_up",
             "queue_move_down",
+            "toggle_pause",
             "make_dir",
             "rename",
             "open_connections",
@@ -469,7 +481,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 27);
+        assert_eq!(names.len(), 28);
     }
 
     #[test]

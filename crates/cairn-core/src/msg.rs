@@ -50,6 +50,8 @@ pub enum Action {
     QueueMoveUp,
     /// In the queue view: move the selected pending transfer later (down).
     QueueMoveDown,
+    /// Toggle pause/resume of the active transfer (no-op when none is running).
+    TogglePause,
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
     /// Open a prompt to create a new directory in the active pane.
@@ -191,6 +193,9 @@ pub enum AppEffect {
     },
     /// Cancel the in-flight transfer, if any.
     CancelTransfer,
+    /// Set the paused state of the in-flight transfer (`true` = pause, `false` = resume). No-op when
+    /// no transfer is running.
+    SetTransferPaused(bool),
     /// Delete entries on a connection.
     Delete {
         /// The connection.
