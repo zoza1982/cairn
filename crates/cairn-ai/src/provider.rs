@@ -93,6 +93,7 @@ pub enum ProviderError {
 /// a native tool/function-call API, a JSON-object instruction in the prompt, or a fenced-code-block
 /// instruction for the weakest text-only models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ToolSupport {
     /// Native tool/function calling (e.g. Claude, OpenAI tools) — tools go in the request, the
     /// response comes back as a structured [`LlmResponse::ToolCall`].

@@ -13,10 +13,11 @@ mod plan;
 mod provider;
 mod tools;
 
+use degrade::{decode_plan, encode_request, DegradeError};
+
 pub use context::{
     looks_out_of_scope, wrap_untrusted, ConnectionView, PaneView, WorldSnapshot, SYSTEM_POLICY,
 };
-pub use degrade::{decode_plan, encode_request, DegradeError};
 pub use plan::{
     Plan, PlanError, PlanState, PlanStep, ProposedPlan, ProposedStep, StepExecutor, StepStatus,
 };
@@ -129,6 +130,17 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn request_plan_reports_malformed_payload() {
+        // A balanced JSON object that isn't a valid plan (missing `steps`) → BadPlan, not NoPlan.
+        let provider = MockProvider::new(vec![LlmResponse::Text("{\"summary\": \"x\"}".into())])
+            .with_support(ToolSupport::JsonSchema);
+        let err = request_plan(&provider, LlmRequest::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::BadPlan), "got {err:?}");
     }
 
     #[tokio::test]

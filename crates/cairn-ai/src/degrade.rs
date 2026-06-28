@@ -19,8 +19,7 @@ pub(crate) const PLAN_TOOL: &str = "propose_plan";
 
 /// Errors extracting a plan payload from a model response.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DegradeError {
+pub(crate) enum DegradeError {
     /// The native reply was not a `propose_plan` tool call (some other tool, or plain text).
     #[error("model did not call propose_plan")]
     NotAPlanCall,
@@ -36,16 +35,17 @@ pub enum DegradeError {
 /// fold an output-format instruction into the system prompt (and clear `tools`, which the model
 /// can't use).
 #[must_use]
-pub fn encode_request(tier: ToolSupport, mut req: LlmRequest) -> LlmRequest {
+pub(crate) fn encode_request(tier: ToolSupport, mut req: LlmRequest) -> LlmRequest {
     match tier {
         ToolSupport::Native => {
-            if !req.tools.iter().any(|t| t.name == PLAN_TOOL) {
-                req.tools.push(ToolDef {
-                    name: PLAN_TOOL.to_owned(),
-                    description: "Propose a plan of steps for the user to review and approve."
-                        .to_owned(),
-                });
-            }
+            // Only `propose_plan` is ever advertised — the model proposes; it never directly calls
+            // an action tool (clear-then-add makes that explicit and symmetric with the text tiers).
+            req.tools.clear();
+            req.tools.push(ToolDef {
+                name: PLAN_TOOL.to_owned(),
+                description: "Propose a plan of steps for the user to review and approve."
+                    .to_owned(),
+            });
             req
         }
         ToolSupport::JsonSchema | ToolSupport::Text => {
@@ -69,7 +69,7 @@ fn augment_system(base: Option<&str>, tier: ToolSupport) -> String {
              form: {\"summary\": string, \"steps\": [{\"tool\": string, \"input\": object, \
              \"description\": string}, ...]}. Output nothing outside the fence."
         }
-        ToolSupport::Native => "",
+        ToolSupport::Native => unreachable!("augment_system is only called for the text tiers"),
     };
     match base {
         Some(b) if !b.is_empty() => format!("{b}\n\n{instruction}"),
@@ -81,7 +81,7 @@ fn augment_system(base: Option<&str>, tier: ToolSupport) -> String {
 ///
 /// # Errors
 /// [`DegradeError`] if the response does not carry a usable plan object.
-pub fn decode_plan(
+pub(crate) fn decode_plan(
     tier: ToolSupport,
     resp: &LlmResponse,
 ) -> Result<serde_json::Value, DegradeError> {
@@ -93,9 +93,18 @@ pub fn decode_plan(
         // The text tiers may still come back as a tool call (a more capable model than declared);
         // accept that, otherwise extract a JSON object from the text.
         (_, LlmResponse::ToolCall { name, input }) if name == PLAN_TOOL => Ok(input.clone()),
-        (ToolSupport::Text, LlmResponse::Text(t)) => parse_json_object(strip_code_fence(t)),
+        (ToolSupport::Text, LlmResponse::Text(t)) => {
+            // Prefer the first fenced block, but fall back to scanning the whole reply if that block
+            // held no JSON (a weak model may emit a throwaway fence before the real one).
+            parse_json_object(strip_code_fence(t)).or_else(|e| match e {
+                DegradeError::NoJson => parse_json_object(t),
+                other => Err(other),
+            })
+        }
         (ToolSupport::JsonSchema, LlmResponse::Text(t)) => parse_json_object(t),
-        (_, LlmResponse::ToolCall { .. }) => Err(DegradeError::NotAPlanCall),
+        (ToolSupport::JsonSchema | ToolSupport::Text, LlmResponse::ToolCall { .. }) => {
+            Err(DegradeError::NotAPlanCall)
+        }
     }
 }
 
@@ -115,39 +124,19 @@ fn strip_code_fence(text: &str) -> &str {
     }
 }
 
-/// Find and parse the first balanced top-level `{ … }` JSON object in `text`.
+/// Find and parse the **first** JSON object embedded in `text` (matching the "respond with only a
+/// single JSON object" instruction; leading prose before the `{` and trailing prose after the object
+/// are tolerated). Delegates the actual parse to `serde_json`'s streaming deserializer, so string
+/// escaping, nesting, and UTF-8 are handled correctly with no hand-rolled scanning.
 fn parse_json_object(text: &str) -> Result<serde_json::Value, DegradeError> {
-    let bytes = text.as_bytes();
     let start = text.find('{').ok_or(DegradeError::NoJson)?;
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    for i in start..bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == b'\\' {
-                escaped = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match c {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let slice = &text[start..=i];
-                    return serde_json::from_str(slice).map_err(|_| DegradeError::BadJson);
-                }
-            }
-            _ => {}
-        }
-    }
-    Err(DegradeError::NoJson)
+    // `StreamDeserializer::next` reads exactly one JSON value from `text[start..]` and stops, so any
+    // trailing prose is ignored. `None` is unreachable after a `{`, but map it defensively.
+    serde_json::Deserializer::from_str(&text[start..])
+        .into_iter::<serde_json::Value>()
+        .next()
+        .ok_or(DegradeError::BadJson)?
+        .map_err(|_| DegradeError::BadJson)
 }
 
 #[cfg(test)]
@@ -246,12 +235,86 @@ mod tests {
     }
 
     #[test]
+    fn json_object_parser_is_panic_free_on_adversarial_input() {
+        // Multi-byte UTF-8 inside the object (pins the ASCII-only-indexing invariant).
+        let v = parse_json_object(r#"{"日本語": "値🎉", "steps": []}"#).unwrap();
+        assert_eq!(v["日本語"], "値🎉");
+        // Escaped quote immediately followed by a brace inside a string.
+        let v = parse_json_object(r#"{"k": "\"}", "steps": []}"#).unwrap();
+        assert_eq!(v["k"], "\"}");
+        // A stray closing brace before the first `{` must not underflow the depth counter.
+        let v = parse_json_object(r#"} junk {"steps": []}"#).unwrap();
+        assert!(v["steps"].is_array());
+        // Trailing content after a complete object is ignored.
+        let v = parse_json_object(r#"{"steps": []} and then prose"#).unwrap();
+        assert!(v["steps"].is_array());
+        // Boundary inputs return errors, never panic.
+        assert_eq!(parse_json_object(""), Err(DegradeError::NoJson));
+        // An unterminated object: a `{` was found but the parse fails → BadJson.
+        assert_eq!(
+            parse_json_object(r#"{"s": "abc"#),
+            Err(DegradeError::BadJson)
+        );
+    }
+
+    #[test]
+    fn text_decode_falls_back_past_an_empty_first_fence() {
+        // A throwaway code block before the real JSON fence must still resolve.
+        let resp = LlmResponse::Text(format!(
+            "```\nnot json here\n```\nthen:\n```json\n{}\n```",
+            plan_json()
+        ));
+        assert_eq!(decode_plan(ToolSupport::Text, &resp).unwrap(), plan_json());
+    }
+
+    #[test]
+    fn native_encode_advertises_only_the_plan_tool() {
+        let req = encode_request(
+            ToolSupport::Native,
+            LlmRequest {
+                tools: vec![ToolDef {
+                    name: "delete".into(),
+                    description: String::new(),
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, PLAN_TOOL);
+    }
+
+    #[test]
     fn missing_or_malformed_json_errors() {
+        // No `{` at all → nothing to parse.
         assert_eq!(
             parse_json_object("no object here"),
             Err(DegradeError::NoJson)
         );
-        assert_eq!(parse_json_object("{not valid"), Err(DegradeError::NoJson));
+        // A `{` was found but the content is not valid JSON → BadJson.
+        assert_eq!(parse_json_object("{not valid"), Err(DegradeError::BadJson));
         assert_eq!(parse_json_object("{\"a\": }"), Err(DegradeError::BadJson));
+    }
+
+    #[test]
+    fn augment_system_preserves_the_base_prompt() {
+        let req = encode_request(
+            ToolSupport::JsonSchema,
+            LlmRequest {
+                system: Some("You are Cairn.".to_owned()),
+                ..Default::default()
+            },
+        );
+        let sys = req.system.unwrap();
+        assert!(sys.starts_with("You are Cairn."));
+        assert!(sys.contains("\n\n"));
+        assert!(sys.trim_end().ends_with("]}."));
+    }
+
+    #[test]
+    fn native_encode_is_idempotent() {
+        let once = encode_request(ToolSupport::Native, LlmRequest::default());
+        let twice = encode_request(ToolSupport::Native, once);
+        assert_eq!(twice.tools.len(), 1);
+        assert_eq!(twice.tools[0].name, PLAN_TOOL);
     }
 }
