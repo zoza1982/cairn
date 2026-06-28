@@ -1,0 +1,24 @@
+[package]
+name = "cairn-backend-k8s"
+description = "Kubernetes backend for Cairn: contexts/namespaces/pods/containers as a navigable Vfs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types = { workspace = true }
+cairn-vfs = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+smol_str = "0.3"
+tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
