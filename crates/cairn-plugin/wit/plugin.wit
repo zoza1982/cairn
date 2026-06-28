@@ -1,0 +1,132 @@
+package cairn:plugin@1.0.0;
+
+/// Core types shared by host and guest (mirrors `cairn-types`). See RFC-0006.
+interface types {
+  /// Mirrors `cairn_types::Caps` (bitflags). Bit positions must never change across minor versions.
+  /// NB: `list-dir` (not `list` as in RFC-0006's draft) because `list` is a reserved WIT keyword;
+  /// it maps to `Caps::LIST` host-side.
+  flags caps {
+    list-dir, read, write, create-dir, delete, rename, rename-atomic,
+    copy-server, chmod, chown, symlink, append, random-read,
+    multipart, versions, watch, search-content,
+  }
+
+  // `stream-entry` (not `stream`) because `stream` is a reserved WIT keyword.
+  enum entry-kind { file, dir, symlink, stream-entry, special }
+
+  record entry {
+    name:           string,
+    kind:           entry-kind,
+    size:           option<u64>,
+    modified-secs:  option<u64>,
+    etag:           option<string>,
+    symlink-target: option<string>,
+  }
+
+  record byte-range {
+    offset: u64,
+    len:    option<u64>,
+  }
+
+  record backend-error {
+    code:      string,
+    msg:       string,
+    retryable: bool,
+  }
+
+  variant vfs-error {
+    not-found(string),
+    forbidden(string),
+    already-exists(string),
+    unsupported(caps),
+    timeout-ms(u64),
+    connection(string),
+    auth,
+    conflict,
+    backend(backend-error),
+    cancelled,
+    io(string),
+  }
+}
+
+/// Host functions available to plugins. Each is linked only when the corresponding grant is present
+/// (default-deny). An unlinked import that the guest references causes instantiation failure.
+interface host {
+  use types.{vfs-error};
+
+  record http-request {
+    method:  string,
+    url:     string,
+    headers: list<tuple<string, string>>,
+    body:    option<list<u8>>,
+  }
+
+  record http-response {
+    status:  u16,
+    headers: list<tuple<string, string>>,
+    body:    list<u8>,
+  }
+
+  /// Write a log line (0=error … 3=debug). Requires the `log` grant.
+  log: func(level: u8, msg: string);
+
+  /// Wall-clock seconds since the Unix epoch. Always linkable; no I/O, no secrets.
+  now-secs: func() -> u64;
+
+  /// Brokered HTTP fetch. Requires a `network` grant naming the target host.
+  http-fetch: func(req: http-request) -> result<http-response, string>;
+
+  /// Use a credential by opaque handle; the host brokers it and returns an ephemeral artifact —
+  /// never the underlying secret. Requires a `credentials` grant naming the handle.
+  use-credential: func(handle: string, action: string) -> result<string, string>;
+}
+
+/// The interface a plugin component must export to act as a VFS backend.
+interface backend {
+  use types.{caps, entry, byte-range, vfs-error};
+
+  record list-page-result {
+    entries: list<entry>,
+    cursor:  option<string>,
+    done:    bool,
+  }
+
+  scheme:       func() -> string;
+  backend-caps: func() -> caps;
+  caps-at:      func(path: string) -> caps;
+
+  list-page: func(
+    dir:            string,
+    cursor:         option<string>,
+    include-hidden: bool,
+  ) -> result<list-page-result, vfs-error>;
+
+  stat: func(path: string) -> result<entry, vfs-error>;
+
+  resource read-stream {
+    read-chunk: func(max-bytes: u32) -> result<list<u8>, vfs-error>;
+    close: func();
+  }
+  open-read: func(path: string, range: option<byte-range>) -> result<read-stream, vfs-error>;
+
+  resource write-sink {
+    write-chunk: func(chunk: list<u8>) -> result<_, vfs-error>;
+    finish: func() -> result<entry, vfs-error>;
+    abort:  func();
+  }
+  open-write: func(
+    path:      string,
+    overwrite: bool,
+    size-hint: option<u64>,
+  ) -> result<write-sink, vfs-error>;
+
+  create-dir: func(path: string) -> result<_, vfs-error>;
+  remove:     func(path: string, recursive: bool) -> result<_, vfs-error>;
+  rename:     func(src: string, dst: string) -> result<_, vfs-error>;
+}
+
+/// A backend plugin: it imports host capabilities (granted) and exports a VFS backend.
+world backend-plugin {
+  import host;
+  export backend;
+}

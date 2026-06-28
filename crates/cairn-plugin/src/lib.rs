@@ -5,12 +5,17 @@
 //! linked **host functions** (capability-gated; default-deny), and run an export — all fully
 //! offline and hermetically testable (WebAssembly executes without any external service).
 //!
-//! The Component Model / WIT interface (ADR-0004) and the `Vfs`-backend bridge layer on top of this
-//! core in a later step; what is here is the part that proves a misbehaving plugin cannot hang the
-//! host or exhaust memory, and that a guest reaches the host only through granted imports.
+//! The Component Model / WIT interface (ADR-0004, RFC-0006) builds on this core: [`PluginComponent`]
+//! loads a component exporting `cairn:plugin/backend` and calls its non-streaming ops. The full
+//! `PluginVfsBackend: Vfs` async bridge (streaming resources, mutations, granted host imports) is the
+//! next step. What is here proves a misbehaving plugin cannot hang the host or exhaust memory, and
+//! that a guest reaches the host only through granted imports.
 
 use thiserror::Error;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
+
+mod component;
+pub use component::{engine_config, PluginComponent};
 
 /// Per-instance resource limits.
 #[derive(Debug, Clone, Copy)]

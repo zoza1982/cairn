@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **WASM plugin backend bridge — foundation** (M8-3a): the `cairn-plugin` host can now load a
+  **component** that exports the `cairn:plugin/backend` interface (the `cairn:plugin@1.0.0` WIT
+  package from RFC-0006) and call its non-streaming introspection/metadata ops (`scheme`,
+  `backend-caps` → `Caps`, `caps-at`, `stat`, `list-page`). Built on wasmtime's component model with
+  generated host bindings, a per-instance memory cap + fuel limit, and an **empty, ambient-authority-
+  free WASI context** — no preopened directories, no environment, null stdio, no network (the WASI
+  interfaces are linked but grant nothing). A committed guest fixture
+  component exercises it end-to-end, so CI needs no WASM toolchain. The streaming read/write
+  resources, mutations, the granted `host` import interface, and the full `PluginVfsBackend: Vfs`
+  async bridge are the next slice (M8-3b).
 - **Concurrent transfers** (M2): up to N transfers now run at once (default **2**, set via
   `[transfers] concurrency` in config; clamped to ≥ 1). The status line shows an aggregate while
   several run (`⇅ 2 active · 2.0 MiB at 1.0 MiB/s (+1 queued)`), and the `Ctrl-T` queue view lists
