@@ -38,6 +38,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Char('r') => Some(Action::Refresh),
         // Plan-overlay actions (no-ops when no overlay is open).
+        // NOTE: revisit when text-input overlays land — 'a'/'x' must not fire while a text field
+        // is capturing input.
         KeyCode::Char('a') => Some(Action::ApproveAll),
         KeyCode::Char('x') => Some(Action::Reject),
         _ => None,

@@ -53,34 +53,24 @@ fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize) {
     let area = centered(frame.area(), 64, h);
     frame.render_widget(Clear, area);
 
+    let block = Block::bordered()
+        .title(" AI plan — review before running ")
+        .border_style(Style::default().fg(Color::Magenta));
+    // Lay content out within the block's interior so nothing overwrites the border.
+    let content = block.inner(area);
+    frame.render_widget(block, area);
+
     let [summary_area, steps_area, help_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
-    .areas(area);
-
-    let block = Block::bordered()
-        .title(" AI plan — review before running ")
-        .border_style(Style::default().fg(Color::Magenta));
-    frame.render_widget(block, area);
-
-    // Inset one cell so content sits inside the border.
-    let inner = |r: Rect| Rect {
-        x: r.x + 2,
-        y: r.y,
-        width: r.width.saturating_sub(4),
-        height: r.height,
-    };
+    .areas(content);
 
     frame.render_widget(
         Paragraph::new(Line::from(plan.summary.clone()))
             .style(Style::default().add_modifier(Modifier::BOLD)),
-        inner(Rect {
-            y: summary_area.y + 1,
-            height: 1,
-            ..summary_area
-        }),
+        summary_area,
     );
 
     let items: Vec<ListItem> = plan
@@ -114,7 +104,7 @@ fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize) {
     if !plan.steps.is_empty() {
         list_state.select(Some(cursor.min(plan.steps.len() - 1)));
     }
-    frame.render_stateful_widget(list, inner(steps_area), &mut list_state);
+    frame.render_stateful_widget(list, steps_area, &mut list_state);
 
     let help = if plan.can_bulk_approve() {
         "↵ approve · a approve all · x reject · esc abort"
@@ -123,7 +113,7 @@ fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(help)).style(Style::default().fg(Color::Gray)),
-        inner(help_area),
+        help_area,
     );
 }
 

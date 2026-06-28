@@ -145,6 +145,30 @@ impl Plan {
         self.steps.iter().all(|s| allows_bulk_approve(s.capability))
     }
 
+    /// Whether every step has been approved — the precondition for [`execute`](Self::execute).
+    /// False for an empty plan (there is nothing to run).
+    #[must_use]
+    pub fn is_all_approved(&self) -> bool {
+        !self.steps.is_empty() && self.steps.iter().all(|s| s.status == StepStatus::Approved)
+    }
+
+    /// The index of the next step still awaiting a decision, searching forward from `after` and
+    /// wrapping to the start. `None` when no step is pending.
+    #[must_use]
+    pub fn next_pending_from(&self, after: usize) -> Option<usize> {
+        let start = after.saturating_add(1);
+        self.steps
+            .iter()
+            .skip(start)
+            .position(|s| s.status == StepStatus::Pending)
+            .map(|rel| rel + start)
+            .or_else(|| {
+                self.steps
+                    .iter()
+                    .position(|s| s.status == StepStatus::Pending)
+            })
+    }
+
     /// Approve every step at once.
     ///
     /// # Errors
@@ -276,6 +300,35 @@ mod tests {
         let mut p = Plan::from_proposed(proposed(&[("copy", ""), ("delete", "")])).unwrap();
         assert!(!p.can_bulk_approve());
         assert_eq!(p.approve_all().unwrap_err(), PlanError::BulkApproveRefused);
+    }
+
+    #[test]
+    fn is_all_approved_tracks_step_status() {
+        let mut p = Plan::from_proposed(proposed(&[("list", ""), ("copy", "")])).unwrap();
+        assert!(!p.is_all_approved());
+        p.approve_step(0).unwrap();
+        assert!(!p.is_all_approved());
+        p.approve_step(1).unwrap();
+        assert!(p.is_all_approved());
+        // An empty plan is never "all approved".
+        let empty = Plan::from_proposed(proposed(&[])).unwrap();
+        assert!(!empty.is_all_approved());
+    }
+
+    #[test]
+    fn next_pending_from_advances_then_wraps() {
+        let mut p =
+            Plan::from_proposed(proposed(&[("list", ""), ("copy", ""), ("move", "")])).unwrap();
+        // From step 0, the next pending is 1.
+        assert_eq!(p.next_pending_from(0), Some(1));
+        // Approve step 1; from 1 it should skip to 2.
+        p.approve_step(1).unwrap();
+        assert_eq!(p.next_pending_from(1), Some(2));
+        // From the last step it wraps back to the first still-pending (0).
+        assert_eq!(p.next_pending_from(2), Some(0));
+        // Once all approved, there is no pending step.
+        p.approve_all().unwrap();
+        assert_eq!(p.next_pending_from(0), None);
     }
 
     #[tokio::test]

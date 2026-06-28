@@ -145,6 +145,8 @@ pub struct AppState {
     pub should_quit: bool,
     /// A transient status/notification line.
     pub status: Option<String>,
+    /// Whether an AI plan request is in flight (suppresses duplicate requests).
+    pub ai_pending: bool,
 }
 
 impl AppState {
@@ -160,6 +162,7 @@ impl AppState {
             overlay: None,
             should_quit: false,
             status: None,
+            ai_pending: false,
         }
     }
 

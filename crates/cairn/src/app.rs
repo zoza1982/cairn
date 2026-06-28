@@ -193,6 +193,8 @@ async fn propose_plan(prompt: &str) -> Result<cairn_ai::Plan, String> {
         }],
         tools: Vec::new(),
     };
+    // `AgentError`'s Display is our own, secret-free enum. When the HTTP providers (M7-2) land,
+    // map their transport errors to categorized, redacted messages here before they reach the UI.
     request_plan(&provider, req)
         .await
         .map_err(|e| e.to_string())

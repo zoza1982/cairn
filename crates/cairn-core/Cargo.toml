@@ -15,6 +15,8 @@ workspace = true
 [dependencies]
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
+# FIXME(arch): the reducer holds an AI `Plan` in `Overlay::AiPlan`, so it depends on cairn-ai.
+# Consider promoting the pure plan data types to cairn-types so the core stays dependency-light.
 cairn-ai = { workspace = true }
 
 [dev-dependencies]

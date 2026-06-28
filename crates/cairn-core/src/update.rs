@@ -2,7 +2,6 @@
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, DEMO_AI_PROMPT};
 use crate::state::{AppState, Listing, Overlay, Side};
-use cairn_ai::StepStatus;
 use cairn_types::{Entry, VfsPath};
 use std::sync::Arc;
 
@@ -75,6 +74,10 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         Action::Move => start_transfer(state, true),
         Action::Delete => confirm_delete(state),
         Action::AiPropose => {
+            if state.ai_pending {
+                return Vec::new(); // a request is already in flight
+            }
+            state.ai_pending = true;
             state.status = Some("Asking the assistant…".to_owned());
             vec![AppEffect::RequestAiPlan {
                 prompt: DEMO_AI_PROMPT.to_owned(),
@@ -92,6 +95,13 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
 
 /// Handle an action while a modal overlay is open. Routes to the handler for the open overlay.
 fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    // Quit (q / Ctrl-C) always quits immediately, even from within an overlay — close it first so
+    // the terminal is restored cleanly. Esc/Cancel only dismisses the overlay.
+    if action == Action::Quit {
+        state.overlay = None;
+        state.should_quit = true;
+        return Vec::new();
+    }
     match &state.overlay {
         Some(Overlay::ConfirmDelete { .. }) => apply_confirm_delete_action(state, action),
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
@@ -110,7 +120,7 @@ fn apply_confirm_delete_action(state: &mut AppState, action: Action) -> Vec<AppE
             }
             _ => Vec::new(),
         },
-        Action::Cancel | Action::Quit => {
+        Action::Cancel => {
             state.overlay = None;
             Vec::new()
         }
@@ -126,6 +136,7 @@ fn apply_ai_plan_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Stay,
         Execute,
         Abort,
+        Reject,
         BulkBlocked,
     }
 
@@ -147,15 +158,11 @@ fn apply_ai_plan_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
             Action::Confirm | Action::Enter => {
                 let i = *cursor;
                 let _ = plan.approve_step(i);
-                // Advance to the next still-pending step, if any.
-                if let Some(n) = plan
-                    .steps
-                    .iter()
-                    .position(|s| s.status == StepStatus::Pending)
-                {
+                // Advance to the next still-pending step (forward, wrapping), if any.
+                if let Some(n) = plan.next_pending_from(i) {
                     *cursor = n;
                 }
-                if all_approved(plan) {
+                if plan.is_all_approved() {
                     Next::Execute
                 } else {
                     Next::Stay
@@ -169,11 +176,14 @@ fn apply_ai_plan_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
                 }
             }
             Action::Reject => {
+                // Execution requires every step approved, so rejecting one makes the plan
+                // unrunnable; abort the whole plan rather than leave a silent dead-end.
                 let i = *cursor;
                 let _ = plan.reject_step(i);
-                Next::Stay
+                plan.abort();
+                Next::Reject
             }
-            Action::Cancel | Action::Quit => {
+            Action::Cancel => {
                 plan.abort();
                 Next::Abort
             }
@@ -193,6 +203,11 @@ fn apply_ai_plan_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
             state.status = Some("Plan aborted".to_owned());
             Vec::new()
         }
+        Next::Reject => {
+            state.overlay = None;
+            state.status = Some("Plan rejected".to_owned());
+            Vec::new()
+        }
         Next::Execute => {
             let Some(Overlay::AiPlan { plan, .. }) = state.overlay.take() else {
                 return Vec::new();
@@ -201,11 +216,6 @@ fn apply_ai_plan_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
             vec![AppEffect::ExecutePlan { plan }]
         }
     }
-}
-
-/// Whether every step in the plan has been approved (the precondition for execution).
-fn all_approved(plan: &cairn_ai::Plan) -> bool {
-    !plan.steps.is_empty() && plan.steps.iter().all(|s| s.status == StepStatus::Approved)
 }
 
 /// The `(source-full-path, leaf-name)` pairs targeted by an operation: the marked entries, or the
@@ -351,11 +361,17 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             Vec::new()
         }
         AppEvent::AiPlanProposed(Ok(plan)) => {
-            state.status = Some(format!("Assistant proposed {} step(s)", plan.steps.len()));
-            state.overlay = Some(Overlay::AiPlan { plan, cursor: 0 });
+            state.ai_pending = false;
+            if plan.steps.is_empty() {
+                state.status = Some("Assistant proposed no steps".to_owned());
+            } else {
+                state.status = Some(format!("Assistant proposed {} step(s)", plan.steps.len()));
+                state.overlay = Some(Overlay::AiPlan { plan, cursor: 0 });
+            }
             Vec::new()
         }
         AppEvent::AiPlanProposed(Err(msg)) => {
+            state.ai_pending = false;
             state.status = Some(format!("assistant error: {msg}"));
             Vec::new()
         }
@@ -705,6 +721,54 @@ mod tests {
         assert!(fx.is_empty());
         assert!(s.overlay.is_none());
         assert_eq!(s.status.as_deref(), Some("Plan aborted"));
+    }
+
+    #[test]
+    fn quit_from_overlay_quits_the_app() {
+        let mut s = state();
+        open_plan(&mut s, &["copy"]);
+        let _ = update(&mut s, Msg::Action(Action::Quit));
+        assert!(s.should_quit);
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn rejecting_a_step_aborts_the_plan() {
+        let mut s = state();
+        open_plan(&mut s, &["copy", "delete"]);
+        let fx = update(&mut s, Msg::Action(Action::Reject));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        assert_eq!(s.status.as_deref(), Some("Plan rejected"));
+    }
+
+    #[test]
+    fn empty_plan_does_not_open_overlay() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::AiPropose)); // sets ai_pending
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::AiPlanProposed(Ok(make_plan(&[])))),
+        );
+        assert!(s.overlay.is_none());
+        assert!(!s.ai_pending);
+        assert_eq!(s.status.as_deref(), Some("Assistant proposed no steps"));
+    }
+
+    #[test]
+    fn ai_propose_is_suppressed_while_a_request_is_in_flight() {
+        let mut s = state();
+        let fx = update(&mut s, Msg::Action(Action::AiPropose));
+        assert_eq!(fx.len(), 1); // first request goes out
+        assert!(s.ai_pending);
+        let fx = update(&mut s, Msg::Action(Action::AiPropose));
+        assert!(fx.is_empty()); // second is suppressed
+                                // The proposal clears the pending flag.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::AiPlanProposed(Ok(make_plan(&["list"])))),
+        );
+        assert!(!s.ai_pending);
     }
 
     #[test]
