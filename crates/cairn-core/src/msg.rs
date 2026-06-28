@@ -141,6 +141,14 @@ pub enum AppEvent {
     },
     /// The assistant proposed a plan, or failed to (carries a redacted message).
     AiPlanProposed(Result<Plan, String>),
+    /// An approved AI plan finished executing (completed, stopped on failure, or cancelled) — distinct
+    /// from [`AppEvent::OpDone`] so it clears the `ai_executing` flag.
+    AiPlanExecuted {
+        /// Human-readable, secret-free status.
+        status: String,
+        /// Whether execution ended in failure.
+        error: bool,
+    },
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -207,4 +215,6 @@ pub enum AppEffect {
         /// The fully-approved plan.
         plan: Plan,
     },
+    /// Cancel the in-flight AI plan execution, if any.
+    CancelAiPlan,
 }

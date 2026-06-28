@@ -218,9 +218,18 @@ impl Plan {
     /// Execute the plan: every step must be `Approved`. Steps run in order; the first failure sets
     /// the plan to [`PlanState::Failed`] and stops. On success the plan is [`PlanState::Done`].
     ///
+    /// `is_cancelled` is polled before each step; if it returns `true` the plan stops with
+    /// [`PlanState::Aborted`] (already-run steps stay `Done`). It is a closure rather than a concrete
+    /// token so this crate stays free of any async-runtime dependency. Cancellation granularity is
+    /// between steps — an in-flight step runs to completion.
+    ///
     /// # Errors
     /// [`PlanError::NotApproved`] if any step is not approved before execution.
-    pub async fn execute<E: StepExecutor + Sync>(&mut self, exec: &E) -> Result<(), PlanError> {
+    pub async fn execute<E: StepExecutor + Sync>(
+        &mut self,
+        exec: &E,
+        is_cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), PlanError> {
         for (i, s) in self.steps.iter().enumerate() {
             if s.status != StepStatus::Approved {
                 return Err(PlanError::NotApproved(i));
@@ -228,6 +237,10 @@ impl Plan {
         }
         self.state = PlanState::Executing;
         for i in 0..self.steps.len() {
+            if is_cancelled() {
+                self.state = PlanState::Aborted;
+                return Ok(());
+            }
             match exec.execute(&self.steps[i]).await {
                 Ok(()) => self.steps[i].status = StepStatus::Done,
                 Err(msg) => {
@@ -340,7 +353,7 @@ mod tests {
         let mut p = Plan::from_proposed(proposed(&[("list", ""), ("copy", "")])).unwrap();
         p.approve_all().unwrap();
         let exec = MockExec::new(None);
-        p.execute(&exec).await.unwrap();
+        p.execute(&exec, &|| false).await.unwrap();
         assert_eq!(p.state, PlanState::Done);
         assert!(p.steps.iter().all(|s| s.status == StepStatus::Done));
         assert_eq!(exec.executed.lock().unwrap().len(), 2);
@@ -351,7 +364,7 @@ mod tests {
         let mut p = Plan::from_proposed(proposed(&[("copy", "")])).unwrap();
         let exec = MockExec::new(None);
         assert_eq!(
-            p.execute(&exec).await.unwrap_err(),
+            p.execute(&exec, &|| false).await.unwrap_err(),
             PlanError::NotApproved(0)
         );
         assert!(exec.executed.lock().unwrap().is_empty());
@@ -364,7 +377,7 @@ mod tests {
         p.approve_step(0).unwrap();
         p.approve_step(1).unwrap();
         let exec = MockExec::new(None);
-        p.execute(&exec).await.unwrap();
+        p.execute(&exec, &|| false).await.unwrap();
         assert_eq!(p.state, PlanState::Done);
     }
 
@@ -374,11 +387,28 @@ mod tests {
             Plan::from_proposed(proposed(&[("copy", ""), ("copy", ""), ("copy", "")])).unwrap();
         p.approve_all().unwrap();
         let exec = MockExec::new(Some(1)); // fail the second step
-        p.execute(&exec).await.unwrap();
+        p.execute(&exec, &|| false).await.unwrap();
         assert_eq!(p.state, PlanState::Failed);
         assert_eq!(p.steps[0].status, StepStatus::Done);
         assert_eq!(p.steps[1].status, StepStatus::Failed);
         assert_eq!(p.steps[2].status, StepStatus::Approved); // never ran
         assert_eq!(exec.executed.lock().unwrap().len(), 2); // third not attempted
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_before_the_next_step() {
+        let mut p =
+            Plan::from_proposed(proposed(&[("copy", ""), ("copy", ""), ("copy", "")])).unwrap();
+        p.approve_all().unwrap();
+        let exec = MockExec::new(None);
+        // Allow the first step, cancel before the second: the closure is polled once per step.
+        // `fetch_add` returns the prior value — 0 (false) before step 0, 1+ (true) thereafter.
+        let polls = std::sync::atomic::AtomicU32::new(0);
+        let is_cancelled = || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0;
+        p.execute(&exec, &is_cancelled).await.unwrap();
+        assert_eq!(p.state, PlanState::Aborted);
+        assert_eq!(p.steps[0].status, StepStatus::Done); // first ran
+        assert_eq!(p.steps[1].status, StepStatus::Approved); // cancelled before running
+        assert_eq!(exec.executed.lock().unwrap().len(), 1);
     }
 }
