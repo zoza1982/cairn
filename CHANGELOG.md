@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-ai` context & injection defense: a secrets-free `WorldSnapshot` for the model, an
+  `<untrusted_data>` wrapper that neutralizes break-out attempts, an out-of-scope heuristic, and
+  the standing system policy (M7-5).
 - `cairn-ai`: the agentic AI core — a provider-agnostic `LlmProvider` trait + `MockProvider`, the
   closed tool surface (capability per tool; unknown tools rejected), and the plan→confirm→execute
   state machine (bulk-approve only when every step is safe/recoverable; failure aborts the rest).

@@ -7,10 +7,14 @@
 //! operation. Concrete cloud/local providers and TUI wiring are layered on later. See `docs/LLD.md`
 //! §10.
 
+mod context;
 mod plan;
 mod provider;
 mod tools;
 
+pub use context::{
+    looks_out_of_scope, wrap_untrusted, ConnectionView, PaneView, WorldSnapshot, SYSTEM_POLICY,
+};
 pub use plan::{
     Plan, PlanError, PlanState, PlanStep, ProposedPlan, ProposedStep, StepExecutor, StepStatus,
 };
