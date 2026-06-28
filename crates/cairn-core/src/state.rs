@@ -176,6 +176,36 @@ pub enum Overlay {
         /// The selection cursor into [`AppState::connections`].
         cursor: usize,
     },
+    /// A single-line text entry (new-directory name, rename, …).
+    Prompt {
+        /// What submitting the text will do.
+        kind: PromptKind,
+        /// The text entered so far.
+        input: String,
+    },
+}
+
+/// What submitting a [`Overlay::Prompt`] text field will do.
+#[derive(Debug, Clone)]
+pub enum PromptKind {
+    /// Create a new directory (the entered name) in the active pane's current directory.
+    MakeDir,
+    /// Rename an existing entry (at `from`) to the entered name, within the same directory.
+    Rename {
+        /// The path being renamed.
+        from: VfsPath,
+    },
+}
+
+impl PromptKind {
+    /// A short title for the prompt box.
+    #[must_use]
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::MakeDir => "New directory",
+            Self::Rename { .. } => "Rename",
+        }
+    }
 }
 
 /// A selectable connection for the switcher: a registered backend plus a human-readable label.
@@ -244,5 +274,12 @@ impl AppState {
     /// A pane by side, mutably.
     pub fn pane_mut(&mut self, side: Side) -> &mut PaneState {
         &mut self.panes[side.index()]
+    }
+
+    /// Whether a text-entry overlay is open and capturing keystrokes (so the input layer routes raw
+    /// keys to the field rather than resolving them as actions).
+    #[must_use]
+    pub fn capturing_text(&self) -> bool {
+        matches!(self.overlay, Some(Overlay::Prompt { .. }))
     }
 }

@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open_connection` remains deferred pending the broker-backed opener.
 
 ### Added
+- **Text-input overlay + mkdir/rename** (M2-3): a reusable single-line prompt (`Overlay::Prompt`)
+  with a terminal-agnostic `TextEdit` message, driving two first consumers — `F7` creates a directory
+  and `F2` renames the entry under the cursor (configurable as `make_dir` / `rename`). While a prompt
+  is open the event loop routes keystrokes to the field (`Ctrl-C` still quits); names are validated
+  (non-empty, not `.`/`..`, no `/`) and `VfsPath` parsing independently blocks traversal. Rename
+  refuses to overwrite an existing destination (and aborts rather than risk a clobber on a non-
+  not-found stat error). Completing any mutating op now clears stale positional marks.
 - Per-pane **sort modes & hidden-file toggle** (M1-8): `s` cycles the active pane's sort
   (name → size → modified) and `.` toggles whether hidden entries (dotfiles) are listed. Directories
   always sort first; size/modified order the most-relevant first (largest / newest) with unknown

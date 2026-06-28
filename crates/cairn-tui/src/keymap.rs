@@ -4,7 +4,7 @@
 //! `config.ui.keybindings`) on top of it; the bare [`action_for`] function is the default with no
 //! overrides. The mapping is centralized here so the rest of the UI deals only in [`Action`]s.
 
-use cairn_core::Action;
+use cairn_core::{Action, TextEdit};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::HashMap;
 
@@ -109,6 +109,8 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "refresh" => Action::Refresh,
         "cycle_sort" => Action::CycleSort,
         "toggle_hidden" => Action::ToggleHidden,
+        "make_dir" => Action::MakeDir,
+        "rename" => Action::Rename,
         "open_connections" => Action::OpenConnections,
         "ai_propose" => Action::AiPropose,
         "approve_all" => Action::ApproveAll,
@@ -218,11 +220,39 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         // 's' cycles the sort mode; '.' toggles hidden entries (ranger/vim convention).
         KeyCode::Char('s') => Some(Action::CycleSort),
         KeyCode::Char('.') => Some(Action::ToggleHidden),
-        // Plan-overlay actions (no-ops when no overlay is open).
-        // NOTE: revisit when text-input overlays land — 'a'/'x' must not fire while a text field
-        // is capturing input.
+        // F7 = make directory, F2 = rename (Total Commander / Norton convention).
+        KeyCode::F(7) => Some(Action::MakeDir),
+        KeyCode::F(2) => Some(Action::Rename),
+        // Plan-overlay actions (no-ops when no overlay is open). These letters are safe because while
+        // a text prompt is capturing input the event loop routes keys to [`text_edit_for`] instead of
+        // resolving actions, so 'a'/'x' type into the field rather than firing here.
         KeyCode::Char('a') => Some(Action::ApproveAll),
         KeyCode::Char('x') => Some(Action::Reject),
+        _ => None,
+    }
+}
+
+/// Map a key event to a [`TextEdit`] for a focused text prompt, or `None` to ignore it.
+///
+/// The event loop calls this (instead of [`Keymap::action_for`]) while a prompt is capturing input,
+/// so ordinary keys edit the field. `Enter`/`Esc` submit/cancel; modified character keys (Ctrl/Alt)
+/// are ignored here — `Ctrl-C` is intercepted as quit upstream.
+#[must_use]
+pub fn text_edit_for(key: KeyEvent) -> Option<TextEdit> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Enter => Some(TextEdit::Submit),
+        KeyCode::Esc => Some(TextEdit::Cancel),
+        KeyCode::Backspace => Some(TextEdit::Backspace),
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(TextEdit::Insert(c))
+        }
         _ => None,
     }
 }
@@ -410,6 +440,8 @@ mod tests {
             "refresh",
             "cycle_sort",
             "toggle_hidden",
+            "make_dir",
+            "rename",
             "open_connections",
             "ai_propose",
             "approve_all",
@@ -422,7 +454,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 23);
     }
 
     #[test]

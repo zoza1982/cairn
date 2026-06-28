@@ -2,7 +2,7 @@
 
 use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
-use cairn_core::{AppState, Listing, Overlay, PaneState, Side};
+use cairn_core::{AppState, Listing, Overlay, PaneState, PromptKind, Side};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -76,7 +76,27 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             frame.render_widget(body, area);
         }
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
+        Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),
     }
+}
+
+/// Draw a single-line text prompt (new directory, rename) with the entered text and a block cursor.
+fn render_prompt(frame: &mut Frame, kind: &PromptKind, input: &str) {
+    // 6 rows: 2 borders + 3 content lines + 1 of breathing space (matches the ConfirmDelete box).
+    let area = centered(frame.area(), 50, 6);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(format!(" {} ", kind.title()))
+        .border_style(Style::default().fg(Color::Cyan));
+    let body = Paragraph::new(vec![
+        // A `▏` block stands in for the cursor at the end of the field.
+        Line::from(format!("{input}\u{258f}")),
+        Line::from(""),
+        Line::from("[Enter] OK    [Esc] Cancel"),
+    ])
+    .block(block)
+    .alignment(Alignment::Center);
+    frame.render_widget(body, area);
 }
 
 /// Draw the AI plan → confirm overlay: the summary, each step with its approval status and
@@ -349,6 +369,20 @@ mod tests {
         assert!(text.contains("AI plan"));
         assert!(text.contains("archive old logs"));
         assert!(text.contains("approve all")); // safe plan → bulk-approve offered
+    }
+
+    #[test]
+    fn prompt_overlay_shows_title_input_and_hint() {
+        let mut s = ready_state();
+        s.overlay = Some(cairn_core::Overlay::Prompt {
+            kind: cairn_core::PromptKind::MakeDir,
+            input: "myfolder".to_owned(),
+        });
+        let text = render_text(&s, 80, 24);
+        assert!(text.contains("New directory"));
+        assert!(text.contains("myfolder"));
+        assert!(text.contains("Enter")); // the hint line is not clipped
+        assert!(text.contains("Esc"));
     }
 
     #[test]

@@ -10,13 +10,15 @@ use std::time::Duration;
 
 use cairn_backend_local::LocalVfs;
 use cairn_config::Config;
-use cairn_core::{initial_effects, update, AppEffect, AppEvent, AppState, ConnectionChoice, Msg};
+use cairn_core::{
+    initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, Msg,
+};
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
-use cairn_tui::{Keymap, Theme};
+use cairn_tui::{text_edit_for, Keymap, Theme};
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -160,7 +162,7 @@ async fn event_loop(
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
-            Some(input) = input_rx.recv() => map_input(input, &ui.keymap),
+            Some(input) = input_rx.recv() => map_input(input, &ui.keymap, state),
             else => break,
         };
         let Some(msg) = msg else { continue };
@@ -178,8 +180,17 @@ async fn event_loop(
 }
 
 /// Translate a terminal event into a reducer message (or `None` to ignore).
-fn map_input(input: Event, keymap: &Keymap) -> Option<Msg> {
+///
+/// While a text prompt is capturing input, keys are routed to the field as [`Msg::Text`] rather than
+/// resolved to actions — except `Ctrl-C`, which always quits so the user is never trapped in a field.
+fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
     match input {
+        Event::Key(key) if state.capturing_text() => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Some(Msg::Action(Action::Quit));
+            }
+            text_edit_for(key).map(Msg::Text)
+        }
         Event::Key(key) => keymap.action_for(key).map(Msg::Action),
         // A resize triggers a redraw via the no-op tick.
         Event::Resize(_, _) => Some(Msg::Tick),
@@ -228,6 +239,22 @@ fn dispatch(effect: AppEffect, registry: &VfsRegistry, event_tx: &mpsc::Sender<A
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
                 let ev = run_delete_effect(&registry, conn, paths).await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::CreateDir { conn, path } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_create_dir_effect(&registry, conn, path).await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::Rename { conn, from, to } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_rename_effect(&registry, conn, from, to).await;
                 let _ = event_tx.send(ev).await;
             });
         }
@@ -378,6 +405,72 @@ async fn run_delete_effect(
     }
 }
 
+async fn run_create_dir_effect(
+    registry: &VfsRegistry,
+    conn: ConnectionId,
+    path: VfsPath,
+) -> AppEvent {
+    let Some(vfs) = registry.get(conn).await else {
+        return AppEvent::OpDone {
+            status: "connection unavailable".to_owned(),
+            error: true,
+        };
+    };
+    match vfs.create_dir(&path).await {
+        Ok(()) => AppEvent::OpDone {
+            status: "Directory created".to_owned(),
+            error: false,
+        },
+        Err(e) => AppEvent::OpDone {
+            status: format!("Create failed: {}", e.redacted()),
+            error: true,
+        },
+    }
+}
+
+async fn run_rename_effect(
+    registry: &VfsRegistry,
+    conn: ConnectionId,
+    from: VfsPath,
+    to: VfsPath,
+) -> AppEvent {
+    let Some(vfs) = registry.get(conn).await else {
+        return AppEvent::OpDone {
+            status: "connection unavailable".to_owned(),
+            error: true,
+        };
+    };
+    // Refuse to clobber an existing target — a rename must not silently destroy data (local
+    // `fs::rename` overwrites atomically, so the backend won't stop us). Only a definite "not found"
+    // is safe to proceed on; any other stat error (forbidden, transport) aborts rather than risking
+    // an overwrite.
+    match vfs.stat(&to).await {
+        Ok(_) => {
+            return AppEvent::OpDone {
+                status: "Rename failed: destination already exists".to_owned(),
+                error: true,
+            };
+        }
+        Err(VfsError::NotFound(_)) => {}
+        Err(e) => {
+            return AppEvent::OpDone {
+                status: format!("Rename failed: {}", e.redacted()),
+                error: true,
+            };
+        }
+    }
+    match vfs.rename(&from, &to).await {
+        Ok(()) => AppEvent::OpDone {
+            status: "Renamed".to_owned(),
+            error: false,
+        },
+        Err(e) => AppEvent::OpDone {
+            status: format!("Rename failed: {}", e.redacted()),
+            error: true,
+        },
+    }
+}
+
 async fn list_dir(
     registry: &VfsRegistry,
     conn: ConnectionId,
@@ -488,12 +581,90 @@ mod tests {
     #[test]
     fn map_input_translates_keys_and_resize() {
         let km = Keymap::default();
+        let st = AppState::new(LEFT, RIGHT, VfsPath::root());
         let q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert!(matches!(map_input(q, &km), Some(Msg::Action(_))));
+        assert!(matches!(map_input(q, &km, &st), Some(Msg::Action(_))));
         assert!(matches!(
-            map_input(Event::Resize(80, 24), &km),
+            map_input(Event::Resize(80, 24), &km, &st),
             Some(Msg::Tick)
         ));
+    }
+
+    #[test]
+    fn map_input_routes_keys_to_text_while_a_prompt_captures() {
+        use cairn_core::{Overlay, PromptKind};
+        let km = Keymap::default();
+        let mut st = AppState::new(LEFT, RIGHT, VfsPath::root());
+        st.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::MakeDir,
+            input: String::new(),
+        });
+        // 'q' types a 'q' instead of quitting.
+        let q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(
+            map_input(q, &km, &st),
+            Some(Msg::Text(cairn_core::TextEdit::Insert('q')))
+        ));
+        // Ctrl-C still quits even while capturing.
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            map_input(ctrl_c, &km, &st),
+            Some(Msg::Action(Action::Quit))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_refuses_to_overwrite_an_existing_destination() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"keep").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let ev = run_rename_effect(
+            &registry,
+            LEFT,
+            VfsPath::parse("/a.txt").unwrap(),
+            VfsPath::parse("/b.txt").unwrap(),
+        )
+        .await;
+        assert!(matches!(ev, AppEvent::OpDone { error: true, .. }));
+        // The destination is untouched and the source still exists.
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), b"keep");
+        assert!(dir.path().join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn rename_moves_to_a_free_destination() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("a.txt"), b"data").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let ev = run_rename_effect(
+            &registry,
+            LEFT,
+            VfsPath::parse("/a.txt").unwrap(),
+            VfsPath::parse("/c.txt").unwrap(),
+        )
+        .await;
+        assert!(matches!(ev, AppEvent::OpDone { error: false, .. }));
+        assert!(!dir.path().join("a.txt").exists());
+        assert_eq!(std::fs::read(dir.path().join("c.txt")).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn create_dir_makes_a_directory() {
+        let dir = tempfile_dir();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let ev = run_create_dir_effect(&registry, LEFT, VfsPath::parse("/sub").unwrap()).await;
+        assert!(matches!(ev, AppEvent::OpDone { error: false, .. }));
+        assert!(dir.path().join("sub").is_dir());
     }
 
     fn tempfile_dir() -> tempfile::TempDir {
