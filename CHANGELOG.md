@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-backend-ssh`: the SSH/SFTP backend's `Vfs` mapping over an `SftpOps` transport seam
+  (list/stat/ranged-read/write/mkdir/rename/recursive-remove), fully unit-tested against an
+  in-memory mock, plus a `russh-sftp` adapter; RFC-0003. Live SSH transport is the integration
+  step (M4-1/M4-2).
 - `cairn-plugin`: the sandboxed WASM plugin host on `wasmtime` — instantiate untrusted modules
   with a memory cap and execution-fuel limit (a runaway guest traps instead of hanging the host),
   and default-deny host imports (capability-gated). Hermetic, WAT-module tests (M8-2).
