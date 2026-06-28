@@ -104,11 +104,14 @@ pub enum AppEvent {
         /// The page result.
         result: Result<ListPage, VfsError>,
     },
-    /// Incremental progress for an in-flight transfer: cumulative bytes written so far. Coalesced and
-    /// delivered best-effort (may be dropped under load), so it is advisory display only.
+    /// Incremental progress for an in-flight transfer: cumulative bytes written so far, plus the
+    /// average rate. Coalesced and delivered best-effort (may be dropped under load), so it is
+    /// advisory display only.
     TransferProgress {
         /// Cumulative bytes transferred so far.
         bytes: u64,
+        /// Average throughput so far, in bytes per second.
+        rate_bps: u64,
     },
     /// A delete/mkdir/rename/plan operation finished; carries a status message and whether it failed.
     OpDone {

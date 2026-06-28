@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status line shows the queue depth (`⇅ transferring… 3.4 MiB (+2 queued)`); cancelling or completing
   the active transfer (or dismissing its overwrite prompt) drains the next one. `Ctrl-T` (config
   `open_queue`) opens a **queue view** showing the active + pending transfers, with `x` to clear the
-  pending ones.
+  pending ones. The status line also shows the live **throughput** (`⇅ transferring… 2.0 MiB at
+  512 KiB/s`).
 - **Large-list row virtualization** (M1-9): only the on-screen window of rows is materialized each
   frame (the cursor is kept roughly centred), so browsing a directory with tens of thousands of
   entries costs O(viewport) instead of O(entries) per render.
