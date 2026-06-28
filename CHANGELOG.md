@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-tui` (ratatui dual-pane render + keymap) and the binary event loop / effect runner:
+  `cairn` now opens an interactive dual-pane local-filesystem browser — navigate, switch panes,
+  mark, refresh, quit; non-blocking (M1-5/6/7/8). Graceful message when not run in a TTY.
 - `cairn-core`: the Elm/TEA app model and pure `update` reducer (panes, cursor/marks, navigate,
   list events) — no I/O, 10 tests (M1-4).
 - `cairn-backend-local`: the local filesystem backend over `tokio::fs` (list, stat, ranged
