@@ -13,7 +13,7 @@ use std::time::Duration;
 /// How many times to try and how long to wait between tries.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
-    /// Total attempts including the first (so `1` means no retry).
+    /// Total attempts including the first (so `1` means no retry). `0` is treated as `1`.
     pub max_attempts: u32,
     /// Base delay; the wait before retry `n` (0-indexed) is `base * 2^n`, capped at `max_delay`.
     pub base_delay: Duration,
@@ -22,6 +22,8 @@ pub struct RetryPolicy {
 }
 
 impl Default for RetryPolicy {
+    /// 4 attempts with 100 ms / 200 ms / 400 ms backoff (≤ 700 ms total sleep), capped at 5 s —
+    /// suitable for transient network blips; adjust for slower backends.
     fn default() -> Self {
         Self {
             max_attempts: 4,
@@ -44,19 +46,25 @@ impl RetryPolicy {
 }
 
 /// The capped exponential backoff delay before the retry following attempt `attempt` (0-indexed):
-/// `base * 2^attempt`, clamped to `max`. Saturating, so a large `attempt` cannot overflow.
+/// `base * 2^attempt`, clamped to `max`. Computed in `u128` nanoseconds so it always saturates to
+/// `max` (a large `attempt` or `base` can never overflow or under-clamp).
+///
+// TODO: add per-call jitter (e.g. ±25% of the delay) to spread simultaneous retries across panes /
+// transfer workers. Low priority for single-pane use; matters under high concurrency.
 #[must_use]
 pub fn backoff_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
-    let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
-    base.checked_mul(u32::try_from(factor).unwrap_or(u32::MAX))
-        .unwrap_or(max)
-        .min(max)
+    let factor = 1u128.checked_shl(attempt).unwrap_or(u128::MAX);
+    let nanos = base.as_nanos().saturating_mul(factor).min(max.as_nanos());
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 /// Run `op`, retrying while it fails with a retryable [`VfsError`] and attempts remain.
 ///
 /// The first failure that is **not** retryable, or the last attempt's error, is returned. With
 /// [`RetryPolicy::none`] this is a single call with no delay.
+///
+/// Must run on a Tokio runtime with the **time driver** enabled (the backoff uses
+/// `tokio::time::sleep`); the app runtime enables it via `enable_all`.
 ///
 /// # Errors
 /// The final [`VfsError`] from `op`.
@@ -65,15 +73,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, VfsError>>,
 {
-    let attempts = policy.max_attempts.max(1);
-    for attempt in 0..attempts {
+    let max = policy.max_attempts.max(1);
+    // All but the final attempt: on a retryable error, back off and try again.
+    for attempt in 0..max.saturating_sub(1) {
         match op().await {
             Ok(v) => return Ok(v),
-            Err(e) => {
-                let last = attempt + 1 >= attempts;
-                if last || !e.is_retryable() {
-                    return Err(e);
-                }
+            Err(e) if !e.is_retryable() => return Err(e),
+            Err(_) => {
                 let delay = backoff_delay(attempt, policy.base_delay, policy.max_delay);
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
@@ -81,8 +87,8 @@ where
             }
         }
     }
-    // Unreachable: the loop always returns on the final attempt.
-    unreachable!("retry loop exhausted without returning")
+    // The final attempt: its result is returned unconditionally (no `unreachable!` needed).
+    op().await
 }
 
 #[cfg(test)]
@@ -101,6 +107,13 @@ mod tests {
         assert_eq!(backoff_delay(4, base, max), Duration::from_secs(1));
         // A huge exponent saturates to the cap, never panics.
         assert_eq!(backoff_delay(64, base, max), max);
+        // Tiny base + large attempt still clamps exactly to `max` (no intermediate truncation).
+        assert_eq!(
+            backoff_delay(40, Duration::from_nanos(1), Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        // A huge base saturates rather than overflowing.
+        assert_eq!(backoff_delay(3, Duration::MAX, max), max);
     }
 
     fn flaky_policy() -> RetryPolicy {
@@ -152,6 +165,34 @@ mod tests {
         .await;
         assert!(matches!(out, Err(VfsError::Timeout(_))));
         assert_eq!(calls.get(), 4); // exactly max_attempts
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actually_sleeps_the_backoff_schedule() {
+        // With virtual time, prove the backoff is awaited: two retryable failures then success
+        // should consume base + 2*base = 300ms of (paused) time for a 100ms base.
+        let policy = RetryPolicy {
+            max_attempts: 4,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(5),
+        };
+        let calls = Cell::new(0u32);
+        let start = tokio::time::Instant::now();
+        let out: Result<u32, _> = retry(policy, || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                if n < 3 {
+                    Err(VfsError::Timeout(Duration::from_secs(1)))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 3);
+        // 100ms (after attempt 0) + 200ms (after attempt 1).
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
     }
 
     #[tokio::test]
