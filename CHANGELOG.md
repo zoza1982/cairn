@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   broker boundary, AI agentic layer, and WASM plugin system.
 - ADRs recording the load-bearing decisions: core architecture (ADR-0001), vault crypto + broker
   boundary (ADR-0002), object-store SDKs (ADR-0003), WASM plugin runtime (ADR-0004).
+- Implementation Plan & living progress tracker (`docs/IMPLEMENTATION_PLAN.md`): milestones M0–M8 +
+  v0.1, work breakdown with status, critical path & dependency DAG, parallelization lanes, RFC
+  sequencing, risk register, and a same-PR status-update rule (CLAUDE.md §5).
+- GitHub Milestones M0–M8 + v0.1 backing the tracker.
 
 ### Changed
 - Renumbered `CLAUDE.md` sections to accommodate the new team-of-agents model (§2).

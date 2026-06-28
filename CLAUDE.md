@@ -129,8 +129,13 @@ A PR is not complete until its documentation is. Depending on the change, that m
 | **Non-trivial design** (new backend, vault crypto, AI layer) | An RFC/design doc in `docs/rfcs/` reviewed *before* large implementation. |
 | **Bug fix** | A regression test, and a one-line `CHANGELOG.md` entry. |
 | **Behavior/UX change** | Screenshots or ASCII before/after in the PR description. |
+| **Work on a tracked milestone item** | Update that item's row + status (and the dashboard) in `docs/IMPLEMENTATION_PLAN.md` in the **same PR**. |
 
 Docs live with the code. Stale docs are treated as bugs.
+
+**`docs/IMPLEMENTATION_PLAN.md` is the living progress tracker** — the single source of truth for what
+is done, in progress, and next. It is updated in the same PR that does the work (a stale status row is
+a bug). Milestones map to GitHub Milestones; work items become GitHub Issues as they enter "Ready".
 
 ## 6. Quality gates (run after each coding feature, before human review)
 
