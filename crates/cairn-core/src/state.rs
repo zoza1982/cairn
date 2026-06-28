@@ -341,6 +341,9 @@ pub struct AppState {
     pub transfer_rate: Option<u64>,
     /// Total bytes to transfer (from a pre-scan), if known — enables the percentage/ETA display.
     pub transfer_total: Option<u64>,
+    /// Whether the active transfer is paused. Toggled by the user; reset when the transfer finishes.
+    /// Display-only here — the runtime drives the engine's pause signal in response to the effect.
+    pub transfer_paused: bool,
 }
 
 impl AppState {
@@ -363,6 +366,7 @@ impl AppState {
             transfer_queue: VecDeque::new(),
             transfer_rate: None,
             transfer_total: None,
+            transfer_paused: false,
         }
     }
 

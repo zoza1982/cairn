@@ -359,21 +359,27 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             }
             _ => human_bytes(bytes),
         };
-        let rate = match state.transfer_rate {
-            Some(r) => format!(" at {}/s", human_bytes(r)),
-            None => String::new(),
-        };
-        // ETA needs both a total and a positive rate; suppress a sub-second "ETA 0s" tail.
-        let eta = match (state.transfer_total, state.transfer_rate) {
-            (Some(total), Some(r)) if r > 0 && total > bytes => {
-                let secs = (total - bytes) / r;
-                if secs > 0 {
-                    format!(", ETA {}", human_duration(secs))
-                } else {
-                    String::new()
+        // While paused, drop the rate/ETA (they're meaningless when stopped) and show a paused label.
+        let (rate, eta) = if state.transfer_paused {
+            (String::new(), String::new())
+        } else {
+            let rate = match state.transfer_rate {
+                Some(r) => format!(" at {}/s", human_bytes(r)),
+                None => String::new(),
+            };
+            // ETA needs both a total and a positive rate; suppress a sub-second "ETA 0s" tail.
+            let eta = match (state.transfer_total, state.transfer_rate) {
+                (Some(total), Some(r)) if r > 0 && total > bytes => {
+                    let secs = (total - bytes) / r;
+                    if secs > 0 {
+                        format!(", ETA {}", human_duration(secs))
+                    } else {
+                        String::new()
+                    }
                 }
-            }
-            _ => String::new(),
+                _ => String::new(),
+            };
+            (rate, eta)
         };
         let queued = state.transfer_queue.len();
         let suffix = if queued > 0 {
@@ -381,11 +387,14 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         } else {
             String::new()
         };
-        Line::from(format!(
-            " {count}   ⇅ transferring… {amount}{rate}{eta}{suffix}"
-        ))
+        let label = if state.transfer_paused {
+            "⏸ paused"
+        } else {
+            "⇅ transferring…"
+        };
+        Line::from(format!(" {count}   {label} {amount}{rate}{eta}{suffix}"))
     } else {
-        let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · r refresh · ^O conn · ^T queue · ^A ai";
+        let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · p pause · r refresh · ^O conn · ^T queue · ^A ai";
         Line::from(format!(" {count}   {help}"))
     };
     frame.render_widget(
@@ -632,6 +641,23 @@ mod tests {
             "expected human-readable byte total"
         );
         assert!(text.contains("512.0 KiB/s"), "expected throughput rate");
+    }
+
+    #[test]
+    fn status_line_shows_paused_and_drops_rate_eta() {
+        let mut s = ready_state();
+        s.transfer_bytes = Some(4 * 1024 * 1024);
+        s.transfer_total = Some(8 * 1024 * 1024);
+        s.transfer_rate = Some(2 * 1024 * 1024);
+        s.transfer_paused = true;
+        let text = render_text(&s, 120, 24);
+        assert!(text.contains("paused"), "expected paused label: {text}");
+        assert!(text.contains("50%"), "still shows progress: {text}");
+        assert!(!text.contains("ETA"), "ETA suppressed while paused: {text}");
+        assert!(
+            !text.contains("MiB/s"),
+            "rate suppressed while paused: {text}"
+        );
     }
 
     #[test]

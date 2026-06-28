@@ -19,7 +19,7 @@ use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 const LEFT: ConnectionId = ConnectionId(1);
@@ -95,7 +95,9 @@ async fn run_async() -> anyhow::Result<()> {
         "initial_effects must emit only List effects; a transfer here would be uncancellable"
     );
     for effect in initial {
-        dispatch(effect, &registry, &event_tx, &mut None, &mut None);
+        dispatch(
+            effect, &registry, &event_tx, &mut None, &mut None, &mut None,
+        );
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
 
@@ -170,12 +172,17 @@ async fn event_loop(
     event_rx: &mut mpsc::Receiver<AppEvent>,
     input_rx: &mut mpsc::Receiver<Event>,
 ) -> anyhow::Result<()> {
-    // Cancellation tokens of the in-flight transfer / AI plan (if any), held runtime-side so the
-    // matching Cancel effect can signal them. Each is cleared when its Done event arrives.
-    // NOTE: if a third independently-cancellable operation appears, extract a shared cancel-slot
-    // abstraction rather than repeating this pattern again.
+    // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
+    // matching effect can signal them. Each is cleared when its Done event arrives.
+    // NOTE: `transfer_cancel` and `transfer_pause` are a *control pair* for the one in-flight
+    // transfer — always created together (in `AppEffect::Transfer`) and cleared together (on
+    // `TransferDone`/`TransferConflict`). If a third per-transfer control channel is needed, fold
+    // them into a single `TransferControls { cancel, pause }` so they can't drift apart; likewise
+    // extract a shared slot abstraction if a third independently-controllable operation appears.
     let mut transfer_cancel: Option<CancellationToken> = None;
     let mut ai_cancel: Option<CancellationToken> = None;
+    // Pause signal for the in-flight transfer (if any), driven by a `SetTransferPaused` effect.
+    let mut transfer_pause: Option<watch::Sender<bool>> = None;
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -191,6 +198,7 @@ async fn event_loop(
             Msg::Event(AppEvent::TransferDone { .. } | AppEvent::TransferConflict { .. })
         ) {
             transfer_cancel = None;
+            transfer_pause = None;
         }
         if matches!(msg, Msg::Event(AppEvent::AiPlanExecuted { .. })) {
             ai_cancel = None;
@@ -207,6 +215,7 @@ async fn event_loop(
                 event_tx,
                 &mut transfer_cancel,
                 &mut ai_cancel,
+                &mut transfer_pause,
             );
         }
     }
@@ -233,13 +242,15 @@ fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
 }
 
 /// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s. `transfer_cancel`
-/// holds the in-flight transfer's cancellation token so a [`AppEffect::CancelTransfer`] can fire it.
+/// holds the in-flight transfer's cancellation token so a [`AppEffect::CancelTransfer`] can fire it,
+/// and `transfer_pause` holds its pause signal so a [`AppEffect::SetTransferPaused`] can drive it.
 fn dispatch(
     effect: AppEffect,
     registry: &VfsRegistry,
     event_tx: &mpsc::Sender<AppEvent>,
     transfer_cancel: &mut Option<CancellationToken>,
     ai_cancel: &mut Option<CancellationToken>,
+    transfer_pause: &mut Option<watch::Sender<bool>>,
 ) {
     match effect {
         AppEffect::List {
@@ -274,9 +285,14 @@ fn dispatch(
             // Hand the task a token whose clone we keep, so `CancelTransfer` can abort it.
             let cancel = CancellationToken::new();
             *transfer_cancel = Some(cancel.clone());
+            // Likewise keep the pause sender so `SetTransferPaused` can drive the engine; the task
+            // gets the receiver. Starts unpaused.
+            let (pause_tx, paused) = watch::channel(false);
+            *transfer_pause = Some(pause_tx);
             tokio::spawn(async move {
                 let ev = run_transfer_effect(
                     &registry, src_conn, dst_conn, items, is_move, overwrite, &event_tx, cancel,
+                    paused,
                 )
                 .await;
                 let _ = event_tx.send(ev).await;
@@ -285,6 +301,13 @@ fn dispatch(
         AppEffect::CancelTransfer => {
             if let Some(token) = transfer_cancel.take() {
                 token.cancel();
+            }
+        }
+        AppEffect::SetTransferPaused(paused) => {
+            // Ignore if no transfer is running (the sender slot is empty). A send error means the
+            // transfer task already finished and dropped its receiver — also safely ignored.
+            if let Some(tx) = transfer_pause.as_ref() {
+                let _ = tx.send(paused);
             }
         }
         AppEffect::Delete { conn, paths } => {
@@ -478,6 +501,11 @@ async fn run_transfer_effect(
     overwrite: bool,
     event_tx: &mpsc::Sender<AppEvent>,
     cancel: CancellationToken,
+    // Drives the engine's pause once the byte copy starts. NOTE: the read-only pre-flight phases
+    // below (conflict pre-check + size pre-scan) honor only `cancel`, not `paused`, so pressing `p`
+    // during a long pre-scan shows "paused" while the scan finishes; the pause takes hold at
+    // `run_transfer`. Harmless (read-only) and `Esc` still aborts both phases.
+    paused: watch::Receiver<bool>,
 ) -> AppEvent {
     let (Some(src), Some(dst)) = (registry.get(src_conn).await, registry.get(dst_conn).await)
     else {
@@ -563,9 +591,6 @@ async fn run_transfer_effect(
             });
         }
     };
-    // Pause/resume is plumbed through the engine but not yet driven from the UI, so feed a
-    // never-paused channel here. The event loop will own the real `watch::Sender` in a follow-up.
-    let (_pause_tx, paused) = tokio::sync::watch::channel(false);
     match cairn_transfer::run_transfer(&src, &dst, &items, spec, &cancel, &paused, &mut on_progress)
         .await
     {
@@ -906,6 +931,7 @@ mod tests {
             true, // overwrite: skip the conflict pre-check in this cancellation test
             &tx,
             cancel,
+            watch::channel(false).1, // never paused
         )
         .await;
         match ev {
@@ -942,6 +968,7 @@ mod tests {
             false,
             &tx,
             CancellationToken::new(),
+            watch::channel(false).1, // never paused
         )
         .await;
         assert!(matches!(

@@ -167,6 +167,20 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             state.status = Some("Cancelling transfer…".to_owned());
             vec![AppEffect::CancelTransfer]
         }
+        // Pause/resume the active transfer. No-op (with a hint) when none is running.
+        Action::TogglePause => {
+            if state.transfer_bytes.is_none() {
+                state.status = Some("No transfer to pause".to_owned());
+                return Vec::new();
+            }
+            state.transfer_paused = !state.transfer_paused;
+            state.status = Some(if state.transfer_paused {
+                "Transfer paused".to_owned()
+            } else {
+                "Transfer resumed".to_owned()
+            });
+            vec![AppEffect::SetTransferPaused(state.transfer_paused)]
+        }
         // No overlay open: confirm/cancel and the plan-only actions are otherwise no-ops.
         // Queue reorder only acts inside the queue overlay; a no-op with no overlay open.
         Action::Confirm
@@ -796,6 +810,7 @@ fn arm_transfer(state: &mut AppState, is_move: bool, count: usize) {
     state.transfer_bytes = Some(0);
     state.transfer_rate = None;
     state.transfer_total = None;
+    state.transfer_paused = false;
 }
 
 fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
@@ -943,6 +958,10 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             state.transfer_bytes = None;
             state.transfer_rate = None;
             state.transfer_total = None;
+            // Keep `transfer_paused` reset symmetric with `TransferDone`: a `p` pressed during the
+            // pre-flight check (while `transfer_bytes` was briefly `Some`) must not leave a stale
+            // paused flag once the transfer bounces back as a conflict.
+            state.transfer_paused = false;
             // Don't clobber an overlay the user already has open (e.g. a delete confirmation): put
             // the transfer back at the front of the queue so the tail-drain retries it (and shows
             // the overwrite prompt) once that overlay closes.
@@ -977,6 +996,9 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             state.transfer_bytes = None;
             state.transfer_rate = None;
             state.transfer_total = None;
+            // A new transfer always starts running; clear any leftover paused flag so the queued
+            // one (auto-started by the tail drain) and its status display aren't shown as paused.
+            state.transfer_paused = false;
             // The queue is drained by the tail call in `update`.
             finish_op(state, &status, error)
         }
@@ -1427,6 +1449,67 @@ mod tests {
         let fx = update(&mut s, Msg::Action(Action::Cancel));
         assert!(matches!(&fx[..], [AppEffect::CancelTransfer]));
         assert!(s.status.as_deref().unwrap().contains("Cancelling"));
+    }
+
+    #[test]
+    fn toggle_pause_flips_state_and_emits_effect_only_while_transferring() {
+        let mut s = state();
+        // No transfer running: TogglePause is a no-op (with a hint) and leaves the flag clear.
+        let fx = update(&mut s, Msg::Action(Action::TogglePause));
+        assert!(fx.is_empty());
+        assert!(!s.transfer_paused);
+        assert!(s.status.as_deref().unwrap().contains("No transfer"));
+        // Start a transfer, then pause: flag set, SetTransferPaused(true) emitted.
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let fx = update(&mut s, Msg::Action(Action::TogglePause));
+        assert!(matches!(&fx[..], [AppEffect::SetTransferPaused(true)]));
+        assert!(s.transfer_paused);
+        assert!(s.status.as_deref().unwrap().contains("paused"));
+        // Toggle again: resume.
+        let fx = update(&mut s, Msg::Action(Action::TogglePause));
+        assert!(matches!(&fx[..], [AppEffect::SetTransferPaused(false)]));
+        assert!(!s.transfer_paused);
+        assert!(s.status.as_deref().unwrap().contains("resumed"));
+    }
+
+    #[test]
+    fn transfer_conflict_clears_the_paused_flag() {
+        // A `p` pressed during the pre-flight check (transfer_bytes briefly Some) then a bounce-back
+        // conflict must not strand a stale paused flag.
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let _ = update(&mut s, Msg::Action(Action::TogglePause));
+        assert!(s.transfer_paused);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferConflict {
+                src_conn: ConnectionId(1),
+                dst_conn: ConnectionId(2),
+                items: vec![(VfsPath::root(), VfsPath::root())],
+                is_move: false,
+                conflicts: 1,
+            }),
+        );
+        assert!(!s.transfer_paused, "a conflict clears the paused flag");
+    }
+
+    #[test]
+    fn transfer_done_clears_the_paused_flag() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let _ = update(&mut s, Msg::Action(Action::TogglePause));
+        assert!(s.transfer_paused);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferDone {
+                status: "Copied 1 file(s)".to_owned(),
+                error: false,
+            }),
+        );
+        assert!(!s.transfer_paused, "completion clears the paused flag");
     }
 
     #[test]
