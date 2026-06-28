@@ -1,0 +1,20 @@
+[package]
+name = "cairn-plugin"
+description = "Cairn's sandboxed WASM plugin host (wasmtime): resource-limited, capability-gated execution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"
+wasmtime = { version = "46.0.1", default-features = false, features = ["cranelift", "wat", "runtime"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt"] }

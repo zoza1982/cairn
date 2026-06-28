@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cairn-plugin`: the sandboxed WASM plugin host on `wasmtime` — instantiate untrusted modules
+  with a memory cap and execution-fuel limit (a runaway guest traps instead of hanging the host),
+  and default-deny host imports (capability-gated). Hermetic, WAT-module tests (M8-2).
 - `cairn-backend-object`: the provider-agnostic object-store core — the `ObjectStore` trait,
   prefix/delimiter listing synthesis (object-vs-prefix, directory-marker folding), an
   `ObjectStoreVfs` mapping onto `Vfs`, and an in-memory `MockObjectStore`. Cloud providers
