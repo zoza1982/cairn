@@ -344,8 +344,12 @@ fn list_window(cursor: usize, total: usize, rows: usize) -> usize {
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let pane = state.active();
     let count = pane_count_label(pane);
-    // A live transfer takes over the status line with its running byte total (and queue depth).
+    // A live transfer takes over the status line with its running byte total (rate + queue depth).
     let line = if let Some(bytes) = state.transfer_bytes {
+        let rate = match state.transfer_rate {
+            Some(r) => format!(" at {}/s", human_bytes(r)),
+            None => String::new(),
+        };
         let queued = state.transfer_queue.len();
         let suffix = if queued > 0 {
             format!(" (+{queued} queued)")
@@ -353,7 +357,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             String::new()
         };
         Line::from(format!(
-            " {count}   ⇅ transferring… {}{suffix}",
+            " {count}   ⇅ transferring… {}{rate}{suffix}",
             human_bytes(bytes)
         ))
     } else {
@@ -582,12 +586,14 @@ mod tests {
     fn status_line_shows_live_transfer_progress() {
         let mut s = ready_state();
         s.transfer_bytes = Some(2 * 1024 * 1024);
+        s.transfer_rate = Some(512 * 1024);
         let text = render_text(&s, 100, 24);
         assert!(text.contains("transferring"), "expected transfer indicator");
         assert!(
             text.contains("2.0 MiB"),
             "expected human-readable byte total"
         );
+        assert!(text.contains("512.0 KiB/s"), "expected throughput rate");
     }
 
     #[test]

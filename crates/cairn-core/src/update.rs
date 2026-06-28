@@ -738,6 +738,7 @@ fn arm_transfer(state: &mut AppState, is_move: bool, count: usize) {
         if is_move { "Moving" } else { "Copying" },
     ));
     state.transfer_bytes = Some(0);
+    state.transfer_rate = None;
 }
 
 fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
@@ -860,10 +861,11 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // Refresh both panes so any filesystem changes the plan made are reflected.
             finish_op(state, &status, error)
         }
-        AppEvent::TransferProgress { bytes } => {
-            // Advisory display only; ignore if no transfer is tracked (a late event after OpDone).
+        AppEvent::TransferProgress { bytes, rate_bps } => {
+            // Advisory display only; ignore if no transfer is tracked (a late event after the done).
             if state.transfer_bytes.is_some() {
                 state.transfer_bytes = Some(bytes);
+                state.transfer_rate = Some(rate_bps);
             }
             Vec::new()
         }
@@ -877,6 +879,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
         } => {
             // The transfer didn't run (no overwrite); drop the progress indicator.
             state.transfer_bytes = None;
+            state.transfer_rate = None;
             // Don't clobber an overlay the user already has open (e.g. a delete confirmation): put
             // the transfer back at the front of the queue so the tail-drain retries it (and shows
             // the overwrite prompt) once that overlay closes.
@@ -904,6 +907,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // finishing mid-transfer can't wipe it (and a stray late `TransferProgress` is ignored
             // by its `is_some` guard once this resets the slot).
             state.transfer_bytes = None;
+            state.transfer_rate = None;
             // The queue is drained by the tail call in `update`.
             finish_op(state, &status, error)
         }
@@ -1276,12 +1280,16 @@ mod tests {
         let fx = update(&mut s, Msg::Action(Action::Copy));
         assert!(matches!(&fx[..], [AppEffect::Transfer { .. }]));
         assert_eq!(s.transfer_bytes, Some(0), "transfer tracking starts");
-        // Progress updates the running total.
+        // Progress updates the running total and the rate.
         let _ = update(
             &mut s,
-            Msg::Event(AppEvent::TransferProgress { bytes: 4096 }),
+            Msg::Event(AppEvent::TransferProgress {
+                bytes: 4096,
+                rate_bps: 2048,
+            }),
         );
         assert_eq!(s.transfer_bytes, Some(4096));
+        assert_eq!(s.transfer_rate, Some(2048));
         // The transfer's own completion clears it.
         let _ = update(
             &mut s,
@@ -1291,13 +1299,20 @@ mod tests {
             }),
         );
         assert_eq!(s.transfer_bytes, None);
+        assert_eq!(s.transfer_rate, None, "rate cleared on completion");
     }
 
     #[test]
     fn transfer_progress_after_completion_is_ignored() {
         let mut s = state();
         // No transfer tracked: a late/stray progress event must not resurrect the indicator.
-        let _ = update(&mut s, Msg::Event(AppEvent::TransferProgress { bytes: 10 }));
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress {
+                bytes: 10,
+                rate_bps: 0,
+            }),
+        );
         assert_eq!(s.transfer_bytes, None);
     }
 
@@ -1319,7 +1334,10 @@ mod tests {
         // …and subsequent progress still lands.
         let _ = update(
             &mut s,
-            Msg::Event(AppEvent::TransferProgress { bytes: 8192 }),
+            Msg::Event(AppEvent::TransferProgress {
+                bytes: 8192,
+                rate_bps: 0,
+            }),
         );
         assert_eq!(s.transfer_bytes, Some(8192));
     }

@@ -421,6 +421,14 @@ fn outcome_summary(o: &cairn_transfer::TransferOutcome) -> String {
     format!("{} file(s), {} dir(s)", o.files, o.dirs)
 }
 
+/// Average throughput in bytes/sec over `secs` elapsed. The elapsed time is floored at a small
+/// epsilon so a near-instant transfer reports a sane number rather than an absurd one-frame spike;
+/// the `f64`→`u64` cast saturates (never wraps/panics).
+fn avg_rate(bytes: u64, secs: f64) -> u64 {
+    let secs = secs.max(0.05);
+    (bytes as f64 / secs) as u64
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_transfer_effect(
     registry: &VfsRegistry,
@@ -486,7 +494,10 @@ async fn run_transfer_effect(
     let verb = if is_move { "Moved" } else { "Copied" };
     // Emit coalesced, non-blocking progress: accumulate bytes and notify the UI at most every
     // `TRANSFER_PROGRESS_STEP` bytes via `try_send`, which drops the update if the bounded channel is
-    // full rather than stalling the transfer task (the render path must never be blocked here).
+    // full rather than stalling the transfer task (the render path must never be blocked here). The
+    // reported rate is the average throughput since the transfer started.
+    let started = std::time::Instant::now();
+    let rate_bps = |bytes: u64| -> u64 { avg_rate(bytes, started.elapsed().as_secs_f64()) };
     let mut bytes = 0u64;
     let mut last_sent = 0u64;
     let mut on_progress = |b: u64| {
@@ -494,14 +505,20 @@ async fn run_transfer_effect(
         debug_assert!(bytes >= last_sent, "progress bytes must be cumulative");
         if bytes - last_sent >= TRANSFER_PROGRESS_STEP {
             last_sent = bytes;
-            let _ = event_tx.try_send(AppEvent::TransferProgress { bytes });
+            let _ = event_tx.try_send(AppEvent::TransferProgress {
+                bytes,
+                rate_bps: rate_bps(bytes),
+            });
         }
     };
     match cairn_transfer::run_transfer(&src, &dst, &items, spec, &cancel, &mut on_progress).await {
         Ok(out) => {
             // Flush the exact final total for one frame before `TransferDone` clears the indicator
             // (so a transfer smaller than the coalescing step doesn't only ever show "0 B").
-            let _ = event_tx.try_send(AppEvent::TransferProgress { bytes: out.bytes });
+            let _ = event_tx.try_send(AppEvent::TransferProgress {
+                bytes: out.bytes,
+                rate_bps: rate_bps(out.bytes),
+            });
             AppEvent::TransferDone {
                 status: format!("{verb} {}", outcome_summary(&out)),
                 error: false,
@@ -890,6 +907,17 @@ mod tests {
         let ev = run_create_dir_effect(&registry, LEFT, VfsPath::parse("/sub").unwrap()).await;
         assert!(matches!(ev, AppEvent::OpDone { error: false, .. }));
         assert!(dir.path().join("sub").is_dir());
+    }
+
+    #[test]
+    fn avg_rate_floors_elapsed_and_saturates() {
+        // 1 MiB over 1s → 1 MiB/s.
+        assert_eq!(avg_rate(1024 * 1024, 1.0), 1024 * 1024);
+        // Near-instant transfer: elapsed is floored at 0.05s, so the rate is bounded, not absurd.
+        assert_eq!(avg_rate(1024 * 1024, 0.0), 1024 * 1024 * 20);
+        assert_eq!(avg_rate(1024 * 1024, -1.0), 1024 * 1024 * 20); // negative also floored
+                                                                   // No panic / wrap at the extreme.
+        let _ = avg_rate(u64::MAX, 0.000_001);
     }
 
     fn tempfile_dir() -> tempfile::TempDir {

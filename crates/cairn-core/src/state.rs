@@ -332,6 +332,9 @@ pub struct AppState {
     /// Transfers waiting behind the active one. A copy/move issued while one is running is enqueued
     /// here and started (FIFO) when the active transfer finishes.
     pub transfer_queue: VecDeque<QueuedTransfer>,
+    /// Average throughput (bytes/sec) of the active transfer, for the status display. `Some` only
+    /// once at least one progress update has arrived.
+    pub transfer_rate: Option<u64>,
 }
 
 impl AppState {
@@ -352,6 +355,7 @@ impl AppState {
             connections: Vec::new(),
             transfer_bytes: None,
             transfer_queue: VecDeque::new(),
+            transfer_rate: None,
         }
     }
 
