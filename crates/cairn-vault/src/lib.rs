@@ -9,19 +9,24 @@
 //! OS-keychain unlock (per ADR-0002) is deferred; this milestone implements the passphrase path,
 //! which is fully testable and the required fallback on headless hosts.
 
+use cairn_types::{CredentialKind, CredentialShape};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+mod cred;
 mod error;
 pub use cairn_secrets::SecretString;
+pub use cred::{CredentialSecret, SshCredential};
 pub use error::VaultError;
 
 const MAGIC: &[u8; 8] = b"CAIRNVLT";
-const VERSION: u16 = 1;
+// v2: typed `CredentialSecret` payloads (RFC-0008). v1 (flat string secrets) is not forward-read; the
+// vault has no released users, so this is a clean break rather than a migration.
+const VERSION: u16 = 2;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
@@ -68,38 +73,81 @@ impl KdfParams {
     }
 }
 
-/// A stored credential. Its secret payload is private and only at-rest-encrypted; access it via
-/// [`Credential::expose_secret`]. Does not implement `Debug` to avoid accidental leaks.
-#[derive(Clone, Serialize, Deserialize)]
+/// A stored credential: a non-secret id/label plus a typed [`CredentialSecret`]. Implements neither
+/// `Debug` nor `Serialize` — the `secret` field has neither, and any auto-derived impl would expose
+/// secret material. It is persisted only via the zeroizing wire-mirror inside [`Vault::save`], and
+/// the secret is wiped from memory when the `Credential` (hence the `Vault`) drops.
+#[derive(Clone)]
 pub struct Credential {
     /// Stable identifier.
     pub id: CredentialId,
     /// Human-readable label.
     pub label: String,
-    /// Backend family this credential is for (e.g. `"ssh"`, `"s3"`).
-    pub backend: String,
-    secret: String,
+    secret: CredentialSecret,
 }
 
 impl Credential {
-    /// Borrow the secret payload. Callers must not log or persist it in the clear.
+    /// The typed secret payload (for the execution layer to authenticate with).
     #[must_use]
-    pub fn expose_secret(&self) -> &str {
+    pub fn secret(&self) -> &CredentialSecret {
         &self.secret
+    }
+
+    /// The backend family this credential authenticates against.
+    #[must_use]
+    pub fn kind(&self) -> CredentialKind {
+        self.secret.kind()
+    }
+
+    /// A non-secret description (family + variant + delegation).
+    #[must_use]
+    pub fn shape(&self) -> CredentialShape {
+        self.secret.shape()
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Store {
-    creds: Vec<Credential>,
+/// The on-disk credential record: the serializable, zeroizing mirror of [`Credential`]. The id/label
+/// are non-secret (`zeroize(skip)`); the secret rides in the wire form and is wiped on drop.
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+struct CredentialWire {
+    #[zeroize(skip)]
+    id: CredentialId,
+    #[zeroize(skip)]
+    label: String,
+    secret: cred::CredentialSecretWire,
 }
 
-/// An unlocked vault held in memory. The key is zeroized on drop.
+impl From<&Credential> for CredentialWire {
+    fn from(c: &Credential) -> Self {
+        Self {
+            id: c.id,
+            label: c.label.clone(),
+            secret: (&c.secret).into(),
+        }
+    }
+}
+
+impl From<&CredentialWire> for Credential {
+    fn from(w: &CredentialWire) -> Self {
+        Self {
+            id: w.id,
+            label: w.label.clone(),
+            secret: (&w.secret).into(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Store {
+    creds: Vec<CredentialWire>,
+}
+
+/// An unlocked vault held in memory. The key and the typed secrets are zeroized on drop.
 pub struct Vault {
     path: PathBuf,
     params: KdfParams,
     kek: Zeroizing<[u8; KEY_LEN]>,
-    store: Store,
+    creds: Vec<Credential>,
 }
 
 impl Vault {
@@ -129,7 +177,7 @@ impl Vault {
             path,
             params,
             kek,
-            store: Store::default(),
+            creds: Vec::new(),
         };
         vault.save()?;
         Ok(vault)
@@ -159,23 +207,25 @@ impl Vault {
             .map_err(|_| VaultError::Decrypt)?;
         let plaintext = Zeroizing::new(plaintext);
         let store: Store = postcard::from_bytes(&plaintext).map_err(|_| VaultError::Format)?;
+        // Convert the wire records into typed in-memory credentials, then drop the wire `store`
+        // immediately so its transient secret strings are zeroized before we return.
+        let creds: Vec<Credential> = store.creds.iter().map(Credential::from).collect();
+        drop(store);
         Ok(Self {
             path,
             params: parsed.params,
             kek,
-            store,
+            creds,
         })
     }
 
-    /// Add a credential, returning its new id.
-    pub fn add(&mut self, label: &str, backend: &str, secret: &SecretString) -> CredentialId {
-        use cairn_secrets::ExposeSecret;
+    /// Add a typed credential, returning its new id. Call [`Vault::save`] to persist.
+    pub fn add(&mut self, label: &str, secret: CredentialSecret) -> CredentialId {
         let id = Uuid::new_v4();
-        self.store.creds.push(Credential {
+        self.creds.push(Credential {
             id,
             label: label.to_owned(),
-            backend: backend.to_owned(),
-            secret: secret.expose_secret().to_owned(),
+            secret,
         });
         id
     }
@@ -183,36 +233,36 @@ impl Vault {
     /// Fetch a credential by id.
     #[must_use]
     pub fn get(&self, id: CredentialId) -> Option<&Credential> {
-        self.store.creds.iter().find(|c| c.id == id)
+        self.creds.iter().find(|c| c.id == id)
     }
 
-    /// Remove a credential by id, returning whether it existed.
+    /// Remove a credential by id, returning whether it existed. Call [`Vault::save`] to persist.
     pub fn remove(&mut self, id: CredentialId) -> bool {
-        let before = self.store.creds.len();
-        self.store.creds.retain(|c| c.id != id);
-        self.store.creds.len() != before
+        let before = self.creds.len();
+        self.creds.retain(|c| c.id != id);
+        self.creds.len() != before
     }
 
-    /// List `(id, label, backend)` for all credentials — never the secret values.
+    /// List `(id, label, shape)` for all credentials — never the secret values. The
+    /// [`CredentialShape`] gives the family/variant/delegation for display, without exposing material.
     #[must_use]
-    pub fn labels(&self) -> Vec<(CredentialId, String, String)> {
-        self.store
-            .creds
+    pub fn infos(&self) -> Vec<(CredentialId, String, CredentialShape)> {
+        self.creds
             .iter()
-            .map(|c| (c.id, c.label.clone(), c.backend.clone()))
+            .map(|c| (c.id, c.label.clone(), c.shape()))
             .collect()
     }
 
     /// The number of stored credentials.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.store.creds.len()
+        self.creds.len()
     }
 
     /// Whether the vault holds no credentials.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.store.creds.is_empty()
+        self.creds.is_empty()
     }
 
     /// Encrypt and atomically write the vault to disk.
@@ -220,8 +270,16 @@ impl Vault {
     /// # Errors
     /// Serialization, crypto, or I/O errors.
     pub fn save(&self) -> Result<(), VaultError> {
+        // Mirror the typed creds into the zeroizing wire form just for serialization; `store` is
+        // dropped at the end of this method, wiping the transient secret strings.
+        let store = Store {
+            creds: self.creds.iter().map(CredentialWire::from).collect(),
+        };
+        // The final buffer is `Zeroizing`. NB residual: `to_allocvec` grows an internal `Vec`, so any
+        // intermediate buffers freed during reallocation are not wiped — a small, defense-in-depth
+        // gap (the bytes are freed heap behind the encryption boundary, never logged or persisted).
         let plaintext =
-            Zeroizing::new(postcard::to_allocvec(&self.store).map_err(|_| VaultError::Format)?);
+            Zeroizing::new(postcard::to_allocvec(&store).map_err(|_| VaultError::Format)?);
         let nonce: [u8; NONCE_LEN] = rand_array();
         let header = build_header(&self.params, &nonce);
         let cipher = XChaCha20Poly1305::new_from_slice(self.kek.as_ref())
@@ -335,10 +393,15 @@ fn rand_array<const N: usize>() -> [u8; N] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_secrets::SecretString;
+    use cairn_secrets::{ExposeSecret, SecretString};
 
     fn pass(s: &str) -> SecretString {
         SecretString::from(s.to_owned())
+    }
+
+    /// An SSH password credential, for tests.
+    fn ssh_pw(s: &str) -> CredentialSecret {
+        CredentialSecret::Ssh(SshCredential::Password(SecretString::from(s.to_owned())))
     }
 
     #[test]
@@ -349,7 +412,7 @@ mod tests {
             let mut v =
                 Vault::create_with_params(&path, &pass("hunter2"), KdfParams::fast_for_tests())
                     .unwrap();
-            let id = v.add("prod-ssh", "ssh", &pass("super-secret-key"));
+            let id = v.add("prod-ssh", ssh_pw("super-secret-key"));
             v.save().unwrap();
             id
         };
@@ -358,8 +421,14 @@ mod tests {
         assert_eq!(v.len(), 1);
         let cred = v.get(id).unwrap();
         assert_eq!(cred.label, "prod-ssh");
-        assert_eq!(cred.backend, "ssh");
-        assert_eq!(cred.expose_secret(), "super-secret-key");
+        assert_eq!(cred.kind(), CredentialKind::Ssh);
+        // The typed secret round-trips through seal/open.
+        match cred.secret() {
+            CredentialSecret::Ssh(SshCredential::Password(p)) => {
+                assert_eq!(p.expose_secret(), "super-secret-key");
+            }
+            _ => panic!("expected an SSH password credential"),
+        }
     }
 
     #[test]
@@ -380,7 +449,7 @@ mod tests {
         {
             let mut v =
                 Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
-            v.add("x", "s3", &pass("data"));
+            v.add("x", ssh_pw("data"));
             v.save().unwrap();
         }
         let mut bytes = std::fs::read(&path).unwrap();
@@ -411,11 +480,12 @@ mod tests {
         let path = dir.path().join("v");
         let mut v =
             Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
-        v.add("a", "ssh", &pass("topsecret"));
-        let labels = v.labels();
-        assert_eq!(labels.len(), 1);
-        let rendered = format!("{labels:?}");
+        v.add("a", ssh_pw("topsecret"));
+        let infos = v.infos();
+        assert_eq!(infos.len(), 1);
+        let rendered = format!("{infos:?}");
         assert!(!rendered.contains("topsecret"));
+        assert_eq!(infos[0].2.kind, CredentialKind::Ssh);
     }
 
     #[test]
@@ -424,7 +494,7 @@ mod tests {
         let path = dir.path().join("v");
         let mut v =
             Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
-        let id = v.add("a", "ssh", &pass("k"));
+        let id = v.add("a", ssh_pw("k"));
         assert!(v.remove(id));
         assert!(!v.remove(id));
         assert!(v.is_empty());
@@ -438,6 +508,113 @@ mod tests {
         assert!(matches!(
             Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()),
             Err(VaultError::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn private_key_roundtrips_with_and_without_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let (with_id, without_id) = {
+            let mut v =
+                Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
+            let with_id = v.add(
+                "encrypted-key",
+                CredentialSecret::Ssh(SshCredential::PrivateKey {
+                    key_pem: SecretString::from("PEMBODY".to_owned()),
+                    passphrase: Some(SecretString::from("kp".to_owned())),
+                }),
+            );
+            let without_id = v.add(
+                "bare-key",
+                CredentialSecret::Ssh(SshCredential::PrivateKey {
+                    key_pem: SecretString::from("PEMBODY2".to_owned()),
+                    passphrase: None,
+                }),
+            );
+            v.save().unwrap();
+            (with_id, without_id)
+        };
+        let v = Vault::open(&path, &pass("pw")).unwrap();
+        match v.get(with_id).unwrap().secret() {
+            CredentialSecret::Ssh(SshCredential::PrivateKey {
+                key_pem,
+                passphrase,
+            }) => {
+                assert_eq!(key_pem.expose_secret(), "PEMBODY");
+                assert_eq!(passphrase.as_ref().unwrap().expose_secret(), "kp");
+            }
+            _ => panic!("expected a private-key credential"),
+        }
+        match v.get(without_id).unwrap().secret() {
+            CredentialSecret::Ssh(SshCredential::PrivateKey {
+                key_pem,
+                passphrase,
+            }) => {
+                assert_eq!(key_pem.expose_secret(), "PEMBODY2");
+                assert!(
+                    passphrase.is_none(),
+                    "no passphrase must round-trip as None"
+                );
+            }
+            _ => panic!("expected a private-key credential"),
+        }
+        assert_eq!(v.get(with_id).unwrap().shape().variant, "private-key");
+        assert!(!v.get(with_id).unwrap().shape().delegation);
+    }
+
+    #[test]
+    fn agent_roundtrips_as_delegation_with_no_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let id = {
+            let mut v =
+                Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
+            let id = v.add("agent", CredentialSecret::Ssh(SshCredential::Agent));
+            v.save().unwrap();
+            id
+        };
+        let v = Vault::open(&path, &pass("pw")).unwrap();
+        assert!(matches!(
+            v.get(id).unwrap().secret(),
+            CredentialSecret::Ssh(SshCredential::Agent)
+        ));
+        let shape = v.get(id).unwrap().shape();
+        assert_eq!(shape.variant, "agent");
+        assert!(shape.delegation, "agent is a delegation variant");
+    }
+
+    #[test]
+    fn sealed_file_does_not_contain_plaintext_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let mut v =
+            Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
+        v.add("k", ssh_pw("PLAINTEXT-NEEDLE"));
+        v.save().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // The on-disk blob is encrypted, so the secret must not appear in cleartext.
+        assert!(
+            bytes
+                .windows(b"PLAINTEXT-NEEDLE".len())
+                .all(|w| w != b"PLAINTEXT-NEEDLE"),
+            "plaintext secret leaked into the sealed file"
+        );
+    }
+
+    #[test]
+    fn old_format_version_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Rewrite the version field (bytes 8..10) to the old v1; `parse` must reject it before any
+        // decrypt attempt.
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            Vault::open(&path, &pass("pw")),
+            Err(VaultError::Version(1))
         ));
     }
 }

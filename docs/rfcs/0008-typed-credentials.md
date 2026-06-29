@@ -1,6 +1,7 @@
 # RFC-0008: Typed per-backend credentials, keychain unlock, and the broker-api split
 
-- **Status:** Accepted — §3 (broker-api split) implemented in M3-4 PR-A; §1/§2/§4/§5 pending
+- **Status:** Accepted — §3 (broker-api split, PR-A) + §1 typed model (PR-B, SSH variant; other
+  families + `TokenCache` deferred to their backend PRs) implemented; §4 (keychain) / §5 (TUI) pending
 - **Author(s):** security-engineer (synthesized), software-architect
 - **Date:** 2026-06-29
 - **Tracking item:** M3-4 (typed credential variants), M3-3 (OS keychain + auto-lock), M3-7 (vault-unlock TUI)
@@ -160,6 +161,18 @@ credential list shows labels + `CredentialShape` only; reveal-secret is deferred
 5. M3-3 providers + auto-lock; M3-7 overlay. Each step is security-reviewed.
 
 SSH (RFC-0003 / M4) consumes `CredentialSecret::Ssh` immediately after step 3.
+
+## Residual risks & follow-ups (noted during PR-B review)
+
+- **Serializer scratch memory.** `postcard::to_allocvec` grows an internal `Vec`; intermediate
+  buffers freed on reallocation are not zeroized (only the final buffer is `Zeroizing`). This is
+  inherent to serialize-then-encrypt and pre-existed PR-B; it is defense-in-depth only (freed heap,
+  behind the AEAD boundary, never logged/persisted). A future hardening could serialize into a
+  pre-sized `Zeroizing` buffer.
+- **Two backend-family vocabularies.** `cairn_types::Scheme` and `cairn_types::CredentialKind`
+  describe the same concept with different strings (`s3`/`aws`, `gcs`/`gcp`, `k8s`/`kubernetes`).
+  When M4+ wires a resolved credential to a connection scheme, add a documented
+  `CredentialKind ↔ Scheme` mapping with an exhaustiveness test rather than ad-hoc string matching.
 
 ## Open questions
 

@@ -7,13 +7,14 @@
 //! (`tests/isolation.rs`) enforces that `cairn-vault` never enters those crates' graphs, turning the
 //! "AI never sees secrets" property from a convention into a compile-time guarantee. See RFC-0008.
 
-use cairn_types::CredentialId;
+use cairn_types::{CredentialId, CredentialShape};
 
 /// A non-secret summary of a stored credential, safe to show to any actor (including the AI and
-/// plugins). Carries an identifier, a human label, and the backend family — never secret material.
+/// plugins). Carries an identifier, a human label, and a [`CredentialShape`] (family + variant +
+/// whether it delegates) — never secret material.
 ///
-/// `#[non_exhaustive]`: this is the stable boundary type; later milestones add fields (a typed
-/// `CredentialShape`, a `delegation` flag — see RFC-0008), so construct it via [`CredentialInfo::new`].
+/// `#[non_exhaustive]`: this is the stable boundary type; construct it via [`CredentialInfo::new`] so
+/// future fields don't break call sites.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CredentialInfo {
@@ -21,15 +22,15 @@ pub struct CredentialInfo {
     pub id: CredentialId,
     /// Human-readable label.
     pub label: String,
-    /// Backend family (e.g. `"s3"`, `"ssh"`).
-    pub backend: String,
+    /// Non-secret description: backend family, auth variant, and delegation flag.
+    pub shape: CredentialShape,
 }
 
 impl CredentialInfo {
     /// Construct a non-secret credential summary.
     #[must_use]
-    pub fn new(id: CredentialId, label: String, backend: String) -> Self {
-        Self { id, label, backend }
+    pub fn new(id: CredentialId, label: String, shape: CredentialShape) -> Self {
+        Self { id, label, shape }
     }
 }
 

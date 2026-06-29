@@ -8,11 +8,13 @@
 //! See `docs/LLD.md` §3 for the design rationale.
 
 mod caps;
+mod creds;
 mod entry;
 mod ids;
 mod path;
 
 pub use caps::Caps;
+pub use creds::{CredentialKind, CredentialShape};
 pub use entry::{ContainerState, Entry, EntryExt, EntryKind, PodPhase, UnixPerms};
 pub use ids::{ConnectionId, CredentialId, Scheme};
 pub use path::{PathError, VfsPath};

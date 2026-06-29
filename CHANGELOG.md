@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed credential model** (M3-4, RFC-0008): the vault now stores a typed `CredentialSecret`
+  (starting with the SSH variant: password / private-key+passphrase / agent) instead of a flat
+  string. The public secret type implements neither `Debug` nor `Serialize` — a `compile_fail` test
+  guards the no-`Debug` invariant — and the only serializable form is a `pub(crate)` zeroizing
+  wire-mirror used solely inside the seal/open path, so an unlocked secret is wiped from memory on
+  drop (lock). `Broker::resolve` now returns the typed secret (key vs password vs agent), and
+  `CredentialInfo` carries a non-secret `CredentialShape` (family + variant + delegation). The vault
+  on-disk format is bumped to v2 (clean break; no released users). Other backends' credential
+  variants land with their backend PRs; the cloud `TokenCache` lands with M5.
 - **`cairn-broker-api` — compile-time AI/plugin secret isolation** (M3-4, RFC-0008): a new crate
   exposing only the secret-free credential boundary (`CredentialDirectory` + `CredentialInfo`). The
   AI and plugin layers now depend on it instead of `cairn-broker`, so `cairn-ai` no longer pulls
