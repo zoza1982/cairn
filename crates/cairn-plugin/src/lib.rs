@@ -14,7 +14,10 @@
 use thiserror::Error;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
+mod backend;
+mod bridge;
 mod component;
+pub use backend::PluginVfsBackend;
 pub use component::{engine_config, PluginComponent};
 
 /// Per-instance resource limits.

@@ -5,10 +5,11 @@
 //! `backend-caps`, `caps-at`, `stat`, `list-page`) behind a small host wrapper. Capabilities are
 //! mapped to [`cairn_types::Caps`] so the eventual `PluginVfsBackend: Vfs` reads naturally.
 //!
-//! Deferred to the follow-up (M8-3b): the streaming `read-stream`/`write-sink` resources, mutations,
-//! the granted `host` import interface, the async `Vfs` impl (dedicated-thread bridge), and per-call
-//! fuel/epoch refills. This slice proves the component pipeline end-to-end against a committed guest
-//! fixture, hermetically (CI needs no WASM toolchain).
+//! The granted `host` interface (log/now-secs; brokered fns deny-stubbed) is linked here, and
+//! [`crate::backend::PluginVfsBackend`] exposes this as an async `Vfs` over a dedicated thread.
+//! Deferred (M8-3b PR2/PR3): the streaming `read-stream`/`write-sink` resources and mutations, then
+//! an epoch deadline + the real brokered host functions (M8-4). Verified hermetically against a
+//! committed guest fixture (CI needs no WASM toolchain).
 
 use crate::{Limits, PluginError};
 use cairn_types::Caps;
@@ -23,6 +24,13 @@ wasmtime::component::bindgen!({
 
 use cairn::plugin::types::{Caps as Caps0, Entry, VfsError};
 use exports::cairn::plugin::backend::ListPageResult;
+
+// Re-exports so the `backend`/`bridge` modules can name the generated WIT types without re-running
+// `bindgen!`.
+pub(crate) use cairn::plugin::types::{
+    Entry as WitEntry, EntryKind as WitEntryKind, VfsError as WitVfsError,
+};
+pub(crate) use exports::cairn::plugin::backend::ListPageResult as WitListPageResult;
 
 /// Store state for a component instance: the memory limiter plus an **ambient-authority-free** WASI
 /// context.
@@ -48,6 +56,58 @@ impl WasiView for CompState {
     }
 }
 
+// The granted `host` interface. `log`/`now-secs` are always safe (no I/O, no secrets). The brokered
+// `http-fetch`/`use-credential` are deny-stubs here — a guest importing them instantiates but the call
+// returns an error; the real broker-backed implementations (grant-gated) are M8-4/M8-5.
+impl cairn::plugin::host::Host for CompState {
+    fn log(&mut self, level: u8, msg: String) {
+        let level = match level {
+            0 => tracing::Level::ERROR,
+            1 => tracing::Level::WARN,
+            2 => tracing::Level::INFO,
+            _ => tracing::Level::DEBUG,
+        };
+        // Cap the untrusted guest message: a guest could pass a multi-MiB string (bounded only by
+        // its 16 MiB memory), forcing a large host copy + log record per call.
+        const MAX_LOG: usize = 4096;
+        let msg = if msg.len() > MAX_LOG {
+            // Truncate at a UTF-8 char boundary at or below the cap (plain `truncate` would panic).
+            let end = (0..=MAX_LOG)
+                .rev()
+                .find(|&i| msg.is_char_boundary(i))
+                .unwrap_or(0);
+            format!("{}…[truncated]", &msg[..end])
+        } else {
+            msg
+        };
+        // The guest message is untrusted; logged as data, never interpolated as a format string.
+        match level {
+            tracing::Level::ERROR => tracing::error!(target: "plugin", "{msg}"),
+            tracing::Level::WARN => tracing::warn!(target: "plugin", "{msg}"),
+            tracing::Level::INFO => tracing::info!(target: "plugin", "{msg}"),
+            _ => tracing::debug!(target: "plugin", "{msg}"),
+        }
+    }
+
+    fn now_secs(&mut self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn http_fetch(
+        &mut self,
+        _req: cairn::plugin::host::HttpRequest,
+    ) -> Result<cairn::plugin::host::HttpResponse, String> {
+        Err("http-fetch requires a network grant (M8-4)".to_owned())
+    }
+
+    fn use_credential(&mut self, _handle: String, _action: String) -> Result<String, String> {
+        Err("use-credential requires a credentials grant (M8-4)".to_owned())
+    }
+}
+
 /// A loaded backend-plugin component plus its store. Not `Sync`; the eventual `Vfs` bridge will own
 /// this on a dedicated thread (a `wasmtime::Store` is `!Sync`).
 pub struct PluginComponent {
@@ -70,9 +130,16 @@ impl PluginComponent {
         let component = Component::from_binary(engine, bytes)
             .map_err(|e| PluginError::Compile(e.to_string()))?;
         let mut linker: Linker<CompState> = Linker::new(engine);
-        // TODO(M8-3b): switch to `add_to_linker_async` for the async `Vfs` (dedicated-thread) bridge.
+        // The dedicated-thread `Vfs` bridge makes synchronous guest calls, so the sync WASI linker
+        // is correct (no async linker needed).
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| PluginError::Instantiate(e.to_string()))?;
+        // The granted `host` interface (log/now-secs real; brokered fns deny-stubbed — see `Host`).
+        cairn::plugin::host::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
+            &mut linker,
+            |s| s,
+        )
+        .map_err(|e| PluginError::Instantiate(e.to_string()))?;
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.max_memory_bytes)
             .build();
@@ -91,6 +158,12 @@ impl PluginComponent {
         let bindings = BackendPlugin::instantiate(&mut store, &component, &linker)
             .map_err(|e| PluginError::Instantiate(e.to_string()))?;
         Ok(Self { store, bindings })
+    }
+
+    /// Reset the fuel budget. The dedicated-thread bridge calls this before each `Vfs` op so every
+    /// call gets its own budget rather than sharing one cumulative pool across the instance lifetime.
+    pub(crate) fn refuel(&mut self, fuel: u64) {
+        let _ = self.store.set_fuel(fuel);
     }
 
     /// The URI scheme this backend serves (e.g. `"mycloud"`).
@@ -183,7 +256,7 @@ fn trap(e: wasmtime::Error) -> PluginError {
 /// Map the component `caps` flags to [`cairn_types::Caps`]. Bit identity is guaranteed by RFC-0006
 /// (the WIT `flags` order mirrors `Caps`), but we map field-by-field so a future reordering is caught
 /// at compile time rather than silently mis-mapping.
-fn map_caps(c: Caps0) -> Caps {
+pub(crate) fn map_caps(c: Caps0) -> Caps {
     let mut out = Caps::empty();
     // NB: `Caps::LOCAL_PATH` has no WIT counterpart by design — it is host-only (gates
     // `Vfs::local_path` for the local backend) and must never be grantable to a sandboxed plugin.

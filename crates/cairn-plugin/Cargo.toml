@@ -14,7 +14,12 @@ workspace = true
 
 [dependencies]
 cairn-types = { workspace = true }
+cairn-vfs = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
 thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["sync"] }
 wasmtime = { version = "46.0.1", default-features = false, features = [
     "cranelift",
     "wat",
@@ -28,4 +33,5 @@ wasmtime = { version = "46.0.1", default-features = false, features = [
 wasmtime-wasi = { version = "46.0.1", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["macros", "rt"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }
+futures = "0.3"
