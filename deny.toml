@@ -34,6 +34,10 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
+    # Community Data License Agreement – Permissive 2.0. Carried by `webpki-root-certs` (the Mozilla
+    # CA root bundle, pulled via rustls-platform-verifier → reqwest under the `gcs` feature). It is a
+    # permissive license for *data* (the cert set), with no copyleft on our code. Safe to allow.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

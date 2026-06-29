@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **GCS object-store live backend** (M5-8, ADR-0003): `cairn-backend-object` gains `GcsObjectStore`
+  and `gcs_connect` (behind the non-default `gcs` feature), a `google-cloud-storage` adapter
+  implementing the same provider-agnostic `ObjectStore` seam — list (prefix/delimiter + page tokens),
+  head, ranged read, write, delete, and server-side copy (GCS `rewrite`). It uses the SDK's two
+  clients (HTTP data-plane `Storage` for read/write, gRPC control-plane `StorageControl` for the
+  rest) and supports a custom endpoint (anonymous auth) for local emulators. Credentials come from
+  the broker as the typed `CredentialSecret::Gcp`: a service-account JSON key, or Application Default
+  Credentials. The SDK rides the rustls/ring stack (no OpenSSL). The live emulator path is deferred
+  (the GCS control plane is gRPC; HTTP emulators like fake-gcs don't cover it) — the adapter is
+  type-checked and the `ObjectStore`→`Vfs` mapping is exercised by the S3 MinIO job and the
+  `MockObjectStore` contract.
+- **GCP credential variant** (M5 / M3-4, RFC-0008): the vault's typed `CredentialSecret` gains a
+  `Gcp` family — `ServiceAccountKey` (the JSON key, entirely secret) and `ApplicationDefault`
+  (delegation) — sealed through the same `pub(crate)` zeroizing wire-mirror as the SSH/AWS variants.
 - **S3 object-store live backend** (M5-3, ADR-0003): `cairn-backend-object` gains `S3ObjectStore`
   and `s3_connect` (behind the non-default `s3` feature), an `aws-sdk-s3` adapter implementing the
   provider-agnostic `ObjectStore` seam — delimiter listing with continuation tokens and common

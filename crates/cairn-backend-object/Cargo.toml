@@ -20,7 +20,8 @@ default = []
 # (cairn-vault); off by default so the lean cross-platform build stays SDK-free. The full build
 # (Linux) and the MinIO integration job enable it.
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:cairn-vault"]
-gcs = []
+# `gcs` pulls the Google Cloud Storage SDK + the typed GCP credential it consumes (cairn-vault).
+gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:cairn-vault", "dep:serde_json"]
 azure = []
 # Exposes the in-memory MockObjectStore to dependent crates' tests.
 test-utils = []
@@ -47,6 +48,16 @@ aws-sdk-s3 = { version = "1", optional = true, default-features = false, feature
     "default-https-client",
     "rt-tokio",
 ] }
+# Google Cloud Storage SDK for the GCS adapter (behind the `gcs` feature). v1 uses reqwest+rustls by
+# default (no native-tls/OpenSSL), matching our TLS posture.
+google-cloud-storage = { version = "1", optional = true }
+# google-cloud-auth is needed directly so we can construct Credentials objects (anonymous for
+# the emulator, service-account, and ADC). It is a transitive dep via google-cloud-storage but
+# must be declared here to use its types in our code.
+google-cloud-auth = { version = "1", optional = true }
+# serde_json is needed to parse the service-account key JSON string into the Value that
+# google-cloud-auth's service_account::Builder::new requires.
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 # `net`/`time`/`rt-multi-thread` are only needed by the env-guarded S3 integration test (it drives the
