@@ -19,7 +19,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 mod cred;
 mod error;
-pub use cairn_secrets::SecretString;
+pub use cairn_secrets::{ExposeSecret, SecretString};
 pub use cred::{CredentialSecret, SshCredential};
 pub use error::VaultError;
 

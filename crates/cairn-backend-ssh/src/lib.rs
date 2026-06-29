@@ -3,12 +3,17 @@
 //! The product logic — mapping SFTP operations onto the [`Vfs`] trait — lives in [`SftpVfs`], which
 //! is generic over an [`SftpOps`] transport so it is fully unit-testable against an in-memory mock.
 //! The real transport (`russh` + `russh-sftp`) is the thin [`RealSftp`] adapter; establishing the
-//! SSH connection is behind the `transport` feature and exercised by an integration test against a
-//! live server (per the M4 CI design). See `docs/LLD.md` §3.6 and RFC-0003.
+//! SSH connection ([`ssh_connect`]) lives in `connect.rs` behind the `ssh` feature (it pulls `russh`),
+//! while `RealSftp` (over `russh-sftp`, TLS-free) stays unconditional. See `docs/LLD.md` §3.6,
+//! RFC-0003, ADR-0006.
 
+#[cfg(feature = "ssh")]
+mod connect;
 mod ops;
 mod real;
 
+#[cfg(feature = "ssh")]
+pub use connect::{ssh_connect, HostKeyPolicy, SshConnectParams};
 pub use ops::{RemoteEntry, RemoteMeta, SftpOps};
 pub use real::RealSftp;
 
@@ -212,6 +217,16 @@ mod tests {
             .with_dir("/d/sub")
             .with_file("/d/sub/b.txt", b"bbbb");
         SftpVfs::new(ConnectionId(1), mock)
+    }
+
+    /// `SftpVfs` must be `Send + Sync` to live behind `Arc<dyn Vfs>`. Guards against russh's
+    /// historically `!Send` futures regressing the real adapter (R7 in the implementation plan).
+    #[test]
+    fn vfs_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SftpVfs<MockSftp>>();
+        // `RealSftp` (over russh-sftp) is compiled unconditionally, so guard it in the lean build too.
+        assert_send_sync::<SftpVfs<RealSftp>>();
     }
 
     #[tokio::test]
