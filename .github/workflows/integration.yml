@@ -69,10 +69,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Start Azurite
+        # `--skipApiVersionCheck`: the runner's `az` CLI negotiates a very new Storage API version
+        # that the pinned Azurite image rejects ("API version ... is not supported"); skipping the
+        # check lets both the `az` container-create step and the SDK round-trip talk to it. (The
+        # azure_storage 0.21 SDK itself sends an older, supported version.)
         run: |
           docker run -d --name azurite -p 10000:10000 \
             mcr.microsoft.com/azure-storage/azurite \
-            azurite-blob --blobHost 0.0.0.0
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
       - name: Wait for Azurite to be ready
         run: |
           for i in $(seq 1 30); do
