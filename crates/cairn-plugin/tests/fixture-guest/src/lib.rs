@@ -1,11 +1,13 @@
 //! A minimal in-memory backend-plugin component fixture for the host's plugin-VFS tests.
 //!
 //! It serves a single directory `/dir` containing one file `/dir/a.txt` (contents `b"hello"`).
-//! `open-read` streams that file's bytes (honoring an optional byte range); `open-write`/mutations
-//! still return `unsupported` (PR3).
+//! `open-read` streams that file's bytes (honoring an optional byte range); `open-write` accepts a
+//! streamed write under `/dir/` and `finish` reports the accumulated size; `create-dir`/`remove`/
+//! `rename` exercise the mutation plumbing (including the `recursive` flag and distinct error
+//! mappings) without a real filesystem.
 //!
-//! Two extra paths exercise the host's defenses against a *misbehaving* guest (the host treats every
-//! plugin as untrusted): `/dir/infinite` is a read stream that never reports EOF, and
+//! Two extra read paths exercise the host's defenses against a *misbehaving* guest (the host treats
+//! every plugin as untrusted): `/dir/infinite` is a read stream that never reports EOF, and
 //! `/dir/oversized` returns more bytes than the host requested. Built locally
 //! (`cargo component build`) and committed as `../fixtures/backend.wasm` so CI needs no WASM
 //! toolchain.
@@ -13,7 +15,7 @@
 #[allow(warnings)]
 mod bindings;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use bindings::cairn::plugin::types::{ByteRange, Caps, Entry, EntryKind, VfsError};
 use bindings::exports::cairn::plugin::backend::{
@@ -24,7 +26,11 @@ const FILE_BODY: &[u8] = b"hello";
 
 struct Fixture;
 
-struct StubWriteSink;
+/// A write sink that accumulates streamed bytes in memory; `finish` reports the byte count.
+struct MemWriteSink {
+    name: String,
+    buf: RefCell<Vec<u8>>,
+}
 
 /// What a [`MemReadStream`] yields. `Bytes` is the well-behaved case; the others are deliberately
 /// hostile, to exercise the host's stream defenses.
@@ -61,12 +67,20 @@ impl GuestReadStream for MemReadStream {
     fn close(&self) {}
 }
 
-impl GuestWriteSink for StubWriteSink {
-    fn write_chunk(&self, _chunk: Vec<u8>) -> Result<(), VfsError> {
-        Err(VfsError::Unsupported(Caps::empty()))
+impl GuestWriteSink for MemWriteSink {
+    fn write_chunk(&self, chunk: Vec<u8>) -> Result<(), VfsError> {
+        self.buf.borrow_mut().extend_from_slice(&chunk);
+        Ok(())
     }
     fn finish(&self) -> Result<Entry, VfsError> {
-        Err(VfsError::Unsupported(Caps::empty()))
+        Ok(Entry {
+            name: self.name.clone(),
+            kind: EntryKind::File,
+            size: Some(self.buf.borrow().len() as u64),
+            modified_secs: None,
+            etag: None,
+            symlink_target: None,
+        })
     }
     fn abort(&self) {}
 }
@@ -84,18 +98,18 @@ fn file_entry() -> Entry {
 
 impl Guest for Fixture {
     type ReadStream = MemReadStream;
-    type WriteSink = StubWriteSink;
+    type WriteSink = MemWriteSink;
 
     fn scheme() -> String {
         "fixture".to_string()
     }
 
     fn backend_caps() -> Caps {
-        Caps::LIST_DIR | Caps::READ
+        Caps::LIST_DIR | Caps::READ | Caps::WRITE | Caps::CREATE_DIR | Caps::DELETE | Caps::RENAME
     }
 
     fn caps_at(_path: String) -> Caps {
-        Caps::LIST_DIR | Caps::READ
+        Caps::LIST_DIR | Caps::READ | Caps::WRITE | Caps::CREATE_DIR | Caps::DELETE | Caps::RENAME
     }
 
     fn list_page(
@@ -156,23 +170,48 @@ impl Guest for Fixture {
     }
 
     fn open_write(
-        _path: String,
+        path: String,
         _overwrite: bool,
         _size_hint: Option<u64>,
     ) -> Result<WriteSink, VfsError> {
-        Err(VfsError::Unsupported(Caps::empty()))
+        // Accept a write to a leaf directly under `/dir`.
+        match path.strip_prefix("/dir/") {
+            // Hostile case: `finish` reports a traversal name, to prove the host rejects it.
+            Some("evilname") => Ok(WriteSink::new(MemWriteSink {
+                name: "../evil".to_string(),
+                buf: RefCell::new(Vec::new()),
+            })),
+            Some(leaf) if !leaf.is_empty() && !leaf.contains('/') => Ok(WriteSink::new(MemWriteSink {
+                name: leaf.to_string(),
+                buf: RefCell::new(Vec::new()),
+            })),
+            _ => Err(VfsError::NotFound(path)),
+        }
     }
 
-    fn create_dir(_path: String) -> Result<(), VfsError> {
-        Err(VfsError::Unsupported(Caps::empty()))
+    fn create_dir(path: String) -> Result<(), VfsError> {
+        match path.as_str() {
+            "/dir" => Err(VfsError::AlreadyExists(path)), // distinct error mapping
+            p if p.starts_with("/dir/") => Ok(()),
+            _ => Err(VfsError::NotFound(path)),
+        }
     }
 
-    fn remove(_path: String, _recursive: bool) -> Result<(), VfsError> {
-        Err(VfsError::Unsupported(Caps::empty()))
+    fn remove(path: String, recursive: bool) -> Result<(), VfsError> {
+        match path.as_str() {
+            "/dir/a.txt" => Ok(()),
+            // A non-empty dir needs `recursive` — proves the flag is threaded through.
+            "/dir" if recursive => Ok(()),
+            "/dir" => Err(VfsError::Conflict),
+            _ => Err(VfsError::NotFound(path)),
+        }
     }
 
-    fn rename(_src: String, _dst: String) -> Result<(), VfsError> {
-        Err(VfsError::Unsupported(Caps::empty()))
+    fn rename(src: String, _dst: String) -> Result<(), VfsError> {
+        match src.as_str() {
+            "/dir/a.txt" => Ok(()),
+            _ => Err(VfsError::NotFound(src)),
+        }
     }
 }
 

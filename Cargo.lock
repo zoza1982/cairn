@@ -420,6 +420,7 @@ name = "cairn-plugin"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "cairn-types",
  "cairn-vfs",
  "futures",

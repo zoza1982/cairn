@@ -3,15 +3,17 @@
 //!
 //! The plugin's `Store` is `!Send`, so it lives on a dedicated thread (see [`crate::bridge`]); this
 //! type is the `Send + Sync` async face that messages it. PR1 landed metadata + listing
-//! (`scheme`/`connection`/`caps`/`list`/`stat`); PR2 adds streaming reads (`open_read` → a
-//! `read-stream` resource exposed as a [`ReadHandle`]); `open_write`/mutations are PR3.
+//! (`scheme`/`connection`/`caps`/`list`/`stat`); PR2 added streaming reads (`open_read` → a
+//! `read-stream` resource as a [`ReadHandle`]); PR3 adds streaming writes (`open_write` →
+//! `write-sink` as a [`WriteHandle`]) and mutations (`create_dir`/`remove`/`rename`) — the full
+//! `Vfs` contract.
 
 use crate::bridge::{
-    map_entry, plugin_dead_error, plugin_error_to_vfs, plugin_thread, to_vfs_error,
-    valid_leaf_name, PluginMsg,
+    map_entry, map_entry_checked, plugin_dead_error, plugin_error_to_vfs, plugin_thread,
+    to_vfs_error, valid_leaf_name, PluginMsg,
 };
-use crate::component::WitByteRange;
-use crate::handle::PluginReadHandle;
+use crate::component::{WitByteRange, WitVfsError};
+use crate::handle::{PluginReadHandle, PluginWriteHandle};
 use crate::{Limits, PluginComponent, PluginError};
 use cairn_types::{Caps, ConnectionId, Entry, Scheme, VfsPath};
 use cairn_vfs::{
@@ -168,7 +170,7 @@ impl Vfs for PluginVfsBackend {
             .map_err(|_| plugin_dead_error())?
             .map_err(plugin_error_to_vfs)?
             .map_err(to_vfs_error)
-            .map(map_entry)
+            .and_then(map_entry_checked)
     }
 
     async fn open_read(
@@ -204,12 +206,70 @@ impl Vfs for PluginVfsBackend {
         ))
     }
 
-    async fn open_write(&self, _path: &VfsPath, _opts: WriteOpts) -> Result<WriteHandle, VfsError> {
-        // M8-3b PR2: the `write-sink` resource → `WriteHandle` bridge.
-        Err(VfsError::Unsupported(Caps::WRITE))
+    async fn open_write(&self, path: &VfsPath, opts: WriteOpts) -> Result<WriteHandle, VfsError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(PluginMsg::OpenWrite {
+                path: path.as_str(),
+                overwrite: opts.overwrite,
+                size_hint: opts.size_hint,
+                reply: reply_tx,
+            })
+            .map_err(|_| plugin_dead_error())?;
+        let id = reply_rx
+            .await
+            .map_err(|_| plugin_dead_error())?
+            .map_err(plugin_error_to_vfs)?
+            .map_err(to_vfs_error)?;
+        Ok(WriteHandle::new(Box::new(PluginWriteHandle::new(
+            id,
+            Arc::clone(&self.tx),
+        ))))
     }
 
-    async fn remove(&self, _path: &VfsPath, _recurse: Recurse) -> Result<(), VfsError> {
-        Err(VfsError::Unsupported(Caps::DELETE))
+    async fn create_dir(&self, path: &VfsPath) -> Result<(), VfsError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(PluginMsg::CreateDir {
+                path: path.as_str(),
+                reply: reply_tx,
+            })
+            .map_err(|_| plugin_dead_error())?;
+        unit_reply(reply_rx).await
     }
+
+    async fn remove(&self, path: &VfsPath, recurse: Recurse) -> Result<(), VfsError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(PluginMsg::Remove {
+                path: path.as_str(),
+                recursive: recurse == Recurse::Yes,
+                reply: reply_tx,
+            })
+            .map_err(|_| plugin_dead_error())?;
+        unit_reply(reply_rx).await
+    }
+
+    async fn rename(&self, from: &VfsPath, to: &VfsPath) -> Result<(), VfsError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(PluginMsg::Rename {
+                src: from.as_str(),
+                dst: to.as_str(),
+                reply: reply_tx,
+            })
+            .map_err(|_| plugin_dead_error())?;
+        unit_reply(reply_rx).await
+    }
+}
+
+/// Await a mutation reply that carries no payload, flattening the three error layers (dead thread /
+/// host trap / guest `vfs-error`) into a [`VfsError`]. Shared by `create_dir`/`remove`/`rename`.
+async fn unit_reply(
+    rx: oneshot::Receiver<Result<Result<(), WitVfsError>, PluginError>>,
+) -> Result<(), VfsError> {
+    rx.await
+        .map_err(|_| plugin_dead_error())?
+        .map_err(plugin_error_to_vfs)?
+        .map_err(to_vfs_error)
 }
