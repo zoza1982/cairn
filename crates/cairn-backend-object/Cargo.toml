@@ -16,7 +16,10 @@ workspace = true
 default = []
 # Real cloud providers (S3/GCS/Azure) are added behind these features; they require the official
 # SDKs and live/emulated services and are not built or tested in the default/CI build (ADR-0006).
-s3 = []
+# `s3` pulls the AWS SDK (aws-lc-rs crypto, hyper) + the typed AWS credential it consumes
+# (cairn-vault); off by default so the lean cross-platform build stays SDK-free. The full build
+# (Linux) and the MinIO integration job enable it.
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:cairn-vault"]
 gcs = []
 azure = []
 # Exposes the in-memory MockObjectStore to dependent crates' tests.
@@ -25,10 +28,27 @@ test-utils = []
 [dependencies]
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
+# Consumed only by the live S3 adapter (the typed AWS credential); the backend is part of the
+# execution layer that legitimately handles secrets (AI/plugin isolation is enforced elsewhere).
+cairn-vault = { workspace = true, optional = true }
 async-trait = "0.1"
 bytes = "1"
 futures = "0.3"
 smol_str = "0.3"
+# AWS SDK for the S3 adapter (behind the `s3` feature). `aws-config` keeps its full defaults so the
+# `Profile`/`DefaultChain` credential variants resolve via the real chain (incl. SSO and
+# `credential_process`). `aws-sdk-s3` drops only the legacy `rustls` feature (an old hyper-0.14 +
+# rustls-0.21 + webpki-0.101 connector that carries known webpki advisories); `default-https-client`
+# provides the modern hyper-1.x + rustls-0.23 + aws-lc-rs TLS stack we actually use.
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+# `net`/`time`/`rt-multi-thread` are only needed by the env-guarded S3 integration test (it drives the
+# AWS SDK's hyper client); the hermetic unit tests use only io-util/macros/rt.
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread", "net", "time"] }

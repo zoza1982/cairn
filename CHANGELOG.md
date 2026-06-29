@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **S3 object-store live backend** (M5-3, ADR-0003): `cairn-backend-object` gains `S3ObjectStore`
+  and `s3_connect` (behind the non-default `s3` feature), an `aws-sdk-s3` adapter implementing the
+  provider-agnostic `ObjectStore` seam — delimiter listing with continuation tokens and common
+  prefixes, `head`, ranged `GET`, `PUT`, `DELETE`, and server-side `COPY`. It also drives
+  S3-compatible stores (e.g. MinIO) via an endpoint override + path-style addressing
+  (`S3ConnectParams`). Credentials come from the broker as the typed `CredentialSecret::Aws`: static
+  keys (incl. STS session tokens), a named profile, or the SDK default provider chain. The AWS SDK
+  (aws-lc-rs crypto, hyper) is feature-gated, so the lean cross-platform build never compiles it; a
+  MinIO integration job (env-guarded by `CAIRN_IT_S3`) exercises the live round-trip. Multipart and
+  resumable upload (M5-4/M5-5) remain follow-ups.
+- **AWS credential variant** (M5 / M3-4, RFC-0008): the vault's typed `CredentialSecret` gains an
+  `Aws` family — `Static { access_key_id, secret_access_key, session_token }`, `Profile`, and
+  `DefaultChain` — sealed through the same `pub(crate)` zeroizing wire-mirror as the SSH variant
+  (no `Debug`/`Serialize` on the public type; access key id is treated as a non-secret identifier).
 - **SSH/SFTP live backend** (M4, RFC-0003): the first network backend can now establish a real
   connection. `cairn-backend-ssh` gains `ssh_connect` (behind the non-default `ssh` feature) — TCP →
   russh handshake → host-key verification (`HostKeyPolicy::Strict` / `AcceptNew` TOFU; a changed key
