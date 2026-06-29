@@ -13,8 +13,9 @@ authors.workspace = true
 workspace = true
 
 [features]
+default = []
 # Real cloud providers (S3/GCS/Azure) are added behind these features; they require the official
-# SDKs and live/emulated services and are not built or tested in the default/CI build.
+# SDKs and live/emulated services and are not built or tested in the default/CI build (ADR-0006).
 s3 = []
 gcs = []
 azure = []

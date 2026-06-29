@@ -17,16 +17,22 @@
 
 | Field | Value |
 |---|---|
-| **Phase** | Build in progress — the hermetic core of every milestone has landed |
-| **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0004 · ✅ RFC-0001..0007 |
-| **Current milestone** | **Hermetic cores delivered across M0–M8; SDK/service integration env-deferred** |
+| **Phase** | **"Finish the project" (2026-06-29):** hold lifted — building every remaining milestone in order, network backends feature-gated + emulator-tested in CI |
+| **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0006 · ✅ RFC-0001..0007 |
+| **Current milestone** | **Foundation: feature-gated backends + lean/full CI split (ADR-0006, PR-0). Next: M3-4 credentials → M4 SSH** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
 | **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core & plan→confirm UI + M8 runtime, WIT RFC & keybindings + M4 SFTP-mapping + M6 Docker- & K8s-mapping ✅ · cloud providers + live-transport (SSH/Docker/K8s) + LLM HTTP providers + WASM component bridge ⏭ |
 | **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 33 / 19 / 0 / 0 / 19 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
 
-> **Environment note.** Items marked **⏭ env-deferred** require live or emulated network services
+> **Unblocked (2026-06-29).** The "env-deferred" hold is lifted. Network backends now build behind
+> non-default Cargo features (ADR-0006) so the default cross-platform CI stays lean/hermetic and the
+> full TLS build runs Linux-only; live verification uses emulators (sshd/MinIO/Azurite/fake-gcs/kind/
+> dind) in a dedicated, env-guarded integration job. Build order: SSH → object-store → containers →
+> AI HTTP + MCP → plugin finish → v0.1 release. The legacy note below describes the prior state.
+>
+> **Environment note (legacy).** Items marked **⏭ env-deferred** require live or emulated network services
 > (SSH servers, MinIO/Azurite/fake-gcs, dind, `kind`) and/or very heavy SDKs (`aws-sdk-s3`, `kube`,
 > `bollard`, `wasmtime`) that cannot be built and integration-tested in the current environment. Their
 > **designs are complete** (LLD §8/§11, ADR-0003/0004) and the **provider-agnostic cores that *can*
