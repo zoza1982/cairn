@@ -11,8 +11,7 @@
 //! authorize→confirm→execute action mediation (per ADR-0002 / LLD §9.6) is layered on in M7.
 
 pub use cairn_broker_api::{CredentialDirectory, CredentialInfo};
-use cairn_secrets::SecretString;
-use cairn_vault::{CredentialId, Vault};
+use cairn_vault::{CredentialId, CredentialSecret, Vault};
 use std::sync::Mutex;
 
 /// Who is requesting an action — recorded in the audit journal.
@@ -88,16 +87,16 @@ impl Broker {
         *self.vault.lock().expect("broker mutex") = None;
     }
 
-    /// The secret-free world view: every stored credential's id/label/backend. Safe to expose to
-    /// untrusted actors (the AI, plugins).
+    /// The secret-free world view: every stored credential's id/label/shape (family + variant +
+    /// delegation). Safe to expose to untrusted actors (the AI, plugins).
     #[must_use]
     pub fn credentials(&self) -> Vec<CredentialInfo> {
         let guard = self.vault.lock().expect("broker mutex");
         match guard.as_ref() {
             Some(v) => v
-                .labels()
+                .infos()
                 .into_iter()
-                .map(|(id, label, backend)| CredentialInfo::new(id, label, backend))
+                .map(|(id, label, shape)| CredentialInfo::new(id, label, shape))
                 .collect(),
             None => Vec::new(),
         }
@@ -107,15 +106,16 @@ impl Broker {
     ///
     /// This is the **only** path from a reference to a secret and is intended for the execution
     /// layer (backends performing an authenticated operation), never to be surfaced to the AI/plugin
-    /// tool surface.
+    /// tool surface. Returns the typed [`CredentialSecret`] so a backend can authenticate with the
+    /// right material (key vs password vs agent); the secret's `Secret*` fields zeroize on drop.
     ///
     /// # Errors
     /// [`BrokerError::Locked`] if the vault is locked, [`BrokerError::NotFound`] if the id is unknown.
-    pub fn resolve(&self, actor: Actor, id: CredentialId) -> Result<SecretString, BrokerError> {
+    pub fn resolve(&self, actor: Actor, id: CredentialId) -> Result<CredentialSecret, BrokerError> {
         let guard = self.vault.lock().expect("broker mutex");
         let vault = guard.as_ref().ok_or(BrokerError::Locked)?;
         let cred = vault.get(id).ok_or(BrokerError::NotFound)?;
-        let secret = SecretString::from(cred.expose_secret().to_owned());
+        let secret = cred.secret().clone();
         drop(guard);
         self.record(JournalEntry {
             actor,
@@ -148,7 +148,7 @@ impl CredentialDirectory for Broker {
 mod tests {
     use super::*;
     use cairn_secrets::{ExposeSecret, SecretString};
-    use cairn_vault::{KdfParams, Vault};
+    use cairn_vault::{CredentialSecret, KdfParams, SshCredential, Vault};
 
     fn unlocked_with_one() -> (Broker, CredentialId) {
         let dir = tempfile::tempdir().unwrap();
@@ -159,7 +159,12 @@ mod tests {
             KdfParams::fast_for_tests(),
         )
         .unwrap();
-        let id = v.add("prod", "s3", &SecretString::from("AKIAsecret".to_owned()));
+        let id = v.add(
+            "prod",
+            CredentialSecret::Ssh(SshCredential::Password(SecretString::from(
+                "AKIAsecret".to_owned(),
+            ))),
+        );
         // keep the tempdir alive for the test by leaking it; the file is read into the vault already
         std::mem::forget(dir);
         (Broker::new(v), id)
@@ -169,7 +174,12 @@ mod tests {
     fn resolve_returns_secret_and_journals() {
         let (broker, id) = unlocked_with_one();
         let secret = broker.resolve(Actor::User, id).unwrap();
-        assert_eq!(secret.expose_secret(), "AKIAsecret");
+        match secret {
+            CredentialSecret::Ssh(SshCredential::Password(p)) => {
+                assert_eq!(p.expose_secret(), "AKIAsecret");
+            }
+            _ => panic!("expected an SSH password credential"),
+        }
         let journal = broker.journal();
         assert_eq!(journal.len(), 1);
         assert_eq!(journal[0].actor, Actor::User);
@@ -184,25 +194,29 @@ mod tests {
         assert_eq!(view.len(), 1);
         let rendered = format!("{view:?}");
         assert!(!rendered.contains("AKIAsecret"));
-        assert_eq!(view[0].backend, "s3");
+        assert_eq!(view[0].shape.kind.as_str(), "ssh");
     }
 
     #[test]
     fn locked_broker_resolves_nothing() {
         let broker = Broker::locked();
         assert!(!broker.is_unlocked());
-        let err = broker.resolve(Actor::Ai, CredentialId::nil()).unwrap_err();
-        assert!(matches!(err, BrokerError::Locked));
+        // `matches!` (not `unwrap_err`) because the Ok type `CredentialSecret` intentionally has no
+        // `Debug` impl — a secret must never be formattable.
+        assert!(matches!(
+            broker.resolve(Actor::Ai, CredentialId::nil()),
+            Err(BrokerError::Locked)
+        ));
         assert!(broker.credentials().is_empty());
     }
 
     #[test]
     fn unknown_id_is_not_found() {
         let (broker, _id) = unlocked_with_one();
-        let err = broker
-            .resolve(Actor::Plugin("x".into()), CredentialId::nil())
-            .unwrap_err();
-        assert!(matches!(err, BrokerError::NotFound));
+        assert!(matches!(
+            broker.resolve(Actor::Plugin("x".into()), CredentialId::nil()),
+            Err(BrokerError::NotFound)
+        ));
     }
 
     #[test]
