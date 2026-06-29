@@ -73,10 +73,12 @@ jobs:
         # that the pinned Azurite image rejects ("API version ... is not supported"); skipping the
         # check lets both the `az` container-create step and the SDK round-trip talk to it. (The
         # azure_storage 0.21 SDK itself sends an older, supported version.)
+        # `--loose`: the 0.21 SDK adds `x-ms-range-get-content-crc64` on ranged GETs, which real
+        # Azure supports but Azurite's strict mode rejects; loose mode accepts the extra header.
         run: |
           docker run -d --name azurite -p 10000:10000 \
             mcr.microsoft.com/azure-storage/azurite \
-            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
       - name: Wait for Azurite to be ready
         run: |
           for i in $(seq 1 30); do
