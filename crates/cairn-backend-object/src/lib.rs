@@ -26,6 +26,13 @@ mod s3;
 #[cfg(feature = "s3")]
 pub use s3::{s3_connect, S3ConnectParams, S3ObjectStore};
 
+// The live Google Cloud Storage adapter lives behind the `gcs` feature (pulls the GCS SDK + the
+// typed GCP credential). The provider-agnostic core stays SDK-free.
+#[cfg(feature = "gcs")]
+mod gcs;
+#[cfg(feature = "gcs")]
+pub use gcs::{gcs_connect, GcsConnectParams, GcsObjectStore};
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
 #[cfg(any(test, feature = "test-utils"))]

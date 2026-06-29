@@ -20,7 +20,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 mod cred;
 mod error;
 pub use cairn_secrets::{ExposeSecret, SecretString};
-pub use cred::{AwsCredential, CredentialSecret, SshCredential};
+pub use cred::{AwsCredential, CredentialSecret, GcpCredential, SshCredential};
 pub use error::VaultError;
 
 const MAGIC: &[u8; 8] = b"CAIRNVLT";
@@ -639,6 +639,43 @@ mod tests {
         let shape = v.get(temp_id).unwrap().shape();
         assert_eq!(shape.variant, "static");
         assert!(!shape.delegation, "static keys are not a delegation");
+    }
+
+    #[test]
+    fn gcp_service_account_and_adc_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let (sa_id, adc_id) = {
+            let mut v =
+                Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
+            let sa_id = v.add(
+                "sa",
+                CredentialSecret::Gcp(GcpCredential::ServiceAccountKey(pass(
+                    "{\"type\":\"service_account\",\"private_key\":\"SECRET\"}",
+                ))),
+            );
+            let adc_id = v.add(
+                "adc",
+                CredentialSecret::Gcp(GcpCredential::ApplicationDefault),
+            );
+            v.save().unwrap();
+            (sa_id, adc_id)
+        };
+        let v = Vault::open(&path, &pass("pw")).unwrap();
+        assert_eq!(v.get(sa_id).unwrap().kind(), CredentialKind::Gcp);
+        match v.get(sa_id).unwrap().secret() {
+            CredentialSecret::Gcp(GcpCredential::ServiceAccountKey(k)) => {
+                assert!(k.expose_secret().contains("SECRET"));
+            }
+            _ => panic!("expected a GCP service-account credential"),
+        }
+        assert!(matches!(
+            v.get(adc_id).unwrap().secret(),
+            CredentialSecret::Gcp(GcpCredential::ApplicationDefault)
+        ));
+        assert_eq!(v.get(sa_id).unwrap().shape().variant, "service-account");
+        assert!(!v.get(sa_id).unwrap().shape().delegation);
+        assert!(v.get(adc_id).unwrap().shape().delegation);
     }
 
     #[test]

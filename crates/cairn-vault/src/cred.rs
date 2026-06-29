@@ -33,6 +33,8 @@ pub enum CredentialSecret {
     Ssh(SshCredential),
     /// An AWS / S3-compatible credential.
     Aws(AwsCredential),
+    /// A Google Cloud (GCS) credential.
+    Gcp(GcpCredential),
 }
 
 impl CredentialSecret {
@@ -42,6 +44,7 @@ impl CredentialSecret {
         match self {
             Self::Ssh(_) => CredentialKind::Ssh,
             Self::Aws(_) => CredentialKind::Aws,
+            Self::Gcp(_) => CredentialKind::Gcp,
         }
     }
 
@@ -54,6 +57,9 @@ impl CredentialSecret {
             }
             Self::Aws(a) => {
                 CredentialShape::new(CredentialKind::Aws, a.variant(), a.is_delegation())
+            }
+            Self::Gcp(g) => {
+                CredentialShape::new(CredentialKind::Gcp, g.variant(), g.is_delegation())
             }
         }
     }
@@ -127,6 +133,32 @@ impl AwsCredential {
     }
 }
 
+/// Google Cloud authentication material for GCS (per the M5 design). Either an explicit
+/// service-account key (the JSON key file is the whole secret) or delegation to Application Default
+/// Credentials (env `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud` login, or the instance metadata
+/// server) — which stores no key material in the vault.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum GcpCredential {
+    /// A service-account key: the full JSON key-file contents (entirely secret).
+    ServiceAccountKey(SecretString),
+    /// Delegate to Application Default Credentials. No key material is stored in the vault.
+    ApplicationDefault,
+}
+
+impl GcpCredential {
+    fn variant(&self) -> &'static str {
+        match self {
+            Self::ServiceAccountKey(_) => "service-account",
+            Self::ApplicationDefault => "application-default",
+        }
+    }
+
+    fn is_delegation(&self) -> bool {
+        matches!(self, Self::ApplicationDefault)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire-mirror: the ONLY serializable form. Zeroized on drop. `pub(crate)` so it cannot escape the
 // vault; conversions copy through `expose_secret`/re-wrap exactly at the seal/open boundary.
@@ -136,6 +168,7 @@ impl AwsCredential {
 pub(crate) enum CredentialSecretWire {
     Ssh(SshWire),
     Aws(AwsWire),
+    Gcp(GcpWire),
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -159,14 +192,32 @@ pub(crate) enum AwsWire {
     DefaultChain,
 }
 
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub(crate) enum GcpWire {
+    ServiceAccountKey(String),
+    ApplicationDefault,
+}
+
 // The exhaustive matches in these `From` impls are the sync guard between the public and wire enums:
-// adding a `CredentialSecret`/`SshCredential`/`AwsCredential` variant without its wire counterpart
-// is a compile error.
+// adding a `CredentialSecret`/`SshCredential`/`AwsCredential`/`GcpCredential` variant without its
+// wire counterpart is a compile error.
 impl From<&CredentialSecret> for CredentialSecretWire {
     fn from(c: &CredentialSecret) -> Self {
         match c {
             CredentialSecret::Ssh(s) => CredentialSecretWire::Ssh(SshWire::from(s)),
             CredentialSecret::Aws(a) => CredentialSecretWire::Aws(AwsWire::from(a)),
+            CredentialSecret::Gcp(g) => CredentialSecretWire::Gcp(GcpWire::from(g)),
+        }
+    }
+}
+
+impl From<&GcpCredential> for GcpWire {
+    fn from(g: &GcpCredential) -> Self {
+        match g {
+            GcpCredential::ServiceAccountKey(k) => {
+                GcpWire::ServiceAccountKey(k.expose_secret().to_owned())
+            }
+            GcpCredential::ApplicationDefault => GcpWire::ApplicationDefault,
         }
     }
 }
@@ -210,6 +261,18 @@ impl From<&CredentialSecretWire> for CredentialSecret {
         match w {
             CredentialSecretWire::Ssh(s) => CredentialSecret::Ssh(SshCredential::from(s)),
             CredentialSecretWire::Aws(a) => CredentialSecret::Aws(AwsCredential::from(a)),
+            CredentialSecretWire::Gcp(g) => CredentialSecret::Gcp(GcpCredential::from(g)),
+        }
+    }
+}
+
+impl From<&GcpWire> for GcpCredential {
+    fn from(w: &GcpWire) -> Self {
+        match w {
+            GcpWire::ServiceAccountKey(k) => {
+                GcpCredential::ServiceAccountKey(SecretString::from(k.clone()))
+            }
+            GcpWire::ApplicationDefault => GcpCredential::ApplicationDefault,
         }
     }
 }
