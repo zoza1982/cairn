@@ -1,15 +1,20 @@
 //! The real Docker engine adapter over `bollard`.
 //!
-//! Container and image **listing** are implemented against the Docker Engine API. Browsing a
-//! container's filesystem (`list_dir`/`stat`/`read`) is done over the archive/exec APIs as the
-//! integration step (validated against a live daemon per the M6 CI design); those return
-//! `Unsupported` here until that lands. The full path-routing/mapping is verified via the mock.
+//! Container and image **listing** are implemented against the Docker Engine API. Container
+//! filesystem browsing (`list_dir`/`stat`/`read`) is implemented over the Docker archive endpoint
+//! (`GET /containers/{id}/archive?path=…`), which returns a tar stream. The tar is collected into
+//! memory and then parsed synchronously with the `tar` crate — an adequate approach for M6
+//! (streaming-extract and zero-copy are follow-ups). The full path-routing/mapping is verified via
+//! the mock; the live adapter is validated against a real daemon in the dind integration job.
 
 use crate::ops::{ContainerInfo, ContainerOps, ImageInfo, RemoteEntry, RemoteMeta};
 use async_trait::async_trait;
 use bollard::Docker;
-use cairn_types::{Caps, ContainerState};
+use cairn_types::{Caps, ContainerState, EntryKind, VfsPath};
 use cairn_vfs::VfsError;
+use futures::StreamExt;
+use std::collections::BTreeSet;
+use std::io::Read;
 
 /// A [`ContainerOps`] implementation backed by a live Docker engine via `bollard`.
 pub struct BollardDocker {
@@ -26,6 +31,28 @@ impl BollardDocker {
             .map(|docker| Self { docker })
             .map_err(|e| VfsError::Connection(Box::new(e)))
     }
+
+    /// Fetch a tar archive for the given path inside the container, collecting all stream chunks.
+    ///
+    /// Maps an HTTP 404 from the Docker daemon to [`VfsError::NotFound`]; any other engine error
+    /// becomes [`VfsError::Backend`].
+    async fn fetch_archive(&self, container: &str, path: &str) -> Result<Vec<u8>, VfsError> {
+        let opts = bollard::query_parameters::DownloadFromContainerOptionsBuilder::default()
+            .path(path)
+            .build();
+        let mut stream = self.docker.download_from_container(container, Some(opts));
+        let mut buf = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => buf.extend_from_slice(&chunk),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => return Err(not_found(path)),
+                Err(e) => return Err(backend_err(e)),
+            }
+        }
+        Ok(buf)
+    }
 }
 
 fn backend_err(e: impl std::fmt::Display) -> VfsError {
@@ -34,6 +61,13 @@ fn backend_err(e: impl std::fmt::Display) -> VfsError {
         msg: e.to_string(),
         retryable: false,
     }
+}
+
+/// Build a `NotFound` error for the given container-internal path.  Falls back to the VFS root
+/// if the path is somehow unparseable (which cannot happen for paths we control, but keeps the
+/// error site infallible).
+fn not_found(path: &str) -> VfsError {
+    VfsError::NotFound(VfsPath::parse(path).unwrap_or_else(|_| VfsPath::root()))
 }
 
 /// Map bollard's container-state enum to the cairn-types state.
@@ -49,6 +83,35 @@ fn map_state(s: Option<bollard::models::ContainerSummaryStateEnum>) -> Container
         // REMOVING / STOPPING / EMPTY / None have no precise cairn equivalent.
         _ => ContainerState::Unknown,
     }
+}
+
+/// Return the tar-entry prefix Docker uses when archiving `path`.
+///
+/// The Docker archive API names entries relative to the *parent* of the requested path, using the
+/// basename as the leading component — EXCEPT the root, whose entries Docker names with a leading
+/// `/` (verified against a live daemon). Examples:
+/// - `path = "/"` → entries: ``, `/.dockerenv`, `/bin`, `/bin/ls`, …  → prefix `""` (empty)
+/// - `path = "/etc"` → entries: `etc/`, `etc/hostname`, …             → prefix `"etc/"`
+/// - `path = "/etc/hostname"` → single entry `hostname`               → prefix `"hostname/"` (file)
+///
+/// Entry names are additionally normalized by [`strip_tar_prefix`] to absorb the Docker root `/`
+/// and the Podman/older-Moby `./` variants before this prefix is stripped.
+fn tar_prefix(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        // "/" trims to "" → rsplit_once returns None → root entries are direct children (no prefix).
+        None => String::new(),
+        // "/etc" → ("", "etc") or "/foo/bar" → ("/foo", "bar")
+        Some((_, basename)) => format!("{basename}/"),
+    }
+}
+
+/// Normalize a raw tar entry name to a parent-relative form: strip the Docker root `/` prefix and
+/// the Podman/older-Moby `./` prefix, then strip the directory `prefix` for the listed path. Returns
+/// `None` when the entry is not under `prefix` (e.g. the archive's self-entry).
+fn strip_tar_prefix<'a>(raw: &'a str, prefix: &str) -> Option<&'a str> {
+    let normalized = raw.trim_start_matches("./").trim_start_matches('/');
+    normalized.strip_prefix(prefix)
 }
 
 #[async_trait]
@@ -103,15 +166,177 @@ impl ContainerOps for BollardDocker {
             .collect())
     }
 
-    async fn list_dir(&self, _container: &str, _path: &str) -> Result<Vec<RemoteEntry>, VfsError> {
-        Err(VfsError::Unsupported(Caps::LIST))
+    /// List the immediate children of `path` inside the container's filesystem.
+    ///
+    /// Uses `GET /containers/{container}/archive?path={path}`. The Docker daemon returns a tar
+    /// whose entry names are rooted at the basename of the requested path (e.g. requesting
+    /// `/etc` yields entries `etc/`, `etc/hostname`, `etc/subdir/file`). This method strips that
+    /// prefix, deduplicates intermediate directory names, and returns only the immediate children.
+    ///
+    /// **M6 memory note:** The archive endpoint is recursive — the full subtree (all descendant
+    /// files and their bytes) is streamed and buffered in memory just to enumerate immediate
+    /// children. This is acceptable for M6 but will OOM on large containers. A follow-up should
+    /// use `HEAD /containers/{id}/archive` (archive info endpoint) or a streaming tar walk that
+    /// stops at depth > 1 without buffering file contents.
+    async fn list_dir(&self, container: &str, path: &str) -> Result<Vec<RemoteEntry>, VfsError> {
+        let buf = self.fetch_archive(container, path).await?;
+        let prefix = tar_prefix(path);
+
+        let mut archive = tar::Archive::new(buf.as_slice());
+        let mut seen_dirs = BTreeSet::<String>::new();
+        let mut files: Vec<RemoteEntry> = Vec::new();
+
+        for entry_result in archive.entries().map_err(backend_err)? {
+            let entry = entry_result.map_err(backend_err)?;
+            let entry_path = entry.path().map_err(backend_err)?;
+            let entry_str_raw = entry_path.to_string_lossy();
+
+            // Normalize away the Docker root `/` and Podman/older-Moby `./` prefixes, then strip the
+            // directory prefix to get the path relative to the requested directory.
+            let relative = match strip_tar_prefix(&entry_str_raw, &prefix) {
+                Some(r) => r,
+                None => continue, // entry outside our subtree (e.g. the archive self-entry)
+            };
+
+            // Empty relative path is the self/root entry — skip it.
+            if relative.is_empty() || relative == "." {
+                continue;
+            }
+
+            // Remove trailing slash so we can analyse the components uniformly.
+            let name_part = relative.trim_end_matches('/');
+
+            if let Some(slash_pos) = name_part.find('/') {
+                // This entry is a deeper descendant — the first component is a directory.
+                let dir_name = &name_part[..slash_pos];
+                if !dir_name.is_empty() {
+                    seen_dirs.insert(dir_name.to_owned());
+                }
+            } else if entry.header().entry_type().is_dir() {
+                // Immediate directory child (e.g. `etc/subdir/` stripped to `subdir`).
+                seen_dirs.insert(name_part.to_owned());
+            } else if entry.header().entry_type().is_symlink()
+                || entry.header().entry_type().is_hard_link()
+            {
+                // Symlinks have no own size; hardlink entries in a recursive archive carry header
+                // size 0 (only the first occurrence of the inode is a regular file), so reporting
+                // their `size()` would be a misleading 0. Surface unknown size instead.
+                // TODO(symlinks): present as EntryKind::Symlink once that is added to the VFS surface.
+                files.push(RemoteEntry {
+                    name: name_part.to_owned(),
+                    kind: EntryKind::File,
+                    size: None,
+                });
+            } else {
+                // Immediate file child (regular file, hard link, char/block device, FIFO, etc.).
+                let size = entry.header().size().map_err(backend_err)?;
+                files.push(RemoteEntry {
+                    name: name_part.to_owned(),
+                    kind: EntryKind::File,
+                    size: Some(size),
+                });
+            }
+        }
+
+        // Dirs first (sorted), then files — consistent ordering the UI can rely on.
+        let mut entries: Vec<RemoteEntry> = seen_dirs
+            .into_iter()
+            .map(|name| RemoteEntry {
+                name,
+                kind: EntryKind::Dir,
+                size: None,
+            })
+            .collect();
+        entries.extend(files);
+        Ok(entries)
     }
 
-    async fn stat(&self, _container: &str, _path: &str) -> Result<RemoteMeta, VfsError> {
-        Err(VfsError::Unsupported(Caps::LIST))
+    /// Stat `path` inside the container by examining the first tar entry returned by the archive
+    /// endpoint. A 404 from the daemon maps to [`VfsError::NotFound`].
+    async fn stat(&self, container: &str, path: &str) -> Result<RemoteMeta, VfsError> {
+        let buf = self.fetch_archive(container, path).await?;
+        let mut archive = tar::Archive::new(buf.as_slice());
+        let entry = archive
+            .entries()
+            .map_err(backend_err)?
+            .next()
+            .ok_or_else(|| not_found(path))?
+            .map_err(backend_err)?;
+        let header = entry.header();
+        if header.entry_type().is_dir() {
+            Ok(RemoteMeta {
+                kind: EntryKind::Dir,
+                size: None,
+            })
+        } else {
+            // Symlinks: report as File for now; see TODO in list_dir.
+            Ok(RemoteMeta {
+                kind: EntryKind::File,
+                size: Some(header.size().map_err(backend_err)?),
+            })
+        }
     }
 
-    async fn read(&self, _container: &str, _path: &str) -> Result<Vec<u8>, VfsError> {
-        Err(VfsError::Unsupported(Caps::READ))
+    /// Read the full contents of `path` inside the container.
+    ///
+    /// Downloads the path via the archive endpoint (a tar with a single entry) and reads that
+    /// entry's bytes. A 404 from the daemon maps to [`VfsError::NotFound`]. Reading a directory
+    /// path is rejected with [`VfsError::Unsupported`].
+    async fn read(&self, container: &str, path: &str) -> Result<Vec<u8>, VfsError> {
+        let buf = self.fetch_archive(container, path).await?;
+        let mut archive = tar::Archive::new(buf.as_slice());
+        let mut entry = archive
+            .entries()
+            .map_err(backend_err)?
+            .next()
+            .ok_or_else(|| not_found(path))?
+            .map_err(backend_err)?;
+        if entry.header().entry_type().is_dir() {
+            return Err(VfsError::Unsupported(Caps::READ));
+        }
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).map_err(backend_err)?;
+        Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strip_tar_prefix, tar_prefix};
+
+    #[test]
+    fn tar_prefix_root_is_empty() {
+        // Docker names root archive entries with a leading `/` (not `./`), so the root prefix must
+        // be empty — a non-empty prefix here silently dropped every root child (the M6-2 root bug).
+        assert_eq!(tar_prefix("/"), "");
+        assert_eq!(tar_prefix(""), "");
+    }
+
+    #[test]
+    fn tar_prefix_nested_uses_basename() {
+        assert_eq!(tar_prefix("/etc"), "etc/");
+        assert_eq!(tar_prefix("/etc/ssl"), "ssl/");
+        assert_eq!(tar_prefix("/a/b/c"), "c/");
+    }
+
+    #[test]
+    fn strip_root_entries_docker_style() {
+        // Real Docker root archive: ``, `/.dockerenv`, `/bin`, `/bin/ls`.
+        assert_eq!(strip_tar_prefix("/.dockerenv", ""), Some(".dockerenv"));
+        assert_eq!(strip_tar_prefix("/bin", ""), Some("bin"));
+        assert_eq!(strip_tar_prefix("/bin/ls", ""), Some("bin/ls"));
+        // The archive self-entry (root) collapses to empty and is skipped by the caller.
+        assert_eq!(strip_tar_prefix("/", ""), Some(""));
+        assert_eq!(strip_tar_prefix("", ""), Some(""));
+    }
+
+    #[test]
+    fn strip_nested_entries_docker_and_podman() {
+        // Docker basename-rooted, and the Podman/older-Moby `./` variant.
+        assert_eq!(strip_tar_prefix("etc/hostname", "etc/"), Some("hostname"));
+        assert_eq!(strip_tar_prefix("./etc/hostname", "etc/"), Some("hostname"));
+        assert_eq!(strip_tar_prefix("etc/", "etc/"), Some(""));
+        // An entry outside the requested subtree is rejected.
+        assert_eq!(strip_tar_prefix("var/log", "etc/"), None);
     }
 }
