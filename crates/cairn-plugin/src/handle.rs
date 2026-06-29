@@ -1,17 +1,20 @@
-//! [`PluginReadHandle`] — a [`tokio::io::AsyncRead`] over a guest `read-stream` resource.
+//! Streaming handles bridging guest `read-stream`/`write-sink` resources to Cairn's async I/O traits.
 //!
-//! The stream resource is `!Send` and lives on the plugin thread (see [`crate::bridge`]); this handle
-//! is the `Send + Unpin` async face the rest of Cairn sees. Each `poll_read` that needs more bytes
-//! sends one [`PluginMsg::ReadChunk`] and awaits the `oneshot` reply, buffering any bytes that don't
-//! fit the caller's buffer. An empty chunk is EOF. `Drop` tells the thread to close and free the
-//! resource, so a reader abandoned mid-stream never leaks a guest handle.
+//! Each resource is `!Send` and lives on the plugin thread (see [`crate::bridge`]); these handles are
+//! the `Send` async faces the rest of Cairn sees, talking to the thread by [`ResourceId`].
+//! [`PluginReadHandle`] is a [`tokio::io::AsyncRead`] (one [`PluginMsg::ReadChunk`] per poll that
+//! needs bytes; empty chunk = EOF). [`PluginWriteHandle`] is a [`cairn_vfs::WriteSink`]. Both free
+//! their guest resource on drop, so a handle abandoned mid-stream never leaks.
 
 use crate::bridge::{
-    plugin_dead_error, plugin_error_to_vfs, plugin_stream_limit_error, to_vfs_error, PluginMsg,
-    ResourceId,
+    map_entry_checked, plugin_dead_error, plugin_error_to_vfs, plugin_stream_limit_error,
+    to_vfs_error, PluginMsg, ResourceId,
 };
 use crate::component::WitVfsError;
 use crate::PluginError;
+use bytes::Bytes;
+use cairn_types::Entry;
+use cairn_vfs::{VfsError, WriteSink};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -151,5 +154,75 @@ impl Drop for PluginReadHandle {
     fn drop(&mut self) {
         // Best-effort: free the guest resource. The thread may already be gone.
         let _ = self.tx.send(PluginMsg::CloseRead { id: self.id });
+    }
+}
+
+/// A [`WriteSink`] backed by a guest write sink, identified by [`ResourceId`].
+pub(crate) struct PluginWriteHandle {
+    id: ResourceId,
+    tx: Arc<mpsc::Sender<PluginMsg>>,
+    /// Set once `finish`/`abort` has consumed the sink, so `Drop` doesn't send a spurious abort.
+    done: bool,
+}
+
+impl PluginWriteHandle {
+    pub(crate) fn new(id: ResourceId, tx: Arc<mpsc::Sender<PluginMsg>>) -> Self {
+        Self {
+            id,
+            tx,
+            done: false,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl WriteSink for PluginWriteHandle {
+    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), VfsError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(PluginMsg::WriteChunk {
+                id: self.id,
+                chunk, // `Bytes` moves through the channel — no copy
+                reply: reply_tx,
+            })
+            .map_err(|_| plugin_dead_error())?;
+        reply_rx
+            .await
+            .map_err(|_| plugin_dead_error())?
+            .map_err(plugin_error_to_vfs)?
+            .map_err(to_vfs_error)
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<Entry, VfsError> {
+        self.done = true; // committing — suppress the Drop-time abort
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(PluginMsg::FinishWrite {
+                id: self.id,
+                reply: reply_tx,
+            })
+            .map_err(|_| plugin_dead_error())?;
+        let entry = reply_rx
+            .await
+            .map_err(|_| plugin_dead_error())?
+            .map_err(plugin_error_to_vfs)?
+            .map_err(to_vfs_error)?;
+        // The guest's returned entry name is untrusted (traversal/injection); reject a bad one.
+        map_entry_checked(entry)
+    }
+
+    async fn abort(mut self: Box<Self>) {
+        self.done = true; // explicit abort — Drop must not send a second one
+        let _ = self.tx.send(PluginMsg::AbortWrite { id: self.id });
+    }
+}
+
+impl Drop for PluginWriteHandle {
+    fn drop(&mut self) {
+        // A handle dropped without `finish`/`abort` must not silently commit a partial write — abort
+        // and free the guest resource. No-op if `finish`/`abort` already ran.
+        if !self.done {
+            let _ = self.tx.send(PluginMsg::AbortWrite { id: self.id });
+        }
     }
 }

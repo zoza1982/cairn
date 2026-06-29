@@ -1,10 +1,10 @@
 //! Drive a plugin component through the `Vfs` trait via [`PluginVfsBackend`], against the committed
-//! guest fixture (no WASM toolchain needed in CI). PR1 covered metadata + listing; PR2 adds the
-//! streaming-read path, including the host's defenses against a misbehaving guest.
+//! guest fixture (no WASM toolchain needed in CI). Covers the full contract — metadata, listing,
+//! streaming reads and writes, and mutations — plus the host's defenses against a misbehaving guest.
 
 use cairn_plugin::{engine_config, Limits, PluginComponent, PluginVfsBackend};
 use cairn_types::{Caps, ConnectionId, EntryKind, Scheme, VfsPath};
-use cairn_vfs::{ByteRange, CapabilityProvider, ListOpts, Vfs, VfsError};
+use cairn_vfs::{ByteRange, CapabilityProvider, ListOpts, Recurse, Vfs, VfsError};
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 use wasmtime::Engine;
@@ -31,7 +31,7 @@ async fn scheme_connection_and_caps_are_reported() {
     assert_eq!(b.scheme(), Scheme::Plugin("fixture".into()));
     assert_eq!(b.connection(), ConnectionId(1));
     assert!(b.caps().contains(Caps::LIST) && b.caps().contains(Caps::READ));
-    assert!(!b.caps().contains(Caps::WRITE));
+    assert!(b.caps().contains(Caps::WRITE) && b.caps().contains(Caps::DELETE));
 }
 
 #[tokio::test]
@@ -154,13 +154,95 @@ async fn dropping_a_handle_mid_stream_keeps_the_instance_usable() {
 }
 
 #[tokio::test]
-async fn open_write_is_unsupported_for_now() {
-    // Deferred to M8-3b PR3; must report Unsupported, not panic.
+async fn open_write_streams_and_finish_reports_size() {
+    let b = backend();
+    let mut h = b
+        .open_write(&p("/dir/new.txt"), cairn_vfs::WriteOpts::default())
+        .await
+        .expect("open_write");
+    h.write_chunk(bytes::Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    h.write_chunk(bytes::Bytes::from_static(b"defg"))
+        .await
+        .unwrap();
+    let entry = h.finish().await.expect("finish");
+    assert_eq!(entry.name, "new.txt");
+    assert_eq!(entry.kind, EntryKind::File);
+    assert_eq!(entry.size, Some(7));
+}
+
+#[tokio::test]
+async fn finish_with_a_traversal_name_is_rejected() {
+    // A malicious guest whose `finish` returns an entry name like "../evil" must not pass through —
+    // the host validates the leaf name (traversal / terminal-injection defense), as `list` does.
+    let b = backend();
+    let mut h = b
+        .open_write(&p("/dir/evilname"), cairn_vfs::WriteOpts::default())
+        .await
+        .expect("open_write");
+    h.write_chunk(bytes::Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    assert!(matches!(h.finish().await, Err(VfsError::Backend { .. })));
+}
+
+#[tokio::test]
+async fn open_write_missing_parent_maps_to_not_found() {
     let b = backend();
     assert!(matches!(
-        b.open_write(&p("/dir/a.txt"), cairn_vfs::WriteOpts::default())
+        b.open_write(&p("/nope/x"), cairn_vfs::WriteOpts::default())
             .await,
-        Err(VfsError::Unsupported(_))
+        Err(VfsError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn aborting_a_write_keeps_the_instance_usable() {
+    // Drop a write handle without finishing → the sink is aborted, not committed; the thread lives.
+    let b = backend();
+    {
+        let mut h = b
+            .open_write(&p("/dir/tmp"), cairn_vfs::WriteOpts::default())
+            .await
+            .expect("open_write");
+        h.write_chunk(bytes::Bytes::from_static(b"partial"))
+            .await
+            .unwrap();
+        // `h` dropped here without finish → AbortWrite.
+    }
+    assert_eq!(b.stat(&p("/dir/a.txt")).await.unwrap().name, "a.txt");
+}
+
+#[tokio::test]
+async fn create_dir_maps_ok_and_already_exists() {
+    let b = backend();
+    assert!(b.create_dir(&p("/dir/sub")).await.is_ok());
+    assert!(matches!(
+        b.create_dir(&p("/dir")).await,
+        Err(VfsError::AlreadyExists(_))
+    ));
+}
+
+#[tokio::test]
+async fn remove_threads_the_recursive_flag() {
+    let b = backend();
+    // A non-empty dir is a Conflict without recursion, Ok with it.
+    assert!(matches!(
+        b.remove(&p("/dir"), Recurse::No).await,
+        Err(VfsError::Conflict)
+    ));
+    assert!(b.remove(&p("/dir"), Recurse::Yes).await.is_ok());
+    assert!(b.remove(&p("/dir/a.txt"), Recurse::No).await.is_ok());
+}
+
+#[tokio::test]
+async fn rename_maps_ok_and_not_found() {
+    let b = backend();
+    assert!(b.rename(&p("/dir/a.txt"), &p("/dir/b.txt")).await.is_ok());
+    assert!(matches!(
+        b.rename(&p("/dir/missing"), &p("/dir/x")).await,
+        Err(VfsError::NotFound(_))
     ));
 }
 

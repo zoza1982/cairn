@@ -6,10 +6,11 @@
 //! offline and hermetically testable (WebAssembly executes without any external service).
 //!
 //! The Component Model / WIT interface (ADR-0004, RFC-0006) builds on this core: [`PluginComponent`]
-//! loads a component exporting `cairn:plugin/backend` and calls its non-streaming ops. The full
-//! `PluginVfsBackend: Vfs` async bridge (streaming resources, mutations, granted host imports) is the
-//! next step. What is here proves a misbehaving plugin cannot hang the host or exhaust memory, and
-//! that a guest reaches the host only through granted imports.
+//! loads a component exporting `cairn:plugin/backend`, and [`PluginVfsBackend`] exposes it as a full
+//! async [`Vfs`](cairn_vfs::Vfs) over a dedicated thread — metadata, listing, streaming reads and
+//! writes, and mutations. Still owed before live untrusted use: an epoch deadline + real brokered
+//! host functions (M8-4). What is here proves a misbehaving plugin cannot hang the host or exhaust
+//! memory, and that a guest reaches the host only through granted imports.
 
 use thiserror::Error;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};

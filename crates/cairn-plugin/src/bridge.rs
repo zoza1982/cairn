@@ -4,9 +4,9 @@
 //! A plugin instance is owned by one OS thread ([`plugin_thread`]); the async side
 //! ([`PluginVfsBackend`](crate::PluginVfsBackend)) holds only a `Send + Sync` channel sender and
 //! sends one [`PluginMsg`] per operation, awaiting a `oneshot` reply. This is what lets a `!Send`
-//! `Store` back a `Send + Sync` `Vfs`. PR1 covered metadata + listing (stat + list); PR2 adds
-//! streaming reads (a `read-stream` resource, addressed across calls by a [`ResourceId`]). Writes
-//! and mutations are PR3.
+//! `Store` back a `Send + Sync` `Vfs`. PR1 covered metadata + listing (stat + list); PR2 added
+//! streaming reads (a `read-stream` resource, addressed across calls by a [`ResourceId`]); PR3 adds
+//! streaming writes (a `write-sink` resource) and mutations (create-dir/remove/rename).
 //!
 //! The thread runs until every channel sender is dropped — the async backend *and* any live
 //! `ReadHandle` each hold an `Arc<Sender>` clone, so the instance stays alive exactly as long as
@@ -16,6 +16,7 @@ use crate::component::{
     PluginComponent, ResourceAny, WitByteRange, WitEntry, WitListPageResult, WitVfsError,
 };
 use crate::{Limits, PluginError};
+use bytes::Bytes;
 use cairn_types::{Entry, EntryKind, VfsPath};
 use cairn_vfs::VfsError;
 use std::collections::HashMap;
@@ -60,6 +61,40 @@ pub(crate) enum PluginMsg {
     },
     /// Close a read stream and free its guest resource (fire-and-forget).
     CloseRead { id: ResourceId },
+    /// Open a write sink; reply carries a [`ResourceId`] for the live sink.
+    OpenWrite {
+        path: String,
+        overwrite: bool,
+        size_hint: Option<u64>,
+        reply: Reply<ResourceId>,
+    },
+    /// Write the next chunk to an open sink. `Bytes` so the host→thread hand-off is zero-copy.
+    WriteChunk {
+        id: ResourceId,
+        chunk: Bytes,
+        reply: Reply<()>,
+    },
+    /// Commit a sink and free its guest resource, returning the resulting entry.
+    FinishWrite {
+        id: ResourceId,
+        reply: Reply<WitEntry>,
+    },
+    /// Abort a sink and free its guest resource (fire-and-forget).
+    AbortWrite { id: ResourceId },
+    /// Create a directory.
+    CreateDir { path: String, reply: Reply<()> },
+    /// Remove an entry (optionally recursively).
+    Remove {
+        path: String,
+        recursive: bool,
+        reply: Reply<()>,
+    },
+    /// Rename/move an entry.
+    Rename {
+        src: String,
+        dst: String,
+        reply: Reply<()>,
+    },
 }
 
 /// The plugin thread: owns the `Store`/instance (and the live-resource table) and serves messages
@@ -71,8 +106,11 @@ pub(crate) fn plugin_thread(
     rx: mpsc::Receiver<PluginMsg>,
 ) {
     // Owned guest resource handles live here, never crossing the thread boundary (`ResourceAny` is
-    // `!Send`). The async side refers to them only by `ResourceId`.
-    let mut resources: HashMap<ResourceId, ResourceAny> = HashMap::new();
+    // `!Send`). The async side refers to them only by `ResourceId`. Read streams and write sinks are
+    // kept in separate tables (distinct guest resource types), sharing one id counter so ids are
+    // globally unique.
+    let mut reads: HashMap<ResourceId, ResourceAny> = HashMap::new();
+    let mut sinks: HashMap<ResourceId, ResourceAny> = HashMap::new();
     let mut next_id: ResourceId = 0;
 
     while let Ok(msg) = rx.recv() {
@@ -96,12 +134,12 @@ pub(crate) fn plugin_thread(
                     Ok(Ok(res)) => {
                         let id = next_id;
                         next_id = next_id.wrapping_add(1);
-                        resources.insert(id, res);
+                        reads.insert(id, res);
                         // If the caller's future was dropped between sending `OpenRead` and awaiting
                         // the reply, the resource we just created would otherwise leak (no
                         // `ReadHandle` ever learns its id) — free it on send failure.
                         if reply.send(Ok(Ok(id))).is_err() {
-                            if let Some(res) = resources.remove(&id) {
+                            if let Some(res) = reads.remove(&id) {
                                 component.close_read(res);
                             }
                         }
@@ -121,7 +159,7 @@ pub(crate) fn plugin_thread(
             } => {
                 component.refuel(limits.fuel);
                 // `ResourceAny` is `Copy`, so the handle stays in the table across chunks.
-                let r = match resources.get(&id).copied() {
+                let r = match reads.get(&id).copied() {
                     Some(res) => match component.read_chunk(res, max_bytes) {
                         // Enforce the `<= max_bytes` contract: a malicious guest must not be able to
                         // force a host allocation larger than what we requested.
@@ -138,19 +176,90 @@ pub(crate) fn plugin_thread(
                 let _ = reply.send(r);
             }
             PluginMsg::CloseRead { id } => {
-                if let Some(res) = resources.remove(&id) {
+                if let Some(res) = reads.remove(&id) {
                     component.refuel(limits.fuel);
                     component.close_read(res);
                 }
+            }
+            PluginMsg::OpenWrite {
+                path,
+                overwrite,
+                size_hint,
+                reply,
+            } => {
+                component.refuel(limits.fuel);
+                match component.open_write(&path, overwrite, size_hint) {
+                    Ok(Ok(res)) => {
+                        let id = next_id;
+                        next_id = next_id.wrapping_add(1);
+                        sinks.insert(id, res);
+                        // Free the sink if the caller's future was dropped before learning the id
+                        // (cancellation leak, mirroring `OpenRead`).
+                        if reply.send(Ok(Ok(id))).is_err() {
+                            if let Some(res) = sinks.remove(&id) {
+                                component.abort_write(res);
+                            }
+                        }
+                    }
+                    Ok(Err(we)) => {
+                        let _ = reply.send(Ok(Err(we)));
+                    }
+                    Err(pe) => {
+                        let _ = reply.send(Err(pe));
+                    }
+                }
+            }
+            PluginMsg::WriteChunk { id, chunk, reply } => {
+                component.refuel(limits.fuel);
+                let r = match sinks.get(&id).copied() {
+                    Some(res) => component.write_chunk(res, &chunk),
+                    None => Err(PluginError::Trap("unknown write-sink handle".to_owned())),
+                };
+                let _ = reply.send(r);
+            }
+            PluginMsg::FinishWrite { id, reply } => {
+                component.refuel(limits.fuel);
+                // `finish` consumes the sink, so remove it from the table first.
+                let r = match sinks.remove(&id) {
+                    Some(res) => component.finish_write(res),
+                    None => Err(PluginError::Trap("unknown write-sink handle".to_owned())),
+                };
+                let _ = reply.send(r);
+            }
+            PluginMsg::AbortWrite { id } => {
+                if let Some(res) = sinks.remove(&id) {
+                    component.refuel(limits.fuel);
+                    component.abort_write(res);
+                }
+            }
+            PluginMsg::CreateDir { path, reply } => {
+                component.refuel(limits.fuel);
+                let _ = reply.send(component.create_dir(&path));
+            }
+            PluginMsg::Remove {
+                path,
+                recursive,
+                reply,
+            } => {
+                component.refuel(limits.fuel);
+                let _ = reply.send(component.remove(&path, recursive));
+            }
+            PluginMsg::Rename { src, dst, reply } => {
+                component.refuel(limits.fuel);
+                let _ = reply.send(component.rename(&src, &dst));
             }
         }
     }
 
     // Free any resources still open when the instance shuts down (guest destructors run before the
-    // Store drops).
-    for (_, res) in resources.drain() {
+    // Store drops). Sinks are aborted (no implicit commit on teardown).
+    for (_, res) in reads.drain() {
         component.refuel(limits.fuel);
         component.close_read(res);
+    }
+    for (_, res) in sinks.drain() {
+        component.refuel(limits.fuel);
+        component.abort_write(res);
     }
 }
 
@@ -231,11 +340,17 @@ fn parse_path(p: &str) -> VfsPath {
     })
 }
 
+/// An upper bound on a guest-supplied leaf name. Generous (far above any real filesystem's limit)
+/// but finite, so a guest can't force a multi-megabyte name allocation per entry.
+const MAX_LEAF_NAME: usize = 4096;
+
 /// Whether `name` is a valid leaf name for an [`Entry`] (no path separators, no `.`/`..`, no control
-/// chars). Guest-supplied names are untrusted: a name with `/` would be a traversal vector if a
-/// consumer joined it naively, and control chars are a terminal-injection risk in the renderer.
+/// chars, bounded length). Guest-supplied names are untrusted: a name with `/` would be a traversal
+/// vector if a consumer joined it naively, control chars are a terminal-injection risk in the
+/// renderer, and an unbounded name is a memory vector.
 pub(crate) fn valid_leaf_name(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= MAX_LEAF_NAME
         && name != "."
         && name != ".."
         && !name.contains('/')
@@ -244,7 +359,22 @@ pub(crate) fn valid_leaf_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_control())
 }
 
-/// Map a guest `entry` to a [`cairn_types::Entry`].
+/// Map a single guest `entry`, rejecting an invalid leaf name. `list` *filters* bad entries out of a
+/// page, but single-entry callers (`stat`, write `finish`) have nothing to filter — they must surface
+/// an error rather than hand an unvalidated, possibly traversal/injection-bearing name to a consumer.
+pub(crate) fn map_entry_checked(e: WitEntry) -> Result<Entry, VfsError> {
+    if !valid_leaf_name(&e.name) {
+        return Err(VfsError::Backend {
+            code: "plugin_invalid_entry".into(),
+            msg: "plugin returned an entry with an invalid name".into(),
+            retryable: false,
+        });
+    }
+    Ok(map_entry(e))
+}
+
+/// Map a guest `entry` to a [`cairn_types::Entry`]. Callers handling a single entry should prefer
+/// [`map_entry_checked`]; this is used directly only by `list`, which validates names via its filter.
 pub(crate) fn map_entry(e: WitEntry) -> Entry {
     use crate::component::WitEntryKind;
     Entry {
@@ -288,6 +418,24 @@ mod tests {
         assert!(!valid_leaf_name("a\0b"));
         assert!(!valid_leaf_name("a\nb"));
         assert!(!valid_leaf_name("\x1b[31mred"));
+        assert!(valid_leaf_name(&"a".repeat(MAX_LEAF_NAME)));
+        assert!(!valid_leaf_name(&"a".repeat(MAX_LEAF_NAME + 1)));
+    }
+
+    #[test]
+    fn map_entry_checked_rejects_an_invalid_name() {
+        let bad = WitEntry {
+            name: "../evil".to_owned(),
+            kind: crate::component::WitEntryKind::File,
+            size: Some(1),
+            modified_secs: None,
+            etag: None,
+            symlink_target: None,
+        };
+        assert!(matches!(
+            map_entry_checked(bad),
+            Err(VfsError::Backend { .. })
+        ));
     }
 
     #[test]

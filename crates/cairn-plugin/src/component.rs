@@ -6,10 +6,10 @@
 //! mapped to [`cairn_types::Caps`] so the eventual `PluginVfsBackend: Vfs` reads naturally.
 //!
 //! The granted `host` interface (log/now-secs; brokered fns deny-stubbed) is linked here, and
-//! [`crate::backend::PluginVfsBackend`] exposes this as an async `Vfs` over a dedicated thread.
-//! Deferred (M8-3b PR2/PR3): the streaming `read-stream`/`write-sink` resources and mutations, then
-//! an epoch deadline + the real brokered host functions (M8-4). Verified hermetically against a
-//! committed guest fixture (CI needs no WASM toolchain).
+//! [`crate::backend::PluginVfsBackend`] exposes this as an async `Vfs` over a dedicated thread. The
+//! streaming `read-stream`/`write-sink` resources and mutation calls are wrapped too (PR2/PR3).
+//! Deferred (M8-4): an epoch deadline + the real brokered host functions. Verified hermetically
+//! against a committed guest fixture (CI needs no WASM toolchain).
 
 use crate::{Limits, PluginError};
 use cairn_types::Caps;
@@ -266,6 +266,92 @@ impl PluginComponent {
             .call_close(&mut self.store, stream);
         let _ = stream.resource_drop(&mut self.store);
     }
+
+    /// Open a write sink; returns the owned guest resource handle on success.
+    pub(crate) fn open_write(
+        &mut self,
+        path: &str,
+        overwrite: bool,
+        size_hint: Option<u64>,
+    ) -> Result<Result<ResourceAny, WitVfsError>, PluginError> {
+        self.bindings
+            .cairn_plugin_backend()
+            .call_open_write(&mut self.store, path, overwrite, size_hint)
+            .map_err(trap)
+    }
+
+    /// Write the next chunk to a write sink.
+    pub(crate) fn write_chunk(
+        &mut self,
+        sink: ResourceAny,
+        chunk: &[u8],
+    ) -> Result<Result<(), WitVfsError>, PluginError> {
+        self.bindings
+            .cairn_plugin_backend()
+            .write_sink()
+            .call_write_chunk(&mut self.store, sink, chunk)
+            .map_err(trap)
+    }
+
+    /// Commit a write sink and free the guest resource, returning the resulting entry.
+    pub(crate) fn finish_write(
+        &mut self,
+        sink: ResourceAny,
+    ) -> Result<Result<Entry, WitVfsError>, PluginError> {
+        let r = self
+            .bindings
+            .cairn_plugin_backend()
+            .write_sink()
+            .call_finish(&mut self.store, sink)
+            .map_err(trap);
+        let _ = sink.resource_drop(&mut self.store);
+        r
+    }
+
+    /// Abort a write sink (discard partial data) and free the guest resource.
+    pub(crate) fn abort_write(&mut self, sink: ResourceAny) {
+        let _ = self
+            .bindings
+            .cairn_plugin_backend()
+            .write_sink()
+            .call_abort(&mut self.store, sink);
+        let _ = sink.resource_drop(&mut self.store);
+    }
+
+    /// Create a directory.
+    pub(crate) fn create_dir(
+        &mut self,
+        path: &str,
+    ) -> Result<Result<(), WitVfsError>, PluginError> {
+        self.bindings
+            .cairn_plugin_backend()
+            .call_create_dir(&mut self.store, path)
+            .map_err(trap)
+    }
+
+    /// Remove an entry (optionally recursively).
+    pub(crate) fn remove(
+        &mut self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Result<(), WitVfsError>, PluginError> {
+        self.bindings
+            .cairn_plugin_backend()
+            .call_remove(&mut self.store, path, recursive)
+            .map_err(trap)
+    }
+
+    /// Rename/move an entry.
+    pub(crate) fn rename(
+        &mut self,
+        src: &str,
+        dst: &str,
+    ) -> Result<Result<(), WitVfsError>, PluginError> {
+        self.bindings
+            .cairn_plugin_backend()
+            .call_rename(&mut self.store, src, dst)
+            .map_err(trap)
+    }
 }
 
 /// A [`Config`] with the settings [`PluginComponent::instantiate`] requires: the component model and
@@ -348,7 +434,7 @@ mod tests {
         assert_eq!(p.scheme().unwrap(), "fixture");
         let caps = p.caps().unwrap();
         assert!(caps.contains(Caps::LIST) && caps.contains(Caps::READ));
-        assert!(!caps.contains(Caps::WRITE));
+        assert!(caps.contains(Caps::WRITE) && caps.contains(Caps::RENAME));
     }
 
     #[test]

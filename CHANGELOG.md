@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **WASM plugin backend — streaming writes + mutations** (M8-3b): `PluginVfsBackend` now implements
+  the **full `Vfs` contract**. `open_write` bridges a guest `write-sink` resource to a `WriteHandle`
+  (chunked write → `finish` returns the resulting `Entry`); a handle dropped without `finish` aborts
+  the write rather than silently committing a partial one. `create_dir`/`remove` (with the recursive
+  flag) /`rename` are wired through to the guest, each error mapped to the matching `VfsError`. Like
+  reads, write sinks are owned on the plugin thread and freed on drop. The entry name a guest returns
+  from `finish` (and `stat`) is now validated as a leaf name — rejecting traversal/control-char
+  injection — and leaf names are length-bounded, matching the `list` defense. (The `cargo-component`
+  fixture is rebuilt and committed.) Remaining before live untrusted use: an epoch deadline + the real
+  brokered host functions (M8-4).
 - **WASM plugin backend — streaming reads** (M8-3b): `PluginVfsBackend::open_read` now bridges a
   guest `read-stream` resource to a `tokio::io::AsyncRead` (`ReadHandle`), so a plugin-backed file
   reads (and ranged-reads) like any built-in backend. The resource is owned on the plugin thread

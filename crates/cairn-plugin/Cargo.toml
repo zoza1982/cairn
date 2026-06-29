@@ -16,6 +16,8 @@ workspace = true
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
 async-trait = "0.1"
+# `WriteSink::write_chunk` takes a `bytes::Bytes`; same crate/version cairn-vfs uses for that trait.
+bytes = "1"
 futures = "0.3"
 thiserror = "2"
 tracing = "0.1"
