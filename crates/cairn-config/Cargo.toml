@@ -13,10 +13,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-directories = "5"
+directories = "6"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-toml = "0.8"
+toml = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Safe `getuid` for the shell-action config file-trust check (no `unsafe`; the workspace forbids it).
