@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cairn-broker-api` — compile-time AI/plugin secret isolation** (M3-4, RFC-0008): a new crate
+  exposing only the secret-free credential boundary (`CredentialDirectory` + `CredentialInfo`). The
+  AI and plugin layers now depend on it instead of `cairn-broker`, so `cairn-ai` no longer pulls
+  `cairn-vault` into its dependency graph and cannot even *name* a secret-returning API. A
+  `cargo metadata` dependency-closure test fails CI if `cairn-broker`/`cairn-vault`/`cairn-secrets`
+  ever re-enter the `cairn-ai`/`cairn-plugin` graph — turning the "AI never sees raw secrets" property
+  from a convention into a guarantee. The non-secret `CredentialId` moved to `cairn-types`
+  (re-exported from `cairn-vault` for compatibility).
+
 ### Changed
 - **Feature-gated network backends + lean/full CI split** (ADR-0006): the heavy/TLS-bearing backend
   SDKs now sit behind non-default Cargo features so the default build stays lean and cross-platform.

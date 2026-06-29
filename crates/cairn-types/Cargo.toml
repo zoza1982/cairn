@@ -16,3 +16,6 @@ workspace = true
 bitflags = "2"
 smol_str = "0.3"
 thiserror = "2"
+# Only the `CredentialId` type alias — no features needed here (the leaf must not force `v4`/`getrandom`
+# or `serde` onto every consumer). `cairn-vault` enables the features it actually uses.
+uuid = { version = "1", default-features = false }

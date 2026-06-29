@@ -1,0 +1,20 @@
+[package]
+name = "cairn-broker-api"
+description = "The secret-free credential boundary (CredentialDirectory) the AI and plugin layers depend on."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types = { workspace = true }
+
+[dev-dependencies]
+# Used only by tests/isolation.rs to assert the secret-isolation dependency invariant.
+cargo_metadata = "0.18"

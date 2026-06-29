@@ -2,6 +2,11 @@
 
 use smol_str::SmolStr;
 
+/// A stable, non-secret handle to a stored credential. Lives here (the shared leaf) rather than in
+/// `cairn-vault` so the secret-free `cairn-broker-api` boundary can name it without depending on the
+/// vault — see RFC-0008. It is an identifier only; it carries no secret material.
+pub type CredentialId = uuid::Uuid;
+
 /// An opaque handle to a configured (and possibly connected) backend instance.
 ///
 /// The UI never constructs one directly; the connection registry hands them out.

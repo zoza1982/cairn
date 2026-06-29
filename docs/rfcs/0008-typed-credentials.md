@@ -1,6 +1,6 @@
 # RFC-0008: Typed per-backend credentials, keychain unlock, and the broker-api split
 
-- **Status:** Proposed
+- **Status:** Accepted — §3 (broker-api split) implemented in M3-4 PR-A; §1/§2/§4/§5 pending
 - **Author(s):** security-engineer (synthesized), software-architect
 - **Date:** 2026-06-29
 - **Tracking item:** M3-4 (typed credential variants), M3-3 (OS keychain + auto-lock), M3-7 (vault-unlock TUI)

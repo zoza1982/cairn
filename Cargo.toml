@@ -25,6 +25,7 @@ cairn-transfer = { path = "crates/cairn-transfer", version = "0.0.0" }
 cairn-secrets = { path = "crates/cairn-secrets", version = "0.0.0" }
 cairn-vault = { path = "crates/cairn-vault", version = "0.0.0" }
 cairn-broker = { path = "crates/cairn-broker", version = "0.0.0" }
+cairn-broker-api = { path = "crates/cairn-broker-api", version = "0.0.0" }
 cairn-config = { path = "crates/cairn-config", version = "0.0.0" }
 cairn-ai = { path = "crates/cairn-ai", version = "0.0.0" }
 cairn-backend-object = { path = "crates/cairn-backend-object", version = "0.0.0" }

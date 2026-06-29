@@ -311,7 +311,7 @@ name = "cairn-ai"
 version = "0.0.0"
 dependencies = [
  "async-trait",
- "cairn-broker",
+ "cairn-broker-api",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -386,10 +386,19 @@ dependencies = [
 name = "cairn-broker"
 version = "0.0.0"
 dependencies = [
+ "cairn-broker-api",
  "cairn-secrets",
  "cairn-vault",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "cairn-broker-api"
+version = "0.0.0"
+dependencies = [
+ "cairn-types",
+ "cargo_metadata",
 ]
 
 [[package]]
@@ -471,6 +480,7 @@ dependencies = [
  "bitflags 2.13.0",
  "smol_str",
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -479,6 +489,7 @@ version = "0.0.0"
 dependencies = [
  "argon2",
  "cairn-secrets",
+ "cairn-types",
  "chacha20poly1305",
  "getrandom 0.4.3",
  "postcard",
@@ -500,6 +511,15 @@ dependencies = [
  "smol_str",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "camino"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f2d30e4173c4026932d51d31d6b0613b1fd3014bf3f9f8943d4ba139c437ba0"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -568,6 +588,29 @@ dependencies = [
  "once_cell",
  "rustix",
  "winx",
+]
+
+[[package]]
+name = "cargo-platform"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e35af189006b9c0f00a064685c727031e3ed2d8020f7ba284d78cc2671bd36ea"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cargo_metadata"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d886547e41f740c616ae73108f6eb70afe6d940c7bc697cb30f13daec073037"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

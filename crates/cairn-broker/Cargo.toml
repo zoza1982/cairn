@@ -13,6 +13,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+cairn-broker-api = { workspace = true }
 cairn-secrets = { workspace = true }
 cairn-vault = { workspace = true }
 thiserror = "2"
