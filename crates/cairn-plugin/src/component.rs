@@ -134,6 +134,12 @@ impl PluginComponent {
         let mut linker: Linker<CompState> = Linker::new(engine);
         // The dedicated-thread `Vfs` bridge makes synchronous guest calls, so the sync WASI linker
         // is correct (no async linker needed).
+        //
+        // SECURITY: this links the *full* WASI 0.2 surface, which includes a blocking `wasi:io/poll`.
+        // The epoch deadline cannot interrupt a guest blocked inside that native call (epoch only
+        // traps in guest wasm — see `crate::epoch`), so a malicious guest could park this thread.
+        // Acceptable only because plugins are not yet user-loadable; narrowing this to the
+        // non-blocking subset a backend actually needs is gated before live untrusted use (M8-5).
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| PluginError::Instantiate(e.to_string()))?;
         // The granted `host` interface (log/now-secs real; brokered fns deny-stubbed — see `Host`).
@@ -157,15 +163,28 @@ impl PluginComponent {
         store
             .set_fuel(limits.fuel)
             .map_err(|e| PluginError::Instantiate(e.to_string()))?;
+        // Epoch interruption is enabled on the engine (see `engine_config`), so a deadline MUST be
+        // armed or the guest traps on its first instruction. The bridge re-arms it before every op;
+        // this initial arm covers direct (non-bridge) calls too. `.max(1)`: 0 would trap immediately.
+        store.set_epoch_deadline(limits.max_call_ticks.max(1));
         let bindings = BackendPlugin::instantiate(&mut store, &component, &linker)
             .map_err(|e| PluginError::Instantiate(e.to_string()))?;
         Ok(Self { store, bindings })
     }
 
-    /// Reset the fuel budget. The dedicated-thread bridge calls this before each `Vfs` op so every
-    /// call gets its own budget rather than sharing one cumulative pool across the instance lifetime.
-    pub(crate) fn refuel(&mut self, fuel: u64) {
-        let _ = self.store.set_fuel(fuel);
+    /// Re-arm both per-call budgets (fuel + the wall-clock epoch deadline) before a guest op, so each
+    /// op gets its own budget rather than sharing one cumulative pool across the instance lifetime.
+    /// The epoch deadline only bites while an [`EpochTicker`](crate::EpochTicker) advances the
+    /// engine's epoch.
+    pub(crate) fn arm(&mut self, limits: Limits) {
+        let _ = self.store.set_fuel(limits.fuel);
+        // `.max(1)`: a 0-tick deadline would trap the very next op (deadline == current epoch).
+        self.store.set_epoch_deadline(limits.max_call_ticks.max(1));
+    }
+
+    /// The engine backing this instance — used to spawn an [`EpochTicker`](crate::EpochTicker).
+    pub(crate) fn engine(&self) -> &Engine {
+        self.store.engine()
     }
 
     /// The URI scheme this backend serves (e.g. `"mycloud"`).
@@ -354,22 +373,31 @@ impl PluginComponent {
     }
 }
 
-/// A [`Config`] with the settings [`PluginComponent::instantiate`] requires: the component model and
-/// fuel metering. Pass it to [`Engine::new`].
+/// A [`Config`] with the settings [`PluginComponent::instantiate`] requires: the component model,
+/// fuel metering, and **epoch interruption** (the wall-clock backstop; see
+/// [`EpochTicker`](crate::EpochTicker)). Pass it to [`Engine::new`].
+///
+/// NB: because epoch interruption is on, every store from this engine traps immediately unless a
+/// deadline is armed — `PluginComponent::instantiate` does so (and the bridge re-arms per op).
 #[must_use]
 pub fn engine_config() -> Config {
     let mut cfg = Config::new();
     cfg.consume_fuel(true);
     cfg.wasm_component_model(true);
+    cfg.epoch_interruption(true);
     cfg
 }
 
-/// Map a guest call error into a [`PluginError`], distinguishing fuel exhaustion from a crash (mirrors
-/// the core-module path's `map_call_err`) so callers can tell "resource-killed" from "trapped".
+/// Map a guest call error into a [`PluginError`], distinguishing fuel exhaustion and the wall-clock
+/// (epoch) deadline from a crash (mirrors the core-module path's `map_call_err`) so callers can tell
+/// "resource-killed" from "trapped".
 fn trap(e: wasmtime::Error) -> PluginError {
     if let Some(trap) = e.downcast_ref::<Trap>() {
         if *trap == Trap::OutOfFuel {
             return PluginError::OutOfFuel;
+        }
+        if *trap == Trap::Interrupt {
+            return PluginError::Timeout;
         }
         return PluginError::Trap(trap.to_string());
     }

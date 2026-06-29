@@ -8,9 +8,11 @@
 //! The Component Model / WIT interface (ADR-0004, RFC-0006) builds on this core: [`PluginComponent`]
 //! loads a component exporting `cairn:plugin/backend`, and [`PluginVfsBackend`] exposes it as a full
 //! async [`Vfs`](cairn_vfs::Vfs) over a dedicated thread — metadata, listing, streaming reads and
-//! writes, and mutations. Still owed before live untrusted use: an epoch deadline + real brokered
-//! host functions (M8-4). What is here proves a misbehaving plugin cannot hang the host or exhaust
-//! memory, and that a guest reaches the host only through granted imports.
+//! writes, and mutations. A spinning guest is bounded by both fuel and a wall-clock [`EpochTicker`]
+//! deadline. Still owed before live untrusted use: narrowing the linked WASI surface (a guest can
+//! still *block* in `wasi:io/poll`, which epoch can't interrupt) and the real brokered host functions
+//! (M8-4/M8-5). What is here proves a misbehaving plugin cannot hang the host with pure computation
+//! or exhaust memory, and that a guest reaches the host only through granted imports.
 
 use thiserror::Error;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
@@ -18,9 +20,11 @@ use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBu
 mod backend;
 mod bridge;
 mod component;
+mod epoch;
 mod handle;
 pub use backend::PluginVfsBackend;
 pub use component::{engine_config, PluginComponent};
+pub use epoch::EpochTicker;
 
 /// Per-instance resource limits.
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +38,14 @@ pub struct Limits {
     /// page cap). Generous by default; raise it for a backend that legitimately serves larger
     /// objects.
     pub max_stream_bytes: u64,
+    /// Wall-clock deadline for a single guest call, in [`EpochTicker`] ticks. Fuel bounds
+    /// *instructions* but does not advance while a guest spins, so a wall-clock **epoch** deadline is
+    /// the companion bound on wall time. It is re-armed **per op** (not per session — a guest can be
+    /// slow on every call without tripping it); effective timeout ≈ `max_call_ticks × EpochTicker`
+    /// interval. Clamped to ≥ 1 (0 would trap every call immediately). Only enforced while an
+    /// [`EpochTicker`] drives the engine's epoch (the `PluginVfsBackend` bridge spawns one). NB: epoch
+    /// cannot interrupt a guest *blocked inside a host/WASI call* — see the `epoch` module docs.
+    pub max_call_ticks: u64,
 }
 
 impl Default for Limits {
@@ -42,6 +54,8 @@ impl Default for Limits {
             max_memory_bytes: 16 * 1024 * 1024,
             fuel: 100_000_000,
             max_stream_bytes: 4 * 1024 * 1024 * 1024,
+            // 50 ticks × the bridge's 100 ms interval ≈ a 5 s per-call wall-clock ceiling.
+            max_call_ticks: 50,
         }
     }
 }
@@ -62,6 +76,9 @@ pub enum PluginError {
     /// The guest exhausted its execution fuel.
     #[error("plugin exceeded its fuel limit")]
     OutOfFuel,
+    /// The guest exceeded its wall-clock (epoch) deadline — e.g. spun or blocked too long.
+    #[error("plugin exceeded its time limit")]
+    Timeout,
     /// The guest trapped during execution.
     #[error("plugin trapped: {0}")]
     Trap(String),
@@ -132,6 +149,11 @@ impl PluginHost {
         if let Some(trap) = e.downcast_ref::<Trap>() {
             if *trap == Trap::OutOfFuel {
                 return PluginError::OutOfFuel;
+            }
+            // Unreachable for `PluginHost` (its engine has no `epoch_interruption`); kept for
+            // symmetry with `component::trap`, which runs on an epoch-enabled engine.
+            if *trap == Trap::Interrupt {
+                return PluginError::Timeout;
             }
             return PluginError::Trap(trap.to_string());
         }
