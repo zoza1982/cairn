@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **SSH/SFTP live backend** (M4, RFC-0003): the first network backend can now establish a real
+  connection. `cairn-backend-ssh` gains `ssh_connect` (behind the non-default `ssh` feature) — TCP →
+  russh handshake → host-key verification (`HostKeyPolicy::Strict` / `AcceptNew` TOFU; a changed key
+  is always rejected, and there is no "accept anything" mode) → authentication (password / private
+  key + passphrase / SSH agent) → open the `sftp` subsystem → a ready `SftpVfs`. It consumes the
+  typed `CredentialSecret::Ssh` from the broker. The `russh` stack is feature-gated so the lean,
+  cross-platform build (and Windows/macOS CI) never compiles it; the `russh-sftp` adapter stays
+  unconditional. Connection pooling/keepalive, jump hosts, and `~/.ssh/config` parsing are follow-ups.
 - **Typed credential model** (M3-4, RFC-0008): the vault now stores a typed `CredentialSecret`
   (starting with the SSH variant: password / private-key+passphrase / agent) instead of a flat
   string. The public secret type implements neither `Debug` nor `Serialize` — a `compile_fail` test

@@ -12,14 +12,27 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# The live SSH connection layer (russh) + the typed credential it consumes (cairn-vault). Off by
+# default so the lean, cross-platform build builds only the `SftpOps` seam + the russh-sftp adapter
+# (TLS-free); the full build (Linux) and the sshd integration job enable it. See ADR-0006 / RFC-0003.
+# `tokio/time` is only used by the gated connector, so keep it out of the lean build.
+ssh = ["dep:russh", "dep:cairn-vault", "tokio/time"]
+
 [dependencies]
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
+# Consumed only by the live connector (the typed SSH credential); the backend is part of the
+# execution layer that legitimately handles secrets (the AI/plugin isolation is enforced elsewhere).
+cairn-vault = { workspace = true, optional = true }
 async-trait = "0.1"
 bytes = "1"
 futures = "0.3"
+russh = { version = "0.61", optional = true }
 russh-sftp = "2"
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net", "time"] }
+tempfile = "3"

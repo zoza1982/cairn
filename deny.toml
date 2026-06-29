@@ -12,6 +12,12 @@ ignore = [
     # `atomic-polyfill` unmaintained; pulled transitively via postcard -> heapless. No security
     # surface for our use. Revisit when postcard/heapless drop it.
     "RUSTSEC-2023-0089",
+    # Marvin timing side-channel in the `rsa` crate (pulled by russh/ssh-key for SSH RSA key
+    # support, behind the non-default `ssh` feature). No fixed upstream version exists. The attack is
+    # a timing oracle on RSA *decryption* (PKCS#1 v1.5); Cairn's SSH client only *signs* an auth
+    # challenge with the user's key — it never decrypts attacker-controlled ciphertext — so the
+    # client-side exposure is minimal. Mitigation: prefer Ed25519 keys. Revisit when `rsa` ships a fix.
+    "RUSTSEC-2023-0071",
 ]
 
 [licenses]
