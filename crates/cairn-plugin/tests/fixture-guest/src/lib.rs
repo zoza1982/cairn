@@ -41,6 +41,8 @@ enum Mode {
     Infinite,
     /// Returns one byte *more* than the host requested (a `<= max_bytes` contract violation).
     Oversized,
+    /// Spins forever inside the call — exercises the host's wall-clock (epoch) deadline.
+    Spin,
 }
 
 /// A read stream. `Cell` gives interior mutability for the cursor (the WIT resource methods take
@@ -62,6 +64,10 @@ impl GuestReadStream for MemReadStream {
             }
             Mode::Infinite => Ok(vec![b'x'; max_bytes as usize]),
             Mode::Oversized => Ok(vec![b'x'; max_bytes as usize + 1]),
+            #[allow(clippy::empty_loop)]
+            Mode::Spin => loop {
+                core::hint::spin_loop();
+            },
         }
     }
     fn close(&self) {}
@@ -161,6 +167,7 @@ impl Guest for Fixture {
             }
             "/dir/infinite" => Mode::Infinite,
             "/dir/oversized" => Mode::Oversized,
+            "/dir/spin" => Mode::Spin,
             _ => return Err(VfsError::NotFound(path)),
         };
         Ok(ReadStream::new(MemReadStream {

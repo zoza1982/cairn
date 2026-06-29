@@ -15,6 +15,7 @@
 use crate::component::{
     PluginComponent, ResourceAny, WitByteRange, WitEntry, WitListPageResult, WitVfsError,
 };
+use crate::epoch::EpochTicker;
 use crate::{Limits, PluginError};
 use bytes::Bytes;
 use cairn_types::{Entry, EntryKind, VfsPath};
@@ -97,14 +98,30 @@ pub(crate) enum PluginMsg {
     },
 }
 
+/// How often the [`EpochTicker`] advances the engine's epoch. Combined with `Limits::max_call_ticks`
+/// this sets the per-call wall-clock ceiling (default 50 × 100 ms ≈ 5 s). Coarse on purpose — epoch
+/// interruption is a backstop, not a precise deadline (fuel is the fine-grained, deterministic bound).
+const EPOCH_TICK: Duration = Duration::from_millis(100);
+
 /// The plugin thread: owns the `Store`/instance (and the live-resource table) and serves messages
-/// until every sender is dropped (`recv` then errors). Refuels before each guest call so every op
-/// gets its own fuel budget.
+/// until every sender is dropped (`recv` then errors). Arms fuel + the epoch deadline before each
+/// guest call so every op gets its own budget.
 pub(crate) fn plugin_thread(
     mut component: PluginComponent,
     limits: Limits,
     rx: mpsc::Receiver<PluginMsg>,
 ) {
+    // Drive the engine's epoch for this instance's whole lifetime so the per-call epoch deadline
+    // actually fires. Tied to the thread (not the backend), so it also covers a `ReadHandle` that
+    // outlives the backend (such a handle keeps this thread — and thus the ticker — alive). Dropped
+    // when the thread exits.
+    //
+    // INVARIANT: one `Engine` per instance (each `PluginVfsBackend` is built from its own engine), so
+    // exactly one ticker drives each engine's epoch. If a future caller shares one engine across
+    // instances it must share a single ticker too — N tickers advance one epoch N× and shrink the
+    // effective deadline to 1/N (see `crate::epoch`).
+    let _ticker = EpochTicker::spawn(component.engine(), EPOCH_TICK);
+
     // Owned guest resource handles live here, never crossing the thread boundary (`ResourceAny` is
     // `!Send`). The async side refers to them only by `ResourceId`. Read streams and write sinks are
     // kept in separate tables (distinct guest resource types), sharing one id counter so ids are
@@ -116,7 +133,7 @@ pub(crate) fn plugin_thread(
     while let Ok(msg) = rx.recv() {
         match msg {
             PluginMsg::Stat { path, reply } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 let _ = reply.send(component.stat(&path));
             }
             PluginMsg::ListPage {
@@ -125,11 +142,11 @@ pub(crate) fn plugin_thread(
                 include_hidden,
                 reply,
             } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 let _ = reply.send(component.list_page(&dir, cursor.as_deref(), include_hidden));
             }
             PluginMsg::OpenRead { path, range, reply } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 match component.open_read(&path, range) {
                     Ok(Ok(res)) => {
                         let id = next_id;
@@ -157,7 +174,7 @@ pub(crate) fn plugin_thread(
                 max_bytes,
                 reply,
             } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 // `ResourceAny` is `Copy`, so the handle stays in the table across chunks.
                 let r = match reads.get(&id).copied() {
                     Some(res) => match component.read_chunk(res, max_bytes) {
@@ -177,7 +194,7 @@ pub(crate) fn plugin_thread(
             }
             PluginMsg::CloseRead { id } => {
                 if let Some(res) = reads.remove(&id) {
-                    component.refuel(limits.fuel);
+                    component.arm(limits);
                     component.close_read(res);
                 }
             }
@@ -187,7 +204,7 @@ pub(crate) fn plugin_thread(
                 size_hint,
                 reply,
             } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 match component.open_write(&path, overwrite, size_hint) {
                     Ok(Ok(res)) => {
                         let id = next_id;
@@ -210,7 +227,7 @@ pub(crate) fn plugin_thread(
                 }
             }
             PluginMsg::WriteChunk { id, chunk, reply } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 let r = match sinks.get(&id).copied() {
                     Some(res) => component.write_chunk(res, &chunk),
                     None => Err(PluginError::Trap("unknown write-sink handle".to_owned())),
@@ -218,7 +235,7 @@ pub(crate) fn plugin_thread(
                 let _ = reply.send(r);
             }
             PluginMsg::FinishWrite { id, reply } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 // `finish` consumes the sink, so remove it from the table first.
                 let r = match sinks.remove(&id) {
                     Some(res) => component.finish_write(res),
@@ -228,12 +245,12 @@ pub(crate) fn plugin_thread(
             }
             PluginMsg::AbortWrite { id } => {
                 if let Some(res) = sinks.remove(&id) {
-                    component.refuel(limits.fuel);
+                    component.arm(limits);
                     component.abort_write(res);
                 }
             }
             PluginMsg::CreateDir { path, reply } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 let _ = reply.send(component.create_dir(&path));
             }
             PluginMsg::Remove {
@@ -241,11 +258,11 @@ pub(crate) fn plugin_thread(
                 recursive,
                 reply,
             } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 let _ = reply.send(component.remove(&path, recursive));
             }
             PluginMsg::Rename { src, dst, reply } => {
-                component.refuel(limits.fuel);
+                component.arm(limits);
                 let _ = reply.send(component.rename(&src, &dst));
             }
         }
@@ -254,11 +271,11 @@ pub(crate) fn plugin_thread(
     // Free any resources still open when the instance shuts down (guest destructors run before the
     // Store drops). Sinks are aborted (no implicit commit on teardown).
     for (_, res) in reads.drain() {
-        component.refuel(limits.fuel);
+        component.arm(limits);
         component.close_read(res);
     }
     for (_, res) in sinks.drain() {
-        component.refuel(limits.fuel);
+        component.arm(limits);
         component.abort_write(res);
     }
 }
@@ -295,6 +312,7 @@ fn sanitize_msg(s: String) -> String {
 pub(crate) fn plugin_error_to_vfs(e: PluginError) -> VfsError {
     let code = match &e {
         PluginError::OutOfFuel => "plugin_fuel_exhausted",
+        PluginError::Timeout => "plugin_timeout",
         PluginError::Trap(_) => "plugin_trap",
         PluginError::Compile(_) => "plugin_compile",
         PluginError::Instantiate(_) => "plugin_instantiate",
@@ -420,6 +438,24 @@ mod tests {
         assert!(!valid_leaf_name("\x1b[31mred"));
         assert!(valid_leaf_name(&"a".repeat(MAX_LEAF_NAME)));
         assert!(!valid_leaf_name(&"a".repeat(MAX_LEAF_NAME + 1)));
+    }
+
+    #[test]
+    fn plugin_error_to_vfs_maps_timeout_and_fuel() {
+        for (err, code) in [
+            (PluginError::Timeout, "plugin_timeout"),
+            (PluginError::OutOfFuel, "plugin_fuel_exhausted"),
+        ] {
+            match plugin_error_to_vfs(err) {
+                VfsError::Backend {
+                    code: c, retryable, ..
+                } => {
+                    assert_eq!(c, code);
+                    assert!(!retryable);
+                }
+                other => panic!("expected Backend, got {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -138,6 +138,31 @@ async fn read_chunk_larger_than_requested_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_spinning_guest_call_hits_the_wall_clock_deadline() {
+    // End-to-end: a guest that spins inside a call is trapped by the epoch deadline (not fuel) and
+    // surfaces as a `plugin_timeout` backend error. Huge fuel so the *epoch* wins the race; a tiny
+    // tick budget so it fires fast. `tokio::time::timeout` is a safety net: if the deadline somehow
+    // never fires the test fails instead of hanging CI.
+    let limits = Limits {
+        fuel: u64::MAX,
+        max_call_ticks: 1,
+        ..Limits::default()
+    };
+    let b = backend_with(limits);
+    let mut h = b.open_read(&p("/dir/spin"), None).await.expect("open");
+    let mut out = Vec::new();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(30), h.read_to_end(&mut out));
+    let err = read
+        .await
+        .expect("epoch deadline must fire well within 30s")
+        .expect_err("a spinning guest must error, not return data");
+    assert!(
+        err.to_string().contains("plugin_timeout"),
+        "expected a plugin_timeout error, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn dropping_a_handle_mid_stream_keeps_the_instance_usable() {
     // Abandoning a read without reaching EOF must free the guest resource (via the handle's Drop)
     // and leave the thread alive for further operations — i.e. no leak, no deadlock.

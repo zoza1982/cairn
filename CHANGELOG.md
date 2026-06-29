@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **WASM plugin wall-clock deadline** (M8-4): guests now have an **epoch** time limit alongside the
+  fuel (instruction) limit. An `EpochTicker` advances the engine's epoch on a fixed interval and each
+  guest op arms a deadline (`Limits::max_call_ticks`, ≈5 s by default), trapping a guest that *spins*
+  past it as a `plugin_timeout` error. The ticker is tied to the instance lifetime and holds only a
+  weak engine handle, so it never leaks a thread or keeps an engine alive. Note: epoch only interrupts
+  guest wasm, not a guest *blocked inside a host/WASI call* (e.g. `wasi:io/poll`); narrowing the
+  linked WASI surface to bound that is gated before exposing untrusted plugins live (M8-5).
 - **WASM plugin backend — streaming writes + mutations** (M8-3b): `PluginVfsBackend` now implements
   the **full `Vfs` contract**. `open_write` bridges a guest `write-sink` resource to a `WriteHandle`
   (chunked write → `finish` returns the resulting `Entry`); a handle dropped without `finish` aborts
