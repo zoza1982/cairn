@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Azure Blob object-store live backend** (M5-9, ADR-0003): `cairn-backend-object` gains
+  `AzureObjectStore` and `azure_connect` (behind the non-default `azure` feature), an
+  `azure_storage_blobs` adapter implementing the same `ObjectStore` seam — list (prefix/delimiter +
+  continuation), head, ranged read, write, delete, and server-side copy. Credentials come from the
+  broker as the typed `CredentialSecret::Azure`: a storage-account shared key or a SAS token (Azure
+  AD is reserved in the vault but not yet wired in the adapter). The 0.21 SDK line is used (the 1.0
+  rewrite is AAD-only and can't talk to Azurite) on the rustls stack (no OpenSSL). A live **Azurite**
+  integration job (env-guarded by `CAIRN_IT_AZURE`) exercises the full round-trip — the third backend
+  with a real emulator gate (alongside the S3 MinIO job). This completes the v0.1 "functional on
+  GCS/Azure" contract.
+- **Azure credential variant** (M5 / M3-4, RFC-0008): the vault's typed `CredentialSecret` gains an
+  `Azure` family — `SharedKey { account, key }`, `SasToken`, and `AzureAd` (delegation) — sealed
+  through the same `pub(crate)` zeroizing wire-mirror as the other variants.
 - **GCS object-store live backend** (M5-8, ADR-0003): `cairn-backend-object` gains `GcsObjectStore`
   and `gcs_connect` (behind the non-default `gcs` feature), a `google-cloud-storage` adapter
   implementing the same provider-agnostic `ObjectStore` seam — list (prefix/delimiter + page tokens),

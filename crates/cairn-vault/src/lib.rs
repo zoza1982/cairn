@@ -20,7 +20,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 mod cred;
 mod error;
 pub use cairn_secrets::{ExposeSecret, SecretString};
-pub use cred::{AwsCredential, CredentialSecret, GcpCredential, SshCredential};
+pub use cred::{AwsCredential, AzureCredential, CredentialSecret, GcpCredential, SshCredential};
 pub use error::VaultError;
 
 const MAGIC: &[u8; 8] = b"CAIRNVLT";
@@ -639,6 +639,52 @@ mod tests {
         let shape = v.get(temp_id).unwrap().shape();
         assert_eq!(shape.variant, "static");
         assert!(!shape.delegation, "static keys are not a delegation");
+    }
+
+    #[test]
+    fn azure_variants_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let (sk_id, sas_id, ad_id) = {
+            let mut v =
+                Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
+            let sk_id = v.add(
+                "sk",
+                CredentialSecret::Azure(AzureCredential::SharedKey {
+                    account: "devstoreaccount1".to_owned(),
+                    key: pass("base64key=="),
+                }),
+            );
+            let sas_id = v.add(
+                "sas",
+                CredentialSecret::Azure(AzureCredential::SasToken(pass("sv=2021&sig=SECRET"))),
+            );
+            let ad_id = v.add("ad", CredentialSecret::Azure(AzureCredential::AzureAd));
+            v.save().unwrap();
+            (sk_id, sas_id, ad_id)
+        };
+        let v = Vault::open(&path, &pass("pw")).unwrap();
+        assert_eq!(v.get(sk_id).unwrap().kind(), CredentialKind::Azure);
+        match v.get(sk_id).unwrap().secret() {
+            CredentialSecret::Azure(AzureCredential::SharedKey { account, key }) => {
+                assert_eq!(account, "devstoreaccount1");
+                assert_eq!(key.expose_secret(), "base64key==");
+            }
+            _ => panic!("expected an Azure shared-key credential"),
+        }
+        match v.get(sas_id).unwrap().secret() {
+            CredentialSecret::Azure(AzureCredential::SasToken(t)) => {
+                assert!(t.expose_secret().contains("SECRET"));
+            }
+            _ => panic!("expected an Azure SAS credential"),
+        }
+        assert!(matches!(
+            v.get(ad_id).unwrap().secret(),
+            CredentialSecret::Azure(AzureCredential::AzureAd)
+        ));
+        assert_eq!(v.get(sk_id).unwrap().shape().variant, "shared-key");
+        assert!(!v.get(sk_id).unwrap().shape().delegation);
+        assert!(v.get(ad_id).unwrap().shape().delegation);
     }
 
     #[test]

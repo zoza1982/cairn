@@ -12,6 +12,16 @@ ignore = [
     # `atomic-polyfill` unmaintained; pulled transitively via postcard -> heapless. No security
     # surface for our use. Revisit when postcard/heapless drop it.
     "RUSTSEC-2023-0089",
+    # `instant` is unmaintained; pulled transitively by the Azure SDK's `azure_core` 0.21 stack
+    # (`http-types`), behind the non-default `azure` feature (Linux-only-full). It is a wall-clock
+    # shim with no security surface for our use. No fix in the 0.21 line (the 1.0 SDK rewrite drops
+    # it but is AAD-only and can't talk to Azurite). Revisit if/when we move to the 1.0 Azure SDK.
+    "RUSTSEC-2024-0384",
+    # `http-types` `Authorization::value`/`WwwAuthenticate::value` can violate ASCII invariants
+    # (notice). Pulled by `azure_core` 0.21 behind the non-default `azure` feature. Our header values
+    # are SDK/credential-generated (base64 keys, SAS tokens — all ASCII), so the invariant holds in
+    # practice. No fix in the 0.21 line. Revisit on a move to the 1.0 Azure SDK.
+    "RUSTSEC-2026-0174",
     # Marvin timing side-channel in the `rsa` crate (pulled by russh/ssh-key for SSH RSA key
     # support, behind the non-default `ssh` feature). No fixed upstream version exists. The attack is
     # a timing oracle on RSA *decryption* (PKCS#1 v1.5); Cairn's SSH client only *signs* an auth

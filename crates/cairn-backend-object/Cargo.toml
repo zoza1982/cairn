@@ -22,7 +22,8 @@ default = []
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:cairn-vault"]
 # `gcs` pulls the Google Cloud Storage SDK + the typed GCP credential it consumes (cairn-vault).
 gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:cairn-vault", "dep:serde_json"]
-azure = []
+# `azure` pulls the Azure Blob SDK + the typed Azure credential it consumes (cairn-vault).
+azure = ["dep:azure_storage", "dep:azure_storage_blobs", "dep:cairn-vault"]
 # Exposes the in-memory MockObjectStore to dependent crates' tests.
 test-utils = []
 
@@ -55,6 +56,17 @@ google-cloud-storage = { version = "1", optional = true }
 # the emulator, service-account, and ADC). It is a transitive dep via google-cloud-storage but
 # must be declared here to use its types in our code.
 google-cloud-auth = { version = "1", optional = true }
+# Azure Blob Storage SDK for the Azure adapter (behind the `azure` feature). The 0.21 line (the 1.0
+# rewrite `azure_storage_blob` is AAD-only — no shared-key/SAS, so it can't talk to Azurite). 0.21
+# supports shared-key, SAS, and bearer via `StorageCredentials`. Rides reqwest+rustls (no OpenSSL).
+azure_storage = { version = "0.21", optional = true, default-features = false, features = [
+    "enable_reqwest_rustls",
+    "hmac_rust",
+] }
+azure_storage_blobs = { version = "0.21", optional = true, default-features = false, features = [
+    "enable_reqwest_rustls",
+    "hmac_rust",
+] }
 # serde_json is needed to parse the service-account key JSON string into the Value that
 # google-cloud-auth's service_account::Builder::new requires.
 serde_json = { version = "1", optional = true }

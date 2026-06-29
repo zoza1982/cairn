@@ -35,6 +35,8 @@ pub enum CredentialSecret {
     Aws(AwsCredential),
     /// A Google Cloud (GCS) credential.
     Gcp(GcpCredential),
+    /// An Azure Blob Storage credential.
+    Azure(AzureCredential),
 }
 
 impl CredentialSecret {
@@ -45,6 +47,7 @@ impl CredentialSecret {
             Self::Ssh(_) => CredentialKind::Ssh,
             Self::Aws(_) => CredentialKind::Aws,
             Self::Gcp(_) => CredentialKind::Gcp,
+            Self::Azure(_) => CredentialKind::Azure,
         }
     }
 
@@ -60,6 +63,9 @@ impl CredentialSecret {
             }
             Self::Gcp(g) => {
                 CredentialShape::new(CredentialKind::Gcp, g.variant(), g.is_delegation())
+            }
+            Self::Azure(a) => {
+                CredentialShape::new(CredentialKind::Azure, a.variant(), a.is_delegation())
             }
         }
     }
@@ -159,6 +165,39 @@ impl GcpCredential {
     }
 }
 
+/// Azure Blob Storage authentication material (per the M5 design). A storage-account shared key, a
+/// SAS token, or delegation to Azure AD (the `DefaultAzureCredential` chain — env, managed identity,
+/// `az login`, …), which stores no key material in the vault.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum AzureCredential {
+    /// Storage-account shared key: the account name (a non-secret identifier) plus its access key.
+    SharedKey {
+        /// Storage account name (an identifier, not secret material).
+        account: String,
+        /// Account access key.
+        key: SecretString,
+    },
+    /// A shared-access-signature token (the whole token is secret).
+    SasToken(SecretString),
+    /// Delegate to the Azure AD credential chain. No key material is stored in the vault.
+    AzureAd,
+}
+
+impl AzureCredential {
+    fn variant(&self) -> &'static str {
+        match self {
+            Self::SharedKey { .. } => "shared-key",
+            Self::SasToken(_) => "sas-token",
+            Self::AzureAd => "azure-ad",
+        }
+    }
+
+    fn is_delegation(&self) -> bool {
+        matches!(self, Self::AzureAd)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire-mirror: the ONLY serializable form. Zeroized on drop. `pub(crate)` so it cannot escape the
 // vault; conversions copy through `expose_secret`/re-wrap exactly at the seal/open boundary.
@@ -169,6 +208,7 @@ pub(crate) enum CredentialSecretWire {
     Ssh(SshWire),
     Aws(AwsWire),
     Gcp(GcpWire),
+    Azure(AzureWire),
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -198,6 +238,13 @@ pub(crate) enum GcpWire {
     ApplicationDefault,
 }
 
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub(crate) enum AzureWire {
+    SharedKey { account: String, key: String },
+    SasToken(String),
+    AzureAd,
+}
+
 // The exhaustive matches in these `From` impls are the sync guard between the public and wire enums:
 // adding a `CredentialSecret`/`SshCredential`/`AwsCredential`/`GcpCredential` variant without its
 // wire counterpart is a compile error.
@@ -207,6 +254,7 @@ impl From<&CredentialSecret> for CredentialSecretWire {
             CredentialSecret::Ssh(s) => CredentialSecretWire::Ssh(SshWire::from(s)),
             CredentialSecret::Aws(a) => CredentialSecretWire::Aws(AwsWire::from(a)),
             CredentialSecret::Gcp(g) => CredentialSecretWire::Gcp(GcpWire::from(g)),
+            CredentialSecret::Azure(a) => CredentialSecretWire::Azure(AzureWire::from(a)),
         }
     }
 }
@@ -218,6 +266,19 @@ impl From<&GcpCredential> for GcpWire {
                 GcpWire::ServiceAccountKey(k.expose_secret().to_owned())
             }
             GcpCredential::ApplicationDefault => GcpWire::ApplicationDefault,
+        }
+    }
+}
+
+impl From<&AzureCredential> for AzureWire {
+    fn from(a: &AzureCredential) -> Self {
+        match a {
+            AzureCredential::SharedKey { account, key } => AzureWire::SharedKey {
+                account: account.clone(),
+                key: key.expose_secret().to_owned(),
+            },
+            AzureCredential::SasToken(t) => AzureWire::SasToken(t.expose_secret().to_owned()),
+            AzureCredential::AzureAd => AzureWire::AzureAd,
         }
     }
 }
@@ -262,6 +323,7 @@ impl From<&CredentialSecretWire> for CredentialSecret {
             CredentialSecretWire::Ssh(s) => CredentialSecret::Ssh(SshCredential::from(s)),
             CredentialSecretWire::Aws(a) => CredentialSecret::Aws(AwsCredential::from(a)),
             CredentialSecretWire::Gcp(g) => CredentialSecret::Gcp(GcpCredential::from(g)),
+            CredentialSecretWire::Azure(a) => CredentialSecret::Azure(AzureCredential::from(a)),
         }
     }
 }
@@ -273,6 +335,19 @@ impl From<&GcpWire> for GcpCredential {
                 GcpCredential::ServiceAccountKey(SecretString::from(k.clone()))
             }
             GcpWire::ApplicationDefault => GcpCredential::ApplicationDefault,
+        }
+    }
+}
+
+impl From<&AzureWire> for AzureCredential {
+    fn from(w: &AzureWire) -> Self {
+        match w {
+            AzureWire::SharedKey { account, key } => AzureCredential::SharedKey {
+                account: account.clone(),
+                key: SecretString::from(key.clone()),
+            },
+            AzureWire::SasToken(t) => AzureCredential::SasToken(SecretString::from(t.clone())),
+            AzureWire::AzureAd => AzureCredential::AzureAd,
         }
     }
 }
