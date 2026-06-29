@@ -17,6 +17,7 @@ use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBu
 mod backend;
 mod bridge;
 mod component;
+mod handle;
 pub use backend::PluginVfsBackend;
 pub use component::{engine_config, PluginComponent};
 
@@ -27,6 +28,11 @@ pub struct Limits {
     pub max_memory_bytes: usize,
     /// Execution fuel (roughly, instructions) before the guest is trapped.
     pub fuel: u64,
+    /// Maximum total bytes a single read stream may yield before it is forcibly errored. Bounds a
+    /// malicious guest whose `read-stream` never reports EOF (the streaming analogue of the list
+    /// page cap). Generous by default; raise it for a backend that legitimately serves larger
+    /// objects.
+    pub max_stream_bytes: u64,
 }
 
 impl Default for Limits {
@@ -34,6 +40,7 @@ impl Default for Limits {
         Self {
             max_memory_bytes: 16 * 1024 * 1024,
             fuel: 100_000_000,
+            max_stream_bytes: 4 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -205,6 +212,7 @@ mod tests {
         let limits = Limits {
             max_memory_bytes: 1 << 20,
             fuel: 10_000,
+            ..Limits::default()
         };
         let err = host()
             .run_void(SPIN.as_bytes(), "spin", limits)
@@ -218,6 +226,7 @@ mod tests {
         let limits = Limits {
             max_memory_bytes: 64 * 1024,
             fuel: 1_000_000,
+            ..Limits::default()
         };
         let r = host().run_i32(GROW.as_bytes(), "grow", 1, limits).unwrap();
         assert_eq!(r, -1, "growth past the cap must be denied");
@@ -226,6 +235,7 @@ mod tests {
         let limits = Limits {
             max_memory_bytes: 256 * 1024,
             fuel: 1_000_000,
+            ..Limits::default()
         };
         let r = host().run_i32(GROW.as_bytes(), "grow", 1, limits).unwrap();
         assert_eq!(r, 1);

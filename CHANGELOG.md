@@ -8,13 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **WASM plugin backend — streaming reads** (M8-3b): `PluginVfsBackend::open_read` now bridges a
+  guest `read-stream` resource to a `tokio::io::AsyncRead` (`ReadHandle`), so a plugin-backed file
+  reads (and ranged-reads) like any built-in backend. The resource is owned on the plugin thread
+  (it is `!Send`) and addressed across calls by an opaque id; a `PluginReadHandle` pulls chunks on
+  demand and frees the resource on drop. Hardened against a hostile guest: a per-stream byte cap
+  (`Limits::max_stream_bytes`) cuts off a stream that never reports EOF, chunks larger than the host
+  requested are rejected, and guest-supplied error strings are stripped of control characters and
+  length-capped before reaching logs/UI. `open_write`/mutations still report `Unsupported` (PR3).
 - **WASM plugin backend as a `Vfs` — read path** (M8-3b): a plugin component can now be browsed
   through the `Vfs` trait via `PluginVfsBackend`, indistinguishable from a built-in backend for
   listing and metadata. Because a wasmtime `Store` is `!Send`/`!Sync`, the instance runs on a
   dedicated thread and the `Send + Sync` backend messages it over a channel (one request + `oneshot`
   reply per op, fuel refilled per call). Implements `scheme`/`connection`/`caps`/`list` (paginated
-  stream)/`stat`; `open_read`/`open_write`/mutations report `Unsupported` for now (streaming
-  read/write resources are the next slice). The granted `host` interface is linked: `log` and
+  stream)/`stat`. The granted `host` interface is linked: `log` and
   `now-secs` are real; `http-fetch`/`use-credential` are deny-stubs until the broker wiring (M8-4).
 - **WASM plugin backend bridge — foundation** (M8-3a): the `cairn-plugin` host can now load a
   **component** that exports the `cairn:plugin/backend` interface (the `cairn:plugin@1.0.0` WIT
