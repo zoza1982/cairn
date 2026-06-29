@@ -1,14 +1,16 @@
 //! Cairn's capability broker.
 //!
 //! The broker is the **sole mediator** between credential references and live secrets. The AI and
-//! plugin layers depend only on this crate and on `cairn-types` — never on `cairn-vault` — so they
-//! cannot reach a secret except through a brokered, journaled operation. The broker exposes a
-//! secret-free world view ([`Broker::credentials`]) to untrusted actors; only the execution layer
-//! calls [`Broker::resolve`], and every resolution is recorded in the audit [`Broker::journal`].
+//! plugin layers depend only on `cairn-broker-api` — the secret-free boundary — never on this crate
+//! or `cairn-vault`, so they cannot even name a secret-returning API (enforced by a dependency-
+//! closure test, see RFC-0008). Only the execution layer holds a [`Broker`] and calls
+//! [`Broker::resolve`]; every resolution is recorded in the audit [`Broker::journal`]. The secret-free
+//! world view ([`Broker::credentials`] / [`CredentialDirectory`]) is what untrusted actors see.
 //!
 //! For this milestone the broker provides credential resolution + journaling; the full
 //! authorize→confirm→execute action mediation (per ADR-0002 / LLD §9.6) is layered on in M7.
 
+pub use cairn_broker_api::{CredentialDirectory, CredentialInfo};
 use cairn_secrets::SecretString;
 use cairn_vault::{CredentialId, Vault};
 use std::sync::Mutex;
@@ -22,17 +24,6 @@ pub enum Actor {
     Ai,
     /// A named plugin.
     Plugin(String),
-}
-
-/// A non-secret summary of a stored credential, safe to show to any actor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CredentialInfo {
-    /// The credential id.
-    pub id: CredentialId,
-    /// Human-readable label.
-    pub label: String,
-    /// Backend family.
-    pub backend: String,
 }
 
 /// One audit-journal entry. Never contains secret material.
@@ -106,7 +97,7 @@ impl Broker {
             Some(v) => v
                 .labels()
                 .into_iter()
-                .map(|(id, label, backend)| CredentialInfo { id, label, backend })
+                .map(|(id, label, backend)| CredentialInfo::new(id, label, backend))
                 .collect(),
             None => Vec::new(),
         }
@@ -142,6 +133,14 @@ impl Broker {
     #[must_use]
     pub fn journal(&self) -> Vec<JournalEntry> {
         self.journal.lock().expect("broker mutex").clone()
+    }
+}
+
+/// The secret-free directory view that the AI/plugin layers consume via `cairn-broker-api` without
+/// depending on this crate or the vault. Delegates to the inherent [`Broker::credentials`].
+impl CredentialDirectory for Broker {
+    fn credentials(&self) -> Vec<CredentialInfo> {
+        Broker::credentials(self)
     }
 }
 

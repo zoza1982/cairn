@@ -2,9 +2,9 @@
 //!
 //! Provider-agnostic LLM access (`provider`), the closed `tools` surface, and the
 //! `plan`→confirm→execute state machine. The model only *proposes* a plan; approval and execution
-//! are gated outside the model. This crate depends only on `cairn-broker` (+ its deps), never on the
-//! vault or backends, so the AI can never reach a secret except through a brokered, journaled
-//! operation. Concrete cloud/local providers and TUI wiring are layered on later. See `docs/LLD.md`
+//! are gated outside the model. This crate depends only on `cairn-broker-api` — the secret-free credential boundary, never on the
+//! vault or backends, so the AI cannot even name a secret-returning API; a dependency-closure test
+//! enforces this (RFC-0008). Concrete providers and TUI wiring are layered on later. See `docs/LLD.md`
 //! §10.
 
 mod context;

@@ -13,6 +13,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+cairn-types = { workspace = true }
 cairn-secrets = { workspace = true }
 argon2 = "0.5"
 # `zeroize` is opt-in since 0.11 (it was default in 0.10); keep it so the cipher's internal key copy

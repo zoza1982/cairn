@@ -27,7 +27,10 @@ const NONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
 
 /// An opaque credential identifier (stored in non-secret config to reference a vault entry).
-pub type CredentialId = Uuid;
+///
+/// Defined in `cairn-types` (the shared leaf) and re-exported here for backwards compatibility; see
+/// RFC-0008 for why the id lives below both the vault and the broker-api boundary.
+pub use cairn_types::CredentialId;
 
 /// Argon2id key-derivation parameters (stored, authenticated, in the vault header).
 #[derive(Debug, Clone, Copy)]

@@ -13,7 +13,9 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-cairn-broker = { workspace = true }
+# The secret-free credential boundary only — NOT `cairn-broker`/`cairn-vault`. A dependency-closure
+# test in `cairn-broker-api` fails CI if the vault ever enters this crate's graph (RFC-0008).
+cairn-broker-api = { workspace = true }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
