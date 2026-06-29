@@ -20,7 +20,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 mod cred;
 mod error;
 pub use cairn_secrets::{ExposeSecret, SecretString};
-pub use cred::{CredentialSecret, SshCredential};
+pub use cred::{AwsCredential, CredentialSecret, SshCredential};
 pub use error::VaultError;
 
 const MAGIC: &[u8; 8] = b"CAIRNVLT";
@@ -582,6 +582,91 @@ mod tests {
         let shape = v.get(id).unwrap().shape();
         assert_eq!(shape.variant, "agent");
         assert!(shape.delegation, "agent is a delegation variant");
+    }
+
+    #[test]
+    fn aws_static_roundtrips_with_and_without_session_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let (temp_id, perm_id) = {
+            let mut v =
+                Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
+            let temp_id = v.add(
+                "sts",
+                CredentialSecret::Aws(AwsCredential::Static {
+                    access_key_id: "AKIATEMP".to_owned(),
+                    secret_access_key: pass("temp-secret"),
+                    session_token: Some(pass("session-tok")),
+                }),
+            );
+            let perm_id = v.add(
+                "perm",
+                CredentialSecret::Aws(AwsCredential::Static {
+                    access_key_id: "AKIAPERM".to_owned(),
+                    secret_access_key: pass("perm-secret"),
+                    session_token: None,
+                }),
+            );
+            v.save().unwrap();
+            (temp_id, perm_id)
+        };
+        let v = Vault::open(&path, &pass("pw")).unwrap();
+        assert_eq!(v.get(temp_id).unwrap().kind(), CredentialKind::Aws);
+        match v.get(temp_id).unwrap().secret() {
+            CredentialSecret::Aws(AwsCredential::Static {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            }) => {
+                assert_eq!(access_key_id, "AKIATEMP");
+                assert_eq!(secret_access_key.expose_secret(), "temp-secret");
+                assert_eq!(
+                    session_token.as_ref().unwrap().expose_secret(),
+                    "session-tok"
+                );
+            }
+            _ => panic!("expected an AWS static credential"),
+        }
+        match v.get(perm_id).unwrap().secret() {
+            CredentialSecret::Aws(AwsCredential::Static { session_token, .. }) => {
+                assert!(
+                    session_token.is_none(),
+                    "absent token must round-trip as None"
+                );
+            }
+            _ => panic!("expected an AWS static credential"),
+        }
+        let shape = v.get(temp_id).unwrap().shape();
+        assert_eq!(shape.variant, "static");
+        assert!(!shape.delegation, "static keys are not a delegation");
+    }
+
+    #[test]
+    fn aws_profile_and_default_chain_are_delegations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let (prof_id, chain_id) = {
+            let mut v =
+                Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()).unwrap();
+            let prof_id = v.add(
+                "prof",
+                CredentialSecret::Aws(AwsCredential::Profile("dev".to_owned())),
+            );
+            let chain_id = v.add("chain", CredentialSecret::Aws(AwsCredential::DefaultChain));
+            v.save().unwrap();
+            (prof_id, chain_id)
+        };
+        let v = Vault::open(&path, &pass("pw")).unwrap();
+        match v.get(prof_id).unwrap().secret() {
+            CredentialSecret::Aws(AwsCredential::Profile(name)) => assert_eq!(name, "dev"),
+            _ => panic!("expected an AWS profile credential"),
+        }
+        assert!(matches!(
+            v.get(chain_id).unwrap().secret(),
+            CredentialSecret::Aws(AwsCredential::DefaultChain)
+        ));
+        assert!(v.get(prof_id).unwrap().shape().delegation);
+        assert!(v.get(chain_id).unwrap().shape().delegation);
     }
 
     #[test]

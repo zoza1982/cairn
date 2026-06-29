@@ -19,6 +19,13 @@ use std::time::SystemTime;
 mod vfs;
 pub use vfs::ObjectStoreVfs;
 
+// The live AWS S3 adapter (and S3-compatible stores like MinIO) lives behind the `s3` feature; it
+// pulls the AWS SDK and the typed AWS credential. The provider-agnostic core above stays SDK-free.
+#[cfg(feature = "s3")]
+mod s3;
+#[cfg(feature = "s3")]
+pub use s3::{s3_connect, S3ConnectParams, S3ObjectStore};
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
 #[cfg(any(test, feature = "test-utils"))]
