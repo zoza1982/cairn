@@ -13,6 +13,7 @@ on:
     # Validate the job on changes to the object backend or this workflow itself.
     paths:
       - "crates/cairn-backend-object/**"
+      - "crates/cairn-backend-docker/**"
       - "crates/cairn-vault/**"
       - ".github/workflows/integration.yml"
 
@@ -103,3 +104,17 @@ jobs:
           CAIRN_IT_AZURE_CONTAINER: cairn-it
           CAIRN_IT_AZURE_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
         run: cargo test -p cairn-backend-object --features azure --test azure_azurite -- --nocapture
+
+  docker-dind:
+    name: Docker contract (dind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # GitHub Linux runners have a working Docker daemon, so `connect_local()` talks to it
+      # directly — no docker-in-docker service needed. The test creates/cleans its own container.
+      - name: Run the Docker fs round-trip against the runner's daemon
+        env:
+          CAIRN_IT_DOCKER: "1"
+        run: cargo test -p cairn-backend-docker --features docker --test docker_dind -- --nocapture

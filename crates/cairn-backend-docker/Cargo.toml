@@ -17,7 +17,7 @@ default = []
 # The live Docker engine adapter (bollard). Off by default so the lean, cross-platform build never
 # pulls bollard's hyper stack; the full build (Linux-only in CI) and the dind integration job enable
 # it. See ADR-0006.
-docker = ["dep:bollard"]
+docker = ["dep:bollard", "dep:tar", "dep:bytes"]
 
 [dependencies]
 cairn-types = { workspace = true }
@@ -25,6 +25,10 @@ cairn-vfs = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 bollard = { version = "0.21", optional = true }
+# The Docker archive API returns a tar stream; `tar` parses it to browse a container's filesystem,
+# `bytes` collects the streamed chunks. Both are pulled only by the live `docker` adapter.
+tar = { version = "0.4", optional = true }
+bytes = { version = "1", optional = true }
 smol_str = "0.3"
 tokio = { version = "1", features = ["io-util"] }
 

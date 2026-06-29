@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Docker container-filesystem browsing, live** (M6-2, RFC-0004): the Docker backend's live
+  `bollard` adapter (`BollardDocker`, behind the non-default `docker` feature) now implements
+  `list_dir`/`stat`/`read` over the Docker Engine **archive API** — `download_from_container` returns
+  a tar stream of a path, which is parsed with the `tar` crate to browse a running container's
+  filesystem (list a directory's immediate children, stat a path, read a file). A missing path maps
+  to `VfsError::NotFound`. Container/image listing was already live; this makes a container pane
+  actually browsable. A dind integration job (env-guarded by `CAIRN_IT_DOCKER`, runs against the CI
+  runner's own daemon) exercises it end-to-end. Live `exec`/`logs` streaming remains a follow-up.
 - **Azure Blob object-store live backend** (M5-9, ADR-0003): `cairn-backend-object` gains
   `AzureObjectStore` and `azure_connect` (behind the non-default `azure` feature), an
   `azure_storage_blobs` adapter implementing the same `ObjectStore` seam — list (prefix/delimiter +
