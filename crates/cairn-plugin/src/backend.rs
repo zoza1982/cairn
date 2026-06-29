@@ -2,13 +2,16 @@
 //! built-in backend to the rest of Cairn.
 //!
 //! The plugin's `Store` is `!Send`, so it lives on a dedicated thread (see [`crate::bridge`]); this
-//! type is the `Send + Sync` async face that messages it. M8-3b PR1 implements the read-only path
-//! (`scheme`/`connection`/`caps`/`list`/`stat`); `open_read`/`open_write`/mutations are follow-ups.
+//! type is the `Send + Sync` async face that messages it. PR1 landed metadata + listing
+//! (`scheme`/`connection`/`caps`/`list`/`stat`); PR2 adds streaming reads (`open_read` → a
+//! `read-stream` resource exposed as a [`ReadHandle`]); `open_write`/mutations are PR3.
 
 use crate::bridge::{
     map_entry, plugin_dead_error, plugin_error_to_vfs, plugin_thread, to_vfs_error,
     valid_leaf_name, PluginMsg,
 };
+use crate::component::WitByteRange;
+use crate::handle::PluginReadHandle;
 use crate::{Limits, PluginComponent, PluginError};
 use cairn_types::{Caps, ConnectionId, Entry, Scheme, VfsPath};
 use cairn_vfs::{
@@ -28,6 +31,8 @@ pub struct PluginVfsBackend {
     scheme: Scheme,
     connection: ConnectionId,
     caps: Caps,
+    /// Per-stream byte ceiling handed to each [`PluginReadHandle`] (see [`Limits`]).
+    max_stream_bytes: u64,
 }
 
 impl PluginVfsBackend {
@@ -54,16 +59,14 @@ impl PluginVfsBackend {
             scheme,
             connection,
             caps,
+            max_stream_bytes: limits.max_stream_bytes,
         })
     }
 }
 
-impl Drop for PluginVfsBackend {
-    fn drop(&mut self) {
-        // Best-effort: the thread may already be gone.
-        let _ = self.tx.send(PluginMsg::Shutdown);
-    }
-}
+// No explicit `Drop`: the plugin thread stops once every `Arc<Sender>` clone is dropped. Sending a
+// shutdown here would force-close streams that outlive the backend — a `ReadHandle` is `'static` and
+// holds its own sender clone precisely so it can keep the instance alive until it is done.
 
 impl CapabilityProvider for PluginVfsBackend {
     fn caps(&self) -> Caps {
@@ -170,11 +173,35 @@ impl Vfs for PluginVfsBackend {
 
     async fn open_read(
         &self,
-        _path: &VfsPath,
-        _range: Option<ByteRange>,
+        path: &VfsPath,
+        range: Option<ByteRange>,
     ) -> Result<ReadHandle, VfsError> {
-        // M8-3b PR2: the streaming `read-stream` resource → `ReadHandle` bridge.
-        Err(VfsError::Unsupported(Caps::READ))
+        let range = range.map(|r| WitByteRange {
+            offset: r.offset,
+            len: r.len,
+        });
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(PluginMsg::OpenRead {
+                path: path.as_str(),
+                range,
+                reply: reply_tx,
+            })
+            .map_err(|_| plugin_dead_error())?;
+        let id = reply_rx
+            .await
+            .map_err(|_| plugin_dead_error())?
+            .map_err(plugin_error_to_vfs)?
+            .map_err(to_vfs_error)?;
+        // Length is unknown up front (the guest streams chunk-by-chunk); no `len_hint`.
+        Ok(ReadHandle::new(
+            Box::new(PluginReadHandle::new(
+                id,
+                Arc::clone(&self.tx),
+                self.max_stream_bytes,
+            )),
+            None,
+        ))
     }
 
     async fn open_write(&self, _path: &VfsPath, _opts: WriteOpts) -> Result<WriteHandle, VfsError> {

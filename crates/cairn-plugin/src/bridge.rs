@@ -4,16 +4,32 @@
 //! A plugin instance is owned by one OS thread ([`plugin_thread`]); the async side
 //! ([`PluginVfsBackend`](crate::PluginVfsBackend)) holds only a `Send + Sync` channel sender and
 //! sends one [`PluginMsg`] per operation, awaiting a `oneshot` reply. This is what lets a `!Send`
-//! `Store` back a `Send + Sync` `Vfs`. M8-3b PR1 covers the read-only path (stat + list); streaming
-//! resources, writes, and mutations are follow-ups.
+//! `Store` back a `Send + Sync` `Vfs`. PR1 covered metadata + listing (stat + list); PR2 adds
+//! streaming reads (a `read-stream` resource, addressed across calls by a [`ResourceId`]). Writes
+//! and mutations are PR3.
+//!
+//! The thread runs until every channel sender is dropped — the async backend *and* any live
+//! `ReadHandle` each hold an `Arc<Sender>` clone, so the instance stays alive exactly as long as
+//! something can still talk to it. On exit, any resources still open are freed.
 
-use crate::component::{PluginComponent, WitEntry, WitListPageResult, WitVfsError};
+use crate::component::{
+    PluginComponent, ResourceAny, WitByteRange, WitEntry, WitListPageResult, WitVfsError,
+};
 use crate::{Limits, PluginError};
 use cairn_types::{Entry, EntryKind, VfsPath};
 use cairn_vfs::VfsError;
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::oneshot;
+
+/// A host-side numeric handle for a live guest resource (e.g. an open read stream). `Send + Copy`,
+/// unlike `ResourceAny` (`!Send`) which never leaves the plugin thread. `u64` so the monotonic
+/// counter never realistically wraps and aliases a still-live handle.
+pub(crate) type ResourceId = u64;
+
+/// The reply payload shape: an outer [`PluginError`] (host/trap) wrapping the inner guest result.
+type Reply<T> = oneshot::Sender<Result<Result<T, WitVfsError>, PluginError>>;
 
 /// A request to the plugin thread. Each carries a `oneshot` reply channel. `scheme`/`caps` are
 /// resolved once at construction (cached on the async side), so they are not messages.
@@ -21,29 +37,46 @@ pub(crate) enum PluginMsg {
     /// Fetch metadata for a path.
     Stat {
         path: String,
-        reply: oneshot::Sender<Result<Result<WitEntry, WitVfsError>, PluginError>>,
+        reply: Reply<WitEntry>,
     },
     /// List one page of a directory.
     ListPage {
         dir: String,
         cursor: Option<String>,
         include_hidden: bool,
-        reply: oneshot::Sender<Result<Result<WitListPageResult, WitVfsError>, PluginError>>,
+        reply: Reply<WitListPageResult>,
     },
-    /// Stop the thread and tear the instance down.
-    Shutdown,
+    /// Open a read stream; reply carries a [`ResourceId`] for the live stream.
+    OpenRead {
+        path: String,
+        range: Option<WitByteRange>,
+        reply: Reply<ResourceId>,
+    },
+    /// Read the next chunk of an open stream (empty `Vec` = EOF).
+    ReadChunk {
+        id: ResourceId,
+        max_bytes: u32,
+        reply: Reply<Vec<u8>>,
+    },
+    /// Close a read stream and free its guest resource (fire-and-forget).
+    CloseRead { id: ResourceId },
 }
 
-/// The plugin thread: owns the `Store`/instance and serves messages until the channel closes or a
-/// [`PluginMsg::Shutdown`] arrives. Refuels before each call so every op gets its own fuel budget.
+/// The plugin thread: owns the `Store`/instance (and the live-resource table) and serves messages
+/// until every sender is dropped (`recv` then errors). Refuels before each guest call so every op
+/// gets its own fuel budget.
 pub(crate) fn plugin_thread(
     mut component: PluginComponent,
     limits: Limits,
     rx: mpsc::Receiver<PluginMsg>,
 ) {
+    // Owned guest resource handles live here, never crossing the thread boundary (`ResourceAny` is
+    // `!Send`). The async side refers to them only by `ResourceId`.
+    let mut resources: HashMap<ResourceId, ResourceAny> = HashMap::new();
+    let mut next_id: ResourceId = 0;
+
     while let Ok(msg) = rx.recv() {
         match msg {
-            PluginMsg::Shutdown => break,
             PluginMsg::Stat { path, reply } => {
                 component.refuel(limits.fuel);
                 let _ = reply.send(component.stat(&path));
@@ -57,7 +90,67 @@ pub(crate) fn plugin_thread(
                 component.refuel(limits.fuel);
                 let _ = reply.send(component.list_page(&dir, cursor.as_deref(), include_hidden));
             }
+            PluginMsg::OpenRead { path, range, reply } => {
+                component.refuel(limits.fuel);
+                match component.open_read(&path, range) {
+                    Ok(Ok(res)) => {
+                        let id = next_id;
+                        next_id = next_id.wrapping_add(1);
+                        resources.insert(id, res);
+                        // If the caller's future was dropped between sending `OpenRead` and awaiting
+                        // the reply, the resource we just created would otherwise leak (no
+                        // `ReadHandle` ever learns its id) — free it on send failure.
+                        if reply.send(Ok(Ok(id))).is_err() {
+                            if let Some(res) = resources.remove(&id) {
+                                component.close_read(res);
+                            }
+                        }
+                    }
+                    Ok(Err(we)) => {
+                        let _ = reply.send(Ok(Err(we)));
+                    }
+                    Err(pe) => {
+                        let _ = reply.send(Err(pe));
+                    }
+                }
+            }
+            PluginMsg::ReadChunk {
+                id,
+                max_bytes,
+                reply,
+            } => {
+                component.refuel(limits.fuel);
+                // `ResourceAny` is `Copy`, so the handle stays in the table across chunks.
+                let r = match resources.get(&id).copied() {
+                    Some(res) => match component.read_chunk(res, max_bytes) {
+                        // Enforce the `<= max_bytes` contract: a malicious guest must not be able to
+                        // force a host allocation larger than what we requested.
+                        Ok(Ok(chunk)) if chunk.len() > max_bytes as usize => {
+                            Err(PluginError::Trap(format!(
+                                "guest returned {} bytes for a {max_bytes}-byte read request",
+                                chunk.len()
+                            )))
+                        }
+                        other => other,
+                    },
+                    None => Err(PluginError::Trap("unknown read-stream handle".to_owned())),
+                };
+                let _ = reply.send(r);
+            }
+            PluginMsg::CloseRead { id } => {
+                if let Some(res) = resources.remove(&id) {
+                    component.refuel(limits.fuel);
+                    component.close_read(res);
+                }
+            }
         }
+    }
+
+    // Free any resources still open when the instance shuts down (guest destructors run before the
+    // Store drops).
+    for (_, res) in resources.drain() {
+        component.refuel(limits.fuel);
+        component.close_read(res);
     }
 }
 
@@ -69,6 +162,24 @@ pub(crate) fn plugin_dead_error() -> VfsError {
         msg: "plugin instance is no longer running".into(),
         retryable: false,
     }
+}
+
+/// The error returned when a read stream exceeds [`Limits::max_stream_bytes`](crate::Limits) — a
+/// guest that never reports EOF is cut off rather than driving the consumer to exhaust memory/disk.
+pub(crate) fn plugin_stream_limit_error(limit: u64) -> VfsError {
+    VfsError::Backend {
+        code: "plugin_stream_limit".into(),
+        msg: format!("plugin read stream exceeded {limit} bytes"),
+        retryable: false,
+    }
+}
+
+/// Strip control characters from and length-cap a guest-supplied diagnostic string. Guest error text
+/// reaches logs and the TUI renderer untrusted: control/escape sequences are a terminal-injection
+/// vector and an unbounded string is a memory vector.
+fn sanitize_msg(s: String) -> String {
+    const MAX: usize = 1024;
+    s.chars().filter(|c| !c.is_control()).take(MAX).collect()
 }
 
 /// Map a host-side [`PluginError`] (trap, fuel exhaustion) to a [`VfsError`].
@@ -95,16 +206,18 @@ pub(crate) fn to_vfs_error(e: WitVfsError) -> VfsError {
         WitVfsError::AlreadyExists(p) => VfsError::AlreadyExists(parse_path(&p)),
         WitVfsError::Unsupported(caps) => VfsError::Unsupported(crate::component::map_caps(caps)),
         WitVfsError::TimeoutMs(ms) => VfsError::Timeout(Duration::from_millis(ms)),
-        WitVfsError::Connection(msg) => VfsError::Connection(Box::new(std::io::Error::other(msg))),
+        WitVfsError::Connection(msg) => {
+            VfsError::Connection(Box::new(std::io::Error::other(sanitize_msg(msg))))
+        }
         WitVfsError::Auth => VfsError::Auth,
         WitVfsError::Conflict => VfsError::Conflict,
         WitVfsError::Backend(e) => VfsError::Backend {
-            code: e.code,
-            msg: e.msg,
+            code: sanitize_msg(e.code),
+            msg: sanitize_msg(e.msg),
             retryable: e.retryable,
         },
         WitVfsError::Cancelled => VfsError::Cancelled,
-        WitVfsError::Io(msg) => VfsError::Io(std::io::Error::other(msg)),
+        WitVfsError::Io(msg) => VfsError::Io(std::io::Error::other(sanitize_msg(msg))),
     }
 }
 
@@ -175,6 +288,18 @@ mod tests {
         assert!(!valid_leaf_name("a\0b"));
         assert!(!valid_leaf_name("a\nb"));
         assert!(!valid_leaf_name("\x1b[31mred"));
+    }
+
+    #[test]
+    fn sanitize_msg_strips_control_chars_and_caps_length() {
+        // Terminal-injection defense: escape/control sequences are removed, plain text kept.
+        assert_eq!(
+            sanitize_msg("ok \x1b[31mred\x1b[0m\n".to_owned()),
+            "ok [31mred[0m"
+        );
+        // Memory defense: a huge guest string is capped.
+        let big = "a".repeat(10_000);
+        assert_eq!(sanitize_msg(big).len(), 1024);
     }
 
     #[test]

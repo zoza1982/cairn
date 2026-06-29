@@ -28,9 +28,11 @@ use exports::cairn::plugin::backend::ListPageResult;
 // Re-exports so the `backend`/`bridge` modules can name the generated WIT types without re-running
 // `bindgen!`.
 pub(crate) use cairn::plugin::types::{
-    Entry as WitEntry, EntryKind as WitEntryKind, VfsError as WitVfsError,
+    ByteRange as WitByteRange, Entry as WitEntry, EntryKind as WitEntryKind,
+    VfsError as WitVfsError,
 };
 pub(crate) use exports::cairn::plugin::backend::ListPageResult as WitListPageResult;
+pub(crate) use wasmtime::component::ResourceAny;
 
 /// Store state for a component instance: the memory limiter plus an **ambient-authority-free** WASI
 /// context.
@@ -229,6 +231,41 @@ impl PluginComponent {
             .call_list_page(&mut self.store, dir, cursor, include_hidden)
             .map_err(trap)
     }
+
+    /// Open a read stream; returns the owned guest resource handle on success.
+    pub(crate) fn open_read(
+        &mut self,
+        path: &str,
+        range: Option<WitByteRange>,
+    ) -> Result<Result<ResourceAny, WitVfsError>, PluginError> {
+        self.bindings
+            .cairn_plugin_backend()
+            .call_open_read(&mut self.store, path, range)
+            .map_err(trap)
+    }
+
+    /// Read the next chunk from a read stream (empty = EOF).
+    pub(crate) fn read_chunk(
+        &mut self,
+        stream: ResourceAny,
+        max_bytes: u32,
+    ) -> Result<Result<Vec<u8>, WitVfsError>, PluginError> {
+        self.bindings
+            .cairn_plugin_backend()
+            .read_stream()
+            .call_read_chunk(&mut self.store, stream, max_bytes)
+            .map_err(trap)
+    }
+
+    /// Close a read stream and free the guest resource.
+    pub(crate) fn close_read(&mut self, stream: ResourceAny) {
+        let _ = self
+            .bindings
+            .cairn_plugin_backend()
+            .read_stream()
+            .call_close(&mut self.store, stream);
+        let _ = stream.resource_drop(&mut self.store);
+    }
 }
 
 /// A [`Config`] with the settings [`PluginComponent::instantiate`] requires: the component model and
@@ -350,6 +387,7 @@ mod tests {
             Limits {
                 max_memory_bytes: 16 * 1024 * 1024,
                 fuel: 200_000,
+                ..Limits::default()
             },
         )
         .unwrap();

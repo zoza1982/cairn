@@ -1,28 +1,62 @@
-//! A minimal in-memory backend-plugin component fixture for the host's M8-3a tests.
+//! A minimal in-memory backend-plugin component fixture for the host's plugin-VFS tests.
 //!
-//! It serves a single directory `/dir` containing one file `/dir/a.txt`. It exports only the
-//! non-streaming `backend` calls meaningfully; `open-read`/`open-write`/mutations return
-//! `unsupported`. Built locally (`cargo component build`) and committed as `../fixtures/backend.wasm`
-//! so CI needs no WASM toolchain.
+//! It serves a single directory `/dir` containing one file `/dir/a.txt` (contents `b"hello"`).
+//! `open-read` streams that file's bytes (honoring an optional byte range); `open-write`/mutations
+//! still return `unsupported` (PR3).
+//!
+//! Two extra paths exercise the host's defenses against a *misbehaving* guest (the host treats every
+//! plugin as untrusted): `/dir/infinite` is a read stream that never reports EOF, and
+//! `/dir/oversized` returns more bytes than the host requested. Built locally
+//! (`cargo component build`) and committed as `../fixtures/backend.wasm` so CI needs no WASM
+//! toolchain.
 
 #[allow(warnings)]
 mod bindings;
+
+use std::cell::Cell;
 
 use bindings::cairn::plugin::types::{ByteRange, Caps, Entry, EntryKind, VfsError};
 use bindings::exports::cairn::plugin::backend::{
     Guest, GuestReadStream, GuestWriteSink, ListPageResult, ReadStream, WriteSink,
 };
 
+const FILE_BODY: &[u8] = b"hello";
+
 struct Fixture;
 
-// The WIT declares `read-stream`/`write-sink` resources; the guest must define their types even
-// though `open-read`/`open-write` never construct one (they return `unsupported`).
-struct StubReadStream;
 struct StubWriteSink;
 
-impl GuestReadStream for StubReadStream {
-    fn read_chunk(&self, _max_bytes: u32) -> Result<Vec<u8>, VfsError> {
-        Err(VfsError::Unsupported(Caps::empty()))
+/// What a [`MemReadStream`] yields. `Bytes` is the well-behaved case; the others are deliberately
+/// hostile, to exercise the host's stream defenses.
+enum Mode {
+    /// A finite buffer, served in `max_bytes`-sized chunks.
+    Bytes(Vec<u8>),
+    /// Never reports EOF — returns `max_bytes` filler bytes on every call.
+    Infinite,
+    /// Returns one byte *more* than the host requested (a `<= max_bytes` contract violation).
+    Oversized,
+}
+
+/// A read stream. `Cell` gives interior mutability for the cursor (the WIT resource methods take
+/// `&self`); the component model runs the guest single-threaded, so this is sound.
+struct MemReadStream {
+    mode: Mode,
+    pos: Cell<usize>,
+}
+
+impl GuestReadStream for MemReadStream {
+    fn read_chunk(&self, max_bytes: u32) -> Result<Vec<u8>, VfsError> {
+        match &self.mode {
+            Mode::Bytes(bytes) => {
+                let pos = self.pos.get();
+                let end = pos.saturating_add(max_bytes as usize).min(bytes.len());
+                let chunk = bytes[pos..end].to_vec();
+                self.pos.set(end);
+                Ok(chunk)
+            }
+            Mode::Infinite => Ok(vec![b'x'; max_bytes as usize]),
+            Mode::Oversized => Ok(vec![b'x'; max_bytes as usize + 1]),
+        }
     }
     fn close(&self) {}
 }
@@ -49,7 +83,7 @@ fn file_entry() -> Entry {
 }
 
 impl Guest for Fixture {
-    type ReadStream = StubReadStream;
+    type ReadStream = MemReadStream;
     type WriteSink = StubWriteSink;
 
     fn scheme() -> String {
@@ -94,8 +128,31 @@ impl Guest for Fixture {
         }
     }
 
-    fn open_read(_path: String, _range: Option<ByteRange>) -> Result<ReadStream, VfsError> {
-        Err(VfsError::Unsupported(Caps::empty()))
+    fn open_read(path: String, range: Option<ByteRange>) -> Result<ReadStream, VfsError> {
+        let mode = match path.as_str() {
+            "/dir/a.txt" => {
+                // Apply an optional byte range, clamping to the file's bounds.
+                let bytes = match range {
+                    None => FILE_BODY.to_vec(),
+                    Some(ByteRange { offset, len }) => {
+                        let start = (offset as usize).min(FILE_BODY.len());
+                        let end = match len {
+                            None => FILE_BODY.len(),
+                            Some(n) => start.saturating_add(n as usize).min(FILE_BODY.len()),
+                        };
+                        FILE_BODY[start..end].to_vec()
+                    }
+                };
+                Mode::Bytes(bytes)
+            }
+            "/dir/infinite" => Mode::Infinite,
+            "/dir/oversized" => Mode::Oversized,
+            _ => return Err(VfsError::NotFound(path)),
+        };
+        Ok(ReadStream::new(MemReadStream {
+            mode,
+            pos: Cell::new(0),
+        }))
     }
 
     fn open_write(
