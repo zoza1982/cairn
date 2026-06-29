@@ -3,12 +3,15 @@
 //! Presents containers and images as a navigable tree: `/containers/<name>/…` browses a container's
 //! filesystem and `/images/<tag>` lists images. The path-routing and entry-mapping logic lives in
 //! [`DockerVfs`] over a [`ContainerOps`] seam and is fully unit-tested against an in-memory mock; the
-//! real engine access is the [`BollardDocker`] adapter. See `docs/LLD.md` §3.6 and RFC-0004.
+//! real engine access is the `BollardDocker` adapter, compiled only under the `docker` feature
+//! (off by default — it pulls bollard's hyper stack). See `docs/LLD.md` §3.6, RFC-0004, ADR-0006.
 
 mod ops;
+#[cfg(feature = "docker")]
 mod real;
 
 pub use ops::{ContainerInfo, ContainerOps, ImageInfo, RemoteEntry, RemoteMeta};
+#[cfg(feature = "docker")]
 pub use real::BollardDocker;
 
 use async_trait::async_trait;

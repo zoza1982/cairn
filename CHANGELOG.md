@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Feature-gated network backends + lean/full CI split** (ADR-0006): the heavy/TLS-bearing backend
+  SDKs now sit behind non-default Cargo features so the default build stays lean and cross-platform.
+  As the first step, the Docker adapter (`bollard`) moved behind a `docker` feature (off by default).
+  CI now builds the lean default on Linux/macOS/Windows and `--all-features` on Linux only, and runs
+  `cargo-deny` on both the default and full dependency graphs — keeping the aws-lc/TLS stack off
+  Windows/macOS while still type-checking every adapter on Linux. Groundwork for the SSH/S3/GCS/Azure/
+  Kubernetes backends, each verified against an emulator in a dedicated integration job.
+
 ### Added
 - **WASM plugin wall-clock deadline** (M8-4): guests now have an **epoch** time limit alongside the
   fuel (instruction) limit. An `EpochTicker` advances the engine's epoch on a fixed interval and each

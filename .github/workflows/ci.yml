@@ -15,6 +15,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Backend SDKs (TLS-heavy: cloud, k8s, docker, ssh transport) live behind non-default Cargo
+# features (ADR-0006). The cross-platform `test` and `clippy-lean` jobs build the LEAN default so
+# Windows/macOS never compile the heavy/aws-lc stack; the Linux-only `*-full` jobs build
+# `--all-features`. NEVER add `--all-features` or a backend `--features` flag to a macOS/Windows job.
 jobs:
   fmt:
     name: rustfmt
@@ -35,6 +39,17 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  clippy-full:
+    name: clippy (all-features, linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
@@ -44,6 +59,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # LEAN: default features only — keeps the heavy backend SDKs off Windows/macOS.
+      - run: cargo test --workspace
+
+  test-full:
+    name: test (all-features, linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -66,6 +91,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Default-feature dependency graph.
+      - id: deny-default
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+      # Full graph: feature-gated backend SDKs are invisible to the default run, so check them too
+      # (license/advisory drift in the TLS stack must not slip in behind a non-default feature).
+      # `continue-on-error` + the gate below so a failure in the first check never SKIPS the second.
+      - id: deny-full
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+      - name: Fail if either deny check failed
+        if: steps.deny-default.outcome == 'failure' || steps.deny-full.outcome == 'failure'
+        run: exit 1
