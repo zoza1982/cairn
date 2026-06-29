@@ -33,6 +33,13 @@ mod gcs;
 #[cfg(feature = "gcs")]
 pub use gcs::{gcs_connect, GcsConnectParams, GcsObjectStore};
 
+// The live Azure Blob Storage adapter lives behind the `azure` feature (pulls the Azure SDK + the
+// typed Azure credential). The provider-agnostic core stays SDK-free.
+#[cfg(feature = "azure")]
+mod azure;
+#[cfg(feature = "azure")]
+pub use azure::{azure_connect, AzureConnectParams, AzureObjectStore};
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
 #[cfg(any(test, feature = "test-utils"))]
