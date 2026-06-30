@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **MCP client foundation** (M7, `RFC-mcp-client`): a new standalone `cairn-mcp` crate — a thin,
+  documented wrapper over the official **`rmcp` 2.0** SDK that lets Cairn act as a **client** of an
+  external Model Context Protocol server. `McpClient` connects over **stdio** (`connect_stdio`, spawning
+  a server as a child process) or **streamable HTTP** (`connect_http`, a URL), performs the MCP
+  `initialize` handshake, then `list_tools` (→ `McpToolInfo`: name + description + input JSON schema) and
+  `call_tool(name, args)` (→ `McpToolResult`: joined text content + `is_error` + structured output).
+  Non-object/non-null arguments are rejected locally as `McpError::InvalidArguments` without contacting
+  the server. Every operation (handshake + each request) is bounded by a timeout (default 30s,
+  configurable via `with_timeout`) so an unresponsive server can never block the caller forever
+  (`McpError::Timeout`), and the spawned stdio server's **stderr is discarded** so it cannot corrupt
+  Cairn's terminal. `McpError` (thiserror, `#[non_exhaustive]`) keeps **secret-free** top-level messages
+  and attaches the rmcp error as `source` (the source chain/`Debug` may still carry transport detail, so
+  callers should log only the `Display`). rmcp is pulled with default features **off**, enabling only
+  `client` + `transport-child-process` + `transport-streamable-http-client-reqwest` + `reqwest`, which
+  pins TLS to **rustls** (no OpenSSL). This is the **transport/protocol layer only**: the crate does
+  **not** depend on `cairn-ai`/`cairn-broker`/`cairn-vault`/`cairn-secrets` and is **not** wired into the
+  agent's closed, capability-gated tool surface — how untrusted MCP tools interact with the
+  plan→confirm→execute safety model is a deliberate **follow-up RFC** (`RFC-mcp-client`). Tested
+  **hermetically**: a tiny in-process `rmcp` echo server (dev-only `server` feature) over an in-memory
+  duplex stream exercises a full connect → `initialize` → `list_tools` → `call_tool` round-trip, plus
+  tests for null/array argument handling, a client-side timeout against an unresponsive server, and
+  result/error mapping. No network or child process in `cargo test`.
 - **Live LLM HTTP providers** (M7-2, RFC-0008): `cairn-ai` gains two concrete `LlmProvider`
   implementations behind the **non-default `http` feature** — `AnthropicProvider` (Claude Messages
   API: `x-api-key`/`anthropic-version` headers, system-message folding into top-level `system`, first

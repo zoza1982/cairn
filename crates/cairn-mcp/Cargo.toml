@@ -1,0 +1,41 @@
+[package]
+name = "cairn-mcp"
+description = "Cairn's Model Context Protocol (MCP) client: connect to an MCP server, list tools, and call a tool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Official Rust MCP SDK. Default features (server + macros + schemars) are OFF to keep this a lean
+# client; we opt into exactly the client + transports we ship. `transport-streamable-http-client-reqwest`
+# pulls the concrete reqwest-backed HTTP transport (the `from_uri` convenience), and the `reqwest`
+# feature pins TLS to **rustls** (`reqwest?/rustls`) so there is no OpenSSL/C-toolchain dependency.
+rmcp = { version = "2", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+# `process` builds the `tokio::process::Command` for the stdio (child-process) transport; `time`
+# powers the per-operation timeouts that stop an unresponsive server from blocking the caller forever.
+tokio = { version = "1", default-features = false, features = ["process", "time"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+# Enable rmcp's `server` feature for tests only: the hermetic round-trip test builds a tiny in-process
+# MCP server and connects the client to it over an in-memory duplex stream (no child process, no socket).
+rmcp = { version = "2", default-features = false, features = ["server"] }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+    "io-util",
+    "time",
+] }
