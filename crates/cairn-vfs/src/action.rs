@@ -94,28 +94,68 @@ pub enum ActionCtx {
     },
 }
 
-/// A handle to a long-lived action session (port-forward or interactive exec), per RFC-0007.
+/// A handle to a long-lived action session (port-forward or interactive exec), per RFC-0009.
 ///
-/// The caller (the TUI) holds it for the session's lifetime: send on `cancel` (or drop the sender)
-/// to terminate; await `done` for the exit result. `local_port` is set for a port-forward; `stdin`
-/// feeds an interactive TTY exec.
+/// The caller (the TUI) holds it for the session's lifetime: send `()` on `cancel` (or drop the
+/// sender) to request termination; await `done` for the exit result. `local_port` is set for a
+/// port-forward session; `stdin`/`stdout` carry the bidirectional I/O of an interactive exec;
+/// `resize` forwards terminal window-resize events to a TTY exec session.
+///
+/// # Non-exhaustive note
+///
+/// This struct is `#[non_exhaustive]`: construct it via [`SessionHandle::new`] rather than with
+/// a struct literal, which is forbidden outside the `cairn-vfs` crate. Field access is unrestricted.
 #[non_exhaustive]
 pub struct SessionHandle {
-    /// Send `()` (or drop) to cancel the session.
+    /// Send `()` (or drop) to request cancellation of the session. The backend's relay task
+    /// detects the signal and performs a best-effort teardown; `done` resolves shortly after.
     pub cancel: tokio::sync::oneshot::Sender<()>,
-    /// Resolves when the session exits cleanly or with an error. Carries a [`VfsError`] (not a bare
-    /// string) so the consumer can apply [`VfsError::redacted`] before display — keeping the error
-    /// type and redaction contract structural rather than convention. Backends must not panic if the
-    /// consumer has dropped this receiver (a torn-down session pane): discard the send error.
-    pub done: tokio::sync::oneshot::Receiver<Result<(), VfsError>>,
-    /// The local TCP port a port-forward bound; `None` for exec sessions.
+    /// Resolves once with the process exit code on success, or a [`VfsError`] on unexpected
+    /// failure. Non-zero exit is `Ok(n)`, not an error — `Ok(0)` means clean exit or clean
+    /// port-forward teardown; `Ok(-1)` is the sentinel used when the session is cancelled before
+    /// the remote process exits. Backends must not panic if the consumer has dropped this receiver
+    /// (e.g. a torn-down session pane); discard the send error silently.
+    pub done: tokio::sync::oneshot::Receiver<Result<i32, VfsError>>,
+    /// The local TCP port bound by a port-forward session; `None` for exec sessions.
     pub local_port: Option<u16>,
-    /// Writer for an interactive exec's stdin; `None` for port-forward / non-interactive exec. The
-    /// consumer owns it for the session's lifetime.
+    /// Stdin pipe for an interactive exec. Absent for port-forward and non-interactive exec.
+    /// The consumer owns it for the session's lifetime; dropping it closes stdin on the remote side.
     pub stdin: Option<tokio::sync::mpsc::Sender<Bytes>>,
-    /// Reader for an interactive exec's combined stdout/stderr; `None` for port-forward. The consumer
-    /// owns it and drains it to display output.
+    /// Combined stdout/stderr stream from an exec session. Absent for port-forward. The consumer
+    /// owns and drains it to display output; dropping it is safe (the relay task exits when the
+    /// sender detects a closed receiver).
     pub stdout: Option<tokio::sync::mpsc::Receiver<Bytes>>,
+    /// TTY resize sink: send `(rows, cols)` to propagate a terminal window resize. Present only
+    /// when the exec was started with `tty: true`; absent for non-TTY exec and port-forward.
+    /// The backend forwards the value to the API-level resize mechanism (e.g. `TerminalSize` watch
+    /// sender for Kubernetes, `resize_exec` for Docker). Errors on send are silently ignored
+    /// (the session may have already ended).
+    pub resize: Option<tokio::sync::mpsc::Sender<(u16, u16)>>,
+}
+
+impl SessionHandle {
+    /// Construct a new [`SessionHandle`].
+    ///
+    /// Backend crates must use this constructor because `#[non_exhaustive]` forbids struct
+    /// literal syntax outside `cairn-vfs`. Field access is unrestricted for callers (TUI, tests).
+    #[must_use]
+    pub fn new(
+        cancel: tokio::sync::oneshot::Sender<()>,
+        done: tokio::sync::oneshot::Receiver<Result<i32, VfsError>>,
+        local_port: Option<u16>,
+        stdin: Option<tokio::sync::mpsc::Sender<Bytes>>,
+        stdout: Option<tokio::sync::mpsc::Receiver<Bytes>>,
+        resize: Option<tokio::sync::mpsc::Sender<(u16, u16)>>,
+    ) -> Self {
+        Self {
+            cancel,
+            done,
+            local_port,
+            stdin,
+            stdout,
+            resize,
+        }
+    }
 }
 
 /// The result of invoking an action.

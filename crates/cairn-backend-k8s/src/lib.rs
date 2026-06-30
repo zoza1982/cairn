@@ -5,10 +5,17 @@
 //! seam and is fully unit-tested against an in-memory mock. Capabilities vary by depth
 //! ([`CapabilityProvider::caps_at`]): listing everywhere, file read only inside a container.
 //!
-//! This crate ships the read-only mapping core plus the **logs streaming action** (M6-6 first
-//! slice). The live `kube-rs` adapter provides `KubeOps::logs` over `Api::<Pod>::log_stream`;
-//! `KubeVfs::invoke("logs")` wires it to `ActionOutcome::Stream`. Interactive `exec` (TTY
-//! `Session`) and `port-forward` are M6-6 follow-ups; see `docs/LLD.md` and RFC-0005.
+//! **Implemented actions (M6-6):**
+//!
+//! - `logs` — `KubeOps::logs` over `Api::<Pod>::log_stream`; `KubeVfs::invoke("logs")` returns
+//!   `ActionOutcome::Stream`. See `real.rs` for the spawn+mpsc pattern.
+//! - `exec` — `KubeOps::exec` over `Api::<Pod>::exec` with `AttachParams`; `KubeVfs::invoke("exec")`
+//!   with `ActionCtx::Exec { argv, tty }` returns `ActionOutcome::Session(SessionHandle)`. Relay
+//!   tasks wire `AttachedProcess` stdin/stdout/stderr to the handle channels; a TTY resize relay
+//!   forwards `(rows, cols)` to `AttachedProcess::terminal_size`. See RFC-0009 §3.
+//!
+//! **Deferred (M6-6 follow-up):** `port-forward` — `Portforwarder`-based `Session` binding a
+//! local TCP port (RFC-0009 §3). The TUI exec pane (RFC-0009 §4) is PR-4.
 
 mod ops;
 #[cfg(feature = "k8s")]
@@ -304,20 +311,28 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
 
     /// Invoke a per-node Kubernetes action.
     ///
-    /// **Implemented (M6-6 first slice):**
-    /// - `logs` — streams pod/container log output as `ActionOutcome::Stream(BoxStream<'static,
-    ///   Result<Bytes, VfsError>>)`. For a pod path (`/<ctx>/<ns>/<pod>`) the container is taken
-    ///   from `ActionCtx::Logs { container }` (or the API server's default when `None`). For a
-    ///   container path (`/<ctx>/<ns>/<pod>/<container>` or deeper) the container is taken
-    ///   directly from the path. `follow` defaults to `false` (bounded history); `tail` defaults
-    ///   to `Some(100)` in non-follow mode so the stream terminates predictably for history reads
-    ///   and integration tests.
+    /// **Implemented:**
+    ///
+    /// - `logs` (M6-6 first slice) — streams pod/container log output as
+    ///   `ActionOutcome::Stream(BoxStream<'static, Result<Bytes, VfsError>>)`. For a pod path
+    ///   (`/<ctx>/<ns>/<pod>`) the container is taken from `ActionCtx::Logs { container }` (or
+    ///   the API server's default when `None`). For a container path (`/<ctx>/<ns>/<pod>/<container>`
+    ///   or deeper) the container is taken directly from the path. `follow` defaults to `false`
+    ///   (bounded history); `tail` defaults to `Some(100)` in non-follow mode so the stream
+    ///   terminates predictably for history reads and integration tests.
+    ///
+    /// - `exec` (M6-6, RFC-0009 §3) — opens an interactive exec session in a running container,
+    ///   returning `ActionOutcome::Session(SessionHandle)`. Requires `ActionCtx::Exec { argv, tty }`;
+    ///   any other `ActionCtx` variant returns `VfsError::Backend { code: "invalid_ctx" }`. The path
+    ///   must reach depth ≥ 4 (`/<ctx>/<ns>/<pod>/<container>`); shallower paths return
+    ///   `VfsError::Backend { code: "not_available" }`. The pod must be in the `Running` phase —
+    ///   a `Pending`/`Succeeded`/`Failed` pod returns `VfsError::NotFound` or `VfsError::Backend`
+    ///   from the API server.
     ///
     /// **Deferred (M6-6 follow-ups):**
-    /// - `exec` — interactive bidirectional `ActionOutcome::Session` with a TTY; requires the
-    ///   WebSocket attach surface and the `SessionHandle` pattern.
+    ///
     /// - `port-forward` — long-lived `ActionOutcome::Session` binding a local TCP port; requires
-    ///   `kube::api::Portforwarder` and lifecycle management.
+    ///   `kube::api::Portforwarder` and `TcpListener` lifecycle management (RFC-0009 §3).
     async fn invoke(
         &self,
         path: &VfsPath,
@@ -372,17 +387,46 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
                 Ok(ActionOutcome::Stream(stream))
             }
 
-            // exec and port-forward are advertised by `actions_at` but live invocation is
-            // deferred — reported distinctly from an unknown action so callers can detect the
-            // deferral.
-            action_ids::EXEC => Err(VfsError::Backend {
-                code: "not_implemented".to_owned(),
-                msg: "exec (interactive TTY Session) is a M6-6 follow-up".to_owned(),
-                retryable: false,
-            }),
+            action_ids::EXEC => {
+                // Exec requires depth ≥ 4: [ctx, ns, pod, container, ...].
+                let (kube_ctx, ns, pod, container) = match segs.as_slice() {
+                    [kube_ctx, ns, pod, container, ..] => (*kube_ctx, *ns, *pod, *container),
+                    _ => {
+                        return Err(VfsError::Backend {
+                            code: "not_available".to_owned(),
+                            msg: "exec is only available at container paths \
+                                  (/<ctx>/<ns>/<pod>/<container> or deeper)"
+                                .to_owned(),
+                            retryable: false,
+                        });
+                    }
+                };
+
+                // Extract argv and tty from the action context.
+                let (argv, tty) = match ctx {
+                    ActionCtx::Exec { argv, tty } => (argv, tty),
+                    _ => {
+                        return Err(VfsError::Backend {
+                            code: "invalid_ctx".to_owned(),
+                            msg: "exec requires ActionCtx::Exec { argv, tty }".to_owned(),
+                            retryable: false,
+                        });
+                    }
+                };
+
+                let handle = self
+                    .ops
+                    .exec(kube_ctx, ns, pod, container, argv, tty)
+                    .await?;
+                Ok(ActionOutcome::Session(handle))
+            }
+
+            // port-forward is advertised by `actions_at` but live invocation is deferred to a
+            // follow-up PR (RFC-0009 §3 port-forward section). Reported distinctly from an
+            // unknown action so callers can detect the deferral.
             action_ids::PORT_FORWARD => Err(VfsError::Backend {
                 code: "not_implemented".to_owned(),
-                msg: "port-forward (Session) is a M6-6 follow-up".to_owned(),
+                msg: "port-forward (Session) is a M6-6 follow-up (RFC-0009 §3)".to_owned(),
                 retryable: false,
             }),
 
@@ -398,6 +442,7 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use ops::mock::MockKube;
     use tokio::io::AsyncReadExt;
 
@@ -683,18 +728,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_exec_and_port_forward_are_deferred() {
+    async fn invoke_port_forward_is_deferred() {
         let vfs = backend();
-        // exec and port-forward are advertised but not yet live — must return not_implemented.
-        assert!(matches!(
-            vfs.invoke(
-                &p("/prod/default/web-0/app"),
-                ActionId::new(action_ids::EXEC),
-                ActionCtx::None
-            )
-            .await,
-            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
-        ));
+        // port-forward is advertised but not yet live — must return not_implemented.
         assert!(matches!(
             vfs.invoke(
                 &p("/prod/default/web-0"),
@@ -704,5 +740,172 @@ mod tests {
             .await,
             Err(VfsError::Backend { code, .. }) if code == "not_implemented"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Interactive exec session tests (mock, hermetic)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn invoke_exec_with_wrong_ctx_returns_invalid_ctx() {
+        let vfs = backend();
+        // exec with ActionCtx::None (not ActionCtx::Exec) must return invalid_ctx.
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default/web-0/app"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::None
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "invalid_ctx"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invoke_exec_on_shallow_path_returns_not_available() {
+        let vfs = backend();
+        // exec on a pod path (depth 3) is not available — only container paths (depth ≥ 4).
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default/web-0"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec!["sh".to_owned()],
+                    tty: false,
+                }
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "not_available"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invoke_exec_non_tty_returns_session_with_echo() {
+        let vfs = backend();
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0/app"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec!["sh".to_owned(), "-c".to_owned(), "cat".to_owned()],
+                    tty: false,
+                },
+            )
+            .await
+            .expect("invoke exec on a known container must succeed");
+
+        let handle = match outcome {
+            ActionOutcome::Session(h) => h,
+            _ => panic!("expected ActionOutcome::Session from invoke exec"),
+        };
+
+        // Non-TTY: stdin/stdout present; resize absent; local_port absent.
+        let stdin = handle.stdin.expect("non-tty exec must have a stdin sender");
+        let mut stdout = handle
+            .stdout
+            .expect("non-tty exec must have a stdout receiver");
+        assert!(
+            handle.resize.is_none(),
+            "non-tty exec must NOT have a resize channel"
+        );
+        assert!(
+            handle.local_port.is_none(),
+            "exec must never set local_port"
+        );
+
+        // Write a chunk to stdin; the mock echoes it back to stdout.
+        stdin
+            .send(Bytes::from_static(b"hello world\n"))
+            .await
+            .expect("stdin send must succeed");
+
+        let echo = stdout
+            .recv()
+            .await
+            .expect("stdout must yield the echoed chunk");
+        assert_eq!(echo, Bytes::from_static(b"hello world\n"));
+
+        // Drop stdin → signals EOF; the mock relay task exits and resolves `done` with Ok(0).
+        drop(stdin);
+        let exit = handle.done.await.expect("done channel must not be dropped");
+        // VfsError doesn't implement PartialEq, so unwrap Ok and check the code directly.
+        assert!(
+            matches!(exit, Ok(0)),
+            "mock exec must exit with code 0, got: {exit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_exec_tty_has_resize_channel() {
+        let vfs = backend();
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0/app"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec!["sh".to_owned()],
+                    tty: true,
+                },
+            )
+            .await
+            .expect("invoke exec (tty=true) on a known container must succeed");
+
+        let handle = match outcome {
+            ActionOutcome::Session(h) => h,
+            _ => panic!("expected ActionOutcome::Session from invoke exec tty"),
+        };
+
+        // TTY: resize channel must be present.
+        let resize = handle.resize.expect("tty exec must have a resize channel");
+
+        // Send a resize event — the mock accepts and discards it.
+        resize
+            .send((24, 80))
+            .await
+            .expect("resize send must succeed while session is alive");
+
+        // Cancel via the cancel sender; done must resolve (with any Ok value).
+        handle
+            .cancel
+            .send(())
+            .expect("cancel send must succeed while session is running");
+
+        let exit = handle.done.await.expect("done channel must not be dropped");
+        assert!(
+            exit.is_ok(),
+            "cancelled exec must resolve done with Ok(_), got: {exit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_exec_cancel_by_dropping_sender_resolves_done() {
+        let vfs = backend();
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0/app"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec!["sh".to_owned()],
+                    tty: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let handle = match outcome {
+            ActionOutcome::Session(h) => h,
+            _ => panic!("expected ActionOutcome::Session"),
+        };
+
+        // Drop the cancel sender (equivalent to sending ()) — done must still resolve.
+        drop(handle.cancel);
+        let exit = handle
+            .done
+            .await
+            .expect("done channel must resolve after cancel drop");
+        assert!(
+            exit.is_ok(),
+            "cancel-by-drop must yield Ok(_), got: {exit:?}"
+        );
     }
 }

@@ -40,17 +40,17 @@ use crate::tar_exec::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::{PodPhase, VfsPath};
-use cairn_vfs::VfsError;
+use cairn_vfs::{SessionHandle, VfsError};
 use futures::stream::BoxStream;
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use kube::{
-    api::{AttachParams, ListParams, LogParams},
+    api::{AttachParams, ListParams, LogParams, TerminalSize},
     config::{KubeConfigOptions, Kubeconfig},
     Api, Client, ResourceExt,
 };
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 // ---------------------------------------------------------------------------
 // Collected output from a single exec invocation
@@ -750,6 +750,243 @@ impl KubeOps for KubeRsOps {
             rx.recv().await.map(|item| (item, rx))
         })
         .boxed()
+    }
+
+    /// Open an interactive exec session in a running pod container via the Kubernetes API.
+    ///
+    /// Uses `Api::<Pod>::exec` with [`AttachParams`] configured for stdin/stdout/stderr (and TTY
+    /// when requested). The [`kube`] client negotiates the WebSocket/SPDY upgrade transparently;
+    /// this method sees only `AsyncRead`/`AsyncWrite` handles.
+    ///
+    /// # Task model
+    ///
+    /// A single Tokio task is spawned that owns the `AttachedProcess`. Inside it:
+    ///
+    /// - **stdin relay**: drains the `stdin` mpsc channel and writes each chunk to the process
+    ///   stdin `AsyncWrite`. When the channel is empty and the sender is dropped, the write-half
+    ///   is dropped too, closing stdin on the remote side.
+    /// - **stdout relay**: reads from the process `AsyncRead` in 4 KiB increments and forwards
+    ///   chunks to the `stdout` mpsc sender. When `tty: false`, a parallel stderr relay does the
+    ///   same and the two streams are interleaved (arrival order).
+    /// - **resize relay** (TTY only): reads `(rows, cols)` from the resize mpsc channel and
+    ///   writes them to the `TerminalSize` watch sender returned by `AttachedProcess::terminal_size`.
+    ///   Uses the watch directly — no polling, the latest value is always applied.
+    /// - **main select**: waits for either `cancel` (drop/send on the oneshot) or the process
+    ///   status future (`AttachedProcess::take_status`) to resolve. On cancel, relay tasks are
+    ///   aborted and `done` resolves with `Ok(-1)`. On natural exit, the exit code is extracted
+    ///   from the Kubernetes `Status` causes (`ExitCode` reason); a missing cause means `Ok(0)`.
+    ///
+    /// # Exit code extraction
+    ///
+    /// The Kubernetes API encodes the process exit code in `Status.details.causes[].message`
+    /// where `reason == "ExitCode"`. A `Status.status == "Success"` (or a missing cause) maps
+    /// to exit code 0. All non-zero exits are `Ok(n)`, not an error — the error path is reserved
+    /// for transport/API failures.
+    ///
+    /// # Credential safety
+    ///
+    /// No credential material appears in `VfsError` messages; `kube::Error::Api` messages contain
+    /// only API-server-provided text, and transport errors are wrapped in `VfsError::Connection`.
+    async fn exec(
+        &self,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        command: Vec<String>,
+        tty: bool,
+    ) -> Result<SessionHandle, VfsError> {
+        let client = build_client_for(ctx.to_owned()).await?;
+        let api: Api<Pod> = Api::namespaced(client, ns);
+
+        let ap = AttachParams::default()
+            .container(container)
+            .stdin(true)
+            .stdout(true)
+            .stderr(!tty) // K8s merges stderr into stdout when tty=true
+            .tty(tty);
+
+        let mut proc = api
+            .exec(pod, command.iter().map(String::as_str), &ap)
+            .await
+            .map_err(map_exec_error)?;
+
+        // Extract all I/O handles from the process before spawning any tasks.
+        // `AttachedProcess` drives the WebSocket in a background task; taking the readers/writers
+        // here does NOT block it — the internal DuplexStream pipes remain open until we drop them.
+        let proc_stdin = proc.stdin().ok_or_else(|| VfsError::Backend {
+            code: "exec-io".to_owned(),
+            msg: "exec: stdin writer unavailable from AttachedProcess".to_owned(),
+            retryable: false,
+        })?;
+        let proc_stdout = proc.stdout().ok_or_else(|| VfsError::Backend {
+            code: "exec-io".to_owned(),
+            msg: "exec: stdout reader unavailable from AttachedProcess".to_owned(),
+            retryable: false,
+        })?;
+        // stderr is None when tty=true (Docker/K8s convention: TTY merges streams).
+        let proc_stderr = proc.stderr();
+        // terminal_size is Some only when tty=true.
+        let terminal_size_watch = proc.terminal_size();
+        // take_status() returns the future for the Kubernetes-level process Status.
+        // Calling it a second time would return None; safe to unwrap once.
+        let status_fut = proc.take_status();
+
+        // Session channels.
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<i32, VfsError>>();
+
+        // Resize channel: present iff tty=true.
+        let (resize_tx, resize_rx) = if tty {
+            let (t, r) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+            (Some(t), Some(r))
+        } else {
+            (None, None)
+        };
+
+        // Spawn the owning task. It holds `proc` for its lifetime and drives all relay sub-tasks.
+        tokio::spawn(async move {
+            // --- stdin relay ---
+            // Moves `stdin_rx` and `proc_stdin` into a sub-task. When `stdin_rx` is exhausted
+            // (sender dropped), the write-half is dropped, signalling EOF to the remote process.
+            let stdin_task = {
+                let mut writer = proc_stdin;
+                let mut rx = stdin_rx;
+                tokio::spawn(async move {
+                    while let Some(chunk) = rx.recv().await {
+                        if writer.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Drop `writer` here → closes the stdin pipe to the remote process.
+                })
+            };
+
+            // --- stdout relay ---
+            // Reads from proc stdout in 4 KiB chunks and forwards to `stdout_tx`.
+            // When the consumer drops `stdout_rx`, `send` returns Err and we stop reading.
+            let stdout_task = {
+                let tx = stdout_tx.clone();
+                let mut reader = proc_stdout;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+            };
+
+            // --- stderr relay (non-TTY only) ---
+            // Interleaves stderr into the same `stdout_tx` channel.  When tty=true proc_stderr
+            // is None and this task is not spawned.
+            let stderr_task = if let Some(mut reader) = proc_stderr {
+                Some(tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stdout_tx
+                                    .send(Bytes::copy_from_slice(&buf[..n]))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }))
+            } else {
+                drop(stdout_tx); // last clone; stdout_task holds the other — drop this one
+                None
+            };
+
+            // --- resize relay (TTY only) ---
+            // Converts (rows, cols) → TerminalSize and forwards to the kube-rs
+            // `futures::channel::mpsc::Sender<TerminalSize>` returned by
+            // `AttachedProcess::terminal_size()`. `try_send` is used (non-blocking / best-effort):
+            // if the internal channel buffer is full we simply discard the resize — the TUI will
+            // send another event on the next window change, so no data is permanently lost.
+            if let (Some(mut rr), Some(mut ts)) = (resize_rx, terminal_size_watch) {
+                tokio::spawn(async move {
+                    while let Some((rows, cols)) = rr.recv().await {
+                        // `try_send` is synchronous; errors (full buffer or closed) are silently
+                        // ignored — the session may have already ended.
+                        let _ = ts.try_send(TerminalSize {
+                            width: cols,
+                            height: rows,
+                        });
+                    }
+                });
+            }
+
+            // --- main select: cancel vs. process exit ---
+            tokio::select! {
+                biased;
+
+                // Cancel path: abort relay tasks and send the sentinel exit code -1.
+                _ = cancel_rx => {
+                    stdin_task.abort();
+                    stdout_task.abort();
+                    if let Some(t) = stderr_task { t.abort(); }
+                    // Best-effort join — may have already exited.
+                    let _ = proc.join().await;
+                    let _ = done_tx.send(Ok(-1));
+                }
+
+                // Normal exit path: the Kubernetes Status future resolves when the remote process
+                // exits. Extract the numeric exit code from the Status causes.
+                status_opt = async {
+                    match status_fut {
+                        Some(f) => f.await,
+                        None => None,
+                    }
+                } => {
+                    // Wait for stdout relay to drain so the consumer receives all output before
+                    // `done` resolves. Ignore the join error (task may already be done).
+                    let _ = stdout_task.await;
+                    stdin_task.abort();
+                    if let Some(t) = stderr_task { t.abort(); }
+                    let _ = proc.join().await;
+
+                    // Extract the numeric exit code. A `Status.status == "Success"` (or an absent
+                    // ExitCode cause) maps to 0. Any parse failure also falls back to 0 (defensive).
+                    let code = status_opt
+                        .as_ref()
+                        .and_then(|s| s.details.as_ref())
+                        .and_then(|d| d.causes.as_ref())
+                        .and_then(|cs| {
+                            cs.iter()
+                                .find(|c| c.reason.as_deref() == Some("ExitCode"))
+                        })
+                        .and_then(|c| c.message.as_ref())
+                        .and_then(|m| m.parse::<i32>().ok())
+                        .unwrap_or(0);
+
+                    // If done_rx was dropped (session pane torn down), discard the send error.
+                    let _ = done_tx.send(Ok(code));
+                }
+            }
+        });
+
+        Ok(SessionHandle::new(
+            cancel_tx,
+            done_rx,
+            None, // local_port: exec never binds a port
+            Some(stdin_tx),
+            Some(stdout_rx),
+            resize_tx,
+        ))
     }
 }
 

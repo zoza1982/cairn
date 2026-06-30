@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::{EntryKind, PodPhase};
-use cairn_vfs::VfsError;
+use cairn_vfs::{SessionHandle, VfsError};
 use futures::stream::BoxStream;
 
 /// A kubeconfig context (no cluster call needed to enumerate these).
@@ -141,6 +141,45 @@ pub trait KubeOps: Send + Sync + 'static {
         follow: bool,
         tail: Option<i64>,
     ) -> BoxStream<'static, Result<Bytes, VfsError>>;
+
+    /// Open an interactive exec session in a running pod container.
+    ///
+    /// Returns a [`SessionHandle`] immediately; the remote process starts concurrently in a
+    /// spawned task. The caller drives the session via the handle's channels:
+    ///
+    /// - Write to `stdin` to send bytes to the process's stdin.
+    /// - Read from `stdout` to receive combined stdout (and, when `tty: false`, stderr) output.
+    /// - Send `(rows, cols)` to `resize` (present only when `tty: true`) to propagate terminal
+    ///   resize events.
+    /// - Drop or send on `cancel` to request teardown; await `done` for the exit code.
+    ///
+    /// # Parameters
+    ///
+    /// - `ctx`: kubeconfig context name.
+    /// - `ns`: namespace.
+    /// - `pod`: pod name. The pod must be in the `Running` phase; a `Pending`/`Succeeded`/`Failed`
+    ///   pod returns [`VfsError::NotFound`] or [`VfsError::Backend`].
+    /// - `container`: container name within the pod.
+    /// - `command`: argv passed directly to the container runtime (not a shell; use
+    ///   `["sh", "-c", "…"]` for shell commands).
+    /// - `tty`: allocate a pseudo-TTY. When `true`: stderr is merged into stdout (Docker/K8s
+    ///   convention), the `resize` channel is populated, and the process sees a PTY. When `false`:
+    ///   stderr is forwarded separately and interleaved into `stdout`; `resize` is `None`.
+    ///
+    /// # Error mapping
+    ///
+    /// 404 → [`VfsError::NotFound`]; 401 → [`VfsError::Auth`]; 403 → [`VfsError::Forbidden`];
+    /// other API errors → [`VfsError::Backend`]. Credential material is never included in error
+    /// messages.
+    async fn exec(
+        &self,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        command: Vec<String>,
+        tty: bool,
+    ) -> Result<SessionHandle, VfsError>;
 }
 
 #[cfg(test)]
@@ -149,7 +188,7 @@ pub(crate) mod mock {
     use async_trait::async_trait;
     use bytes::Bytes;
     use cairn_types::{EntryKind, PodPhase, VfsPath};
-    use cairn_vfs::VfsError;
+    use cairn_vfs::{SessionHandle, VfsError};
     use futures::stream::{self, BoxStream};
     use futures::StreamExt as _;
     use std::collections::BTreeMap;
@@ -425,6 +464,79 @@ pub(crate) mod mock {
                 );
                 stream::iter(vec![Err(err)]).boxed()
             }
+        }
+
+        /// Echo-style exec mock: relays each stdin chunk back to stdout, then exits with code 0.
+        ///
+        /// The cancel signal (drop or explicit send on [`SessionHandle::cancel`]) is honoured
+        /// cooperatively: the relay loop selects between `cancel` and `stdin.recv()`. Resize events
+        /// are accepted and discarded (the mock has no TTY state). Unknown pods return
+        /// [`VfsError::NotFound`].
+        async fn exec(
+            &self,
+            _ctx: &str,
+            _ns: &str,
+            pod: &str,
+            _container: &str,
+            _command: Vec<String>,
+            tty: bool,
+        ) -> Result<SessionHandle, VfsError> {
+            if !self.pods.values().flatten().any(|p| p.name == pod) {
+                return Err(Self::nf(pod));
+            }
+
+            let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+            let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<i32, VfsError>>();
+
+            // TTY-only resize channel — accepted and drained; the mock ignores resize geometry.
+            let (resize_tx, resize_rx) = if tty {
+                let (t, r) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
+                (Some(t), Some(r))
+            } else {
+                (None, None)
+            };
+
+            tokio::spawn(async move {
+                // Drain the resize channel in a background task so backpressure never stalls the
+                // main echo loop (the TTY resize sender would block otherwise).
+                if let Some(mut rr) = resize_rx {
+                    tokio::spawn(async move { while rr.recv().await.is_some() {} });
+                }
+
+                // Echo loop: relay stdin → stdout until stdin closes or cancel fires.
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel_rx => break,
+                        chunk = stdin_rx.recv() => {
+                            match chunk {
+                                Some(c) => {
+                                    // Best-effort echo; stop if the stdout receiver was dropped.
+                                    if stdout_tx.send(c).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break, // stdin sender dropped → EOF
+                            }
+                        }
+                    }
+                }
+
+                // Exit code 0 regardless of how the loop ended.
+                // If done_rx has already been dropped (session pane torn down), discard the error.
+                let _ = done_tx.send(Ok(0));
+            });
+
+            Ok(SessionHandle::new(
+                cancel_tx,
+                done_rx,
+                None, // local_port: exec sessions never bind a port
+                Some(stdin_tx),
+                Some(stdout_rx),
+                resize_tx,
+            ))
         }
     }
 }

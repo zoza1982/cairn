@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Kubernetes interactive exec** (M6-6, RFC-0009 §1 + §3): `KubeVfs::invoke("exec")` with
+  `ActionCtx::Exec { argv, tty }` now returns `ActionOutcome::Session(SessionHandle)` backed by
+  `kube 4.0`'s `Api::<Pod>::exec` + `AttachParams`. The `SessionHandle` shape is refined per
+  RFC-0009 §1: `done` carries `Result<i32, VfsError>` (exit code, not `Result<()>`; non-zero exit
+  is `Ok(n)`), a new `resize: Option<mpsc::Sender<(u16, u16)>>` field is added (present only when
+  `tty: true`), and a `SessionHandle::new()` constructor is added (required because
+  `#[non_exhaustive]` forbids struct-literal construction outside `cairn-vfs`). `KubeRsOps::exec`
+  spawns a task owning the `AttachedProcess` and wires three relay sub-tasks: stdin (`mpsc::Receiver
+  → AsyncWrite`), stdout+stderr (`AsyncRead → mpsc::Sender`, interleaved; stderr absent when TTY),
+  and a resize relay (`mpsc::Receiver<(u16,u16)> → futures::channel::mpsc::Sender<TerminalSize>`,
+  TTY only, uses `try_send` for best-effort non-blocking forwarding). The main task `select!`s
+  between `cancel` (→ `Ok(-1)`) and the `take_status()` future (→ Kubernetes `Status.causes`
+  ExitCode extraction). `MockKube::exec` is an echo-style implementation that relays stdin to
+  stdout and exits with `Ok(0)`. New hermetic tests (5): `invoke_exec_with_wrong_ctx_returns_invalid_ctx`,
+  `invoke_exec_on_shallow_path_returns_not_available`, `invoke_exec_non_tty_returns_session_with_echo`,
+  `invoke_exec_tty_has_resize_channel`, `invoke_exec_cancel_by_dropping_sender_resolves_done`. Kind
+  integration test extended (`CAIRN_IT_K8S`): `k8s_exec_non_tty_round_trip` runs
+  `["sh", "-c", "echo CAIRN_EXEC_MARKER"]` in a kube-system Running pod, asserts the marker in
+  stdout, and asserts `done == Ok(0)`; skips gracefully when no suitable container is found.
+  Workspace `cargo clippy` and `RUSTDOCFLAGS="-D warnings" cargo doc` are green across all crates.
+  Remaining RFC-0009 work: Docker exec (PR-5), port-forward (PR-3), TUI exec pane (PR-4).
+
 - **TUI log-stream viewer overlay** (M6-7): `L` opens a live log-stream overlay for the entry
   under the cursor. The overlay buffers up to 100 000 lines / 4 MiB (ring-buffer; oldest lines
   drop when the cap is reached), auto-scrolls in follow mode (`[follow]` indicator in the border),

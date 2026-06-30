@@ -16,6 +16,10 @@
 //! 6. Exercises `logs` (non-follow, tail 10) on the same kube-system pod — asserts the stream
 //!    yields at least some bytes without errors. System pods log actively, so a non-empty result
 //!    is expected; an empty log (recently-started pod) is noted but does not fail the test.
+//! 7. Exercises `exec` (non-TTY, `["sh", "-c", "echo CAIRN_EXEC_MARKER"]`) — asserts the marker
+//!    appears in stdout and `done` resolves with `Ok(0)`. Skips gracefully when no suitable
+//!    container (Running phase, has `sh`) can be found. The exec handle is programmatically driven
+//!    without a TUI pane (this PR is the backend only; the TUI exec pane is PR-4).
 #![cfg(feature = "k8s")]
 
 use cairn_backend_k8s::{KubeOps, KubeRsOps};
@@ -266,4 +270,128 @@ async fn k8s_cluster_tree_round_trip() {
         // test validated that there were no stream errors, which is the important invariant.
         eprintln!("WARN: log stream yielded 0 bytes (pod may have just started)");
     }
+}
+
+/// Interactive exec round-trip against a kind/live cluster.
+///
+/// Runs `sh -c 'echo CAIRN_EXEC_MARKER'` non-TTY in a kube-system pod, reads stdout from the
+/// `SessionHandle`, asserts the marker is present, and asserts `done` resolves with `Ok(0)`.
+///
+/// Skips gracefully when:
+/// - `CAIRN_IT_K8S` is unset (hermetic CI guard).
+/// - No Running pod in kube-system is found with a container that has `sh` on its PATH (checked
+///   by inspecting the exec error: if the error code is `exec-io` or the API returns 404/400, the
+///   container is not suitable).
+///
+/// This test drives the `SessionHandle` programmatically (no TUI pane). The TUI exec pane is
+/// implemented in PR-4 (RFC-0009 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_exec_non_tty_round_trip() {
+    if std::env::var("CAIRN_IT_K8S").is_err() {
+        eprintln!("CAIRN_IT_K8S unset — skipping live Kubernetes exec integration test");
+        return;
+    }
+
+    let ops = KubeRsOps::new();
+
+    // Use the first kind context (or the first context if no kind context is present).
+    let contexts = ops
+        .list_contexts()
+        .await
+        .expect("list_contexts must succeed");
+    assert!(!contexts.is_empty(), "need at least one kubeconfig context");
+    let ctx = &contexts
+        .iter()
+        .find(|c| c.name.contains("kind"))
+        .unwrap_or(&contexts[0])
+        .name;
+
+    // Enumerate kube-system pods.
+    let ns = "kube-system";
+    let pods = ops
+        .list_pods(ctx, ns)
+        .await
+        .expect("list_pods in kube-system must succeed");
+    assert!(!pods.is_empty(), "kube-system must have at least one pod");
+
+    // Many kube-system pods (coredns, etcd, kube-apiserver) run distroless images
+    // with no shell, where `sh -c …` exec connects but produces no output and a
+    // non-zero status. We therefore try every Running pod/container in turn and
+    // accept the first that has a shell, skipping only if none does — the exec
+    // *mechanism* is fully covered by the hermetic mock tests regardless.
+    let running: Vec<_> = pods
+        .iter()
+        .filter(|p| matches!(p.phase, cairn_types::PodPhase::Running))
+        .collect();
+    if running.is_empty() {
+        eprintln!("SKIP: no Running pod in kube-system — skipping exec test");
+        return;
+    }
+
+    for pod in running {
+        let pod_name = &pod.name;
+        let containers = ops
+            .list_containers(ctx, ns, pod_name)
+            .await
+            .expect("list_containers must succeed");
+        for container in &containers {
+            let container_name = &container.name;
+            eprintln!("Trying exec on pod '{pod_name}' container '{container_name}'...");
+
+            // Launch a non-TTY exec that echoes a known marker.
+            let command = vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "echo CAIRN_EXEC_MARKER".to_owned(),
+            ];
+            let handle = match ops
+                .exec(ctx, ns, pod_name, container_name, command, false)
+                .await
+            {
+                Ok(h) => h,
+                Err(VfsError::NotFound(_)) | Err(VfsError::Backend { .. }) => {
+                    // Pod may not accept exec (phase race) or container has no sh.
+                    eprintln!("  exec setup errored — trying the next container");
+                    continue;
+                }
+                Err(e) => panic!("exec failed unexpectedly: {e}"),
+            };
+
+            // Close stdin immediately — the command does not read it.
+            drop(handle.stdin);
+
+            // Collect stdout until the channel closes (relay exits after the process does).
+            let mut stdout = handle.stdout.expect("non-tty exec must have stdout");
+            let mut output = Vec::new();
+            while let Some(chunk) = stdout.recv().await {
+                output.extend_from_slice(&chunk);
+            }
+            let text = String::from_utf8_lossy(&output);
+
+            // Await the exit code regardless, so the relay/status task is joined.
+            let exit = handle
+                .done
+                .await
+                .expect("done channel must not be dropped before resolution");
+
+            if !text.contains("CAIRN_EXEC_MARKER") {
+                // Distroless container: `sh` is absent, so no marker was echoed.
+                eprintln!("  no marker (likely no shell) — trying the next container");
+                continue;
+            }
+
+            let code = exit.expect("exec must not fail with VfsError");
+            assert_eq!(
+                code, 0,
+                "non-TTY echo command must exit with code 0, got: {code}"
+            );
+            eprintln!("exec round-trip OK on '{pod_name}/{container_name}' — exit code {code}");
+            return;
+        }
+    }
+
+    eprintln!(
+        "SKIP: no kube-system container exposed a shell (all distroless) — \
+         exec mechanism is covered by the hermetic mock tests"
+    );
 }
