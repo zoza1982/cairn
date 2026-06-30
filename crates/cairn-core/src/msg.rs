@@ -74,6 +74,10 @@ pub enum Action {
     Reject,
     /// Open the log viewer for the entry under the cursor.
     OpenLogViewer,
+    /// Open a cooked exec session on the entry under the cursor. Available on backends that support
+    /// the `"exec"` action (e.g. Kubernetes/Docker exec, SSH). The reducer uses `["sh"]` as the
+    /// default argv. Wired to a configurable key once exec-capable backends land.
+    OpenExecSession,
     /// Scroll the active overlay up one page (log viewer, future overlays).
     PageUp,
     /// Scroll the active overlay down one page.
@@ -405,6 +409,13 @@ pub enum AppEffect {
         id: SessionId,
         /// The bytes to send (e.g. a line plus `\n`, or `\x04` for Ctrl-D).
         bytes: Vec<u8>,
+    },
+    /// Drop the stdin sender for an exec session, signalling EOF to the remote process without
+    /// cancelling the session. The overlay stays open to show remaining output; `SessionEnded`
+    /// arrives when the process exits. Unlike `CloseSession`, this does NOT fire the cancel token.
+    CloseStdin {
+        /// Target session.
+        id: SessionId,
     },
     /// Propagate a terminal-window resize to a TTY exec session. No-op in v1 (always `tty: false`);
     /// the variant is present for forward-compatibility so v2 can wire this without an API break.

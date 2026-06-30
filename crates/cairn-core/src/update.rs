@@ -254,6 +254,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         | Action::PageUp
         | Action::PageDown => Vec::new(),
         Action::OpenLogViewer => open_log_viewer(state),
+        Action::OpenExecSession => open_exec_session(state),
         Action::Refresh => reload(state, state.focus),
         Action::CycleSort => {
             let p = state.active_mut();
@@ -427,10 +428,10 @@ fn apply_exec_pane_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> 
             }]
         }
         TextEdit::CloseStdin => {
-            // Drop stdin: close the session (Ctrl-D). The remote process may exit on EOF.
-            let id = session_id;
-            state.overlay = None;
-            vec![AppEffect::CloseSession { id }]
+            // Signal EOF to the remote process by dropping stdin — the process may exit on EOF
+            // (e.g. a shell's `exit`). Unlike `CloseSession`, the overlay stays open to show
+            // remaining output; `SessionEnded` arrives when the process exits.
+            vec![AppEffect::CloseStdin { id: session_id }]
         }
     }
 }
@@ -1039,7 +1040,23 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
 /// While a modal overlay is open we start nothing new (a `ConfirmOverwrite` is a question about
 /// existing work) — already-running transfers in other slots are untouched.
 fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
-    if state.overlay.is_some() {
+    // Block queue advancement only while a modal overlay demands immediate user attention.
+    // Passive/long-lived overlays (LogViewer, ExecPane, PortForwardStatus) coexist with
+    // ongoing transfers — they must not starve the queue.
+    let blocks_queue = matches!(
+        &state.overlay,
+        Some(
+            Overlay::ConfirmDelete { .. }
+                | Overlay::ConfirmOverwrite { .. }
+                | Overlay::ConfirmShellAction { .. }
+                | Overlay::AiPlan { .. }
+                | Overlay::Connections { .. }
+                | Overlay::TransferQueue { .. }
+                | Overlay::Prompt { .. }
+                | Overlay::VaultUnlock { .. }
+        )
+    );
+    if blocks_queue {
         return Vec::new();
     }
     let mut effects = Vec::new();
@@ -1098,6 +1115,54 @@ fn open_log_viewer(state: &mut AppState) -> Vec<AppEffect> {
     }]
 }
 
+/// Open a cooked exec session on the entry under the cursor.
+///
+/// Mints a fresh [`SessionId`], inserts a [`SessionRecord`] into [`AppState::sessions`], opens
+/// the [`Overlay::ExecPane`], and emits [`AppEffect::OpenExecSession`] with `argv = ["sh"]`.
+/// Backend startup failures arrive later as [`AppEvent::SessionEnded`] with an error.
+fn open_exec_session(state: &mut AppState) -> Vec<AppEffect> {
+    let pane = state.active();
+    let Some(entry) = pane.current() else {
+        state.status = Some("Nothing selected".to_owned());
+        return Vec::new();
+    };
+    let Ok(path) = pane.cwd.join(entry.name.as_ref()) else {
+        state.status = Some("Cannot open exec session for this entry".to_owned());
+        return Vec::new();
+    };
+    let conn = pane.conn;
+    let title = format!("{} — exec", entry.name);
+    let id = state.next_session_id;
+    state.next_session_id = SessionId(id.0 + 1);
+
+    state.sessions.insert(
+        id,
+        SessionRecord {
+            path: path.clone(),
+            title: title.clone(),
+            output_lines: VecDeque::new(),
+            output_partial: String::new(),
+            output_byte_size: 0,
+            local_port: None,
+            ended: None,
+        },
+    );
+    state.overlay = Some(Overlay::ExecPane {
+        id,
+        input: String::new(),
+        scroll: 0,
+        follow: true,
+    });
+    vec![AppEffect::OpenExecSession {
+        id,
+        conn,
+        path,
+        argv: vec!["sh".to_owned()],
+        tty: false,
+        title,
+    }]
+}
+
 /// Handle actions while the log-viewer overlay is open.
 fn apply_log_viewer_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     let Some(Overlay::LogViewer {
@@ -1134,6 +1199,7 @@ fn apply_log_viewer_action(state: &mut AppState, action: Action) -> Vec<AppEffec
             *scroll = new_scroll;
             if new_scroll + 1 >= total_lines {
                 *follow = true;
+                *scroll = total_lines.saturating_sub(LOG_VIEWER_PAGE);
             }
             Vec::new()
         }
@@ -1171,8 +1237,13 @@ const EXEC_PANE_PAGE: usize = 20;
 fn apply_exec_pane_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     match action {
         Action::Cancel => {
-            // Detach: close the overlay, leave the remote process running.
-            state.overlay = None;
+            // Detach: close the overlay, leave the remote process running. If the session has
+            // already ended there is no relay task left, so clean up the record now.
+            if let Some(Overlay::ExecPane { id, .. }) = state.overlay.take() {
+                if state.sessions.get(&id).is_some_and(|r| r.ended.is_some()) {
+                    state.sessions.remove(&id);
+                }
+            }
             Vec::new()
         }
         Action::PageUp => {
@@ -1189,6 +1260,7 @@ fn apply_exec_pane_action(state: &mut AppState, action: Action) -> Vec<AppEffect
                 *scroll = new_scroll;
                 if new_scroll + 1 >= total {
                     *follow = true;
+                    *scroll = total.saturating_sub(EXEC_PANE_PAGE);
                 }
             }
             Vec::new()
@@ -1208,6 +1280,7 @@ fn apply_exec_pane_action(state: &mut AppState, action: Action) -> Vec<AppEffect
                 }
                 if *scroll + 1 >= total {
                     *follow = true;
+                    *scroll = total.saturating_sub(EXEC_PANE_PAGE);
                 }
             }
             Vec::new()
@@ -1242,13 +1315,19 @@ fn exec_pane_total_lines(state: &AppState) -> usize {
 
 /// Handle actions while the port-forward status overlay is open.
 ///
-/// `Cancel` (Esc / n / q) closes the overlay AND fires `CloseSession` to tear down the forward.
+/// `Confirm`/`Enter` are intentional no-ops: the status pane is informational and a live
+/// port-forward must not be torn down by accident. Only an explicit `Cancel` (Esc) closes it.
 fn apply_port_forward_status_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     match action {
-        Action::Cancel | Action::Confirm | Action::Enter => {
+        Action::Confirm | Action::Enter => Vec::new(),
+        Action::Cancel => {
             let Some(Overlay::PortForwardStatus { id }) = state.overlay.take() else {
                 return Vec::new();
             };
+            // If the session has already ended (relay task gone), clean up the record.
+            if state.sessions.get(&id).is_some_and(|r| r.ended.is_some()) {
+                state.sessions.remove(&id);
+            }
             vec![AppEffect::CloseSession { id }]
         }
         _ => Vec::new(),
@@ -1296,13 +1375,14 @@ fn append_log_chunk(
 
 /// Append a decoded text chunk into the session output ring buffer.
 ///
-/// Identical policy to [`append_log_chunk`]: splits on `\n`, accumulates complete lines in
-/// `output_lines`, the final unterminated fragment in `output_partial`, and evicts the oldest
-/// lines when either cap is exceeded.
-fn append_session_output(rec: &mut SessionRecord, text: &str) {
+/// Returns the number of complete lines that were evicted from the front to enforce the size
+/// caps. The caller must subtract this from any stored `scroll` offset to prevent the scroll
+/// position from drifting after eviction.
+fn append_session_output(rec: &mut SessionRecord, text: &str) -> usize {
     let lines = &mut rec.output_lines;
     let partial = &mut rec.output_partial;
     let byte_size = &mut rec.output_byte_size;
+    let mut evicted = 0usize;
     let mut segments = text.split('\n');
     if let Some(first) = segments.next() {
         *byte_size += first.len();
@@ -1317,11 +1397,13 @@ fn append_session_output(rec: &mut SessionRecord, text: &str) {
         while (lines.len() > SESSION_OUTPUT_MAX_LINES || *byte_size > SESSION_OUTPUT_MAX_BYTES)
             && !lines.is_empty()
         {
-            if let Some(evicted) = lines.pop_front() {
-                *byte_size = byte_size.saturating_sub(evicted.len() + 1);
+            if let Some(e) = lines.pop_front() {
+                *byte_size = byte_size.saturating_sub(e.len() + 1);
+                evicted += 1;
             }
         }
     }
+    evicted
 }
 
 /// Mint a transfer id, push a fresh [`ActiveTransfer`] tracking it, set the status line, and return
@@ -1541,15 +1623,14 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             }) = &mut state.overlay
             {
                 if *ov_id == id {
-                    let old_total = lines.len() + if partial.is_empty() { 0 } else { 1 };
                     append_log_chunk(lines, partial, byte_size, &text);
                     let new_total = lines.len() + if partial.is_empty() { 0 } else { 1 };
-                    let _ = old_total; // suppress unused warning
                     if *scroll >= new_total && new_total > 0 {
                         *scroll = new_total - 1;
                     }
                     if *follow {
-                        *scroll = new_total.saturating_sub(1);
+                        // Approximate the last-page top so un-follow transitions feel natural when scroll is restored.
+                        *scroll = new_total.saturating_sub(LOG_VIEWER_PAGE);
                     }
                 }
             }
@@ -1610,8 +1691,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // Decode lossily and append to the ring buffer, same mechanism as the log viewer.
             let text = String::from_utf8_lossy(&bytes).into_owned();
             if let Some(rec) = state.sessions.get_mut(&id) {
-                append_session_output(rec, &text);
-                // Keep the exec pane's scroll pinned to the latest line when follow is on.
+                let evicted = append_session_output(rec, &text);
                 let new_total =
                     rec.output_lines.len() + if rec.output_partial.is_empty() { 0 } else { 1 };
                 if let Some(Overlay::ExecPane {
@@ -1622,8 +1702,10 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 }) = &mut state.overlay
                 {
                     if *ov_id == id {
+                        // Adjust scroll for evicted lines to prevent view drift.
+                        *scroll = scroll.saturating_sub(evicted);
                         if *follow {
-                            *scroll = new_total.saturating_sub(1);
+                            *scroll = new_total.saturating_sub(EXEC_PANE_PAGE);
                         } else if *scroll >= new_total && new_total > 0 {
                             *scroll = new_total - 1;
                         }
@@ -1639,6 +1721,13 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
         } => {
             if let Some(rec) = state.sessions.get_mut(&id) {
                 rec.ended = Some(SessionEnd { exit_code, error });
+            }
+            // If the overlay is still showing this session the user can read the exit code; it will
+            // be cleaned up when they close the overlay. Otherwise clean up immediately.
+            let showing = matches!(&state.overlay, Some(Overlay::ExecPane { id: ov_id, .. }) if *ov_id == id)
+                || matches!(&state.overlay, Some(Overlay::PortForwardStatus { id: ov_id }) if *ov_id == id);
+            if !showing {
+                state.sessions.remove(&id);
             }
             Vec::new()
         }
@@ -4023,6 +4112,15 @@ mod session_tests {
         let mut state = base_state();
         let id = SessionId(1);
         insert_session(&mut state, id);
+        // Set up an ExecPane overlay showing this session so the record is preserved
+        // when SessionEnded arrives (Fix 4a: records without a visible overlay are
+        // cleaned up immediately on SessionEnded).
+        state.overlay = Some(Overlay::ExecPane {
+            id,
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+        });
 
         let effects = update(
             &mut state,
@@ -4037,6 +4135,28 @@ mod session_tests {
         let ended = rec.ended.as_ref().expect("ended must be set");
         assert_eq!(ended.exit_code, Some(1));
         assert_eq!(ended.error.as_deref(), Some("process exited"));
+    }
+
+    #[test]
+    fn session_ended_with_no_overlay_removes_record() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+        // No overlay — Fix 4a removes the record immediately when no pane is showing it.
+
+        let effects = update(
+            &mut state,
+            Msg::Event(AppEvent::SessionEnded {
+                id,
+                exit_code: Some(0),
+                error: None,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(
+            !state.sessions.contains_key(&id),
+            "session record should be cleaned up when no overlay is showing it"
+        );
     }
 
     #[test]
@@ -4140,7 +4260,7 @@ mod session_tests {
     }
 
     #[test]
-    fn exec_pane_close_stdin_closes_overlay_and_emits_close_session() {
+    fn exec_pane_close_stdin_signals_eof_and_keeps_overlay_open() {
         let mut state = base_state();
         let id = SessionId(1);
         insert_session(&mut state, id);
@@ -4152,11 +4272,15 @@ mod session_tests {
         });
 
         let effects = update(&mut state, Msg::Text(TextEdit::CloseStdin));
-        assert!(state.overlay.is_none(), "overlay should close on Ctrl-D");
+        // Overlay stays open to show remaining output; SessionEnded arrives when the process exits.
+        assert!(
+            state.overlay.is_some(),
+            "overlay must stay open after CloseStdin (process may still be running)"
+        );
         assert_eq!(effects.len(), 1);
         assert!(
-            matches!(&effects[0], AppEffect::CloseSession { id: eid } if *eid == id),
-            "expected CloseSession effect: {effects:?}"
+            matches!(&effects[0], AppEffect::CloseStdin { id: eid } if *eid == id),
+            "expected CloseStdin effect (not CloseSession): {effects:?}"
         );
     }
 
@@ -4173,6 +4297,50 @@ mod session_tests {
         assert!(
             matches!(&effects[0], AppEffect::CloseSession { id: eid } if *eid == id),
             "expected CloseSession on PortForwardStatus cancel: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn open_exec_session_mints_id_and_opens_overlay() {
+        use cairn_types::{Entry, EntryKind};
+        use std::sync::Arc;
+
+        let mut state = base_state();
+        // Populate the active pane with one entry so the action has a cursor target.
+        state.panes[0].listing =
+            Listing::Ready(Arc::new(vec![Entry::new("web-1", EntryKind::Dir)]));
+        state.panes[0].cursor = 0;
+
+        let effects = update(&mut state, Msg::Action(Action::OpenExecSession));
+
+        // Exactly one effect: OpenExecSession with the minted id and default argv.
+        assert_eq!(effects.len(), 1, "expected exactly one effect: {effects:?}");
+        match &effects[0] {
+            AppEffect::OpenExecSession { id, argv, .. } => {
+                assert_eq!(*id, SessionId(1), "first session must have id 1");
+                assert_eq!(argv, &["sh"], "default argv must be [\"sh\"]");
+            }
+            other => panic!("expected OpenExecSession, got {other:?}"),
+        }
+
+        // The overlay must be ExecPane with the new session id.
+        assert!(
+            matches!(&state.overlay, Some(Overlay::ExecPane { id, .. }) if *id == SessionId(1)),
+            "overlay must be ExecPane(SessionId(1)), got {:?}",
+            state.overlay,
+        );
+
+        // The session record must be inserted.
+        assert!(
+            state.sessions.contains_key(&SessionId(1)),
+            "session record must be inserted into state.sessions"
+        );
+
+        // The id counter must have been advanced.
+        assert_eq!(
+            state.next_session_id,
+            SessionId(2),
+            "next_session_id must be incremented to 2"
         );
     }
 }

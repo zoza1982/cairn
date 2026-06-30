@@ -378,8 +378,13 @@ fn render_log_viewer(
 
     // Viewport: subtract 2 for the borders.
     let viewport = usize::from(area.height.saturating_sub(2));
-    // The reducer's `scroll` is the index of the topmost visible line; clamp defensively.
-    let top = scroll.min(lines.len().saturating_sub(1));
+    // When following, ignore scroll and compute the last page directly so we always fill the
+    // viewport — otherwise scroll=last_line_idx would render only 1 visible line.
+    let top = if follow {
+        lines.len().saturating_sub(viewport)
+    } else {
+        scroll.min(lines.len().saturating_sub(1))
+    };
     let end = (top + viewport).min(lines.len());
     let visible: Vec<ListItem> = lines
         .iter()
@@ -695,14 +700,32 @@ fn render_exec_pane(
     let output_rows = inner.height.saturating_sub(1);
     let viewport = usize::from(output_rows);
     let lines = &rec.output_lines;
-    let top = scroll.min(lines.len().saturating_sub(1));
-    let end = (top + viewport).min(lines.len());
-    let visible: Vec<ListItem> = lines
+    // Total virtual line count: complete lines + 1 if there is a partial (unterminated) line.
+    let partial_line = if rec.output_partial.is_empty() {
+        None
+    } else {
+        Some(rec.output_partial.as_str())
+    };
+    let total_virtual = lines.len() + if partial_line.is_some() { 1 } else { 0 };
+    let top = if follow {
+        total_virtual.saturating_sub(viewport)
+    } else {
+        scroll.min(total_virtual.saturating_sub(1))
+    };
+    let end = (top + viewport).min(total_virtual);
+    let line_end = end.min(lines.len());
+    let mut visible: Vec<ListItem> = lines
         .iter()
         .skip(top)
-        .take(end.saturating_sub(top))
+        .take(line_end.saturating_sub(top))
         .map(|l| ListItem::new(l.as_str()))
         .collect();
+    // If the partial line falls in the visible range, append it dimmed.
+    if end > lines.len() {
+        if let Some(p) = partial_line {
+            visible.push(ListItem::new(p).style(Style::default().fg(Color::DarkGray)));
+        }
+    }
     let output_area = Rect {
         height: output_rows,
         ..inner

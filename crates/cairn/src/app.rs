@@ -790,6 +790,13 @@ fn dispatch(
                 }
             }
         }
+        AppEffect::CloseStdin { id } => {
+            // Drop only the stdin sender; the cancel token stays live so the relay task keeps
+            // draining stdout until the process exits.
+            if let Some(ctrl) = session_controls.get_mut(&id) {
+                ctrl.stdin = None;
+            }
+        }
         AppEffect::ResizeSession { id, rows, cols } => {
             if let Some(ctrl) = session_controls.get(&id) {
                 if let Some(resize) = &ctrl.resize {
@@ -1750,6 +1757,18 @@ async fn run_exec_session_effect(
                     }
                 }
             }
+        }
+    }
+
+    // Drain any remaining stdout that arrived before or concurrently with the done signal.
+    if let Some(rx) = &mut stdout {
+        while let Ok(bytes) = rx.try_recv() {
+            let _ = event_tx
+                .send(AppEvent::SessionOutput {
+                    id,
+                    bytes: bytes.to_vec(),
+                })
+                .await;
         }
     }
 
