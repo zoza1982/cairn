@@ -1341,11 +1341,13 @@ dependencies = [
 name = "cairn-broker"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "cairn-broker-api",
  "cairn-secrets",
  "cairn-vault",
  "tempfile",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
@@ -1354,6 +1356,7 @@ version = "0.1.0"
 dependencies = [
  "cairn-types",
  "cargo_metadata",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1397,14 +1400,18 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "cairn-broker-api",
  "cairn-types",
  "cairn-vfs",
  "futures",
+ "ipnet",
+ "reqwest 0.12.28",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
+ "wiremock",
 ]
 
 [[package]]

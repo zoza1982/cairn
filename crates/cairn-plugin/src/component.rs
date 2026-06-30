@@ -16,7 +16,9 @@
 //! against a committed guest fixture (CI needs no WASM toolchain).
 
 use crate::{Limits, PluginError};
+use cairn_broker_api::{CredentialAction, CredentialBroker};
 use cairn_types::Caps;
+use std::sync::Arc;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -29,8 +31,13 @@ wasmtime::component::bindgen!({
 use cairn::plugin::types::{Caps as Caps0, Entry, VfsError};
 use exports::cairn::plugin::backend::ListPageResult;
 
-// Re-exports so the `backend`/`bridge` modules can name the generated WIT types without re-running
-// `bindgen!`.
+// Re-exports so the `backend`/`bridge`/`http_fetch` modules can name the generated WIT types
+// without re-running `bindgen!`.
+// `WitHttpRequest`/`WitHttpResponse` are only used by `http_fetch.rs` (plugin-network feature).
+#[cfg(feature = "plugin-network")]
+pub(crate) use cairn::plugin::host::{
+    HttpRequest as WitHttpRequest, HttpResponse as WitHttpResponse,
+};
 pub(crate) use cairn::plugin::types::{
     ByteRange as WitByteRange, Entry as WitEntry, EntryKind as WitEntryKind,
     VfsError as WitVfsError,
@@ -39,7 +46,7 @@ pub(crate) use exports::cairn::plugin::backend::ListPageResult as WitListPageRes
 pub(crate) use wasmtime::component::ResourceAny;
 
 /// Store state for a component instance: the memory limiter plus an **ambient-authority-free** WASI
-/// context.
+/// context, plus the per-plugin capability grants and brokered host function state.
 ///
 /// A guest built against `std` references the `wasi:*` interfaces, so a subset must be linkable for
 /// instantiation.  The context is **empty** — no preopened directories, no environment, null stdio,
@@ -48,10 +55,38 @@ pub(crate) use wasmtime::component::ResourceAny;
 /// filesystem, and CLI are absent from the linker; a component importing any of those fails
 /// instantiation (default-deny).  The poll and monotonic-clock stubs close the epoch-evasion gap
 /// (RFC-0010 §2).
+///
+/// The brokered host function fields (`network_grants`, `credential_grants`, `credential_broker`,
+/// and the `plugin-network`-gated HTTP fields) are populated by
+/// [`PluginComponent::instantiate_with_grants`] and default to empty/`None` in the no-grant path.
 struct CompState {
     limits: StoreLimits,
     wasi: WasiCtx,
     table: ResourceTable,
+
+    // ── Capability grants (RFC-0010 §3/§4) ─────────────────────────────────────────────────
+    /// Hostnames this plugin may reach via `host::http-fetch`. Compared case-insensitively
+    /// at call time; not normalized at storage time. Empty → deny-stub.
+    network_grants: Vec<String>,
+    /// Credential handle labels this plugin may use via `host::use-credential`. Empty → deny-stub.
+    credential_grants: Vec<String>,
+    /// The plugin's canonical name, recorded in audit-journal entries.
+    plugin_name: String,
+    /// Credential broker. `None` → use-credential is a deny-stub even with grants.
+    credential_broker: Option<Arc<dyn CredentialBroker>>,
+
+    // ── plugin-network: brokered HTTP client ────────────────────────────────────────────────
+    /// A shared `reqwest::Client` configured with the plugin's redirect policy.
+    /// `None` when the `plugin-network` feature is disabled or network grants are empty.
+    #[cfg(feature = "plugin-network")]
+    http_client: Option<Arc<reqwest::Client>>,
+    /// Per-call HTTP resource limits (response size cap, timeouts).
+    #[cfg(feature = "plugin-network")]
+    http_limits: crate::http_fetch::HttpLimits,
+    /// The tokio runtime handle captured at instantiation time, used to drive async reqwest
+    /// futures from the synchronous plugin thread (`std::thread`, not a tokio task).
+    #[cfg(feature = "plugin-network")]
+    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 impl WasiView for CompState {
@@ -63,9 +98,10 @@ impl WasiView for CompState {
     }
 }
 
-// The granted `host` interface. `log`/`now-secs` are always safe (no I/O, no secrets). The brokered
-// `http-fetch`/`use-credential` are deny-stubs here — a guest importing them instantiates but the call
-// returns an error; the real broker-backed implementations (grant-gated) are M8-4/M8-5.
+// The granted `host` interface. `log`/`now-secs` are always safe (no I/O, no secrets).
+// `http-fetch` and `use-credential` are capability-gated and broker-backed (RFC-0010 §3/§4).
+// When the plugin has no matching grant, or when the broker is absent, the function returns
+// an error string — the plugin instantiates but the call is denied at runtime.
 impl cairn::plugin::host::Host for CompState {
     fn log(&mut self, level: u8, msg: String) {
         let level = match level {
@@ -82,6 +118,8 @@ impl cairn::plugin::host::Host for CompState {
             let end = (0..=MAX_LOG)
                 .rev()
                 .find(|&i| msg.is_char_boundary(i))
+                // `unwrap_or(0)` is unreachable: the range `0..=MAX_LOG` always includes `0`,
+                // and `0` is always a UTF-8 char boundary, so `find` never returns `None`.
                 .unwrap_or(0);
             format!("{}…[truncated]", &msg[..end])
         } else {
@@ -103,15 +141,98 @@ impl cairn::plugin::host::Host for CompState {
             .as_secs()
     }
 
+    /// Brokered HTTP fetch (RFC-0010 §3).
+    ///
+    /// The host performs the HTTP request; the guest never touches a socket. The call is
+    /// rejected if `network_grants` is empty (no network grant), if the URL's hostname is not
+    /// in the grant list, or if SSRF guards trigger. Requires the `plugin-network` feature.
     fn http_fetch(
         &mut self,
-        _req: cairn::plugin::host::HttpRequest,
+        req: cairn::plugin::host::HttpRequest,
     ) -> Result<cairn::plugin::host::HttpResponse, String> {
-        Err("http-fetch requires a network grant (M8-4)".to_owned())
+        // Gate: no network grant → deny without touching any network path.
+        if self.network_grants.is_empty() {
+            return Err("http-fetch: plugin has no network grant".to_owned());
+        }
+
+        #[cfg(feature = "plugin-network")]
+        {
+            // The HTTP client is `None` either because:
+            //  a) network grants are non-empty but the tokio runtime wasn't present at
+            //     instantiation time (should be rare — the binary always has one), OR
+            //  b) `build_client` failed at instantiation.
+            let client =
+                match self.http_client.as_ref() {
+                    Some(c) => c.clone(),
+                    None => return Err(
+                        "http-fetch: HTTP client unavailable (no tokio runtime at instantiation)"
+                            .to_owned(),
+                    ),
+                };
+            let handle = match self.tokio_handle.as_ref() {
+                Some(h) => h.clone(),
+                None => return Err("http-fetch: no tokio runtime handle".to_owned()),
+            };
+            let grants = self.network_grants.clone();
+            let limits = self.http_limits;
+            // Drive the async fetch from this synchronous plugin thread.
+            // Sanitize error strings (RFC §3.4): strip control chars + cap length before
+            // the string crosses the WIT ABI back to the guest, consistent with other host fns.
+            handle
+                .block_on(crate::http_fetch::do_http_fetch(
+                    &req, &grants, &client, limits,
+                ))
+                .map_err(crate::bridge::sanitize_msg)
+        }
+
+        #[cfg(not(feature = "plugin-network"))]
+        {
+            let _ = req;
+            Err("http-fetch: the plugin-network feature is not enabled in this build".to_owned())
+        }
     }
 
-    fn use_credential(&mut self, _handle: String, _action: String) -> Result<String, String> {
-        Err("use-credential requires a credentials grant (M8-4)".to_owned())
+    /// Brokered credential use (RFC-0010 §4).
+    ///
+    /// The plugin names a credential by opaque handle (a vault label). The host:
+    /// 1. Verifies the handle is in the plugin's `credentials` grant.
+    /// 2. Parses the action string into the closed vocabulary (`bearer-token`,
+    ///    `basic-auth-header`). An unrecognised string is rejected before touching the vault.
+    /// 3. Calls the broker, which resolves the secret internally, derives the ephemeral
+    ///    artifact, zeroizes the secret, and returns the artifact.
+    ///
+    /// The raw `CredentialSecret` never reaches this method — it stays in the broker stack
+    /// frame. This method returns only the artifact string or a secret-free error.
+    fn use_credential(&mut self, handle: String, action: String) -> Result<String, String> {
+        // Gate 1: credential not in approved grant list.
+        if !self.credential_grants.contains(&handle) {
+            // Do NOT reveal the grant list in the error.
+            return Err("use-credential: handle not in credentials grant".to_owned());
+        }
+
+        // Gate 2: unknown action — closed vocabulary. Reject before touching the vault.
+        let cred_action = CredentialAction::parse(&action).ok_or_else(|| {
+            format!(
+                "use-credential: unknown action '{action}' \
+                 (accepted: 'bearer-token', 'basic-auth-header')"
+            )
+        })?;
+
+        // Gate 3: no broker wired in (vault locked at instantiation, or not injected in tests).
+        let broker = self.credential_broker.as_ref().ok_or_else(|| {
+            "use-credential: no credential broker available (vault may be locked)".to_owned()
+        })?;
+
+        // Delegate to the broker. The broker resolves the secret, performs the action,
+        // zeroizes the secret, journals the event (no secret material), and returns the
+        // ephemeral artifact. `CredentialBrokerError` is secret-free by design.
+        //
+        // NOTE (SEC-10): credential handle grant lookup is case-sensitive (exact opaque-label
+        // match). The manifest grant label must exactly match the vault entry label — the
+        // comparison intentionally fails closed for any case variant.
+        broker
+            .use_credential(&self.plugin_name, &handle, &cred_action)
+            .map_err(|e| crate::bridge::sanitize_msg(format!("use-credential failed: {e}")))
     }
 }
 
@@ -134,6 +255,38 @@ impl PluginComponent {
     /// if instantiation fails (e.g. an unsatisfied import or fuel/component-model not enabled on
     /// `engine`).
     pub fn instantiate(engine: &Engine, bytes: &[u8], limits: Limits) -> Result<Self, PluginError> {
+        // Zero-grant path: no network grant, no credentials, no broker. Used for fixture tests and
+        // untrusted-plugin sandbox verification; brokered host fns return deny errors.
+        Self::instantiate_with_grants(
+            engine,
+            bytes,
+            limits,
+            crate::PluginHostConfig {
+                grants: crate::PluginGrants::default(),
+                plugin_name: String::new(),
+                credential_broker: None,
+            },
+        )
+    }
+
+    /// Instantiate a component with explicit capability grants and a credential broker
+    /// (RFC-0010 §3/§4).
+    ///
+    /// This is the production entry point. `config.grants.network` controls which hostnames
+    /// `http-fetch` may contact; `config.grants.credentials` controls which vault handles
+    /// `use-credential` may resolve. Both default to empty (deny-all) so callers must
+    /// explicitly grant capabilities.
+    ///
+    /// # Errors
+    /// [`PluginError::Compile`] if the bytes are not a valid component, or
+    /// [`PluginError::Instantiate`] if an unsatisfied import exists or fuel/component-model
+    /// is not enabled on `engine`.
+    pub fn instantiate_with_grants(
+        engine: &Engine,
+        bytes: &[u8],
+        limits: Limits,
+        config: crate::PluginHostConfig,
+    ) -> Result<Self, PluginError> {
         let component = Component::from_binary(engine, bytes)
             .map_err(|e| PluginError::Compile(e.to_string()))?;
         let mut linker: Linker<CompState> = Linker::new(engine);
@@ -147,15 +300,55 @@ impl PluginComponent {
         // cannot interrupt.  The epoch deadline now reliably bounds wall-clock time even
         // for a guest that tries the blocking-evasion attack described in `crate::epoch`.
         crate::wasi_narrowing::add_narrowed_wasi_to_linker(&mut linker)?;
-        // The granted `host` interface (log/now-secs real; brokered fns deny-stubbed — see `Host`).
+        // The granted `host` interface: log/now-secs always; http-fetch/use-credential
+        // capability-gated (by grants in CompState, not by linker presence — the guest
+        // always instantiates but gets a runtime deny if grants are absent).
         cairn::plugin::host::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
             |s| s,
         )
         .map_err(|e| PluginError::Instantiate(e.to_string()))?;
+
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.max_memory_bytes)
             .build();
+
+        // SECURITY (release-gating for M8-5 / PR-C): before the plugin loader (PR-C) makes
+        // this function reachable from the binary with untrusted plugins and grant-bearing
+        // config, the DNS rebinding TOCTOU window in `check_ssrf_via_dns` MUST be closed by
+        // pinning each connection to the `SocketAddr` set validated at pre-flight time via a
+        // custom `reqwest::dns::Resolve` override that re-validates the pinned IP at connect.
+        // See `http_fetch::check_ssrf_via_dns` for the full security note.
+        // Bundle SEC-8 (6to4/Teredo/NAT64 embedded-v4 prefix blocks) with that work.
+        //
+        // Build the HTTP client when the plugin-network feature is enabled and network grants
+        // are non-empty. The tokio runtime handle is captured here (on the calling async task
+        // or thread); it is later used by the synchronous plugin thread to drive async reqwest
+        // futures via `Handle::block_on`.
+        #[cfg(feature = "plugin-network")]
+        let (http_client, http_limits, tokio_handle) = {
+            let h_limits = crate::http_fetch::HttpLimits::default();
+            let handle = tokio::runtime::Handle::try_current().ok();
+            let client = if !config.grants.network.is_empty() && handle.is_some() {
+                match crate::http_fetch::build_client(h_limits) {
+                    Ok(c) => Some(Arc::new(c)),
+                    Err(e) => {
+                        // Log and degrade gracefully — plugin instantiates but http-fetch will
+                        // return an error. The plugin author will see the error at call time.
+                        tracing::warn!(
+                            target: "cairn_plugin",
+                            plugin = %config.plugin_name,
+                            "failed to build HTTP client for plugin: {e}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            (client, h_limits, handle)
+        };
+
         let mut store = Store::new(
             engine,
             CompState {
@@ -169,6 +362,16 @@ impl PluginComponent {
                 // (M8-5) will stub the blocking methods with ImmediatelyReady semantics.
                 wasi: WasiCtx::builder().build(),
                 table: ResourceTable::new(),
+                network_grants: config.grants.network,
+                credential_grants: config.grants.credentials,
+                plugin_name: config.plugin_name,
+                credential_broker: config.credential_broker,
+                #[cfg(feature = "plugin-network")]
+                http_client,
+                #[cfg(feature = "plugin-network")]
+                http_limits,
+                #[cfg(feature = "plugin-network")]
+                tokio_handle,
             },
         );
         store.limiter(|s| &mut s.limits);
@@ -189,7 +392,15 @@ impl PluginComponent {
     /// The epoch deadline only bites while an [`EpochTicker`](crate::EpochTicker) advances the
     /// engine's epoch.
     pub(crate) fn arm(&mut self, limits: Limits) {
-        let _ = self.store.set_fuel(limits.fuel);
+        // `set_fuel` fails only when fuel metering is disabled on the engine. `engine_config`
+        // enables it unconditionally, so this should never fire. Log a warning rather than
+        // silently discarding the error — a misconfigured engine is a programming error.
+        if let Err(e) = self.store.set_fuel(limits.fuel) {
+            tracing::warn!(
+                target: "cairn_plugin",
+                "arm: set_fuel failed (engine misconfiguration?): {e}"
+            );
+        }
         // `.max(1)`: a 0-tick deadline would trap the very next op (deadline == current epoch).
         self.store.set_epoch_deadline(limits.max_call_ticks.max(1));
     }

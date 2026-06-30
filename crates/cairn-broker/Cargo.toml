@@ -17,6 +17,12 @@ cairn-broker-api = { workspace = true }
 cairn-secrets = { workspace = true }
 cairn-vault = { workspace = true }
 thiserror = "2"
+# base64 used for `basic-auth-header` credential action (RFC-0010 §4.2).
+# Version 0.22 is already in the workspace dep tree via other crates.
+base64 = { version = "0.22", features = ["alloc"] }
+# Explicit zeroization of intermediate plaintext material in `perform_credential_action`.
+# `cairn-vault` and `cairn-secrets` already use `zeroize`; this pins the same major version.
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

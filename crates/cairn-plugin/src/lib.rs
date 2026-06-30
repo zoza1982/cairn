@@ -29,6 +29,7 @@
 //! use core::error::Error; }`.  See `crates/cairn-plugin/tests/fixture-guest/` for a complete
 //! reference implementation.
 
+use std::sync::Arc;
 use thiserror::Error;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
@@ -37,10 +38,56 @@ mod bridge;
 mod component;
 mod epoch;
 mod handle;
+#[cfg(feature = "plugin-network")]
+pub(crate) mod http_fetch;
 mod wasi_narrowing;
 pub use backend::PluginVfsBackend;
+pub use cairn_broker_api::CredentialBroker;
 pub use component::{engine_config, PluginComponent};
 pub use epoch::EpochTicker;
+
+/// The capabilities granted to a plugin instance (RFC-0010 §3/§4).
+///
+/// `PluginGrants` is the parsed, validated form of what appears in a plugin manifest's
+/// `[grants]` table. It is constructed by the plugin loader (PR-C) and passed into
+/// [`PluginComponent::instantiate_with_grants`]; plugins that received no grants use
+/// [`PluginGrants::default`] and will see deny-stubs for every brokered host function.
+#[derive(Debug, Clone, Default)]
+pub struct PluginGrants {
+    /// Hostnames this plugin may reach via `host::http-fetch`.
+    ///
+    /// Exact hostname match (no scheme, no port, no wildcards in this version). Values are
+    /// compared case-insensitively at call time but are not normalized to lower-case at storage
+    /// time. Example: `["api.github.com", "releases.example.com"]`.
+    pub network: Vec<String>,
+    /// Credential handle labels this plugin may use via `host::use-credential`.
+    ///
+    /// Each entry is the human-readable `label` under which a credential is stored in
+    /// the vault (the same string the user put in the plugin manifest). The broker
+    /// resolves labels to `CredentialId` at call time.
+    pub credentials: Vec<String>,
+}
+
+/// Everything the plugin host needs to wire up brokered host functions for one plugin
+/// component instance (RFC-0010 §3/§4).
+///
+/// Passed to [`PluginComponent::instantiate_with_grants`]. `Default` produces a zero-grant,
+/// no-broker config; use it for untrusted test fixtures.
+#[derive(Default)]
+pub struct PluginHostConfig {
+    /// Capability grants for this plugin instance.
+    pub grants: PluginGrants,
+    /// The plugin's canonical name, recorded in audit-journal entries by the broker.
+    pub plugin_name: String,
+    /// The credential broker.
+    ///
+    /// `None` — `use-credential` remains a deny-stub even when `grants.credentials`
+    /// is non-empty (the plugin is granted access to named credentials, but no broker is
+    /// wired in — useful for testing or the case where the vault is locked at instantiation
+    /// time). When `Some`, only handles in `grants.credentials` are permitted; others are
+    /// rejected before the broker is touched.
+    pub credential_broker: Option<Arc<dyn CredentialBroker>>,
+}
 
 /// Per-instance resource limits.
 #[derive(Debug, Clone, Copy)]
