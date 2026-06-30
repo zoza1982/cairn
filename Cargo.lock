@@ -1284,6 +1284,7 @@ dependencies = [
  "smol_str",
  "tar",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

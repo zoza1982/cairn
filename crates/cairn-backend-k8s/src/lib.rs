@@ -14,8 +14,13 @@
 //!   tasks wire `AttachedProcess` stdin/stdout/stderr to the handle channels; a TTY resize relay
 //!   forwards `(rows, cols)` to `AttachedProcess::terminal_size`. See RFC-0009 §3.
 //!
-//! **Deferred (M6-6 follow-up):** `port-forward` — `Portforwarder`-based `Session` binding a
-//! local TCP port (RFC-0009 §3). The TUI exec pane (RFC-0009 §4) is PR-4.
+//! **Implemented actions (M6-6, continued):**
+//!
+//! - `port-forward` — `KubeOps::port_forward` over `Api::<Pod>::portforward` + a local
+//!   `TcpListener`; `KubeVfs::invoke("port-forward")` with `ActionCtx::PortForward { local, remote }`
+//!   returns `ActionOutcome::Session(SessionHandle)`. See RFC-0009 §3.
+//!
+//! **Deferred (follow-up PR):** The TUI exec pane (RFC-0009 §4) is PR-4.
 
 mod ops;
 #[cfg(feature = "k8s")]
@@ -329,10 +334,15 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
     ///   a `Pending`/`Succeeded`/`Failed` pod returns `VfsError::NotFound` or `VfsError::Backend`
     ///   from the API server.
     ///
-    /// **Deferred (M6-6 follow-ups):**
+    /// - `port-forward` (M6-6, RFC-0009 §3) — binds a local `TcpListener` and forwards TCP
+    ///   connections to a pod port, returning `ActionOutcome::Session(SessionHandle)`. Requires
+    ///   `ActionCtx::PortForward { local, remote }` where `remote` must be non-zero. `local == 0`
+    ///   requests an OS-assigned ephemeral port. `done` resolves `Ok(0)` on clean cancel, or
+    ///   `Err(VfsError::Backend { code: "accept_failed" })` on a fatal listener error.
     ///
-    /// - `port-forward` — long-lived `ActionOutcome::Session` binding a local TCP port; requires
-    ///   `kube::api::Portforwarder` and `TcpListener` lifecycle management (RFC-0009 §3).
+    /// **Deferred (follow-up PRs):**
+    ///
+    /// - TUI exec/port-forward pane integration (RFC-0009 §4).
     async fn invoke(
         &self,
         path: &VfsPath,
@@ -421,14 +431,55 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
                 Ok(ActionOutcome::Session(handle))
             }
 
-            // port-forward is advertised by `actions_at` but live invocation is deferred to a
-            // follow-up PR (RFC-0009 §3 port-forward section). Reported distinctly from an
-            // unknown action so callers can detect the deferral.
-            action_ids::PORT_FORWARD => Err(VfsError::Backend {
-                code: "not_implemented".to_owned(),
-                msg: "port-forward (Session) is a M6-6 follow-up (RFC-0009 §3)".to_owned(),
-                retryable: false,
-            }),
+            action_ids::PORT_FORWARD => {
+                // Port-forward requires depth >= 3: [ctx, ns, pod, ...].
+                // Deeper paths (container level) are also valid — the forward targets the pod.
+                let (kube_ctx, ns, pod) = match segs.as_slice() {
+                    [kube_ctx, ns, pod, ..] => (*kube_ctx, *ns, *pod),
+                    _ => {
+                        return Err(VfsError::Backend {
+                            code: "not_available".to_owned(),
+                            msg: "port-forward is only available at pod paths \
+                                  (/<ctx>/<ns>/<pod> or deeper)"
+                                .to_owned(),
+                            retryable: false,
+                        });
+                    }
+                };
+
+                // Extract local and remote ports from the action context.
+                let (local, remote) = match ctx {
+                    ActionCtx::PortForward { local, remote } => (local, remote),
+                    _ => {
+                        return Err(VfsError::Backend {
+                            code: "invalid_ctx".to_owned(),
+                            msg: "port-forward requires \
+                                  ActionCtx::PortForward { local, remote }"
+                                .to_owned(),
+                            retryable: false,
+                        });
+                    }
+                };
+
+                // FIX 6: validate the remote port eagerly — port 0 is not a valid Kubernetes
+                // port number and would produce a confusing API error from the server.
+                if remote == 0 {
+                    return Err(VfsError::Backend {
+                        code: "invalid_ctx".to_owned(),
+                        msg: "port-forward remote port must be non-zero".to_owned(),
+                        retryable: false,
+                    });
+                }
+
+                // local == 0 → let the OS choose an ephemeral port (documented convention).
+                let local_port = if local == 0 { None } else { Some(local) };
+
+                let handle = self
+                    .ops
+                    .port_forward(kube_ctx, ns, pod, remote, local_port)
+                    .await?;
+                Ok(ActionOutcome::Session(handle))
+            }
 
             other => Err(VfsError::Backend {
                 code: "not_implemented".to_owned(),
@@ -727,10 +778,15 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // Port-forward session tests (mock, hermetic)
+    // -----------------------------------------------------------------------
+
+    /// `invoke("port-forward")` on a pod path with `ActionCtx::None` must return
+    /// `invalid_ctx` — the action requires `ActionCtx::PortForward { local, remote }`.
     #[tokio::test]
-    async fn invoke_port_forward_is_deferred() {
+    async fn invoke_port_forward_with_wrong_ctx_returns_invalid_ctx() {
         let vfs = backend();
-        // port-forward is advertised but not yet live — must return not_implemented.
         assert!(matches!(
             vfs.invoke(
                 &p("/prod/default/web-0"),
@@ -738,8 +794,194 @@ mod tests {
                 ActionCtx::None
             )
             .await,
-            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
+            Err(VfsError::Backend { code, .. }) if code == "invalid_ctx"
         ));
+    }
+
+    /// `invoke("port-forward")` on a shallow path (namespace depth) must return `not_available`.
+    #[tokio::test]
+    async fn invoke_port_forward_on_shallow_path_returns_not_available() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::PortForward { local: 0, remote: 8080 }
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "not_available"
+        ));
+    }
+
+    /// `invoke("port-forward")` with `local: 0` binds an ephemeral port, returns a
+    /// `Session` with `local_port` set, and the port is reachable via TCP.
+    ///
+    /// This test also verifies the echo semantics of `MockKube::port_forward`: bytes written
+    /// to the local port are echoed back, and `cancel` resolves `done` with `Ok(0)`.
+    #[tokio::test]
+    async fn invoke_port_forward_ephemeral_port_and_echo_round_trip() {
+        let vfs = backend();
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::PortForward {
+                    local: 0,
+                    remote: 8080,
+                },
+            )
+            .await
+            .expect("invoke port-forward on a known pod must succeed");
+
+        let handle = match outcome {
+            ActionOutcome::Session(h) => h,
+            _ => panic!("expected ActionOutcome::Session from invoke port-forward"),
+        };
+
+        // local_port must be set (the mock bound a real listener).
+        let bound_port = handle
+            .local_port
+            .expect("port-forward must report the bound local_port");
+        assert!(bound_port > 0, "bound_port must be a valid port number");
+
+        // Port-forward sessions have no stdin/stdout/resize (relay is at TCP level).
+        assert!(handle.stdin.is_none(), "port-forward must have no stdin");
+        assert!(handle.stdout.is_none(), "port-forward must have no stdout");
+        assert!(handle.resize.is_none(), "port-forward must have no resize");
+
+        // Connect a TcpStream to the bound port and verify the echo.
+        let mut stream = tokio::net::TcpStream::connect(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            bound_port,
+        )))
+        .await
+        .expect("TcpStream::connect to mock port-forward must succeed");
+
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        stream
+            .write_all(b"hello port-forward\n")
+            .await
+            .expect("write to mock port-forward must succeed");
+
+        let mut echo = [0u8; 19];
+        stream
+            .read_exact(&mut echo)
+            .await
+            .expect("read from mock port-forward (echo) must succeed");
+        assert_eq!(&echo, b"hello port-forward\n");
+
+        // Cancel the session: accept loop exits, done resolves with Ok(0).
+        handle
+            .cancel
+            .send(())
+            .expect("cancel send must succeed while session is running");
+
+        let exit = handle.done.await.expect("done channel must not be dropped");
+        assert!(
+            matches!(exit, Ok(0)),
+            "port-forward clean teardown must resolve done with Ok(0), got: {exit:?}"
+        );
+    }
+
+    /// `invoke("port-forward")` on an unknown pod returns `VfsError::NotFound`.
+    #[tokio::test]
+    async fn invoke_port_forward_unknown_pod_returns_not_found() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default/no-such-pod"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::PortForward {
+                    local: 0,
+                    remote: 8080
+                }
+            )
+            .await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    /// `invoke("port-forward")` with `remote: 0` must return `invalid_ctx`.
+    ///
+    /// Port 0 is not a valid Kubernetes port number; it would produce a confusing API-server
+    /// error if forwarded. We catch it early in `KubeVfs::invoke` (FIX 6).
+    #[tokio::test]
+    async fn invoke_port_forward_with_zero_remote_port_returns_invalid_ctx() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default/web-0"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::PortForward { local: 0, remote: 0 }
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "invalid_ctx"
+        ));
+    }
+
+    /// After `cancel` fires, in-flight relay tasks must be torn down: a still-open TCP
+    /// connection is closed from the relay side so reading from it returns EOF.
+    ///
+    /// This verifies FIX 1 (CancellationToken + JoinSet in MockKube::port_forward): without the
+    /// token, the echo task would keep running indefinitely even after `done` resolves, leaving a
+    /// lingering half-open connection.
+    #[tokio::test]
+    async fn invoke_port_forward_cancel_tears_down_inflight_connection() {
+        let vfs = backend();
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::PortForward {
+                    local: 0,
+                    remote: 8080,
+                },
+            )
+            .await
+            .expect("port-forward on a known pod must succeed");
+
+        let handle = match outcome {
+            ActionOutcome::Session(h) => h,
+            _ => panic!("expected ActionOutcome::Session from invoke port-forward"),
+        };
+
+        let bound_port = handle
+            .local_port
+            .expect("port-forward must report the bound local_port");
+
+        // Open a connection and hold it open without writing or reading.
+        let stream = tokio::net::TcpStream::connect(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            bound_port,
+        )))
+        .await
+        .expect("TCP connect to mock port-forward must succeed");
+
+        // Cancel the session.
+        handle
+            .cancel
+            .send(())
+            .expect("cancel send must succeed while session is running");
+
+        // `done` must resolve with Ok(0). This also proves that join_set.shutdown() completed,
+        // meaning every relay task (including the echo task for our open connection) has exited.
+        let exit = handle.done.await.expect("done channel must not be dropped");
+        assert!(
+            matches!(exit, Ok(0)),
+            "port-forward cancel must resolve done with Ok(0), got: {exit:?}"
+        );
+
+        // The relay task dropped its half of the TcpStream, so reading from our end must see
+        // EOF (0 bytes). This fails if the relay is still alive (it would keep reading/echoing).
+        use tokio::io::AsyncReadExt as _;
+        let (mut reader, _writer) = tokio::io::split(stream);
+        let mut buf = [0u8; 16];
+        // A connection reset counts as teardown too; unwrap_or(0) accepts both cases.
+        let n = reader.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "relay teardown must have closed the connection (expected EOF)"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Kubernetes port-forward** (M6-6, RFC-0009 §3): `KubeVfs::invoke("port-forward")` with
+  `ActionCtx::PortForward { local, remote }` now returns `ActionOutcome::Session(SessionHandle)`
+  backed by `kube 4.0`'s `Api::<Pod>::portforward`. `KubeRsOps::port_forward` binds a
+  `TcpListener` on `127.0.0.1:<local>` (or an OS-assigned ephemeral port when `local == 0`)
+  and for each accepted TCP connection opens a fresh `Portforwarder` WebSocket (one per
+  connection — the documented kube-rs pattern) and relays bytes with
+  `tokio::io::copy_bidirectional`. The accept loop runs in a spawned Tokio task and exits on
+  `cancel`; `done` resolves `Ok(0)` on clean teardown. `SessionHandle.local_port` is set
+  immediately (before any connection arrives) so the TUI can display the address at once.
+  `MockKube::port_forward` binds a real `TcpListener` and runs an echo server per connection
+  (bytes written by a client are reflected back), enabling fully hermetic testing. `tokio/net`
+  added to the `k8s` feature and dev-dependency feature set. New hermetic unit tests (4):
+  `invoke_port_forward_with_wrong_ctx_returns_invalid_ctx`,
+  `invoke_port_forward_on_shallow_path_returns_not_available`,
+  `invoke_port_forward_ephemeral_port_and_echo_round_trip` (TCP round-trip + cancel→Ok(0)),
+  `invoke_port_forward_unknown_pod_returns_not_found`. New env-guarded kind integration test
+  (`k8s_port_forward_binds_and_accepts_connection`, `CAIRN_IT_K8S`-gated): forwards to a
+  kube-system pod's port 10250 with an ephemeral local port, asserts the bind succeeds,
+  asserts a TCP connect is accepted, and asserts cancel resolves `done` with `Ok(0)`; skips
+  gracefully when no Running pod is available or RBAC denies the portforward subresource.
+  Workspace `cargo clippy` and `RUSTDOCFLAGS="-D warnings" cargo doc` are green. M6-6 is now
+  complete (logs + exec + port-forward); TUI exec/port-forward pane is M6-7 (PR-4).
+
 - **Kubernetes interactive exec** (M6-6, RFC-0009 §1 + §3): `KubeVfs::invoke("exec")` with
   `ActionCtx::Exec { argv, tty }` now returns `ActionOutcome::Session(SessionHandle)` backed by
   `kube 4.0`'s `Api::<Pod>::exec` + `AttachParams`. The `SessionHandle` shape is refined per
