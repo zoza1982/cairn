@@ -509,13 +509,114 @@ impl PromptKind {
     }
 }
 
+/// The auto-discovery mechanism that surfaced a connection in the switcher.
+///
+/// Used in [`ChoiceProvenance::Discovered`] to distinguish Docker sockets from kubeconfig
+/// contexts. Additional sources (in-cluster Kubernetes, Podman, …) will extend this enum
+/// in Phase P3 of RFC-0011.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoverySource {
+    /// Docker daemon socket or compatible Podman socket.
+    Docker,
+    /// A Kubernetes kubeconfig context.
+    Kubeconfig,
+}
+
+/// How a [`ConnectionChoice`] entered the switcher.
+///
+/// Populated by the `ConnectionCoordinator` at enumeration time. The renderer uses this
+/// for icons or section headers (Phase P3+). The default is `Builtin` so the built-in
+/// local roots require no extra annotation at their construction sites.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ChoiceProvenance {
+    /// A built-in local root (`/`, `$HOME`). Not user-configurable.
+    #[default]
+    Builtin,
+    /// A user-saved connection profile from `cairn.toml`.
+    Saved,
+    /// Auto-discovered from the environment (Docker socket, kubeconfig context, …).
+    Discovered {
+        /// The mechanism that found this entry.
+        source: DiscoverySource,
+    },
+}
+
+/// Reachability status of a switcher entry.
+///
+/// `Ready` is the default (eagerly-mounted at startup in Phase P1). Later phases change
+/// this: `NeedsOpen` enables lazy-open on select (P2); `NeedsVault` routes the selection
+/// through the vault-unlock overlay instead of erroring; `Unreachable` is display-only.
+///
+/// The reducer uses this field to route a selection purely (no I/O in the reducer):
+/// - `Ready` → call `navigate_to_conn` immediately (today's path).
+/// - `NeedsOpen` → emit `AppEffect::OpenConnection { conn }` (P2).
+/// - `NeedsVault` → open the vault-unlock overlay (P2+).
+/// - `Unreachable` → show a status message (P2+).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ChoiceStatus {
+    /// The backend is mounted and immediately navigable.
+    #[default]
+    Ready,
+    /// The backend is known but not yet opened; it opens on selection (Phase P2).
+    NeedsOpen,
+    /// Opening requires vault unlock first; selecting emits the unlock overlay (Phase P2+).
+    NeedsVault,
+    /// The backend is unreachable (probe failed or timed out). Display-only (Phase P3+).
+    Unreachable,
+}
+
+/// Whether a switcher entry is user-editable.
+///
+/// `Profile` entries correspond to a specific saved profile UUID and will be editable via the
+/// connection form (Phase P4). `AutoDiscovered` entries — built-in roots and future
+/// discovered connections — are display-only; the user cannot edit or remove them via the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConnectionKind {
+    /// A user-saved profile with the given stable UUID from `cairn.toml`.
+    Profile {
+        /// The profile's stable UUID (`ConnectionProfile::id` from `cairn-config`).
+        id: uuid::Uuid,
+    },
+    /// Built-in or auto-discovered; not directly editable by the user.
+    #[default]
+    AutoDiscovered,
+}
+
 /// A selectable connection for the switcher: a registered backend plus a human-readable label.
+///
+/// Additive fields (`provenance`, `status`, `kind`) were introduced in Phase P0/P1 of RFC-0011.
+/// Their defaults preserve the original behavior: `Builtin`/`Ready`/`AutoDiscovered` are the
+/// right values for an eager-mounted local root, so existing construction sites can use
+/// `..Default::default()` to fill in the new fields without changing semantics.
 #[derive(Debug, Clone)]
 pub struct ConnectionChoice {
     /// The backend connection to switch the pane to.
     pub conn: ConnectionId,
     /// Display label (e.g. `"local: /home/me"` or a profile's name).
     pub label: String,
+    /// How this entry entered the switcher (for icons/badges in Phase P3+).
+    pub provenance: ChoiceProvenance,
+    /// Current reachability status (drives selection routing in Phase P2+).
+    pub status: ChoiceStatus,
+    /// Whether the entry is user-editable (gates edit/delete actions in Phase P4+).
+    pub kind: ConnectionKind,
+}
+
+impl Default for ConnectionChoice {
+    /// Returns a sentinel choice (`conn = 0`, empty label, `Builtin`/`Ready`/`AutoDiscovered`).
+    ///
+    /// Primarily used in tests via `..Default::default()` to fill in the additive RFC-0011
+    /// fields without having to spell them out at every existing construction site. The sentinel
+    /// `ConnectionId(0)` is never assigned to a real connection.
+    fn default() -> Self {
+        Self {
+            conn: ConnectionId(0),
+            label: String::new(),
+            provenance: ChoiceProvenance::Builtin,
+            status: ChoiceStatus::Ready,
+            kind: ConnectionKind::AutoDiscovered,
+        }
+    }
 }
 
 /// The whole application state. Holds plain data only — no service handles, no I/O.

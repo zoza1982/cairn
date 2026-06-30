@@ -1,11 +1,17 @@
-//! The broker-backed connection opener — the integration seam that turns a saved
-//! [`ConnectionProfile`] into a live [`Vfs`] backend.
+//! The connection-management layer: the broker-backed opener and the RFC-0011 P1 abstractions.
 //!
-//! [`ConnectionOpener::open`] resolves the profile's vault credential reference through the
-//! [`Broker`] (the binary's sole reference→secret mediator), builds the scheme's connection
-//! parameters from the profile's non-secret endpoint fields, and dispatches to the matching backend
-//! connector (`ssh_connect` / `s3_connect` / `gcs_connect` / `azure_connect`). The resulting concrete
-//! backend is returned as an `Arc<dyn Vfs>` ready to register in the [`VfsRegistry`](cairn_vfs::VfsRegistry).
+//! ## Structure
+//!
+//! - **[`ConnectionOpener`]** (this module) — the integration seam that turns a saved
+//!   [`ConnectionProfile`] into a live [`Vfs`] backend. Resolves vault credentials through the
+//!   [`Broker`] and dispatches to the matching backend connector.
+//! - **[`descriptor`]** — runtime-side [`ConnectionDescriptor`](descriptor::ConnectionDescriptor)
+//!   and related types. Lives binary-side only; never crosses into `cairn-core`.
+//! - **[`provider`]** — the [`ConnectionProvider`](provider::ConnectionProvider) trait plus the
+//!   P1 built-in providers ([`BuiltinLocalProvider`](provider::BuiltinLocalProvider),
+//!   [`SavedProfileProvider`](provider::SavedProfileProvider)).
+//! - **[`coordinator`]** — the [`ConnectionCoordinator`](coordinator::ConnectionCoordinator) that
+//!   replaces the imperative body of `register_connections`.
 //!
 //! Each credential-bearing scheme is gated behind a cargo feature (`ssh`/`s3`/`gcs`/`azure`); a
 //! profile whose scheme's feature is not compiled into this binary fails fast with
@@ -21,6 +27,10 @@
 //!   `Overlay::VaultUnlock` flow (M3-7) that unlocks the broker. Until the latter lands the runtime
 //!   wires a *locked* broker, so a real connect attempt returns [`BrokerError::Locked`] — the
 //!   dispatch + parameter construction below are exercised regardless.
+
+pub(crate) mod coordinator;
+pub(crate) mod descriptor;
+pub(crate) mod provider;
 
 use std::sync::Arc;
 

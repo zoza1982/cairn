@@ -1238,6 +1238,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1382,6 +1383,7 @@ dependencies = [
  "cairn-types",
  "cairn-vfs",
  "serde_json",
+ "uuid",
  "zeroize",
 ]
 
