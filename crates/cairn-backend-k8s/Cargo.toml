@@ -12,6 +12,13 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# The live Kubernetes adapter (kube-rs). Off by default so the lean, cross-platform build never pulls
+# kube's TLS/HTTP stack; the full build (Linux-only in CI) and the kind integration job enable it.
+# Pinned to rustls (no OpenSSL); `ws` is for the exec-based pod-fs path. See ADR-0006 / RFC-0005.
+k8s = ["dep:kube", "dep:k8s-openapi"]
+
 [dependencies]
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
@@ -19,6 +26,14 @@ async-trait = "0.1"
 futures = "0.3"
 smol_str = "0.3"
 tokio = { version = "1", features = ["io-util"] }
+# kube-rs client for the live adapter (behind `k8s`). rustls (not openssl); `ws` enables pod exec.
+kube = { version = "4", optional = true, default-features = false, features = [
+    "client",
+    "config",
+    "rustls-tls",
+    "ws",
+] }
+k8s-openapi = { version = "0.28", optional = true, features = ["latest"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }

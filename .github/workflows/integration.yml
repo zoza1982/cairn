@@ -14,6 +14,7 @@ on:
     paths:
       - "crates/cairn-backend-object/**"
       - "crates/cairn-backend-docker/**"
+      - "crates/cairn-backend-k8s/**"
       - "crates/cairn-vault/**"
       - ".github/workflows/integration.yml"
 
@@ -118,3 +119,24 @@ jobs:
         env:
           CAIRN_IT_DOCKER: "1"
         run: cargo test -p cairn-backend-docker --features docker --test docker_dind -- --nocapture
+
+  k8s-kind:
+    name: K8s contract (kind)
+    runs-on: ubuntu-latest
+    # Bound the blast radius if `kind-action` ever stalls bringing up the cluster.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Spin up a real single-node Kubernetes cluster; the action writes the kubeconfig to the
+      # default location and sets the current context, which the adapter reads.
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: cairn-it
+      - name: Wait for kube-system to be up
+        run: kubectl wait --for=condition=Ready pods --all -n kube-system --timeout=150s || kubectl get pods -A
+      - name: Run the K8s tree round-trip against kind
+        env:
+          CAIRN_IT_K8S: "1"
+        run: cargo test -p cairn-backend-k8s --features k8s --test k8s_kind -- --nocapture

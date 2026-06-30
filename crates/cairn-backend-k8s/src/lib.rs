@@ -10,8 +10,12 @@
 //! interactive `exec`, port-forward) are the integration step; see `docs/LLD.md` and RFC-0005.
 
 mod ops;
+#[cfg(feature = "k8s")]
+mod real;
 
 pub use ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta};
+#[cfg(feature = "k8s")]
+pub use real::KubeRsOps;
 
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryExt, EntryKind, Scheme, VfsPath};

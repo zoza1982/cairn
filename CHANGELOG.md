@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Kubernetes navigable tree, live** (M6-5, RFC-0005): the k8s backend's live `kube-rs` adapter
+  (behind the non-default `k8s` feature) makes a cluster browsable — `list_contexts` (from the
+  kubeconfig, no cluster call), `list_namespaces`, `list_pods` (phase / ready / node), and
+  `list_containers` (regular + init + ephemeral). RBAC 403 maps to `VfsError::Forbidden`, a missing
+  pod to `NotFound`. The kube stack is pinned to rustls (no OpenSSL). In-container filesystem
+  browsing (`list_dir`/`stat`/`read` via exec-tar) and watch/streams remain follow-ups. A `kind`
+  integration job (env-guarded by `CAIRN_IT_K8S`) exercises the tree against a real cluster.
 - **Docker container-filesystem browsing, live** (M6-2, RFC-0004): the Docker backend's live
   `bollard` adapter (`BollardDocker`, behind the non-default `docker` feature) now implements
   `list_dir`/`stat`/`read` over the Docker Engine **archive API** — `download_from_container` returns
