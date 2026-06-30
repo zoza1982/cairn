@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [0.1.0] - 2026-06-30
+
+### Added
 - **Kubernetes in-container filesystem browsing** (M6-5b): `KubeRsOps` now implements
   `list_dir`/`stat`/`read` for paths inside a container's filesystem via **tar-over-exec**
   (`kubectl cp` semantics). `list_dir(path)` execs `tar cf - -C <path> .` and parses the tar
@@ -539,4 +547,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Renumbered `CLAUDE.md` sections to accommodate the new team-of-agents model (§2).
 
-[Unreleased]: https://github.com/zoza1982/cairn/commits/main
+[Unreleased]: https://github.com/zoza1982/cairn/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/zoza1982/cairn/releases/tag/v0.1.0

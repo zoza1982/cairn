@@ -21,7 +21,7 @@
 | **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0006 · ✅ RFC-0001..0007 |
 | **Current milestone** | **Foundation: feature-gated backends + lean/full CI split (ADR-0006, PR-0). Next: M3-4 credentials → M4 SSH** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
-| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core & plan→confirm UI + M8 runtime, WIT RFC & keybindings + M4 SFTP-mapping + M6 Docker- & K8s-mapping ✅ · M6-3 Docker logs streaming (first slice) 🟡 · cloud providers + live-transport (SSH/exec/K8s streaming) + LLM HTTP providers + WASM component bridge ⏭ |
+| **Milestones delivered** | M0, M1, M2, M3 (lib) ✅ · M5 abstraction + M7 core & plan→confirm UI + M8 runtime, WIT RFC & keybindings + M4 SFTP-mapping + M6 Docker- & K8s-mapping ✅ · M6-3 Docker logs streaming (first slice) 🟡 · cloud providers + live-transport (SSH/exec/K8s streaming) + LLM HTTP providers + WASM component bridge ⏭ · **v0.1.0 release prep** 🟡 (version `0.0.0`→`0.1.0`, CHANGELOG rolled to `[0.1.0] - 2026-06-30`, cross-platform release workflow ready; tagging is the maintainer's call) |
 | **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 33 / 19 / 0 / 0 / 19 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
@@ -227,10 +227,10 @@ Each milestone is a **GitHub Milestone**; bold work items become **GitHub Issues
 
 | ID | Item | Lead | Deps | Docs | Exit criteria | Status |
 |---|---|---|---|---|---|---|
-| R-1 | Release engineering: cross-platform binaries (musl/universal-mac/Windows), Homebrew/cargo, signing | devops-engineer | M5 (M4) | release docs | tagged build attaches binaries on 3 OSes | ⏭ deferred (follows backend milestones) |
+| R-1 | Release engineering: cross-platform binaries (musl/universal-mac/Windows), Homebrew/cargo, signing | devops-engineer | M5 (M4) | release docs | tagged build attaches binaries on 3 OSes | 🟡 release workflow ready (`.github/workflows/release.yml`): on a `v*` tag (or manual dispatch) it builds `cairn --release --features all-backends` for Linux x86_64 gnu + musl, macOS aarch64 + x86_64, and Windows x86_64, packaging each binary + SHA-256 into a release asset (aws-lc-rs deps wired: CMake/musl-tools on Linux, NASM on Windows, pre-generated bindings on macOS). Tagging is the maintainer's call. Homebrew/cargo publish + signing still ⏭ |
 | R-2 | Docs completeness pass: README, user guide, backend docs, glossary, `--help` | technical-writer | all | README/docs | docs match shipped features (no stale) | ⏭ deferred (follows backend milestones) |
 | R-3 | Release QA: regression matrix, graceful degradation (no truecolor/Nerd-Font/narrow), session restore | qa-engineer | all | TESTING.md | crash-free smoke on 3 OSes + limited terminals | ⏭ deferred (follows backend milestones) |
-| R-4 | CHANGELOG roll-up → v0.1, version bump, ADR/RFC index check | technical-writer, project-manager | R-1..R-3 | CHANGELOG | tagged `v0.1.0` from `main`; dashboard shows v0.1 ✅ | ⏭ deferred (follows backend milestones) |
+| R-4 | CHANGELOG roll-up → v0.1, version bump, ADR/RFC index check | technical-writer, project-manager | R-1..R-3 | CHANGELOG | tagged `v0.1.0` from `main`; dashboard shows v0.1 ✅ | 🟡 version bumped `0.0.0`→`0.1.0` (workspace package + all internal-crate pins; workspace resolves) and `CHANGELOG.md` rolled `[Unreleased]`→`[0.1.0] - 2026-06-30` with a fresh empty `[Unreleased]`. Tag `v0.1.0` is the maintainer's outward-facing call (not created here) |
 
 ---
 
