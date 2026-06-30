@@ -1,0 +1,166 @@
+name: release
+
+# Cross-platform release builds for the `cairn` binary (R-1).
+#
+# Trigger: pushing a `v*` tag (e.g. `v0.1.0`) — the maintainer's outward-facing call — or a manual
+# `workflow_dispatch`. Each matrix entry builds an optimized `cairn` binary, packages it with its
+# SHA-256 checksum, and uploads it as an asset on the GitHub Release for the tag.
+#
+# Per-platform feature decisions
+# ------------------------------
+# `all-backends` pulls the full backend stack: russh (SSH), aws-sdk-s3 (→ aws-lc-rs), google-cloud
+# (GCS), azure_storage (Azure Blob), bollard (Docker), kube-rs (Kubernetes). Everything rides the
+# rustls stack (no OpenSSL); the one component with native build prerequisites is **aws-lc-rs** (the
+# S3 backend's crypto):
+#   * Linux  — needs a C toolchain + CMake (installed below; also covers the musl static build).
+#   * macOS  — non-FIPS builds ship pre-generated bindings, so no extra toolchain is required.
+#   * Windows — NASM is mandatory for x86_64 aws-lc-rs builds (installed below).
+# With those installed, `all-backends` builds on every target, so each target ships the full
+# feature set. The `features` matrix field is the documented per-target knob: if a backend ever
+# fails to build on a given target, set that entry to a reduced set (e.g. `ssh,cloud` to drop the
+# container backends, or `default` for a lean binary) — the release notes step echoes each target's
+# feature set so the published notes always say what every binary contains.
+#
+# This is the release-only counterpart to ci.yml's lean cross-platform / full-Linux split: there the
+# heavy stack is Linux-only for fast PR feedback; here we spend the extra build time to ship the full
+# binary on all platforms. This workflow does not run without a tag (or a manual dispatch).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Needed for softprops/action-gh-release to create the release and upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (glibc) — the flagship build, verified locally with `all-backends`.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: all-backends
+            archive: tar.gz
+          # Linux x86_64 (musl) — a static binary that runs on any glibc/musl distro.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            features: all-backends
+            archive: tar.gz
+          # macOS arm64 (Apple Silicon).
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            features: all-backends
+            archive: tar.gz
+          # macOS x86_64 (Intel) — built natively on the Intel runner to avoid cross-compiling
+          # aws-lc-rs from the arm64 host.
+          - os: macos-13
+            target: x86_64-apple-darwin
+            features: all-backends
+            archive: tar.gz
+          # Windows x86_64 (MSVC).
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: all-backends
+            archive: zip
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # aws-lc-rs (S3 backend) build prerequisites, per target. macOS non-FIPS ships pre-generated
+      # bindings and needs nothing extra.
+      - name: Install Linux build deps (CMake + musl tools)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake musl-tools
+
+      - name: Install NASM (Windows, required by aws-lc-rs)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build
+        run: cargo build --release -p cairn --features ${{ matrix.features }} --target ${{ matrix.target }}
+
+      # Stage the binary + a SHA-256 checksum into a versioned archive named for the target.
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [ "$version" = "$GITHUB_REF_NAME" ] && version="manual-${GITHUB_SHA::8}"
+          name="cairn-${version}-${{ matrix.target }}"
+          staging="dist/${name}"
+          mkdir -p "${staging}"
+          cp "target/${{ matrix.target }}/release/cairn" "${staging}/"
+          cp README.md CHANGELOG.md LICENSE-APACHE LICENSE-MIT "${staging}/" 2>/dev/null || true
+          tar -C dist -czf "${name}.tar.gz" "${name}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          else
+            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          fi
+          echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v',''
+          if ($version -eq "${env:GITHUB_REF_NAME}") { $version = "manual-" + "${env:GITHUB_SHA}".Substring(0,8) }
+          $name = "cairn-$version-${{ matrix.target }}"
+          $staging = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cairn.exe" $staging
+          foreach ($f in @("README.md","CHANGELOG.md","LICENSE-APACHE","LICENSE-MIT")) {
+            if (Test-Path $f) { Copy-Item $f $staging }
+          }
+          Compress-Archive -Path $staging -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+      # Create (or reuse) the release for this tag and attach this target's archive + checksum.
+      # Each matrix job appends its own assets; the body records each binary's feature set.
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Cairn ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          # Each matrix job updates the same release; keep the body target-agnostic so it doesn't
+          # depend on job ordering. All targets are built with the same feature set (all-backends);
+          # per-asset integrity is the accompanying `.sha256`. See CHANGELOG.md for the full notes.
+          body: |
+            Cairn ${{ github.ref_name }} — cross-platform binaries.
+
+            Each archive bundles the `cairn` binary built with the full backend stack
+            (`--features all-backends`: local, SSH/SFTP, S3, GCS, Azure Blob, Docker, Kubernetes)
+            plus the README, CHANGELOG, and licenses. Targets: Linux x86_64 (gnu + musl static),
+            macOS (aarch64 + x86_64), Windows x86_64.
+
+            Verify each download against its `.sha256` before use. See `CHANGELOG.md` for release notes.

@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "cairn"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-ai"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cairn-broker-api",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-backend-docker"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bollard",
@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-backend-k8s"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cairn-types",
@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-backend-local"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-backend-object"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-backend-ssh"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1337,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-broker"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cairn-broker-api",
  "cairn-secrets",
@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-broker-api"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cairn-types",
  "cargo_metadata",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-config"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "directories",
  "rustix",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cairn-ai",
  "cairn-secrets",
@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-mcp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rmcp",
  "serde_json",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-plugin"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1407,7 +1407,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-secrets"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "regex",
  "secrecy",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-transfer"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "cairn-types",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-tui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cairn-ai",
  "cairn-core",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-types"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bitflags 2.13.0",
  "smol_str",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-vault"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2 0.5.3",
  "cairn-secrets",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-vfs"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
