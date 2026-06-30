@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TUI log-stream viewer overlay** (M6-7): `L` opens a live log-stream overlay for the entry
+  under the cursor. The overlay buffers up to 100 000 lines / 4 MiB (ring-buffer; oldest lines
+  drop when the cap is reached), auto-scrolls in follow mode (`[follow]` indicator in the border),
+  and supports manual scroll with `j`/`k` (cursor up/down), `g`/`G` (top/bottom), and
+  `PgUp`/`PgDn`. Any upward scroll disables follow; `G` or `CursorBottom` re-enables it. Status
+  indicators (`Streaming…` / `Done` / `Error: …`) are shown in the bottom-right of the overlay
+  border. `Esc` / `n` closes the overlay and cancels the stream (fires `AppEffect::CloseLogViewer`
+  with a `CancellationToken`). New keybindings: `L` → `open_log_viewer`, `PageUp` → `page_up`,
+  `PageDown` → `page_down`. The runtime drives the stream through `Vfs::invoke("logs", …)` in
+  follow mode, forwarding each lossily-decoded chunk as `AppEvent::LogChunk`; backends without log
+  streaming surface `VfsError::Unsupported` as an in-overlay error.
+
 - **Kubernetes pod/container log streaming** (M6-6 first slice): `KubeVfs::invoke("logs")`
   now returns `ActionOutcome::Stream(BoxStream<'static, Result<Bytes, VfsError>>)` backed by
   `kube 4.0`'s `Api::<Pod>::log_stream`. The `log_stream` method returns an

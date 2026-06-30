@@ -2,7 +2,9 @@
 
 use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
-use cairn_core::{AppState, Listing, MaskedInput, Overlay, PaneState, PromptKind, Side};
+use cairn_core::{
+    AppState, Listing, LogViewerStatus, MaskedInput, Overlay, PaneState, PromptKind, Side,
+};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -117,6 +119,14 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
         Overlay::VaultUnlock { input, error } => {
             render_vault_unlock(frame, input, error.as_deref(), state.vault_unlocking)
         }
+        Overlay::LogViewer {
+            title,
+            lines,
+            follow,
+            scroll,
+            status,
+            ..
+        } => render_log_viewer(frame, title, lines, *follow, *scroll, status),
     }
 }
 
@@ -317,6 +327,52 @@ fn verb_label(verb: Verb) -> &'static str {
         Verb::Exec => "exec",
         Verb::OpenConnection => "connect",
     }
+}
+
+/// Draw the log-stream viewer overlay: a scrollable list of buffered log lines plus a status
+/// indicator (`Streaming…` / `Done` / `Error: …`) in the border title.
+///
+/// `scroll` is the 0-based index of the topmost visible line (managed by the reducer). When
+/// `follow` is true the reducer keeps it pinned to the last page; any scroll-up disables it.
+fn render_log_viewer(
+    frame: &mut Frame,
+    title: &str,
+    lines: &std::collections::VecDeque<String>,
+    follow: bool,
+    scroll: usize,
+    status: &LogViewerStatus,
+) {
+    let area = centered(
+        frame.area(),
+        80,
+        frame.area().height.saturating_sub(2).max(3),
+    );
+    frame.render_widget(Clear, area);
+
+    let status_label = match status {
+        LogViewerStatus::Streaming => " Streaming… ".to_owned(),
+        LogViewerStatus::Done => " Done ".to_owned(),
+        LogViewerStatus::Error(msg) => format!(" Error: {msg} "),
+    };
+    let follow_hint = if follow { " [follow] " } else { "" };
+    let block = Block::bordered()
+        .title(format!(" {} ", title))
+        .title_bottom(Line::from(format!("{follow_hint}{status_label}")).right_aligned())
+        .border_style(Style::default().fg(Color::Cyan));
+
+    // Viewport: subtract 2 for the borders.
+    let viewport = usize::from(area.height.saturating_sub(2));
+    // The reducer's `scroll` is the index of the topmost visible line; clamp defensively.
+    let top = scroll.min(lines.len().saturating_sub(1));
+    let end = (top + viewport).min(lines.len());
+    let visible: Vec<ListItem> = lines
+        .iter()
+        .skip(top)
+        .take(end.saturating_sub(top))
+        .map(|l| ListItem::new(l.as_str()))
+        .collect();
+
+    frame.render_widget(List::new(visible).block(block), area);
 }
 
 /// A centered rect of at most `w`×`h`, clamped to `area`.
@@ -1026,5 +1082,29 @@ mod tests {
             .collect();
         assert!(text.contains("Loading"));
         assert!(text.contains("permission denied"));
+    }
+
+    #[test]
+    fn log_viewer_overlay_shows_lines_and_indicator() {
+        let mut s = ready_state();
+        let mut lines = std::collections::VecDeque::new();
+        lines.push_back("line one".to_owned());
+        lines.push_back("line two".to_owned());
+        s.overlay = Some(cairn_core::Overlay::LogViewer {
+            id: 1,
+            title: "my-pod — logs".to_owned(),
+            lines,
+            partial: String::new(),
+            byte_size: 0,
+            follow: true,
+            scroll: 0,
+            status: cairn_core::LogViewerStatus::Streaming,
+        });
+        let text = render_text(&s, 100, 24);
+        assert!(text.contains("my-pod"), "title in border: {text}");
+        assert!(text.contains("line one"), "first log line: {text}");
+        assert!(text.contains("line two"), "second log line: {text}");
+        assert!(text.contains("Streaming"), "status indicator: {text}");
+        assert!(text.contains("follow"), "follow indicator: {text}");
     }
 }

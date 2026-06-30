@@ -14,8 +14,8 @@ use cairn_backend_local::LocalVfs;
 use cairn_broker::{Actor, Broker, BrokerError};
 use cairn_config::{Config, ConnectionProfile};
 use cairn_core::{
-    initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, Msg,
-    ShellActionMeta, TransferId,
+    initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, LogViewerId,
+    Msg, ShellActionMeta, TransferId,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
@@ -173,6 +173,7 @@ async fn run_async() -> anyhow::Result<()> {
         "initial_effects must emit only List effects; a transfer here would be uncancellable"
     );
     let mut startup_controls = HashMap::new();
+    let mut startup_log_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
     for effect in initial {
         dispatch(
             effect,
@@ -180,6 +181,7 @@ async fn run_async() -> anyhow::Result<()> {
             &event_tx,
             &mut startup_controls,
             &mut None,
+            &mut startup_log_controls,
             &shell_action_defs,
             &vault_ctx,
         );
@@ -336,6 +338,7 @@ async fn event_loop(
     // `TransferDone`/`TransferConflict`). Multiple transfers run concurrently, so this is a map.
     let mut transfer_controls: HashMap<TransferId, TransferControls> = HashMap::new();
     let mut ai_cancel: Option<CancellationToken> = None;
+    let mut log_viewer_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -356,6 +359,9 @@ async fn event_loop(
         if matches!(msg, Msg::Event(AppEvent::AiPlanExecuted { .. })) {
             ai_cancel = None;
         }
+        if let Msg::Event(AppEvent::LogStreamEnded { id, .. }) = &msg {
+            log_viewer_controls.remove(id);
+        }
         let effects = update(state, msg);
         if state.should_quit {
             break;
@@ -368,6 +374,7 @@ async fn event_loop(
                 event_tx,
                 &mut transfer_controls,
                 &mut ai_cancel,
+                &mut log_viewer_controls,
                 shell_action_defs,
                 vault_ctx,
             );
@@ -429,12 +436,14 @@ fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
 /// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s. `transfer_controls`
 /// maps each [`TransferId`] to its cancel token + pause sender, so [`AppEffect::CancelTransfer`] and
 /// [`AppEffect::SetTransferPaused`] can target the right transfer task.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     effect: AppEffect,
     registry: &VfsRegistry,
     event_tx: &mpsc::Sender<AppEvent>,
     transfer_controls: &mut HashMap<TransferId, TransferControls>,
     ai_cancel: &mut Option<CancellationToken>,
+    log_viewer_controls: &mut HashMap<LogViewerId, CancellationToken>,
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
     vault_ctx: &VaultContext,
 ) {
@@ -645,8 +654,114 @@ fn dispatch(
                 let _ = event_tx.send(AppEvent::VaultUnlocked { result }).await;
             });
         }
+        AppEffect::OpenLogViewer {
+            id,
+            conn,
+            path,
+            title: _,
+        } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            let cancel = CancellationToken::new();
+            log_viewer_controls.insert(id, cancel.clone());
+            tokio::spawn(async move {
+                run_log_viewer_effect(registry, id, conn, path, event_tx, cancel).await;
+            });
+        }
+        AppEffect::CloseLogViewer { id } => {
+            if let Some(token) = log_viewer_controls.remove(&id) {
+                token.cancel();
+            }
+        }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
         other => tracing::warn!(effect = ?other, "unhandled effect"),
+    }
+}
+
+/// Stream logs for a container/pod entry and forward each decoded chunk as an [`AppEvent::LogChunk`].
+///
+/// Invokes the backend's `"logs"` action ([`cairn_vfs::ActionCtx::Logs`] in follow mode), reads the
+/// resulting [`cairn_vfs::ActionOutcome::Stream`], and decodes each chunk lossily before forwarding
+/// it. The loop runs until the stream ends (clean EOF → `LogStreamEnded { error: None }`), errors (a
+/// redacted message), or the [`CancellationToken`] fires (Esc closed the overlay — no terminal event
+/// needed). A backend without log streaming returns `VfsError::Unsupported`, surfaced as an error.
+async fn run_log_viewer_effect(
+    registry: VfsRegistry,
+    id: LogViewerId,
+    conn: cairn_types::ConnectionId,
+    path: cairn_types::VfsPath,
+    event_tx: mpsc::Sender<AppEvent>,
+    cancel: CancellationToken,
+) {
+    use cairn_vfs::{ActionCtx, ActionId, ActionOutcome};
+
+    let Some(vfs) = registry.get(conn).await else {
+        let _ = event_tx
+            .send(AppEvent::LogStreamEnded {
+                id,
+                error: Some("connection unavailable".to_owned()),
+            })
+            .await;
+        return;
+    };
+    let outcome = vfs
+        .invoke(
+            &path,
+            ActionId::new("logs"),
+            ActionCtx::Logs {
+                follow: true,
+                since: None,
+                container: None,
+            },
+        )
+        .await;
+    let stream = match outcome {
+        Ok(ActionOutcome::Stream(s)) => s,
+        Ok(_) => {
+            let _ = event_tx
+                .send(AppEvent::LogStreamEnded {
+                    id,
+                    error: Some("logs action returned unexpected outcome".to_owned()),
+                })
+                .await;
+            return;
+        }
+        Err(e) => {
+            let _ = event_tx
+                .send(AppEvent::LogStreamEnded {
+                    id,
+                    error: Some(e.redacted().to_string()),
+                })
+                .await;
+            return;
+        }
+    };
+    futures::pin_mut!(stream);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            chunk = stream.next() => match chunk {
+                Some(Ok(bytes)) => {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let _ = event_tx.send(AppEvent::LogChunk { id, text }).await;
+                }
+                Some(Err(e)) => {
+                    let _ = event_tx
+                        .send(AppEvent::LogStreamEnded {
+                            id,
+                            error: Some(e.redacted().to_string()),
+                        })
+                        .await;
+                    return;
+                }
+                None => {
+                    let _ = event_tx
+                        .send(AppEvent::LogStreamEnded { id, error: None })
+                        .await;
+                    return;
+                }
+            },
+        }
     }
 }
 

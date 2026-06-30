@@ -397,6 +397,31 @@ pub enum Overlay {
         /// The entry the action will run against.
         target: VfsPath,
     },
+    /// Live log stream from a container/pod node (M6-7 Stream half).
+    ///
+    /// `lines` is a ring buffer of decoded UTF-8 lines; `partial` holds a line not yet terminated by
+    /// `'\n'`. `byte_size` tracks total retained bytes so the cap check avoids summing `lines` each
+    /// chunk. `follow` auto-scrolls to the most-recent line; any scroll-up disables it. `scroll` is
+    /// the index of the topmost visible line when `!follow`. `status` drives the "following…" /
+    /// "paused" / "ended" / "error" indicator.
+    LogViewer {
+        /// Session id — matches `AppEvent::LogChunk` and `AppEvent::LogStreamEnded`.
+        id: LogViewerId,
+        /// Display title (e.g. `"nginx — logs"`).
+        title: String,
+        /// Accumulated complete lines, oldest-first.
+        lines: VecDeque<String>,
+        /// Incomplete last line (no trailing `'\n'` yet).
+        partial: String,
+        /// Total byte size of `lines` + `partial` (for the byte-cap check).
+        byte_size: usize,
+        /// When `true`, the render always scrolls to the most recent line.
+        follow: bool,
+        /// Index of the first visible line when `!follow`.
+        scroll: usize,
+        /// Current stream status.
+        status: LogViewerStatus,
+    },
 }
 
 /// What submitting a [`Overlay::Prompt`] text field will do.
@@ -493,11 +518,32 @@ pub struct AppState {
     /// was locked. Drives the startup status hint that points the user at the unlock flow; cleared
     /// once the vault is unlocked.
     pub has_locked_connections: bool,
+    /// Monotonic id counter for log-viewer sessions (like `next_transfer_id`). Starts at 1.
+    pub next_log_viewer_id: LogViewerId,
 }
 
 /// A stable identifier for an in-flight transfer, used to address progress/done events and the
 /// runtime's per-transfer control (cancel token + pause sender). Minted monotonically by the reducer.
 pub type TransferId = u64;
+
+/// A stable identifier for a log-viewer session.
+pub type LogViewerId = u64;
+
+/// Max lines the log viewer keeps in memory.
+pub const LOG_VIEWER_MAX_LINES: usize = 100_000;
+/// Max decoded bytes the log viewer keeps in memory (~4 MiB).
+pub const LOG_VIEWER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Status of an [`Overlay::LogViewer`] stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogViewerStatus {
+    /// Stream is live.
+    Streaming,
+    /// Stream ended cleanly.
+    Done,
+    /// Stream ended with a (redacted, non-secret) error.
+    Error(String),
+}
 
 /// One in-flight transfer the reducer tracks for display and control. The full source/destination
 /// detail lives runtime-side; this is the secret-free view the UI renders.
@@ -551,6 +597,7 @@ impl AppState {
             vault_unlocked: false,
             vault_unlocking: false,
             has_locked_connections: false,
+            next_log_viewer_id: 1,
         }
     }
 
