@@ -190,6 +190,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open_connection` remains deferred pending the broker-backed opener.
 
 ### Fixed
+- **Transfer rate/ETA no longer skews low after a pause** (#55): the throughput rate shown in the
+  status line is now computed over *effective* (non-paused) elapsed time. A lightweight accumulator
+  task tracks the wall-time of each pause interval (true→false on the pause watch) into an
+  `AtomicU64`; the `rate_bps` closure subtracts it before calling `avg_rate`. Rate and ETA snap back
+  to accuracy immediately on resume instead of gradually recovering as fresh progress dilutes the
+  distorted average.
+- **`ConfirmShellAction` no longer misleads about the target path** (#58): the confirm overlay now
+  annotates that the path shown is the *virtual* VFS path — the real OS path is resolved by the
+  effect runner (via `Vfs::local_path`) immediately after the user confirms. Approach (a) from the
+  issue: the real path is not yet available at confirm time so we clarify rather than pre-resolve.
+- **Status bar transient messages are visible** (#54): `render_status` already applied the correct
+  priority (live transfer > transient `AppState::status` > help string); this PR extends test
+  coverage to explicitly verify that a live transfer takes priority even when a status message is
+  set simultaneously, closing the untested arm of the precedence chain.
 - **Interactive copy/move no longer silently overwrites** (M2-6): a UI copy/move that would clobber
   an existing destination now opens an "Overwrite?" confirm (showing how many collide) instead of
   overwriting silently. Confirm re-runs with overwrite enabled; cancel abandons the transfer leaving
