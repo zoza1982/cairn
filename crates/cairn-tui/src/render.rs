@@ -91,6 +91,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             frame.render_widget(body, area);
         }
         Overlay::ConfirmShellAction { name, target, .. } => {
+            // h=7: 2 borders + 5 content rows, exactly matching the 5 lines below.
             let area = centered(frame.area(), 56, 7);
             frame.render_widget(Clear, area);
             let block = Block::bordered()
@@ -99,6 +100,10 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             let body = Paragraph::new(vec![
                 Line::from(format!("Run '{name}' on")),
                 Line::from(target.as_str()),
+                // `target` is the virtual VFS path; the real OS path is resolved on confirm
+                // by the effect runner (via `Vfs::local_path`). What you see here is always
+                // forwarded as-is — no truncation or substitution happens at this stage.
+                Line::from("(virtual path — real OS path resolved on confirm)"),
                 Line::from(""),
                 Line::from("[y] Run    [n] Cancel"),
             ])
@@ -898,6 +903,48 @@ mod tests {
         let text = render_text(&s, 80, 24);
         assert!(text.contains("IRREVERSIBLE"));
         assert!(text.contains("no bulk"));
+    }
+
+    /// Verify the full status-bar precedence chain: transfer > status message > help string.
+    /// The existing `status_line_falls_back_to_the_status_message_when_idle` test covers the
+    /// status-vs-help arm; this test covers the missing transfer-wins-over-status arm.
+    #[test]
+    fn status_line_transfer_wins_over_transient_status_message() {
+        let mut s = ready_state();
+        set_transfer(&mut s, 2 * 1024 * 1024, Some(512 * 1024), None, false);
+        s.status = Some("Sort: name".to_owned());
+        let text = render_text(&s, 100, 24);
+        assert!(
+            text.contains("transferring"),
+            "live transfer must win the status bar: {text}"
+        );
+        assert!(
+            !text.contains("Sort: name"),
+            "transient status must be suppressed while a transfer is live: {text}"
+        );
+    }
+
+    /// The `ConfirmShellAction` overlay must display the VFS virtual path AND the annotation
+    /// clarifying that the real OS path is resolved on confirm — so the user is never misled
+    /// about what the shell action will actually receive (#58).
+    #[test]
+    fn confirm_shell_action_shows_target_and_virtual_path_note() {
+        let mut s = ready_state();
+        s.overlay = Some(cairn_core::Overlay::ConfirmShellAction {
+            index: 0,
+            name: "compress".to_owned(),
+            conn: ConnectionId(1),
+            target: VfsPath::parse("/docs/report.pdf").unwrap(),
+        });
+        let text = render_text(&s, 80, 24);
+        assert!(text.contains("Run shell action?"), "dialog title: {text}");
+        assert!(text.contains("compress"), "action name: {text}");
+        assert!(text.contains("/docs/report.pdf"), "VFS path: {text}");
+        assert!(
+            text.contains("virtual path"),
+            "annotation must tell the user the shown path is virtual, not the real OS path: {text}"
+        );
+        assert!(text.contains("[y] Run"), "action hints: {text}");
     }
 
     #[test]

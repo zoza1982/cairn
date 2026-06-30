@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -565,6 +566,14 @@ fn avg_rate(bytes: u64, secs: f64) -> u64 {
     (bytes as f64 / secs) as u64
 }
 
+/// Subtract accumulated paused wall-time from the total elapsed to get the effective (active)
+/// elapsed for throughput rate calculation. Saturates to [`Duration::ZERO`] when `paused`
+/// exceeds `total` (e.g., the accumulator raced ahead of the clock); [`avg_rate`]'s own 0.05 s
+/// floor then bounds the reported rate.
+fn effective_elapsed(total: Duration, paused: Duration) -> Duration {
+    total.saturating_sub(paused)
+}
+
 /// Sum the source file sizes of a transfer's `items` (recursively for directories), for a
 /// percentage/ETA. Best-effort: returns `None` if any stat/listing fails or a size is unknown, so
 /// the caller falls back to a byte+rate display rather than a misleading total.
@@ -679,9 +688,55 @@ async fn run_transfer_effect(
     // Emit coalesced, non-blocking progress: accumulate bytes and notify the UI at most every
     // `TRANSFER_PROGRESS_STEP` bytes via `try_send`, which drops the update if the bounded channel is
     // full rather than stalling the transfer task (the render path must never be blocked here). The
-    // reported rate is the average throughput since the transfer started.
+    // reported rate is the average throughput over **effective** (non-paused) elapsed time.
+
+    // Track wall-time spent paused so the throughput rate is not skewed by idle clock cycles.
+    // A lightweight accumulator task subscribes to the pause watch: each true→false transition adds
+    // the pause interval (in milliseconds) to a shared `AtomicU64`. The drop-guard cancels the task
+    // when `run_transfer_effect` returns via any path (normal, early-exit, or cancelled).
+    let paused_ms_acc = Arc::new(AtomicU64::new(0));
+    let _accu_guard = {
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+        tokio::spawn({
+            let paused_ms = paused_ms_acc.clone();
+            let cancel = token;
+            let mut paused_rx = paused.clone();
+            async move {
+                let mut pause_start: Option<std::time::Instant> = None;
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = paused_rx.changed() => {
+                            match result {
+                                Ok(()) => {
+                                    if *paused_rx.borrow() {
+                                        pause_start = Some(std::time::Instant::now());
+                                    } else if let Some(s) = pause_start.take() {
+                                        // Clamp to u64::MAX (≈ 584 million years) to avoid a
+                                        // near-impossible overflow; in practice pauses are seconds.
+                                        let ms = u64::try_from(s.elapsed().as_millis())
+                                            .unwrap_or(u64::MAX);
+                                        paused_ms.fetch_add(ms, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(_) => break, // watch sender dropped; transfer has ended
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        guard
+    };
     let started = std::time::Instant::now();
-    let rate_bps = |bytes: u64| -> u64 { avg_rate(bytes, started.elapsed().as_secs_f64()) };
+    let rate_bps = |bytes: u64| -> u64 {
+        let paused_dur = Duration::from_millis(paused_ms_acc.load(Ordering::Relaxed));
+        avg_rate(
+            bytes,
+            effective_elapsed(started.elapsed(), paused_dur).as_secs_f64(),
+        )
+    };
     let mut bytes = 0u64;
     let mut last_sent = 0u64;
     let mut on_progress = |b: u64| {
@@ -1372,6 +1427,38 @@ mod tests {
         assert_eq!(avg_rate(1024 * 1024, -1.0), 1024 * 1024 * 20); // negative also floored
                                                                    // No panic / wrap at the extreme.
         let _ = avg_rate(u64::MAX, 0.000_001);
+    }
+
+    /// Pure unit test for [`effective_elapsed`] — no async, no sleeps.
+    /// Verifies that accumulated paused time is correctly subtracted, with saturation to zero when
+    /// paused >= total (the `avg_rate` floor then bounds the reported rate).
+    #[test]
+    fn effective_elapsed_saturates_at_zero_and_subtracts_correctly() {
+        // Normal: 5 s elapsed, 2 s paused → 3 s effective.
+        assert_eq!(
+            effective_elapsed(Duration::from_secs(5), Duration::from_secs(2)),
+            Duration::from_secs(3)
+        );
+        // Saturates to zero when paused exceeds total (avg_rate's floor then kicks in).
+        assert_eq!(
+            effective_elapsed(Duration::from_secs(1), Duration::from_secs(2)),
+            Duration::ZERO
+        );
+        // Exact match: paused == total → zero.
+        assert_eq!(
+            effective_elapsed(Duration::from_secs(3), Duration::from_secs(3)),
+            Duration::ZERO
+        );
+        // No pause → full elapsed is effective.
+        assert_eq!(
+            effective_elapsed(Duration::from_secs(4), Duration::ZERO),
+            Duration::from_secs(4)
+        );
+        // Both zero.
+        assert_eq!(
+            effective_elapsed(Duration::ZERO, Duration::ZERO),
+            Duration::ZERO
+        );
     }
 
     fn tempfile_dir() -> tempfile::TempDir {
