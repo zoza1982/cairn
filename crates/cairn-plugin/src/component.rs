@@ -266,12 +266,7 @@ impl PluginComponent {
     pub fn instantiate(engine: &Engine, bytes: &[u8], limits: Limits) -> Result<Self, PluginError> {
         // Zero-grant path: no network grant, no credentials, no broker. Used for fixture tests and
         // untrusted-plugin sandbox verification; brokered host fns return deny errors.
-        Self::instantiate_with_grants(
-            engine,
-            bytes,
-            limits,
-            crate::PluginHostConfig::default(),
-        )
+        Self::instantiate_with_grants(engine, bytes, limits, crate::PluginHostConfig::default())
     }
 
     /// Instantiate a component with explicit capability grants and a credential broker
