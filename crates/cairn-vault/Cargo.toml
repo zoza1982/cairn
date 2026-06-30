@@ -12,6 +12,16 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# OS-keychain unlock for the vault passphrase (Secret Service on Linux, Keychain on macOS,
+# Credential Manager on Windows) via `keyring` 4.x. OFF by default so the lean/default and headless
+# builds don't pull the platform secret-store stack (dbus/zbus, security-framework, windows) — per
+# ADR-0006. The passphrase unlock path is always available regardless of this feature.
+keychain = ["dep:keyring"]
+# Exposes `MockUnlockProvider` to dependent crates' tests (e.g. the broker's unlock-flow tests).
+test-utils = []
+
 [dependencies]
 cairn-types = { workspace = true }
 cairn-secrets = { workspace = true }
@@ -26,6 +36,17 @@ tempfile = "3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
+# OS keychain access for `KeychainUnlockProvider` (behind the non-default `keychain` feature). The
+# all-in-one `keyring` 4.x façade auto-selects the right platform store (Secret Service on Linux via
+# zbus, security-framework on macOS, Credential Manager on Windows). Its error type is re-exported
+# from `keyring-core`, so our error mapping is shared with the hermetic mock test. MIT OR Apache-2.0.
+keyring = { version = "4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# keyring-core ships an in-memory mock credential store used to test `KeychainUnlockProvider`
+# hermetically (no real OS keychain). It is a (light, platform-dep-free) transitive dep of `keyring`;
+# declared here so the `keychain`-gated test can build entries against the mock store directly.
+# Keep this major in lockstep with the `keyring-core` that `keyring` depends on: the test shares the
+# `keyring::Error` type (re-exported from keyring-core), so a split would break compilation loudly.
+keyring-core = "1"

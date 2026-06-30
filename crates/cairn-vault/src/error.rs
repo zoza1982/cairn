@@ -19,6 +19,11 @@ pub enum VaultError {
     /// Key derivation failed.
     #[error("key derivation failed")]
     Kdf,
+    /// Obtaining the passphrase from an [`UnlockProvider`](crate::UnlockProvider) failed (e.g. no
+    /// keychain entry, or a keychain backend error). The inner [`UnlockError`](crate::UnlockError) is
+    /// secret-free by construction, so it is safe to include in the message.
+    #[error("vault unlock failed: {0}")]
+    Unlock(#[from] crate::UnlockError),
     /// An underlying I/O error.
     #[error("io error")]
     Io(#[from] std::io::Error),

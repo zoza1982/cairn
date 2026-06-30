@@ -6,8 +6,11 @@
 //! associated data, so tampering or rollback is detected on open. Writes are atomic (temp-file +
 //! rename). See `docs/LLD.md` §9 and ADR-0002.
 //!
-//! OS-keychain unlock (per ADR-0002) is deferred; this milestone implements the passphrase path,
-//! which is fully testable and the required fallback on headless hosts.
+//! The passphrase is supplied through an [`UnlockProvider`]: [`PassphraseUnlockProvider`] (the
+//! always-available headless / prompt fallback) or — behind the non-default `keychain` feature
+//! (ADR-0006) — `KeychainUnlockProvider`, which reads/writes the passphrase in the OS keychain
+//! (Secret Service / macOS Keychain / Windows Credential Manager) per ADR-0002. Auto-lock and the
+//! TUI unlock overlay are deferred to M3-7 / app integration.
 
 use cairn_types::{CredentialKind, CredentialShape};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -19,9 +22,19 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 mod cred;
 mod error;
+mod unlock;
 pub use cairn_secrets::{ExposeSecret, SecretString};
 pub use cred::{AwsCredential, AzureCredential, CredentialSecret, GcpCredential, SshCredential};
 pub use error::VaultError;
+pub use unlock::{open_with, PassphraseUnlockProvider, UnlockError, UnlockProvider};
+
+/// OS-keychain unlock provider (behind the non-default `keychain` feature; see [`UnlockProvider`]).
+#[cfg(feature = "keychain")]
+pub use unlock::KeychainUnlockProvider;
+
+/// In-memory unlock provider for hermetic tests (behind `cfg(test)` / the `test-utils` feature).
+#[cfg(any(test, feature = "test-utils"))]
+pub use unlock::MockUnlockProvider;
 
 const MAGIC: &[u8; 8] = b"CAIRNVLT";
 // v2: typed `CredentialSecret` payloads (RFC-0008). v1 (flat string secrets) is not forward-read; the
