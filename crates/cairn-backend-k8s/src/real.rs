@@ -34,10 +34,14 @@
 //! relays bytes bidirectionally with `tokio::io::copy_bidirectional`. One `Portforwarder` per
 //! connection is the documented kube-rs pattern (each `Portforwarder` is a single WebSocket; a
 //! single forwarder cannot multiplex concurrent connections). The accept loop runs in a spawned
-//! Tokio task and exits when the `cancel` signal fires; `done` resolves with `Ok(0)` on clean
-//! teardown. In-flight relay tasks drain naturally when their TCP connections close.
+//! Tokio task and exits when the `cancel` signal fires. A shared `CancellationToken` is distributed
+//! to every relay task; cancelling it causes each relay to drop its `Portforwarder` stream and
+//! local `TcpStream`, triggering TCP close on both sides. `done` resolves with `Ok(0)` after all
+//! relay tasks have exited.
 
-use crate::ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta};
+use crate::ops::{
+    bind_loopback, ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta,
+};
 use crate::tar_exec::{
     not_found, parse_list_dir, parse_read_tar, parse_stat_tar, tar_basename, tar_parent,
 };
@@ -55,7 +59,6 @@ use kube::{
     Api, Client, ResourceExt,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpListener;
 
 // ---------------------------------------------------------------------------
 // Collected output from a single exec invocation
@@ -997,27 +1000,31 @@ impl KubeOps for KubeRsOps {
     /// Forward a local TCP port to `remote_port` on a running pod.
     ///
     /// Binds a `TcpListener` on `127.0.0.1:<local_port>` (or an ephemeral port when
-    /// `local_port` is `None` or `Some(0)`). Returns a [`SessionHandle`] with `local_port`
-    /// set to the actually-bound port immediately — before any connection arrives — so the
-    /// TUI can display the address at once.
+    /// `local_port` is `None` or `Some(0)`). Builds the `kube::Client` eagerly before starting
+    /// the accept loop — auth/config failures are surfaced immediately as [`VfsError`] rather
+    /// than being silently swallowed per-connection. Returns a [`SessionHandle`] with `local_port`
+    /// set to the actually-bound port immediately, before any connection arrives, so the TUI can
+    /// display the address at once.
     ///
     /// # Accept loop and relay model
     ///
     /// A single Tokio task owns the listener and loops, accepting connections with
     /// `tokio::select!` between `cancel` and `listener.accept()`. For each accepted TCP
-    /// connection, an independent relay sub-task is spawned that:
+    /// connection, an independent relay sub-task is added to a `JoinSet` and:
     ///
-    /// 1. Builds a `kube::Client` for the context (auth/TLS handled by kube-rs).
+    /// 1. Clones the pre-built `kube::Client` (cheap — `Client` is Arc-backed).
     /// 2. Calls `Api::<Pod>::portforward(pod, &[remote_port])` to open a WebSocket to the
     ///    API server (one WebSocket per connection — the documented kube-rs pattern).
     /// 3. Takes the port stream via `Portforwarder::take_stream(remote_port)`.
-    /// 4. Relays bytes bidirectionally with `tokio::io::copy_bidirectional`.
+    /// 4. `tokio::select!`s `copy_bidirectional` against the shared `CancellationToken`.
     /// 5. Drops the upstream stream, then joins the `Portforwarder` task.
     ///
-    /// Relay sub-tasks are fire-and-forget; they complete naturally when their TCP peer
-    /// disconnects. The accept loop does not wait for them on cancel — a cancel stops new
-    /// connections, not in-flight relays. `done` resolves `Ok(0)` immediately after the
-    /// accept loop exits.
+    /// On `cancel`: the accept loop breaks, `token.cancel()` fires, all relay tasks exit their
+    /// `select!`, and `join_set.shutdown()` awaits their completion before `done` resolves.
+    ///
+    /// Accept errors are classified: `ConnectionAborted`/`Interrupted` are transient and retried;
+    /// fd-exhaustion (`EMFILE`/`ENFILE`) backs off 100 ms then retries; other OS errors are fatal
+    /// and resolve `done` with `Err(VfsError::Backend { code: "accept_failed", retryable: true })`.
     ///
     /// # Credential safety
     ///
@@ -1031,71 +1038,50 @@ impl KubeOps for KubeRsOps {
         remote_port: u16,
         local_port: Option<u16>,
     ) -> Result<SessionHandle, VfsError> {
-        let port = local_port.unwrap_or(0);
-        let listener = TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
-            .await
-            .map_err(|e| VfsError::Backend {
-                code: if e.kind() == std::io::ErrorKind::AddrInUse {
-                    "port_in_use".to_owned()
-                } else {
-                    "bind_failed".to_owned()
-                },
-                // Omit the address: the port is surfaced via SessionHandle.local_port;
-                // including it here would duplicate it and potentially leak intent.
-                msg: "port-forward: failed to bind local port".to_owned(),
-                retryable: false,
-            })?;
+        // FIX 5: shared bind helper removes duplicated bind/error-mapping block.
+        let (listener, bound_port) = bind_loopback(local_port.unwrap_or(0)).await?;
 
-        let bound_port = listener
-            .local_addr()
-            .map_err(|e| VfsError::Backend {
-                code: "bind_failed".to_owned(),
-                msg: e.to_string(),
-                retryable: false,
-            })?
-            .port();
+        // FIX 2: build the client once, eagerly, before the accept loop. Auth/config failures
+        // are surfaced here as VfsError rather than being silently dropped per-connection.
+        // kube::Client is Arc-backed; clone() into each relay task is cheap.
+        let client = build_client_for(ctx.to_owned()).await?;
 
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<i32, VfsError>>();
 
-        // Clone owned values for the accept-loop task.
-        let ctx = ctx.to_owned();
+        // FIX 1: CancellationToken shared to all relay tasks so they can be torn down on cancel.
+        let token = tokio_util::sync::CancellationToken::new();
+
         let ns = ns.to_owned();
         let pod = pod.to_owned();
 
         tokio::spawn(async move {
-            loop {
+            let mut join_set = tokio::task::JoinSet::<()>::new();
+            // FIX 3: track a fatal accept error to forward to `done`.
+            let mut fatal_err: Option<VfsError> = None;
+
+            'accept: loop {
                 tokio::select! {
                     biased;
-                    // Cancel path: stop accepting; in-flight relay tasks drain naturally.
-                    _ = &mut cancel_rx => break,
+                    // Cancel path: stop accepting; relay tasks will be torn down below.
+                    _ = &mut cancel_rx => break 'accept,
                     accept = listener.accept() => {
                         match accept {
                             Ok((conn, _peer)) => {
                                 // Spawn an independent relay task per connection.
-                                // Clone cheaply — all values are either `String` (cheap clone
-                                // for small context/ns/pod names) or `u16`.
-                                let ctx = ctx.clone();
+                                // Clone cheaply — Client is Arc-backed; Strings are small names.
+                                let relay_client = client.clone();
                                 let ns = ns.clone();
                                 let pod = pod.clone();
-                                tokio::spawn(async move {
-                                    // Build a fresh client for the context (auth/TLS is handled
-                                    // by kube-rs; no credential material touches this task).
-                                    let client = match build_client_for(ctx).await {
-                                        Ok(c) => c,
-                                        // Transport or config failure: silently drop the
-                                        // connection. The error has already been logged by
-                                        // kube-rs; surfacing it to the accept loop would
-                                        // terminate the listener, harming other connections.
-                                        Err(_) => return,
-                                    };
-
-                                    let api: Api<Pod> = Api::namespaced(client, &ns);
+                                let relay_token = token.clone();
+                                join_set.spawn(async move {
+                                    let api: Api<Pod> = Api::namespaced(relay_client, &ns);
 
                                     // One Portforwarder per connection (each is a WebSocket).
                                     let mut forwarder =
                                         match api.portforward(&pod, &[remote_port]).await {
                                             Ok(f) => f,
+                                            // TODO(tracing): warn! here with redacted pod/ns
                                             Err(_) => return,
                                         };
 
@@ -1109,12 +1095,23 @@ impl KubeOps for KubeRsOps {
                                         };
 
                                     let mut client_conn = conn;
-                                    // Relay bytes in both directions until either side closes.
-                                    let _ = tokio::io::copy_bidirectional(
-                                        &mut client_conn,
-                                        &mut upstream,
-                                    )
-                                    .await;
+
+                                    // FIX 1: relay bytes in both directions, but abort when the
+                                    // cancellation token fires (session cancelled by the user).
+                                    // On cancel, dropping upstream + client_conn closes both TCP
+                                    // sides, which also unblocks the Portforwarder WebSocket.
+                                    tokio::select! {
+                                        _ = relay_token.cancelled() => {
+                                            // TODO(tracing): debug! "relay cancelled"
+                                        }
+                                        result = tokio::io::copy_bidirectional(
+                                            &mut client_conn,
+                                            &mut upstream,
+                                        ) => {
+                                            // Ignore copy error — the peer may have closed first.
+                                            let _ = result;
+                                        }
+                                    }
 
                                     // Explicit drop signals EOF on the upstream write half
                                     // before joining the Portforwarder WebSocket task.
@@ -1122,15 +1119,64 @@ impl KubeOps for KubeRsOps {
                                     let _ = forwarder.join().await;
                                 });
                             }
-                            // Listener error (e.g. OS resource exhaustion): exit the loop.
-                            Err(_) => break,
+                            // FIX 3: classify accept errors rather than treating all as fatal.
+                            Err(e) => {
+                                use std::io::ErrorKind as K;
+                                match e.kind() {
+                                    // Transient: client disconnected before the OS delivered the
+                                    // fd, or the accept() call was interrupted by a signal.
+                                    K::ConnectionAborted | K::Interrupted => continue 'accept,
+                                    // fd exhaustion: sleep briefly so other fds can be released,
+                                    // then retry. The OS error numbers are EMFILE (24) and ENFILE
+                                    // (23) on Linux; reported as `Other` in older Rust, or via
+                                    // raw_os_error() on all versions.
+                                    K::Other => {
+                                        let raw = e.raw_os_error().unwrap_or(0);
+                                        if raw == 24 /* EMFILE */ || raw == 23 /* ENFILE */ {
+                                            // TODO(tracing): warn! about fd exhaustion
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(100),
+                                            )
+                                            .await;
+                                            continue 'accept;
+                                        }
+                                        // Non-fd-exhaustion Other: treat as fatal.
+                                        fatal_err = Some(VfsError::Backend {
+                                            code: "accept_failed".to_owned(),
+                                            msg: "port-forward: accept loop failed".to_owned(),
+                                            retryable: true,
+                                        });
+                                        break 'accept;
+                                    }
+                                    // Any other OS error is fatal (e.g. listener was forcibly
+                                    // closed by the OS, or the socket became invalid).
+                                    _ => {
+                                        // TODO(tracing): warn! with e.kind() (no port/address)
+                                        fatal_err = Some(VfsError::Backend {
+                                            code: "accept_failed".to_owned(),
+                                            msg: "port-forward: accept loop failed".to_owned(),
+                                            retryable: true,
+                                        });
+                                        break 'accept;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            // Resolve done with Ok(0) — clean teardown regardless of cancellation trigger.
+
+            // FIX 1: cancel all in-flight relay tasks and wait for them to exit so that both
+            // TCP connections and Portforwarder WebSockets are cleanly closed before `done`
+            // resolves. `shutdown()` aborts remaining tasks and awaits their drop.
+            token.cancel();
+            join_set.shutdown().await;
+
+            // Resolve done with the accept-loop outcome. On clean cancel or natural exit: Ok(0).
+            // On a fatal accept error: Err so the UI can surface the failure.
+            let result = fatal_err.map_or(Ok(0), Err);
             // If the receiver was dropped (session pane torn down), discard the send error.
-            let _ = done_tx.send(Ok(0));
+            let _ = done_tx.send(result);
         });
 
         Ok(SessionHandle::new(
