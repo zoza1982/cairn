@@ -1105,6 +1105,7 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
+ "rustls",
  "smol_str",
  "tokio",
 ]

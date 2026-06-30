@@ -39,6 +39,11 @@ impl KubeRsOps {
 
     /// Build a [`kube::Client`] scoped to the given context name.
     async fn client_for(&self, ctx: &str) -> Result<Client, VfsError> {
+        // rustls 0.23 no longer auto-installs a process-wide crypto provider, so kube's TLS client
+        // build would panic without one. Install the ring provider once (idempotent: a later call,
+        // or another backend having already installed a provider, is harmless).
+        ensure_crypto_provider();
+
         let opts = KubeConfigOptions {
             context: Some(ctx.to_owned()),
             ..Default::default()
@@ -54,6 +59,19 @@ impl Default for KubeRsOps {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Install the process-wide rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) exactly once.
+///
+/// rustls 0.23 requires a provider to be installed before a `ClientConfig` is built; kube's client
+/// build otherwise panics. `install_default` returns `Err` if a provider is already installed (e.g.
+/// another backend got there first) — that is fine, so the error is ignored.
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// Map a `kube::Error` from an API call to a [`VfsError`].
