@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Vault unlock providers** (M3-3, ADR-0002/ADR-0006): `cairn-vault` gains an `UnlockProvider` trait
+  that supplies the vault passphrase, plus a small `open_with(path, &dyn UnlockProvider)` convenience.
+  Three implementations: `PassphraseUnlockProvider` (the always-available headless / prompt fallback),
+  `KeychainUnlockProvider` (reads/writes the passphrase in the OS keychain — Secret Service on Linux,
+  Keychain on macOS, Credential Manager on Windows — via `keyring` 4.x, behind the **non-default
+  `keychain` feature** so the lean/headless build doesn't pull the platform secret-store stack), and a
+  test-only `MockUnlockProvider` (under `cfg(test)` / the new `test-utils` feature). A new `UnlockError`
+  maps a missing keychain entry to `NotFound` (so callers can fall back to prompting) and every other
+  keychain failure to a fixed, secret-free `Backend` message; `VaultError` gains an `Unlock` variant.
+  The keychain provider is tested **hermetically** against `keyring-core`'s in-memory mock store (no
+  real OS keychain, no dbus). Auto-lock and the TUI unlock overlay (M3-7) remain follow-ups.
 - **Kubernetes navigable tree, live** (M6-5, RFC-0005): the k8s backend's live `kube-rs` adapter
   (behind the non-default `k8s` feature) makes a cluster browsable — `list_contexts` (from the
   kubeconfig, no cluster call), `list_namespaces`, `list_pods` (phase / ready / node), and
