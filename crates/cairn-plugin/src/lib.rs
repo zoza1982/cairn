@@ -40,11 +40,15 @@ mod epoch;
 mod handle;
 #[cfg(feature = "plugin-network")]
 pub(crate) mod http_fetch;
+pub mod loader;
+pub mod manifest;
 mod wasi_narrowing;
 pub use backend::PluginVfsBackend;
 pub use cairn_broker_api::CredentialBroker;
 pub use component::{engine_config, PluginComponent};
 pub use epoch::EpochTicker;
+pub use loader::PluginLoader;
+pub use manifest::{PluginManifest, HOST_API_MAJOR};
 
 /// The capabilities granted to a plugin instance (RFC-0010 §3/§4).
 ///

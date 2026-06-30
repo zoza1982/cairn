@@ -22,6 +22,35 @@ pub use error::ConfigError;
 /// The current config schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
+// ── Plugin capability grants ───────────────────────────────────────────────────────────────────
+
+/// The user's approved capability grants for one plugin version (RFC-0010 §5.4).
+///
+/// Stored in `cairn.toml` under `[plugins."<name>@<version>".grants]`. Not secret — this is
+/// the user's *intent record* (what they approved at install time), not a credential. Declined
+/// capabilities are simply absent (empty list or `false`).
+///
+/// Written by the approval UI (PR-C2) and read by `PluginLoader` (`cairn-plugin`) at mount time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PluginGrantsRecord {
+    /// Whether the plugin is approved to write to Cairn's log via `host::log`.
+    pub log: bool,
+    /// Hostnames this plugin is approved to contact via `host::http-fetch`.
+    /// May be a strict subset of what the manifest requested (user narrowed the grant).
+    pub network: Vec<String>,
+    /// Credential handle labels this plugin is approved to use via `host::use-credential`.
+    pub credentials: Vec<String>,
+}
+
+/// One entry in the `[plugins]` table for a specific plugin version.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginEntry {
+    /// The approved capability grants for this plugin version.
+    pub grants: PluginGrantsRecord,
+}
+
 /// A reference to a credential stored in the vault. Safe to serialize; reveals nothing.
 pub type SecretRef = Uuid;
 
@@ -46,6 +75,12 @@ pub struct Config {
     /// Secrets-vault preferences.
     #[serde(default)]
     pub vault: VaultConfig,
+    /// Installed plugin entries, keyed by `"<name>@<version>"` (RFC-0010 §5.4).
+    ///
+    /// Written by the plugin approval UI (PR-C2); read by `PluginLoader` at mount time.
+    /// Not secret — this is the user's capability grant record.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, PluginEntry>,
 }
 
 impl Default for Config {
@@ -57,6 +92,7 @@ impl Default for Config {
             shell_actions: Vec::new(),
             transfers: TransfersConfig::default(),
             vault: VaultConfig::default(),
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -80,6 +116,32 @@ impl Config {
     #[must_use]
     pub fn vault_path(&self) -> Option<PathBuf> {
         self.vault.path.clone().or_else(default_vault_path)
+    }
+
+    /// Return the approved grants record for the plugin identified by `key` (`"name@version"`).
+    ///
+    /// Returns `None` if the plugin has no entry in the config (not yet installed / approved).
+    /// The loader treats `None` as "deny all" — no capabilities are granted.
+    #[must_use]
+    pub fn plugin_grants(&self, key: &str) -> Option<PluginGrantsRecord> {
+        self.plugins.get(key).map(|e| e.grants.clone())
+    }
+
+    /// Write (or overwrite) the approved grants for the plugin identified by `key`.
+    ///
+    /// This is called by the approval UI (PR-C2) after the user approves capabilities at
+    /// install time. Call [`save`](Config::save) afterwards to persist the change.
+    pub fn set_plugin_grants(&mut self, key: &str, grants: PluginGrantsRecord) {
+        self.plugins.entry(key.to_owned()).or_default().grants = grants;
+    }
+
+    /// Remove the grants record for a plugin (revoke all capabilities).
+    ///
+    /// The plugin directory is NOT removed; only the grants are cleared. On next load,
+    /// the loader will see no grants and deny all capabilities (the plugin will fail
+    /// to instantiate if it actually uses a brokered function).
+    pub fn revoke_plugin_grants(&mut self, key: &str) {
+        self.plugins.remove(key);
     }
 }
 
@@ -673,5 +735,126 @@ mod tests {
         let path = dir.path().join("config.toml");
         let mut cfg = Config::default();
         assert!(cfg.secure_shell_actions(&path).is_none());
+    }
+
+    // ── Plugin grants (RFC-0010 §5.4) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn plugin_grants_roundtrip_through_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.set_plugin_grants(
+            "my-cloud@0.2.1",
+            PluginGrantsRecord {
+                log: true,
+                network: vec!["api.mycloud.example.com".to_owned()],
+                credentials: vec!["my-cloud-key".to_owned()],
+            },
+        );
+        cfg.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        let grants = loaded
+            .plugin_grants("my-cloud@0.2.1")
+            .expect("grants must be present");
+        assert!(grants.log);
+        assert_eq!(grants.network, vec!["api.mycloud.example.com"]);
+        assert_eq!(grants.credentials, vec!["my-cloud-key"]);
+    }
+
+    #[test]
+    fn plugin_grants_absent_returns_none() {
+        let cfg = Config::default();
+        assert!(cfg.plugin_grants("nonexistent@1.0.0").is_none());
+    }
+
+    #[test]
+    fn revoke_plugin_grants_removes_entry() {
+        let mut cfg = Config::default();
+        cfg.set_plugin_grants(
+            "my-cloud@0.2.1",
+            PluginGrantsRecord {
+                log: true,
+                network: vec!["api.mycloud.example.com".to_owned()],
+                credentials: vec![],
+            },
+        );
+        assert!(cfg.plugin_grants("my-cloud@0.2.1").is_some());
+        cfg.revoke_plugin_grants("my-cloud@0.2.1");
+        assert!(
+            cfg.plugin_grants("my-cloud@0.2.1").is_none(),
+            "grants must be removed after revoke"
+        );
+    }
+
+    #[test]
+    fn config_without_plugins_section_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\n[ui]\nkeymap = \"mc\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.plugins.is_empty(), "plugins section absent → empty map");
+    }
+
+    #[test]
+    fn multiple_plugin_grants_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.set_plugin_grants(
+            "plugin-a@1.0.0",
+            PluginGrantsRecord {
+                log: true,
+                network: vec![],
+                credentials: vec![],
+            },
+        );
+        cfg.set_plugin_grants(
+            "plugin-b@2.0.0",
+            PluginGrantsRecord {
+                log: false,
+                network: vec!["api.b.example.com".to_owned()],
+                credentials: vec!["key-b".to_owned()],
+            },
+        );
+        cfg.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        let a = loaded.plugin_grants("plugin-a@1.0.0").unwrap();
+        assert!(a.log);
+        assert!(a.network.is_empty());
+        let b = loaded.plugin_grants("plugin-b@2.0.0").unwrap();
+        assert!(!b.log);
+        assert_eq!(b.network, vec!["api.b.example.com"]);
+        assert_eq!(b.credentials, vec!["key-b"]);
+    }
+
+    #[test]
+    fn plugin_grants_not_secret_in_serialized_form() {
+        // Verify the serialized config contains the grants as plain text (not encrypted).
+        // Plugin grants are NOT secret — they are the user's intent record.
+        let mut cfg = Config::default();
+        cfg.set_plugin_grants(
+            "my-cloud@0.2.1",
+            PluginGrantsRecord {
+                log: true,
+                network: vec!["api.example.com".to_owned()],
+                credentials: vec!["my-key".to_owned()],
+            },
+        );
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            text.contains("api.example.com"),
+            "network grant must be visible in TOML"
+        );
+        assert!(
+            text.contains("my-key"),
+            "credential label must be visible in TOML"
+        );
+        assert!(
+            !text.to_lowercase().contains("password"),
+            "must contain no secret values"
+        );
     }
 }

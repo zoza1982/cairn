@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **DNS connection pinning and IPv6 tunnel classification** (SEC-1 / issue #103, RFC-0010 PR-C1,
+  M8-5): closed the DNS-rebinding TOCTOU race in the plugin HTTP sandbox. Replaced the
+  pre-flight `check_ssrf_via_dns` call (which allowed reqwest to re-resolve the hostname
+  independently at connect time) with a `PinnedSsrfDnsResolver` that implements
+  `reqwest::dns::Resolve` and is installed as the sole DNS authority via
+  `ClientBuilder::dns_resolver()`. The resolver resolves the hostname once via
+  `tokio::net::lookup_host`, validates every returned `IpAddr` with `is_ssrf_blocked_ip`, and
+  hands reqwest only the approved `SocketAddr` set — reqwest does not perform a second DNS
+  lookup. This closes the rebind window entirely.  SEC-8 (IPv6 tunnels): 6to4 (`2002::/16`),
+  Teredo (`2001::/32`), and NAT64 (`64:ff9b::/96`) prefixes are now classified by extracting
+  the embedded IPv4 address and recursing through `is_ssrf_blocked_ip`.
+
+### Added
+
+- **Plugin loader and manifest parser** (RFC-0010 PR-C1, M8-5): new `cairn-plugin::manifest`
+  module with `PluginManifest` (parsed from `plugin.toml` via `serde`+`toml`, all structs
+  `deny_unknown_fields`) covering the `[plugin]`, `[capabilities]`, `[network]`, and `[limits]`
+  sections from RFC-0010 §5.2. Semantic validation: plugin name charset `[a-z0-9_-]` ≤ 64
+  chars, inline SemVer, `api.major` must equal `HOST_API_MAJOR = "1"`, description ≤ 256 chars.
+  New `cairn-plugin::loader` module with `PluginLoader`: directory discovery
+  (`<name>-<version>/plugin.toml` + `component.wasm`), ABI major-version check (§5.3),
+  grants intersection (manifest-requested ∩ config-stored, fail-closed; §5.4), and the full
+  §5.6 load pipeline. New `cairn-config` types `PluginGrantsRecord` and `PluginEntry` stored
+  under `[plugins."<name>@<version>".grants]` in `cairn.toml`, with `plugin_grants()`,
+  `set_plugin_grants()`, and `revoke_plugin_grants()` accessors. 7 loader tests, 12 manifest
+  tests, 6 config tests. Default `cargo test` remains hermetic and offline.
+  Deferred: PR-C2 (TUI approval overlay) and PR-C3 (`cairn plugin install` CLI).
+
 - **Brokered host functions** (RFC-0010 PR-B, M8-4): replaced the deny-stubs for
   `host::http-fetch` and `host::use-credential` with real, capability-gated implementations.
   `http-fetch` performs HTTP on the plugin's behalf using reqwest+rustls (no OpenSSL); every

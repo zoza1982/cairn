@@ -313,13 +313,12 @@ impl PluginComponent {
             .memory_size(limits.max_memory_bytes)
             .build();
 
-        // SECURITY (release-gating for M8-5 / PR-C): before the plugin loader (PR-C) makes
-        // this function reachable from the binary with untrusted plugins and grant-bearing
-        // config, the DNS rebinding TOCTOU window in `check_ssrf_via_dns` MUST be closed by
-        // pinning each connection to the `SocketAddr` set validated at pre-flight time via a
-        // custom `reqwest::dns::Resolve` override that re-validates the pinned IP at connect.
-        // See `http_fetch::check_ssrf_via_dns` for the full security note.
-        // Bundle SEC-8 (6to4/Teredo/NAT64 embedded-v4 prefix blocks) with that work.
+        // SEC-1 (issue #103, closed): DNS-rebinding TOCTOU resolved. A `PinnedSsrfDnsResolver`
+        // is installed in the plugin's `reqwest::Client` as the sole DNS authority. reqwest's
+        // `HttpConnector` uses it directly and does NOT re-resolve at connect time, so the IP
+        // we validate is exactly the IP we connect to. SEC-8 (6to4/Teredo/NAT64 embedded-IPv4
+        // classification) is also implemented in `http_fetch::is_ssrf_blocked_ip`.
+        // See `crates/cairn-plugin/src/http_fetch.rs` and issue #103.
         //
         // Build the HTTP client when the plugin-network feature is enabled and network grants
         // are non-empty. The tokio runtime handle is captured here (on the calling async task
