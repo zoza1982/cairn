@@ -1,30 +1,34 @@
-//! Live Docker filesystem round-trip against a real daemon (dind or local socket).
+//! Live Docker integration tests against a real daemon (dind or local socket).
 //!
-//! **Env-guarded:** this test is a no-op unless `CAIRN_IT_DOCKER` is set, so the default
+//! **Env-guarded:** these tests are a no-op unless `CAIRN_IT_DOCKER` is set, so the default
 //! `cargo test` (and the hermetic CI in `ci.yml`) never touch the daemon. The dedicated
-//! integration job spins up a dind sidecar, sets `CAIRN_IT_DOCKER=1`, and runs this test
+//! integration job spins up a dind sidecar, sets `CAIRN_IT_DOCKER=1`, and runs these tests
 //! with `--features docker`. See ADR-0006.
 //!
-//! The test:
-//! 1. Pulls `busybox:latest` (no-op if already cached by the dind sidecar).
-//! 2. Creates and starts a long-running container.
-//! 3. Drives the **`Vfs`** surface (`list`, `stat`, `open_read`) against the container's
-//!    filesystem, asserting plausible results.
-//! 4. Verifies that a missing path returns `VfsError::NotFound`.
-//! 5. Force-removes the container.
+//! Tests included:
+//! - **`docker_container_fs_round_trip`**: Pulls `busybox:latest`, creates a container, drives the
+//!   `Vfs` surface (`list`/`stat`/`open_read`) against the container's filesystem, asserts that a
+//!   missing path is `NotFound`, then force-removes the container.
+//! - **`docker_container_log_streaming`**: Pulls `busybox:latest`, creates a container that emits
+//!   a known marker line on stdout, drives `DockerVfs::invoke("logs")` (non-follow, bounded tail),
+//!   and asserts the collected stream contains the marker. Force-removes the container.
 #![cfg(feature = "docker")]
 
 use bollard::models::ContainerCreateBody;
 use bollard::Docker;
 use cairn_backend_docker::{BollardDocker, DockerVfs};
 use cairn_types::{ConnectionId, VfsPath};
-use cairn_vfs::{ListOpts, Vfs, VfsError};
+use cairn_vfs::{action_ids, ActionCtx, ActionId, ActionOutcome, ListOpts, Vfs, VfsError};
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 
 const TEST_IMAGE: &str = "busybox:latest";
 /// Container name is stable so a prior failed run can be cleaned up at the start.
 const CONTAINER_NAME: &str = "cairn-it-docker-fs-test";
+/// Separate stable name for the log streaming test container.
+const LOG_CONTAINER_NAME: &str = "cairn-it-docker-logs-test";
+/// Marker printed by the log test container — chosen to be unique and easily grepped.
+const LOG_MARKER: &str = "CAIRN_LOG_STREAM_MARKER";
 
 fn p(s: &str) -> VfsPath {
     VfsPath::parse(s).unwrap()
@@ -189,4 +193,130 @@ async fn docker_container_fs_round_trip() {
     )
     .await
     .expect("force-remove container");
+}
+
+/// Live log-streaming round-trip: invoke `DockerVfs::invoke("logs")` against a container that
+/// emits a known marker on stdout, and assert the stream contains it.
+///
+/// The container runs `sh -c 'echo CAIRN_LOG_STREAM_MARKER; sleep 3600'`. After the echo exits,
+/// the marker is in the daemon's log buffer. We invoke logs with `follow: false` and `tail: "100"`
+/// so the stream is bounded (the test terminates without killing the container mid-stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docker_container_log_streaming() {
+    if std::env::var("CAIRN_IT_DOCKER").is_err() {
+        eprintln!("CAIRN_IT_DOCKER unset — skipping live Docker log streaming test");
+        return;
+    }
+
+    let raw =
+        Docker::connect_with_local_defaults().expect("connect to Docker daemon for scaffolding");
+
+    // Pull the image (no-op when the dind sidecar has already cached it).
+    {
+        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
+            .from_image(TEST_IMAGE)
+            .build();
+        let mut pull = raw.create_image(Some(pull_opts), None, None);
+        while let Some(item) = pull.next().await {
+            item.expect("image pull progress should not error");
+        }
+    }
+
+    // Clean up any leftover container from a previous failed run.
+    let _ = raw
+        .remove_container(
+            LOG_CONTAINER_NAME,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                    .force(true)
+                    .build(),
+            ),
+        )
+        .await;
+
+    // Create and start a container that prints the marker then sleeps.
+    raw.create_container(
+        Some(
+            bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                .name(LOG_CONTAINER_NAME)
+                .build(),
+        ),
+        ContainerCreateBody {
+            image: Some(TEST_IMAGE.to_owned()),
+            // sh is available in busybox; 'echo …; sleep 3600' keeps the container alive so
+            // the VFS can list it, while putting the marker into the log buffer immediately.
+            cmd: Some(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("echo {LOG_MARKER}; sleep 3600"),
+            ]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create log-test container");
+
+    raw.start_container(
+        LOG_CONTAINER_NAME,
+        None::<bollard::query_parameters::StartContainerOptions>,
+    )
+    .await
+    .expect("start log-test container");
+
+    // Give the daemon a moment to flush the echo output into the log buffer.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Build the Vfs under test.
+    let ops = BollardDocker::connect_local().expect("BollardDocker::connect_local");
+    let vfs = DockerVfs::new(ConnectionId(42), ops);
+
+    // Drive invoke("logs") — non-follow / tail=100 so the stream terminates.
+    let log_path = format!("/containers/{LOG_CONTAINER_NAME}");
+    let outcome = vfs
+        .invoke(
+            &p(&log_path),
+            ActionId::new(action_ids::LOGS),
+            ActionCtx::Logs {
+                follow: false,
+                since: None,
+                container: None,
+            },
+        )
+        .await
+        .expect("invoke logs must succeed on a running container");
+
+    let stream = match outcome {
+        ActionOutcome::Stream(s) => s,
+        _ => panic!("expected ActionOutcome::Stream from invoke logs"),
+    };
+
+    // Collect all frames — the stream ends when non-follow mode exhausts buffered history.
+    let chunks: Vec<bytes::Bytes> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|r| r.expect("log stream item must be Ok"))
+        .collect();
+
+    let combined = chunks
+        .iter()
+        .flat_map(|b| b.iter().copied())
+        .collect::<Vec<u8>>();
+    let text = String::from_utf8_lossy(&combined);
+    assert!(
+        text.contains(LOG_MARKER),
+        "log stream must contain the marker '{LOG_MARKER}'; got: {text:?}"
+    );
+
+    // Cleanup.
+    raw.remove_container(
+        LOG_CONTAINER_NAME,
+        Some(
+            bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                .force(true)
+                .build(),
+        ),
+    )
+    .await
+    .expect("force-remove log-test container");
 }

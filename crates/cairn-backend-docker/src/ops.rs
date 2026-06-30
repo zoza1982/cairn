@@ -1,8 +1,10 @@
 //! The [`ContainerOps`] transport seam for the Docker backend, plus an in-memory mock.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use cairn_types::{ContainerState, EntryKind};
 use cairn_vfs::VfsError;
+use futures::stream::BoxStream;
 
 /// Summary of a container.
 #[derive(Debug, Clone)]
@@ -59,14 +61,37 @@ pub trait ContainerOps: Send + Sync + 'static {
     async fn stat(&self, container: &str, path: &str) -> Result<RemoteMeta, VfsError>;
     /// Read a file inside a container.
     async fn read(&self, container: &str, path: &str) -> Result<Vec<u8>, VfsError>;
+    /// Stream log output from a container.
+    ///
+    /// Each item in the returned stream carries one log frame as raw [`Bytes`]. Bollard's
+    /// `LogOutput` type already demultiplexes Docker's 8-byte multiplexed stream header (used
+    /// when no TTY is allocated), so callers receive plain payload bytes — stdout and stderr
+    /// interleaved in arrival order — not raw wire frames.
+    ///
+    /// `follow` controls whether the stream tails live output (`true`) or returns only buffered
+    /// history and then ends (`false`). `tail` is passed verbatim as the Docker `tail` query
+    /// parameter (`"all"` for all history, a decimal number for the last N lines).
+    ///
+    /// Error mapping: a 404 from the daemon (container not found) surfaces as
+    /// [`VfsError::NotFound`] in the stream; any other engine error becomes [`VfsError::Backend`].
+    /// The stream never panics; it may be empty for containers with no log output.
+    fn logs(
+        &self,
+        container: &str,
+        follow: bool,
+        tail: &str,
+    ) -> BoxStream<'static, Result<Bytes, VfsError>>;
 }
 
 #[cfg(test)]
 pub(crate) mod mock {
     use super::{ContainerInfo, ContainerOps, ImageInfo, RemoteEntry, RemoteMeta};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use cairn_types::{ContainerState, EntryKind, VfsPath};
     use cairn_vfs::VfsError;
+    use futures::stream::{self, BoxStream};
+    use futures::StreamExt as _;
     use std::collections::BTreeMap;
 
     /// In-memory Docker engine for tests: a few containers, each with a file tree, and images.
@@ -202,6 +227,27 @@ pub(crate) mod mock {
                 .get(container)
                 .ok_or_else(|| Self::nf(container))?;
             tree.get(path).cloned().ok_or_else(|| Self::nf(path))
+        }
+
+        fn logs(
+            &self,
+            container: &str,
+            _follow: bool,
+            _tail: &str,
+        ) -> BoxStream<'static, Result<Bytes, VfsError>> {
+            // Return a canned two-line log for the known "web" container; error for unknown ones.
+            if self.containers.iter().any(|c| c.name == container) {
+                let lines: Vec<Result<Bytes, VfsError>> = vec![
+                    Ok(Bytes::from_static(b"[mock] log line 1\n")),
+                    Ok(Bytes::from_static(b"[mock] log line 2\n")),
+                ];
+                stream::iter(lines).boxed()
+            } else {
+                let err = VfsError::NotFound(
+                    VfsPath::parse(container).unwrap_or_else(|_| VfsPath::root()),
+                );
+                stream::iter(vec![Err(err)]).boxed()
+            }
         }
     }
 }

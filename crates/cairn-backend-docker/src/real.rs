@@ -10,8 +10,10 @@
 use crate::ops::{ContainerInfo, ContainerOps, ImageInfo, RemoteEntry, RemoteMeta};
 use async_trait::async_trait;
 use bollard::Docker;
+use bytes::Bytes;
 use cairn_types::{Caps, ContainerState, EntryKind, VfsPath};
 use cairn_vfs::VfsError;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -297,6 +299,66 @@ impl ContainerOps for BollardDocker {
         let mut data = Vec::new();
         entry.read_to_end(&mut data).map_err(backend_err)?;
         Ok(data)
+    }
+
+    /// Stream log output from a container via the Docker `GET /containers/{id}/logs` endpoint.
+    ///
+    /// Bollard's `LogOutput` decoder already demultiplexes Docker's 8-byte per-frame stream
+    /// header (present when no TTY is allocated), so callers receive plain payload [`Bytes`] —
+    /// stdout and stderr interleaved in arrival order — without hand-parsing the wire format.
+    ///
+    /// Bollard's `Docker::logs()` return type is lifetime-tied to `&self` (Rust's `impl Trait`
+    /// elision), even though the implementation clones the internal `Arc<Transport>`. To produce
+    /// a `BoxStream<'static, …>` we spawn a Tokio task that owns both the `Docker` clone and the
+    /// bollard stream, forwarding frames over a bounded `mpsc` channel. The receiver side is
+    /// wrapped in `stream::unfold` and boxed. The task exits when either the bollard stream ends
+    /// (non-follow mode or daemon EOF) or the receiver is dropped (caller cancelled).
+    ///
+    /// Error mapping: 404 → [`VfsError::NotFound`]; any other bollard error →
+    /// [`VfsError::Backend`]. Errors appear as `Err` items in the stream, not panics.
+    fn logs(
+        &self,
+        container: &str,
+        follow: bool,
+        tail: &str,
+    ) -> BoxStream<'static, Result<Bytes, VfsError>> {
+        let docker = self.docker.clone();
+        let container = container.to_owned();
+        let tail_owned = tail.to_owned();
+
+        // 64-frame buffer: ample back-pressure at typical log line sizes without retaining much
+        // memory. Adjust upward if the consumer is materially slower than the daemon.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, VfsError>>(64);
+
+        tokio::spawn(async move {
+            let opts = bollard::query_parameters::LogsOptionsBuilder::default()
+                .follow(follow)
+                .stdout(true)
+                .stderr(true)
+                .tail(&tail_owned)
+                .build();
+            let mut stream = docker.logs(&container, Some(opts));
+            while let Some(item) = stream.next().await {
+                let mapped = match item {
+                    Ok(log) => Ok(log.into_bytes()),
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => Err(not_found(&container)),
+                    Err(e) => Err(backend_err(e)),
+                };
+                // If the receiver was dropped (caller cancelled), stop producing.
+                if tx.send(mapped).await.is_err() {
+                    break;
+                }
+            }
+            // Task ends here; dropping `tx` closes the channel, ending the consumer stream.
+        });
+
+        futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .boxed()
     }
 }
 
