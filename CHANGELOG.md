@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Docker & Kubernetes connection-opener arms** (M4-5): the binary's `ConnectionOpener` now also
+  opens `docker` and `kubernetes`/`k8s` profiles (no vault credential — local socket / kubeconfig),
+  behind new `docker`/`k8s` binary features and a `containers` umbrella (`all-backends` now =
+  `ssh` + `cloud` + `containers`). The lean default build stays SDK-free.
 - **Vault-unlock TUI flow** (M3-7): the runnable `cairn` binary can now unlock the encrypted secrets
   vault and bring credential-bearing connections online. A new `Overlay::VaultUnlock` (open with
   **Ctrl-U**, or the `vault_unlock` keybinding) presents a **no-echo** passphrase field backed by a
