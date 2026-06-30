@@ -13,11 +13,15 @@
 //! 5. Exercises `list_dir`/`stat`/`read` on a kube-system pod that has `tar`.
 //!    - If no suitable container can be found, or the container lacks `tar`, the fs checks are
 //!      skipped gracefully rather than failing (exec_unavailable is expected in that case).
+//! 6. Exercises `logs` (non-follow, tail 10) on the same kube-system pod — asserts the stream
+//!    yields at least some bytes without errors. System pods log actively, so a non-empty result
+//!    is expected; an empty log (recently-started pod) is noted but does not fail the test.
 #![cfg(feature = "k8s")]
 
 use cairn_backend_k8s::{KubeOps, KubeRsOps};
 use cairn_types::EntryKind;
 use cairn_vfs::VfsError;
+use futures::StreamExt as _;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn k8s_cluster_tree_round_trip() {
@@ -220,4 +224,46 @@ async fn k8s_cluster_tree_round_trip() {
         matches!(missing_list, Err(VfsError::NotFound(_))),
         "list_dir of a missing path must return NotFound, got: {missing_list:?}"
     );
+
+    // 6. Log streaming (M6-6 first slice).
+    //
+    // Stream the last 10 log lines from the kube-system pod's first container (non-follow so
+    // the stream is bounded and terminates without a timeout). System pods log actively, so we
+    // expect a non-empty result; an empty stream from a very recently-started pod is noted
+    // but is not a test failure (only errors in the stream fail the test).
+    eprintln!("Testing log streaming on pod '{pod_name}' container '{container_name}'...");
+
+    let log_stream = ops.logs(
+        ctx,
+        ns,
+        pod_name,
+        Some(container_name),
+        false, // non-follow: stream terminates after history
+        Some(10),
+    );
+
+    let chunks: Vec<Result<bytes::Bytes, VfsError>> = log_stream.collect().await;
+    eprintln!("Received {} log chunk(s)", chunks.len());
+
+    // All items must be Ok — errors in the stream indicate a problem with the implementation.
+    for chunk in &chunks {
+        assert!(
+            chunk.is_ok(),
+            "log stream must not emit errors, got: {chunk:?}"
+        );
+    }
+
+    let total_bytes: usize = chunks
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(bytes::Bytes::len)
+        .sum();
+
+    if total_bytes > 0 {
+        eprintln!("log stream yielded {total_bytes} bytes — OK");
+    } else {
+        // A very recently-started pod may have no buffered log lines yet.  This is benign; the
+        // test validated that there were no stream errors, which is the important invariant.
+        eprintln!("WARN: log stream yielded 0 bytes (pod may have just started)");
+    }
 }

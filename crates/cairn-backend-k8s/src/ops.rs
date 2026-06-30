@@ -6,8 +6,10 @@
 //! (and the TLS dependency stack it pulls in) is the integration step; see RFC-0005.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use cairn_types::{EntryKind, PodPhase};
 use cairn_vfs::VfsError;
+use futures::stream::BoxStream;
 
 /// A kubeconfig context (no cluster call needed to enumerate these).
 #[derive(Debug, Clone)]
@@ -115,14 +117,41 @@ pub trait KubeOps: Send + Sync + 'static {
         container: &str,
         path: &str,
     ) -> Result<Vec<u8>, VfsError>;
+
+    /// Stream log output from a pod's container.
+    ///
+    /// Returns a `'static` stream of raw log chunks as [`Bytes`]. Each chunk carries one or
+    /// more UTF-8 log lines as delivered by the API server; line boundaries are not guaranteed
+    /// to align with chunk boundaries.
+    ///
+    /// - `container`: target container within the pod. `None` lets the API server select the
+    ///   sole container (single-container pods) or return an error (multi-container pods).
+    /// - `follow`: `true` for live tail; `false` for a bounded history snapshot.
+    /// - `tail`: limit the history to the last `n` lines. `None` means all available history.
+    ///
+    /// Error mapping: 404 → [`VfsError::NotFound`]; 401 → [`VfsError::Auth`];
+    /// 403 → [`VfsError::Forbidden`]; other API errors → [`VfsError::Backend`].
+    /// Errors appear as `Err` items in the stream, not panics.
+    fn logs(
+        &self,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        container: Option<&str>,
+        follow: bool,
+        tail: Option<i64>,
+    ) -> BoxStream<'static, Result<Bytes, VfsError>>;
 }
 
 #[cfg(test)]
 pub(crate) mod mock {
     use super::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use cairn_types::{EntryKind, PodPhase, VfsPath};
     use cairn_vfs::VfsError;
+    use futures::stream::{self, BoxStream};
+    use futures::StreamExt as _;
     use std::collections::BTreeMap;
 
     /// An in-container path → bytes tree (directories are implied by path prefixes).
@@ -372,6 +401,30 @@ pub(crate) mod mock {
                 ))
                 .ok_or_else(|| Self::nf(container))?;
             tree.get(path).cloned().ok_or_else(|| Self::nf(path))
+        }
+
+        fn logs(
+            &self,
+            _ctx: &str,
+            _ns: &str,
+            pod: &str,
+            _container: Option<&str>,
+            _follow: bool,
+            _tail: Option<i64>,
+        ) -> BoxStream<'static, Result<Bytes, VfsError>> {
+            // Return a canned two-line log for the known pod; surface NotFound for unknown ones.
+            if self.pods.values().flatten().any(|p| p.name == pod) {
+                stream::iter(vec![
+                    Ok(Bytes::from_static(b"[mock] k8s log line 1\n")),
+                    Ok(Bytes::from_static(b"[mock] k8s log line 2\n")),
+                ])
+                .boxed()
+            } else {
+                let err = VfsError::NotFound(
+                    VfsPath::parse(&format!("/{pod}")).unwrap_or_else(|_| VfsPath::root()),
+                );
+                stream::iter(vec![Err(err)]).boxed()
+            }
         }
     }
 }
