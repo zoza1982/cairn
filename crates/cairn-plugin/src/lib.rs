@@ -18,6 +18,16 @@
 //! epoch-vs-blocking-WASI evasion gap (RFC-0010 §2). Still owed before live untrusted use: the
 //! real brokered host functions (M8-4/M8-5). What is here proves a misbehaving plugin cannot hang
 //! the host or access restricted surfaces.
+//!
+//! # Guest build constraints
+//!
+//! Plugin crates **must** be compiled with `#![no_std]` targeting `wasm32-wasip2`.  A `std`-linked
+//! guest on that target automatically imports `wasi:cli/{environment,exit,stdin,stdout,stderr,…}`,
+//! none of which are in the narrowed allow-list — instantiation will fail with "unknown import".
+//! Use `dlmalloc` (or another WASI-free allocator) as the global allocator, and satisfy any
+//! generated `impl std::error::Error` bounds via `extern crate self as std; pub mod error { pub
+//! use core::error::Error; }`.  See `crates/cairn-plugin/tests/fixture-guest/` for a complete
+//! reference implementation.
 
 use thiserror::Error;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};

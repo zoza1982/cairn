@@ -35,5 +35,6 @@ wasmtime = { version = "46.0.1", default-features = false, features = [
 wasmtime-wasi = { version = "46.0.1", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }
+# "time" is required for `tokio::time::timeout` in the ImmediatelyReady test.
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "time"] }
 futures = "0.3"

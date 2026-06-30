@@ -40,6 +40,11 @@ use wasmtime_wasi::clocks::{WasiClocks, WasiClocksCtxView, WasiClocksView};
 use wasmtime_wasi::p2::bindings::clocks::monotonic_clock;
 use wasmtime_wasi::p2::bindings::sync::io as sync_io;
 use wasmtime_wasi::p2::{subscribe, DynPollable, Pollable};
+// `WasiClocksView` and `WasiRandomView` are imported so the
+// `T::clocks()` / `t.random()` method references in `add_to_linker` closures
+// resolve without the caller needing these traits in scope.  Without these
+// use-declarations the closures would fail to compile even though the concrete
+// type (`T: WasiView`) provides the methods transitively.
 use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
 use wasmtime_wasi::WasiView;
 
@@ -60,6 +65,13 @@ impl Pollable for ImmediatelyReady {
         // Intentionally empty: resolves immediately without any `.await` point.
         // This is the mechanism that prevents the blocking-evasion attack described
         // in the module-level docs.
+        //
+        // Note: in the *sync* poll path (which is what guests see via the sync
+        // linker), wasmtime-wasi's `poll` host function drives the async ready
+        // futures via a single-poll executor.  Because `ready()` has no `.await`
+        // point, it completes on the first poll without ever suspending.  Do NOT
+        // replace the body with any awaiting logic (e.g. sleep or channel recv) —
+        // doing so would reintroduce the blocking-evasion gap we are closing.
     }
 }
 
@@ -161,8 +173,9 @@ impl sync_io::poll::HostPollable for NbPollTable<'_> {
         // Delegate to ResourceTable's HostPollable::drop, which deletes the
         // DynPollable from the table and (when the resource was owned) also
         // removes the underlying ImmediatelyReady resource via
-        // remove_index_on_delete.  This is the only method we cannot stub
-        // non-trivially — proper cleanup is required to avoid table leaks.
+        // `remove_index_on_delete` (a wasmtime-internal field on DynPollable that
+        // chains the destruction of the backing resource).  This is the one method
+        // we cannot stub non-trivially — proper cleanup prevents ResourceTable leaks.
         use sync_io::poll::HostPollable;
         <ResourceTable as HostPollable>::drop(self.0, pollable)
     }
@@ -222,6 +235,15 @@ where
     // no ambient access).  io/poll uses the non-blocking stub above.
 
     io::error::add_to_linker::<T, HasIoData>(linker, |t| t.ctx().table).map_err(e)?;
+    // HAZARD (PR-B): the `wasi:io/streams` host implementation includes
+    // `blocking-read`, `blocking-write-and-flush`, and friends that CAN park the
+    // host thread inside a native Tokio frame — exactly the gap described in the
+    // module-level docs.  A guest that obtains a stream handle and calls a
+    // blocking method bypasses both epoch and fuel until the native frame returns.
+    // This is acceptable for the current milestone because the empty `WasiCtx`
+    // provides no preopened streams; in practice a guest can only reach the
+    // blocking methods via a host-brokered resource.  PR-B (M8-5) will stub the
+    // blocking methods with the same ImmediatelyReady pattern used for poll.
     io::streams::add_to_linker::<T, HasIoData>(linker, |t| t.ctx().table).map_err(e)?;
     io::poll::add_to_linker::<T, NbPollHasData>(linker, |t| NbPollTable(t.ctx().table))
         .map_err(e)?;
@@ -282,15 +304,19 @@ mod tests {
     fn immediately_ready_resolves_without_suspending() {
         // Drive the async future synchronously via tokio's current_thread runtime.
         // If `ready()` suspended on any future (e.g. sleep), this test would hang;
-        // instead it must return on the first poll.
+        // instead it must return on the first poll.  The 100 ms outer timeout
+        // makes that failure loud rather than a silent CI hang.
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .expect("build current_thread runtime");
         rt.block_on(async {
             let mut r = ImmediatelyReady;
-            // Safety: no timeout here — if this hangs, the CI test runner kills
-            // the process, which is the intended failure signal.
-            r.ready().await;
+            // Note: the timeout is a safety net; if ImmediatelyReady::ready()
+            // ever suspends, this assertion fires promptly rather than hanging CI.
+            tokio::time::timeout(std::time::Duration::from_millis(100), r.ready())
+                .await
+                .expect("ImmediatelyReady::ready() must complete within 100 ms");
         });
     }
 
@@ -345,16 +371,114 @@ mod tests {
     #[test]
     fn nb_poll_returns_all_indices_immediately() {
         // NbPollTable::poll must return indices [0, 1, 2, …, n-1] immediately,
-        // matching the "all ready" contract.
+        // matching the "all ready" contract for any list size.
+        use monotonic_clock::Host as MonoHost;
         use sync_io::poll::Host as PollHost;
 
+        let mut clocks_ctx = wasmtime_wasi::clocks::WasiClocksCtx::default();
+        let mut table = ResourceTable::new();
+
+        // Create three pollables via the non-blocking subscribe stub so the
+        // resource handles are valid entries in the ResourceTable.
+        let mut nb = NbMonotonics(wasmtime_wasi::clocks::WasiClocksCtxView {
+            ctx: &mut clocks_ctx,
+            table: &mut table,
+        });
+        let p0 = nb.subscribe_duration(0).expect("p0");
+        let p1 = nb.subscribe_duration(0).expect("p1");
+        let p2 = nb.subscribe_duration(0).expect("p2");
+
+        let mut poll_table = NbPollTable(&mut table);
+        let ready = poll_table.poll(vec![p0, p1, p2]).expect("poll([p0,p1,p2])");
+
+        // Must return exactly [0, 1, 2] — all indices, in order, no omissions.
+        assert_eq!(
+            ready,
+            vec![0u32, 1, 2],
+            "poll must return all indices immediately; got {ready:?}"
+        );
+    }
+
+    #[test]
+    fn nb_poll_empty_list_returns_empty() {
+        // Empty list edge case: NbPollTable returns [] without trapping.
+        use sync_io::poll::Host as PollHost;
         let mut table = ResourceTable::new();
         let mut poll_table = NbPollTable(&mut table);
-
-        // poll is defined on `Vec<Resource<DynPollable>>`.  We pass an empty
-        // list — all 0 indices are returned trivially.
         let ready = poll_table.poll(vec![]).expect("poll(empty)");
         assert!(ready.is_empty(), "empty poll list → empty ready list");
+    }
+
+    // ── E2E: epoch interrupts a subscribe-duration spin loop ─────────────────────
+
+    /// End-to-end regression test for the blocking-evasion closure.
+    ///
+    /// Before RFC-0010, a guest calling `subscribe-duration(∞)` followed by
+    /// `poll([p])` would park the plugin thread inside a Tokio `sleep_until` call
+    /// that epoch cannot interrupt.  This test instantiates a real component
+    /// (`tests/fixtures/wasi_spin.wasm`) that loops on `subscribe-duration(u64::MAX)`,
+    /// arms the epoch ticker, and asserts that the call is interrupted as
+    /// [`wasmtime::Trap::Interrupt`].
+    ///
+    /// **Regression signal**: replacing `add_narrowed_wasi_to_linker` with the
+    /// stock `add_to_linker_sync` would restore the blocking `sleep_until` path;
+    /// the test would then hang for several seconds before the ticker fires again
+    /// (because epoch cannot fire inside the native Tokio frame), or the test
+    /// framework kills it — the dead-CI variant of this test is intentional.
+    #[test]
+    fn subscribe_duration_loop_is_epoch_interruptible() {
+        use wasmtime::component::Component;
+
+        static WASI_SPIN: &[u8] = include_bytes!("../tests/fixtures/wasi_spin.wasm");
+
+        let engine = wasmtime::Engine::new(&crate::engine_config()).expect("engine");
+
+        // Arm the ticker at 1 ms — fast enough to fire within a few loop iterations.
+        // Note: we cannot observe whether the ticker thread spawned from outside
+        // `epoch::tests` (the `handle` field is private).  The test still verifies
+        // the epoch mechanism: if the ticker thread fails to spawn, epoch never
+        // advances and `spin-poll` runs until the process-level CI timeout kills it.
+        let _ticker = crate::EpochTicker::spawn(&engine, std::time::Duration::from_millis(1));
+
+        let component = Component::new(&engine, WASI_SPIN).expect("load wasi_spin.wasm");
+
+        let mut linker: Linker<TestState> = Linker::new(&engine);
+        add_narrowed_wasi_to_linker(&mut linker)
+            .expect("narrowed WASI must register without error");
+
+        let mut store = Store::new(&engine, test_state());
+        // Provide essentially unlimited fuel so that only the epoch deadline
+        // (not fuel exhaustion) can stop the loop.  Without this the store
+        // would start with 0 fuel (default when consume_fuel is enabled) and
+        // trap on the very first instruction, never reaching the back-edge that
+        // epoch fires at.
+        let _ = store.set_fuel(u64::MAX);
+        // Deadline of 2 ticks: the ticker fires every 1 ms so the first
+        // increment (at ≈1 ms) still leaves 1 tick, and the second (≈2 ms)
+        // trips the deadline.  Gives the spin loop enough iterations to be
+        // meaningful without ever blocking the test thread more than ~5 ms.
+        store.set_epoch_deadline(2);
+
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .expect("spin component must instantiate with the narrowed linker");
+
+        let spin_poll = instance
+            .get_typed_func::<(), ()>(&mut store, "spin-poll")
+            .expect("spin-poll export must exist with type () -> ()");
+
+        let err = spin_poll
+            .call(&mut store, ())
+            .expect_err("spin-poll must be interrupted by the epoch deadline");
+
+        let trap = err
+            .downcast_ref::<wasmtime::Trap>()
+            .expect("error must be a Trap");
+        assert_eq!(
+            *trap,
+            wasmtime::Trap::Interrupt,
+            "epoch deadline must produce Trap::Interrupt"
+        );
     }
 
     // ── Default-deny: sockets not in the narrowed linker ───────────────────────
@@ -399,6 +523,79 @@ mod tests {
         assert!(
             msg.contains("wasi:sockets") || msg.contains("unknown import") || msg.contains("tcp"),
             "error must identify the missing socket import, got: {msg}"
+        );
+    }
+
+    // ── Default-deny: filesystem not in the narrowed linker ────────────────────
+
+    #[test]
+    fn filesystem_import_fails_instantiation_with_narrowed_linker() {
+        // A component that imports wasi:filesystem/types@0.2.0 with a required
+        // named export must fail to instantiate because the narrowed linker never
+        // registers that interface.  Requiring a named export prevents wasmtime
+        // from synthesizing a trivially-satisfying empty instance.
+        let fs_wat = r#"(component
+  (import "wasi:filesystem/types@0.2.0" (instance
+    (export "open-at" (func))
+  ))
+)"#;
+
+        let engine = wasmtime::Engine::new(&crate::engine_config()).expect("engine");
+        let component =
+            Component::new(&engine, fs_wat.as_bytes()).expect("WAT component must parse");
+
+        let mut linker: Linker<TestState> = Linker::new(&engine);
+        add_narrowed_wasi_to_linker(&mut linker)
+            .expect("narrowed WASI must register without error");
+
+        let mut store = Store::new(&engine, test_state());
+        store.set_epoch_deadline(u64::MAX / 2);
+        let _ = store.set_fuel(u64::MAX);
+
+        let err = linker
+            .instantiate(&mut store, &component)
+            .expect_err("component importing filesystem must fail to instantiate");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wasi:filesystem") || msg.contains("unknown import"),
+            "error must identify the missing filesystem import, got: {msg}"
+        );
+    }
+
+    // ── Default-deny: CLI not in the narrowed linker ───────────────────────────
+
+    #[test]
+    fn cli_exit_import_fails_instantiation_with_narrowed_linker() {
+        // A component that imports wasi:cli/exit@0.2.0 (which exposes `proc_exit`,
+        // letting a guest terminate the process) must fail to instantiate.  The
+        // narrowed linker intentionally omits all wasi:cli/* interfaces.
+        let cli_wat = r#"(component
+  (import "wasi:cli/exit@0.2.0" (instance
+    (export "exit" (func))
+  ))
+)"#;
+
+        let engine = wasmtime::Engine::new(&crate::engine_config()).expect("engine");
+        let component =
+            Component::new(&engine, cli_wat.as_bytes()).expect("WAT component must parse");
+
+        let mut linker: Linker<TestState> = Linker::new(&engine);
+        add_narrowed_wasi_to_linker(&mut linker)
+            .expect("narrowed WASI must register without error");
+
+        let mut store = Store::new(&engine, test_state());
+        store.set_epoch_deadline(u64::MAX / 2);
+        let _ = store.set_fuel(u64::MAX);
+
+        let err = linker
+            .instantiate(&mut store, &component)
+            .expect_err("component importing wasi:cli/exit must fail to instantiate");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wasi:cli") || msg.contains("unknown import") || msg.contains("exit"),
+            "error must identify the missing CLI import, got: {msg}"
         );
     }
 }

@@ -160,6 +160,13 @@ impl PluginComponent {
             engine,
             CompState {
                 limits: store_limits,
+                // Empty context: no preopened dirs, env, stdio, or network.
+                // HAZARD (PR-B): `wasi:io/streams` blocking methods (blocking-read,
+                // blocking-write-and-flush, …) can still park the thread inside
+                // a native Tokio frame that epoch cannot interrupt, if a guest
+                // obtains a stream via a host-brokered resource.  With an empty
+                // context, no streams are accessible to a plugin today.  PR-B
+                // (M8-5) will stub the blocking methods with ImmediatelyReady semantics.
                 wasi: WasiCtx::builder().build(),
                 table: ResourceTable::new(),
             },
