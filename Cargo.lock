@@ -1281,6 +1281,7 @@ dependencies = [
  "kube",
  "rustls",
  "smol_str",
+ "tar",
  "tokio",
 ]
 

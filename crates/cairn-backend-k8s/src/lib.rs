@@ -12,6 +12,8 @@
 mod ops;
 #[cfg(feature = "k8s")]
 mod real;
+#[cfg(feature = "k8s")]
+mod tar_exec;
 
 pub use ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta};
 #[cfg(feature = "k8s")]
