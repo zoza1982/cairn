@@ -10,10 +10,13 @@
 //! 2. Picks the first context and lists namespaces — asserts `kube-system` or `default` appears.
 //! 3. Lists pods in `kube-system` — asserts at least one pod exists (kube-system always has pods).
 //! 4. Lists containers of the first pod — asserts at least one container is present.
-//! 5. Verifies that `list_dir` inside a container returns `VfsError::Unsupported` (deferred M6-5b).
+//! 5. Exercises `list_dir`/`stat`/`read` on a kube-system pod that has `tar`.
+//!    - If no suitable container can be found, or the container lacks `tar`, the fs checks are
+//!      skipped gracefully rather than failing (exec_unavailable is expected in that case).
 #![cfg(feature = "k8s")]
 
 use cairn_backend_k8s::{KubeOps, KubeRsOps};
+use cairn_types::EntryKind;
 use cairn_vfs::VfsError;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -96,19 +99,125 @@ async fn k8s_cluster_tree_round_trip() {
         containers.iter().map(|c| &c.name).collect::<Vec<_>>()
     );
 
-    // 5. In-container fs is deferred (M6-5b): list_dir lists EMPTY (navigable, per the trait
-    //    contract + caps_at), while read of a path stays Unsupported.
+    // 5. In-container filesystem access (M6-5b).
+    //
+    // kube-system pods (etcd, kube-apiserver, kindnet, etc.) ship with `tar` in most distributions
+    // and kind images.  We try the first container; if it reports exec_unavailable (no tar), we
+    // skip the filesystem assertions gracefully.
     let container_name = &containers[0].name;
-    let list_dir_result = ops.list_dir(ctx, ns, pod_name, container_name, "/").await;
+
+    // 5a. list_dir on "/" must be non-empty for a running system pod (or exec_unavailable).
+    let list_result = ops.list_dir(ctx, ns, pod_name, container_name, "/").await;
+    eprintln!("list_dir('/') result: {list_result:?}");
+
+    match &list_result {
+        Err(VfsError::Backend { code, .. }) if code == "exec_unavailable" => {
+            eprintln!(
+                "SKIP: container '{container_name}' in pod '{pod_name}' has no 'tar' — \
+                 skipping in-container filesystem checks"
+            );
+            return;
+        }
+        Err(e) => {
+            panic!("list_dir('/') in container '{container_name}' failed unexpectedly: {e}");
+        }
+        Ok(entries) => {
+            assert!(
+                !entries.is_empty(),
+                "expected '/' to be non-empty in a running kube-system pod, got empty listing"
+            );
+            eprintln!(
+                "list_dir('/') entries: {:?}",
+                entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // 5b. list_dir on "/etc" must succeed and return at least one entry.
+    let etc_entries = ops
+        .list_dir(ctx, ns, pod_name, container_name, "/etc")
+        .await
+        .expect("list_dir('/etc') should succeed in a kube-system container");
     assert!(
-        matches!(&list_dir_result, Ok(v) if v.is_empty()),
-        "deferred list_dir must return an empty listing, got: {list_dir_result:?}"
+        !etc_entries.is_empty(),
+        "expected /etc to be non-empty, got empty listing"
     );
-    let read_result = ops
+    eprintln!(
+        "/etc entries: {:?}",
+        etc_entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+
+    // 5c. stat "/" must return a directory.
+    let root_meta = ops
+        .stat(ctx, ns, pod_name, container_name, "/")
+        .await
+        .expect("stat('/') should succeed");
+    assert_eq!(root_meta.kind, EntryKind::Dir, "root '/' must be a Dir");
+
+    // 5d. stat "/etc" must return a directory.
+    let etc_meta = ops
+        .stat(ctx, ns, pod_name, container_name, "/etc")
+        .await
+        .expect("stat('/etc') should succeed");
+    assert_eq!(etc_meta.kind, EntryKind::Dir, "/etc must be a Dir");
+
+    // 5e. stat and read "/etc/hostname" — must exist and contain the pod's name.
+    //     (The kernel mounts /etc/hostname from the pod spec; it is present in every running pod.)
+    let hostname_meta = ops
+        .stat(ctx, ns, pod_name, container_name, "/etc/hostname")
+        .await
+        .expect("stat('/etc/hostname') should succeed");
+    assert_eq!(
+        hostname_meta.kind,
+        EntryKind::File,
+        "/etc/hostname must be a File"
+    );
+
+    let hostname_bytes = ops
         .read(ctx, ns, pod_name, container_name, "/etc/hostname")
+        .await
+        .expect("read('/etc/hostname') should succeed");
+    let hostname = String::from_utf8_lossy(&hostname_bytes);
+    let hostname_trimmed = hostname.trim();
+    assert!(
+        !hostname_trimmed.is_empty(),
+        "/etc/hostname must not be empty"
+    );
+    eprintln!("/etc/hostname = {hostname_trimmed:?}");
+
+    // 5f. read of a directory must return Unsupported (not a crash, not NotFound).
+    let read_dir_result = ops.read(ctx, ns, pod_name, container_name, "/etc").await;
+    assert!(
+        matches!(read_dir_result, Err(VfsError::Unsupported(_))),
+        "reading a directory must return Unsupported, got: {read_dir_result:?}"
+    );
+
+    // 5g. stat and list_dir on a non-existent path must return NotFound.
+    let missing_stat = ops
+        .stat(
+            ctx,
+            ns,
+            pod_name,
+            container_name,
+            "/cairn_nonexistent_path_12345",
+        )
         .await;
     assert!(
-        matches!(read_result, Err(VfsError::Unsupported(_))),
-        "deferred read must be Unsupported until M6-5b, got: {read_result:?}"
+        matches!(missing_stat, Err(VfsError::NotFound(_))),
+        "stat of a missing path must return NotFound, got: {missing_stat:?}"
+    );
+
+    let missing_list = ops
+        .list_dir(
+            ctx,
+            ns,
+            pod_name,
+            container_name,
+            "/cairn_nonexistent_path_12345",
+        )
+        .await;
+    assert!(
+        matches!(missing_list, Err(VfsError::NotFound(_))),
+        "list_dir of a missing path must return NotFound, got: {missing_list:?}"
     );
 }

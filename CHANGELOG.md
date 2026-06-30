@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Kubernetes in-container filesystem browsing** (M6-5b): `KubeRsOps` now implements
+  `list_dir`/`stat`/`read` for paths inside a container's filesystem via **tar-over-exec**
+  (`kubectl cp` semantics). `list_dir(path)` execs `tar cf - -C <path> .` and parses the tar
+  stream for immediate children; `stat(path)` and `read(path)` exec `tar cf - -C <parent> <basename>`
+  and examine the first header entry. A new `tar_exec` module provides pure helper functions
+  (`parse_list_dir`, `parse_stat_tar`, `parse_read_tar`, `tar_parent`, `tar_basename`) that are
+  fully unit-testable without a cluster — 11 new hermetic unit tests cover empty tars, flat
+  directories, deep-descendant deduplication, directory/file stat/read, and NotFound/Unsupported
+  edges. When the container lacks `tar`, all three methods return `VfsError::Backend { code:
+  "exec_unavailable" }` rather than a misleading `NotFound`. The kind integration test
+  (`CAIRN_IT_K8S`) is extended to exercise `list_dir`/`stat`/`read` on `/`, `/etc`, and
+  `/etc/hostname`, with a graceful skip when the target container lacks `tar`. The `tar` crate is
+  added as an optional dep under the `k8s` feature.
 - **Docker container log streaming** (M6-3 first slice): `DockerVfs::invoke("logs")` now returns
   `ActionOutcome::Stream(BoxStream<'static, Result<Bytes, VfsError>>)` backed by bollard's
   `Docker::logs` endpoint. Bollard's `LogOutput` decoder handles Docker's 8-byte multiplexed stream

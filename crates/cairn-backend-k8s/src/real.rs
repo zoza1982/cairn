@@ -1,31 +1,179 @@
 //! Live Kubernetes adapter over `kube-rs 4.0` + `k8s-openapi 0.28`.
 //!
 //! [`KubeRsOps`] implements [`KubeOps`] against a real cluster. It reads the kubeconfig from the
-//! standard location (`$KUBECONFIG` or `~/.kube/config`) and builds a per-call [`kube::Client`]
+//! standard location (`$KUBECONFIG` or `~/.kube/config`) and builds a per-call `kube::Client`
 //! for the requested context. A per-call build is adequate for M6; a caching layer belongs in a
 //! later milestone when connection-pool metrics are needed.
 //!
-//! In-container filesystem access — [`KubeOps::list_dir`], [`KubeOps::stat`], and
-//! [`KubeOps::read`] — is **deferred to M6-5b** (tar-over-exec / `kubectl cp` semantics) and
-//! returns [`VfsError::Unsupported`] with the appropriate [`Caps`] flag.
+//! # In-container filesystem access
+//!
+//! [`KubeOps::list_dir`], [`KubeOps::stat`], and [`KubeOps::read`] are implemented via
+//! **tar-over-exec** (`kubectl cp` semantics, M6-5b):
+//!
+//! - `list_dir(path)` → `tar cf - -C <path> .` (tar the directory, parse immediate children)
+//! - `stat(path)` → `tar cf - -C <parent> <basename>` (examine the first tar header)
+//! - `read(path)` → same command as stat, extract file bytes
+//!
+//! The container must have `tar` on its `PATH`.  When `tar` is absent, all three methods return
+//! [`VfsError::Backend`] with `code = "exec_unavailable"` — a clear, user-surfaceable error
+//! rather than a misleading [`VfsError::NotFound`].
+//!
+//! # Remaining streaming work (M6-6)
+//!
+//! Interactive exec (TTY `Session`), log streaming (`follow`/`since`), and port-forwarding are
+//! **not** implemented here — they require the `ActionOutcome::Session`/`ActionOutcome::Stream`
+//! surface defined in M6-6 and are the next integration step.
 
 use crate::ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta};
+use crate::tar_exec::{
+    not_found, parse_list_dir, parse_read_tar, parse_stat_tar, tar_basename, tar_parent,
+};
 use async_trait::async_trait;
-use cairn_types::{Caps, PodPhase, VfsPath};
+use cairn_types::{PodPhase, VfsPath};
 use cairn_vfs::VfsError;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use kube::{
-    api::ListParams,
+    api::{AttachParams, ListParams},
     config::{KubeConfigOptions, Kubeconfig},
     Api, Client, ResourceExt,
 };
+use tokio::io::AsyncReadExt as _;
+
+// ---------------------------------------------------------------------------
+// Collected output from a single exec invocation
+// ---------------------------------------------------------------------------
+
+/// Raw output collected from a single `exec` call: stdout bytes, stderr bytes, and the
+/// Kubernetes-level [`Status`] returned on the exec status channel.
+struct ExecOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// `None` only if the WebSocket closed before the server sent a Status frame — treat as
+    /// failure.
+    status: Option<Status>,
+}
+
+impl ExecOutput {
+    /// `true` when the exec terminated successfully (exit code 0).
+    fn is_success(&self) -> bool {
+        self.status
+            .as_ref()
+            .and_then(|s| s.status.as_deref())
+            .map(|s| s == "Success")
+            .unwrap_or(false)
+    }
+
+    /// Extract the numeric exit code from the Status causes, if present.
+    fn exit_code(&self) -> Option<i32> {
+        self.status
+            .as_ref()?
+            .details
+            .as_ref()?
+            .causes
+            .as_ref()?
+            .iter()
+            .find(|c| c.reason.as_deref() == Some("ExitCode"))
+            .and_then(|c| c.message.as_ref())
+            .and_then(|m| m.parse::<i32>().ok())
+    }
+
+    /// `true` when the failure looks like `tar` (or another binary) is missing from the
+    /// container's `PATH`.  Checks the exit code (126 = not executable, 127 = not found) and
+    /// both the status message and stderr for common OCI/container-runtime error strings.
+    fn is_exec_unavailable(&self) -> bool {
+        let exit_code_missing = matches!(self.exit_code(), Some(126) | Some(127));
+        let status_msg = self
+            .status
+            .as_ref()
+            .and_then(|s| s.message.as_deref())
+            .unwrap_or("");
+        let stderr_str = String::from_utf8_lossy(&self.stderr);
+        let in_msg = |haystack: &str| -> bool {
+            haystack.contains("executable file not found")
+                || haystack.contains("not found in $PATH")
+                || haystack.contains("OCI runtime exec failed")
+                || haystack.contains("no such file or directory")
+        };
+        exit_code_missing || in_msg(status_msg) || in_msg(&stderr_str)
+    }
+
+    /// `true` when stderr indicates tar could not open the requested path (path does not exist
+    /// inside the container, not a problem with tar itself), OR when the path is a file that was
+    /// given as a directory argument to `tar -C` (which produces "Not a directory" / `ENOTDIR`).
+    ///
+    /// The trait contract says: `list_dir` on a file path returns [`VfsError::NotFound`], not a
+    /// generic backend error.  Mapping `ENOTDIR` to `NotFound` keeps the live adapter consistent
+    /// with the mock.
+    ///
+    /// Note on tar variants:
+    /// - **GNU tar** exits 2 and says `Cannot open: No such file or directory`.
+    /// - **BusyBox tar** (Alpine, the most common k8s base image) exits 1 and says
+    ///   `tar: can't open '<path>': No such file or directory`.
+    ///
+    /// Both variants must be detected to return `NotFound` rather than a confusing `Backend` error.
+    fn is_path_not_found(&self) -> bool {
+        let s = String::from_utf8_lossy(&self.stderr);
+        // GNU tar: "Cannot open: No such file or directory" (exit 2)
+        s.contains("Cannot open: No such file or directory")
+            || s.contains("cannot open: No such file or directory")
+            // BusyBox tar: "can't open '<path>': No such file or directory" (exit 1)
+            || (s.contains("can't open") && s.contains("No such file or directory"))
+            // `tar -C <file>` fails with ENOTDIR: "Cannot change directory: Not a directory".
+            // The trait says list_dir on a file path → NotFound, matching the mock behaviour.
+            || s.contains("Cannot change directory")
+            || s.contains("cannot change directory")
+            // Broad fallback: "No such file or directory" anywhere in stderr on any non-zero exit,
+            // gated on the exit code to reduce false positives.  The exec_unavailable check runs
+            // first and filters out OCI-runtime "no such file" messages for the binary itself.
+            || (matches!(self.exit_code(), Some(1) | Some(2))
+                && s.contains("No such file or directory"))
+    }
+
+    /// Map a non-zero exit to a [`VfsError`], distinguishing exec-unavailable from path-not-found
+    /// from a generic backend error.
+    fn into_vfs_err(self, path: &str) -> VfsError {
+        if self.is_exec_unavailable() {
+            return VfsError::Backend {
+                code: "exec_unavailable".to_owned(),
+                msg: "container has no 'tar'; in-container filesystem browsing requires tar to be \
+                      present on the container's PATH"
+                    .to_owned(),
+                retryable: false,
+            };
+        }
+        if self.is_path_not_found() {
+            return not_found(path);
+        }
+        // Prefer the status message; fall back to stderr; use a generic string if both are empty.
+        let stderr_str = String::from_utf8_lossy(&self.stderr).into_owned();
+        let msg = self
+            .status
+            .and_then(|s| s.message)
+            .filter(|m| !m.is_empty())
+            .or_else(|| Some(stderr_str).filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| "exec: tar command failed with no output".to_owned());
+        VfsError::Backend {
+            code: "exec-failed".to_owned(),
+            msg,
+            retryable: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KubeRsOps
+// ---------------------------------------------------------------------------
 
 /// A [`KubeOps`] implementation backed by a live Kubernetes cluster via `kube-rs`.
 ///
 /// Uses the kubeconfig found at `$KUBECONFIG` or `~/.kube/config`. Builds a fresh
-/// [`kube::Client`] per operation call, scoped to the requested context. Credentials are handled
+/// `kube::Client` per operation call, scoped to the requested context. Credentials are handled
 /// entirely by `kube-rs` (exec plugins, OIDC refresh, service-account tokens, client certs); no
 /// credential material is ever embedded in error messages.
+///
+/// In-container filesystem access uses tar-over-exec; see the module-level documentation for the
+/// command strategy and error semantics.
 pub struct KubeRsOps;
 
 impl KubeRsOps {
@@ -37,7 +185,7 @@ impl KubeRsOps {
         Self
     }
 
-    /// Build a [`kube::Client`] scoped to the given context name.
+    /// Build a `kube::Client` scoped to the given context name.
     async fn client_for(&self, ctx: &str) -> Result<Client, VfsError> {
         // rustls 0.23 no longer auto-installs a process-wide crypto provider, so kube's TLS client
         // build would panic without one. Install the ring provider once (idempotent: a later call,
@@ -53,6 +201,94 @@ impl KubeRsOps {
             .map_err(|e| VfsError::Connection(Box::new(e)))?;
         Client::try_from(config).map_err(|e| VfsError::Connection(Box::new(e)))
     }
+
+    /// Execute `command` in `container` inside `pod`/`ns`/`ctx` and collect stdout, stderr, and
+    /// the process-level Status.
+    ///
+    /// Uses `AttachParams` with `stdin=false`, `stdout=true`, `stderr=true`, `tty=false` — the
+    /// correct shape for a non-interactive data-extraction command like `tar`.  stdout and stderr
+    /// are drained concurrently via `tokio::join!` to prevent the internal `DuplexStream` pipe
+    /// from filling and deadlocking the background `AttachedProcess` task.
+    async fn exec_tar(
+        &self,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        command: &[&str],
+    ) -> Result<ExecOutput, VfsError> {
+        let client = self.client_for(ctx).await?;
+        let api: Api<Pod> = Api::namespaced(client, ns);
+
+        let ap = AttachParams::default()
+            .container(container)
+            .stdin(false)
+            .stdout(true)
+            .stderr(true);
+
+        let mut proc = api
+            .exec(pod, command.iter().copied(), &ap)
+            .await
+            .map_err(map_exec_error)?;
+
+        // Take the readers and status future out of the process handle *before* the join.
+        // `stdout()` and `stderr()` return `impl AsyncRead + Unpin` backed by a `DuplexStream`
+        // whose writer side lives in the background task.  Reading to EOF unblocks the task.
+        let stdout_r = proc.stdout().ok_or_else(|| VfsError::Backend {
+            code: "exec-io".to_owned(),
+            msg: "exec: stdout reader unavailable".to_owned(),
+            retryable: false,
+        })?;
+        let stderr_r = proc.stderr().ok_or_else(|| VfsError::Backend {
+            code: "exec-io".to_owned(),
+            msg: "exec: stderr reader unavailable".to_owned(),
+            retryable: false,
+        })?;
+        // `take_status()` returns `None` only when called a second time; safe to unwrap here.
+        let status_fut = proc.take_status();
+
+        // Drain stdout, stderr, and wait for the process status concurrently.  This is mandatory:
+        // the DuplexStream pipe capacity is 1 KiB by default; without concurrent reading the
+        // background task blocks on write, causing a deadlock.
+        let (stdout_res, stderr_res, status_opt) = tokio::join!(
+            async move {
+                let mut r = stdout_r;
+                let mut buf = Vec::new();
+                r.read_to_end(&mut buf).await.map(|_| buf)
+            },
+            async move {
+                let mut r = stderr_r;
+                let mut buf = Vec::new();
+                r.read_to_end(&mut buf).await.map(|_| buf)
+            },
+            async move {
+                match status_fut {
+                    Some(f) => f.await,
+                    None => None,
+                }
+            },
+        );
+
+        // Clean up the background task now that all I/O is drained.
+        let _ = proc.join().await;
+
+        let stdout = stdout_res.map_err(|e| VfsError::Backend {
+            code: "exec-io".to_owned(),
+            msg: e.to_string(),
+            retryable: false,
+        })?;
+        let stderr = stderr_res.map_err(|e| VfsError::Backend {
+            code: "exec-io".to_owned(),
+            msg: e.to_string(),
+            retryable: false,
+        })?;
+
+        Ok(ExecOutput {
+            stdout,
+            stderr,
+            status: status_opt,
+        })
+    }
 }
 
 impl Default for KubeRsOps {
@@ -61,7 +297,11 @@ impl Default for KubeRsOps {
     }
 }
 
-/// Install the process-wide rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) exactly once.
+// ---------------------------------------------------------------------------
+// Error helpers
+// ---------------------------------------------------------------------------
+
+/// Install the process-wide rustls `CryptoProvider` exactly once.
 ///
 /// rustls 0.23 requires a provider to be installed before a `ClientConfig` is built; kube's client
 /// build otherwise panics. `install_default` returns `Err` if a provider is already installed (e.g.
@@ -74,7 +314,7 @@ fn ensure_crypto_provider() {
     });
 }
 
-/// Map a `kube::Error` from an API call to a [`VfsError`].
+/// Map a `kube::Error` from a plain API call (list, get) to a [`VfsError`].
 ///
 /// HTTP status codes are examined for 401/403/404; all other API errors become
 /// [`VfsError::Backend`] with a safe status message (API response text; no token or credential
@@ -100,6 +340,38 @@ fn map_api_error(e: kube::Error) -> VfsError {
     }
 }
 
+/// Map a `kube::Error` that arose while initiating an exec call.
+///
+/// This path handles errors from the WebSocket upgrade itself (not from the process running
+/// inside the container).  HTTP 401/403/404 have the usual semantics; a message that looks like
+/// an OCI exec-startup failure is surfaced as `exec_unavailable` so the UI can explain why
+/// in-container browsing is not available.
+fn map_exec_error(e: kube::Error) -> VfsError {
+    if let kube::Error::Api(status) = &e {
+        match status.code {
+            401 => return VfsError::Auth,
+            403 => return VfsError::Forbidden(VfsPath::root()),
+            404 => return VfsError::NotFound(VfsPath::root()),
+            _ => {
+                let msg = &status.message;
+                if msg.contains("executable file not found")
+                    || msg.contains("not found in $PATH")
+                    || msg.contains("OCI runtime exec failed")
+                {
+                    return VfsError::Backend {
+                        code: "exec_unavailable".to_owned(),
+                        msg: "container has no 'tar'; in-container filesystem browsing requires \
+                              tar to be present on the container's PATH"
+                            .to_owned(),
+                        retryable: false,
+                    };
+                }
+            }
+        }
+    }
+    VfsError::Connection(Box::new(e))
+}
+
 /// Map a pod's `status.phase` string to [`PodPhase`].
 fn map_phase(phase: Option<&str>) -> PodPhase {
     match phase {
@@ -111,11 +383,15 @@ fn map_phase(phase: Option<&str>) -> PodPhase {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KubeOps implementation
+// ---------------------------------------------------------------------------
+
 #[async_trait]
 impl KubeOps for KubeRsOps {
     async fn list_contexts(&self) -> Result<Vec<ContextInfo>, VfsError> {
         // Parse the kubeconfig from $KUBECONFIG / ~/.kube/config. No cluster call needed.
-        // `Kubeconfig::read` is blocking file I/O, so run it off the async worker thread (§9).
+        // `Kubeconfig::read` is blocking file I/O, so run it off the async worker thread.
         let kubeconfig = tokio::task::spawn_blocking(Kubeconfig::read)
             .await
             .map_err(|e| VfsError::Backend {
@@ -251,51 +527,230 @@ impl KubeOps for KubeRsOps {
         Ok(containers)
     }
 
-    /// List a directory inside a container's filesystem.
+    /// List the immediate children of `path` inside a container's filesystem.
     ///
-    /// **Deferred — M6-5b.** In-container filesystem browsing via tar-over-`exec` (`kubectl cp`
-    /// semantics) is the next integration step. Until then this returns an **empty** listing rather
-    /// than an error: `KubeVfs::caps_at` advertises `LIST` at this depth and the trait contract
-    /// requires a container's root to list as `Ok(vec![])` (never an error), so a container is
-    /// navigable (shows an empty filesystem) instead of erroring on first descent. Because the
-    /// listing is empty, no `stat`/`read` of an in-container path is reachable through normal
-    /// navigation while the feature is deferred.
+    /// Executes `tar cf - -C <path> .` in the container, collects the tar stream, and parses
+    /// immediate children from it.  An existing but empty directory returns `Ok(vec![])` — never
+    /// [`VfsError::NotFound`] — satisfying the trait contract that a container's root is always
+    /// navigable.
+    ///
+    /// Returns [`VfsError::Backend`] with `code = "exec_unavailable"` when `tar` is absent from
+    /// the container's `PATH`, giving the UI something actionable to display.
     async fn list_dir(
         &self,
-        _ctx: &str,
-        _ns: &str,
-        _pod: &str,
-        _container: &str,
-        _path: &str,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        path: &str,
     ) -> Result<Vec<RemoteEntry>, VfsError> {
-        Ok(Vec::new())
+        let command = ["tar", "cf", "-", "-C", path, "."];
+        let out = self.exec_tar(ctx, ns, pod, container, &command).await?;
+
+        if out.is_success() {
+            // parse_list_dir handles an empty-but-valid tar correctly (returns Ok(vec![])).
+            return parse_list_dir(&out.stdout);
+        }
+
+        // Non-zero exit: distinguish path-not-found from exec-unavailable from other errors.
+        // Special case: tar exits non-zero when it cannot open the directory itself.
+        Err(out.into_vfs_err(path))
     }
 
-    /// Stat a path inside a container's filesystem.
+    /// Stat `path` inside a container's filesystem.
     ///
-    /// **Deferred — M6-5b.** See [`list_dir`](Self::list_dir).
+    /// Executes `tar cf - -C <parent> <basename>` (or returns `Dir` immediately for `/`) and
+    /// inspects the first tar header to determine whether the path is a file or directory and what
+    /// its size is.
+    ///
+    /// Returns [`VfsError::NotFound`] when the path does not exist, and
+    /// [`VfsError::Backend`] with `code = "exec_unavailable"` when `tar` is absent.
     async fn stat(
         &self,
-        _ctx: &str,
-        _ns: &str,
-        _pod: &str,
-        _container: &str,
-        _path: &str,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        path: &str,
     ) -> Result<RemoteMeta, VfsError> {
-        Err(VfsError::Unsupported(Caps::READ))
+        // The container root is always a directory — avoid a tar exec for the trivial case.
+        if path == "/" {
+            return Ok(RemoteMeta {
+                kind: cairn_types::EntryKind::Dir,
+                size: None,
+            });
+        }
+
+        let parent = tar_parent(path);
+        let basename = tar_basename(path);
+        let command = ["tar", "cf", "-", "-C", parent, basename];
+        let out = self.exec_tar(ctx, ns, pod, container, &command).await?;
+
+        if out.is_success() {
+            return parse_stat_tar(&out.stdout, path);
+        }
+
+        Err(out.into_vfs_err(path))
     }
 
-    /// Read a file inside a container's filesystem.
+    /// Read the full contents of a file at `path` inside a container's filesystem.
     ///
-    /// **Deferred — M6-5b.** See [`list_dir`](Self::list_dir).
+    /// Executes `tar cf - -C <parent> <basename>` and extracts the first entry's bytes.
+    /// Returns [`VfsError::Unsupported`] when `path` is a directory,
+    /// [`VfsError::NotFound`] when the path does not exist, and
+    /// [`VfsError::Backend`] with `code = "exec_unavailable"` when `tar` is absent.
+    ///
+    /// **M6 memory note:** The entire tar archive (file bytes included) is buffered in memory
+    /// before parsing.  A follow-up should stream-parse to reduce peak memory for large files.
     async fn read(
         &self,
-        _ctx: &str,
-        _ns: &str,
-        _pod: &str,
-        _container: &str,
-        _path: &str,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        path: &str,
     ) -> Result<Vec<u8>, VfsError> {
-        Err(VfsError::Unsupported(Caps::READ))
+        // Root is always a directory — reading it makes no sense and we can short-circuit before
+        // constructing a command with an empty basename (which tar would reject unpredictably).
+        if path == "/" {
+            return Err(VfsError::Unsupported(cairn_types::Caps::READ));
+        }
+        let parent = tar_parent(path);
+        let basename = tar_basename(path);
+        let command = ["tar", "cf", "-", "-C", parent, basename];
+        let out = self.exec_tar(ctx, ns, pod, container, &command).await?;
+
+        if out.is_success() {
+            return parse_read_tar(&out.stdout, path);
+        }
+
+        Err(out.into_vfs_err(path))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for exec-output classification heuristics
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::ExecOutput;
+    use cairn_vfs::VfsError;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Status, StatusCause, StatusDetails};
+
+    fn make_status(code: i32) -> Status {
+        Status {
+            status: Some("Failure".to_owned()),
+            reason: Some("NonZeroExitCode".to_owned()),
+            details: Some(StatusDetails {
+                causes: Some(vec![StatusCause {
+                    reason: Some("ExitCode".to_owned()),
+                    message: Some(code.to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn output(stderr: &[u8], exit_code: i32) -> ExecOutput {
+        ExecOutput {
+            stdout: Vec::new(),
+            stderr: stderr.to_vec(),
+            status: Some(make_status(exit_code)),
+        }
+    }
+
+    // -- GNU tar not-found detection -----------------------------------------
+
+    #[test]
+    fn gnu_tar_cannot_open_maps_to_not_found() {
+        let out = output(
+            b"tar: /etc/missing: Cannot open: No such file or directory\n\
+              tar: Error is not recoverable: exiting now\n",
+            2,
+        );
+        assert!(!out.is_exec_unavailable());
+        assert!(out.is_path_not_found());
+        assert!(matches!(
+            out.into_vfs_err("/etc/missing"),
+            VfsError::NotFound(_)
+        ));
+    }
+
+    // -- BusyBox tar not-found detection (Alpine containers) -----------------
+
+    #[test]
+    fn busybox_tar_cant_open_exit1_maps_to_not_found() {
+        // BusyBox tar uses "can't open" and exits 1 instead of GNU tar's "Cannot open" + exit 2.
+        let out = output(
+            b"tar: can't open '/etc/missing': No such file or directory\n",
+            1,
+        );
+        assert!(!out.is_exec_unavailable());
+        assert!(out.is_path_not_found());
+        assert!(matches!(
+            out.into_vfs_err("/etc/missing"),
+            VfsError::NotFound(_)
+        ));
+    }
+
+    // -- exec_unavailable detection -------------------------------------------
+
+    #[test]
+    fn exit_127_maps_to_exec_unavailable() {
+        // Exit code 127 = "command not found" (shell) / binary not in PATH.
+        let out = output(b"", 127);
+        assert!(out.is_exec_unavailable());
+        let err = out.into_vfs_err("/etc");
+        assert!(matches!(&err, VfsError::Backend { code, .. } if code == "exec_unavailable"));
+    }
+
+    #[test]
+    fn exit_126_maps_to_exec_unavailable() {
+        let out = output(b"", 126);
+        assert!(out.is_exec_unavailable());
+    }
+
+    #[test]
+    fn oci_message_in_status_maps_to_exec_unavailable() {
+        let mut status = make_status(1);
+        status.message = Some(
+            "OCI runtime exec failed: exec: \"tar\": executable file not found in $PATH".to_owned(),
+        );
+        let out = ExecOutput {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status: Some(status),
+        };
+        assert!(out.is_exec_unavailable());
+    }
+
+    // -- ENOTDIR (list_dir on a file path) ------------------------------------
+
+    #[test]
+    fn cannot_chdir_maps_to_not_found() {
+        // `tar cf - -C /etc/hostname .` fails because /etc/hostname is a file, not a dir.
+        let out = output(
+            b"tar: /etc/hostname: Cannot change directory: Not a directory\n",
+            2,
+        );
+        assert!(!out.is_exec_unavailable());
+        assert!(out.is_path_not_found());
+    }
+
+    // -- fallback empty message -----------------------------------------------
+
+    #[test]
+    fn empty_stderr_and_no_status_message_gives_generic_msg() {
+        let out = ExecOutput {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status: None,
+        };
+        let err = out.into_vfs_err("/somewhere");
+        assert!(matches!(&err, VfsError::Backend { code, msg, .. }
+            if code == "exec-failed" && !msg.is_empty()));
     }
 }
