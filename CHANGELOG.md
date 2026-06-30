@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Live LLM HTTP providers** (M7-2, RFC-0008): `cairn-ai` gains two concrete `LlmProvider`
+  implementations behind the **non-default `http` feature** — `AnthropicProvider` (Claude Messages
+  API: `x-api-key`/`anthropic-version` headers, system-message folding into top-level `system`, first
+  `tool_use` block → `ToolCall` else text → `Text`; advertises tools natively) and `OllamaProvider`
+  (local models via `/api/chat`; advertises the robust `JsonSchema` tool tier since Ollama's native
+  function-calling is model-dependent). Both are non-streaming, inject the `reqwest::Client`
+  (rustls, no OpenSSL) so construction is panic-free, and take a configurable `base_url`. HTTP/transport
+  failures map to `ProviderError::Transport` with a **secret-free** message that never embeds the
+  `api_key`; unparseable bodies map to `InvalidResponse`. The `api_key` is a plain `String` — the crate
+  still depends only on `cairn-broker-api` (no vault/secrets), and the `cairn-broker-api` dependency-
+  closure test keeps that boundary enforced. Tested hermetically with `wiremock` (correct path/headers/
+  body, canned `tool_use`/`text`, 401/500 → `Transport` with no key leak, malformed → `InvalidResponse`);
+  an opt-in `#[ignore]` live smoke test is gated by `CAIRN_IT_AI` + `ANTHROPIC_API_KEY`. The `cairn-mcp`
+  server (M7-7) remains a follow-up.
 - **Vault unlock providers** (M3-3, ADR-0002/ADR-0006): `cairn-vault` gains an `UnlockProvider` trait
   that supplies the vault passphrase, plus a small `open_with(path, &dyn UnlockProvider)` convenience.
   Three implementations: `PassphraseUnlockProvider` (the always-available headless / prompt fallback),

@@ -12,6 +12,12 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Live HTTP LLM transports (Anthropic + Ollama). Off by default so the lean/offline build (MockProvider
+# + degradation) carries no network/TLS stack. `dep:reqwest` keeps the optional dep from auto-creating a
+# same-named implicit feature.
+http = ["dep:reqwest"]
+
 [dependencies]
 # The secret-free credential boundary only — NOT `cairn-broker`/`cairn-vault`. A dependency-closure
 # test in `cairn-broker-api` fails CI if the vault ever enters this crate's graph (RFC-0008).
@@ -20,6 +26,19 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Wipe the API key's bytes on drop (CLAUDE.md §9). This is `zeroize` only — NOT `cairn-secrets`'
+# `SecretString` — so the vault stays out of this crate's dependency graph (RFC-0008).
+zeroize = "1"
+# Live HTTP providers only (behind the `http` feature). ring-based rustls (no OpenSSL, no C toolchain)
+# to keep the lean AI build light; `json` for serde request/response bodies; default features off to
+# avoid native-tls. (`cairn-backend-object`'s cloud SDKs already pull both reqwest 0.12 and 0.13 via
+# Azure/GCS — that pre-existing duplication is a separate, workspace-wide cleanup.)
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+# Hermetic HTTP mock server for the live-provider tests (no real network).
+wiremock = "0.6"
