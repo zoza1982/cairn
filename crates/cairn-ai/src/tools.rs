@@ -81,6 +81,60 @@ pub fn capability_for(tool: &str) -> Option<Capability> {
     })
 }
 
+/// The JSON-Schema for a tool's `input` object, resolved by name, or `None` for a name outside the
+/// closed [`TOOLS`] set. Native tool-calling providers advertise this so the model shapes its arguments
+/// correctly; callers fall back to a permissive `{"type":"object"}` for `None`.
+///
+/// Schemas are deliberately minimal and describe only opaque handles (paths, connection ids, commands)
+/// — never a secret. The model proposes inputs; capability containment, not the schema, is the security
+/// boundary (see the module docs).
+///
+/// Only the live HTTP providers advertise per-tool schemas, so this is compiled only under the `http`
+/// feature.
+#[cfg(feature = "http")]
+#[must_use]
+pub(crate) fn input_schema_for(tool: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let schema = match tool {
+        "list" | "stat" | "read" | "delete" => json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path within the active pane."}
+            },
+            "required": ["path"]
+        }),
+        "copy" | "move" => json!({
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Source path."},
+                "dest": {"type": "string", "description": "Destination path."}
+            },
+            "required": ["source", "dest"]
+        }),
+        "exec" => json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Command to run."},
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Command arguments."
+                }
+            },
+            "required": ["command"]
+        }),
+        "open_connection" => json!({
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Connection id or target to open."}
+            },
+            "required": ["target"]
+        }),
+        _ => return None,
+    };
+    Some(schema)
+}
+
 /// Whether a step with this capability may be approved in bulk (`Safe`/`Recoverable` only).
 #[must_use]
 pub fn allows_bulk_approve(cap: Capability) -> bool {
@@ -106,6 +160,18 @@ mod tests {
         assert!(capability_for("read_secret").is_none());
         assert!(capability_for("http_fetch").is_none());
         assert!(capability_for("escalate").is_none());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn input_schema_is_object_for_known_tools_and_none_otherwise() {
+        for t in TOOLS {
+            let schema = input_schema_for(t).expect("known tool has a schema");
+            assert_eq!(schema["type"], "object", "{t} schema must be an object");
+        }
+        // Outside the closed set (e.g. the plan-proposal tool) → caller falls back to {"type":"object"}.
+        assert!(input_schema_for("propose_plan").is_none());
+        assert!(input_schema_for("exfiltrate_secret").is_none());
     }
 
     #[test]

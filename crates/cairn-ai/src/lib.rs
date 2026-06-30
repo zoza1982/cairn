@@ -4,16 +4,22 @@
 //! `plan`→confirm→execute state machine. The model only *proposes* a plan; approval and execution
 //! are gated outside the model. This crate depends only on `cairn-broker-api` — the secret-free credential boundary, never on the
 //! vault or backends, so the AI cannot even name a secret-returning API; a dependency-closure test
-//! enforces this (RFC-0008). Concrete providers and TUI wiring are layered on later. See `docs/LLD.md`
-//! §10.
+//! enforces this (RFC-0008). The offline `MockProvider` is the default path; live HTTP providers
+//! (`AnthropicProvider`, `OllamaProvider`) are gated behind the non-default `http` feature. TUI wiring
+//! is layered on later. See `docs/LLD.md` §10.
 
 mod context;
 mod degrade;
+#[cfg(feature = "http")]
+mod http;
 mod plan;
 mod provider;
 mod tools;
 
 use degrade::{decode_plan, encode_request, DegradeError};
+
+#[cfg(feature = "http")]
+pub use http::{AnthropicProvider, OllamaProvider};
 
 pub use context::{
     looks_out_of_scope, wrap_untrusted, ConnectionView, PaneView, WorldSnapshot, SYSTEM_POLICY,
