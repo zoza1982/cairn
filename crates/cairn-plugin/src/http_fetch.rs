@@ -19,8 +19,11 @@
 //! - **Header hygiene**: `Set-Cookie` is stripped from responses before returning to the
 //!   guest. `Authorization` / `Cookie` / `X-Api-Key` values in *request* headers are
 //!   redacted in log output.
-//! - **Redirects**: each redirect hop is re-checked against the grant list. A redirect to
-//!   an unlisted host is an error.
+//! - **HTTPS-only**: `http://` URLs are rejected; only `https://` is permitted by default.
+//!   A future `allow-http` manifest grant (PR-C) will enable plain HTTP for specific hostnames.
+//! - **Redirects**: `Policy::none()` — redirects are NOT followed. The plugin receives the
+//!   3xx response and may issue a new `http-fetch` call, which goes through the full SSRF
+//!   pipeline. This eliminates redirect-chaining SSRF (SEC-2).
 //!
 //! # Architecture note
 //!
@@ -48,9 +51,21 @@ pub(crate) struct HttpLimits {
     /// Maximum total response body size in bytes. Requests whose response body would exceed this
     /// are aborted and returned as an error. Default: 8 MiB.
     pub max_response_bytes: usize,
-    /// TCP connect timeout in seconds. Default: 10 s.
+    /// TCP connect timeout in seconds. Must be ≤ the per-call epoch ceiling (RFC §3.3).
+    /// Default: 4 s (epoch default: 50 ticks × 100 ms = 5 s).
+    ///
+    /// Also reused as the DNS pre-flight timeout.
     pub connect_timeout_secs: u64,
-    /// Total request timeout in seconds (includes body streaming). Default: 30 s.
+    /// Total request timeout in seconds (includes headers + body streaming). Must be ≤ the
+    /// per-call epoch ceiling (RFC §3.3). Default: 4 s.
+    ///
+    /// # TODO(M8-5 cancellation)
+    ///
+    /// These timeouts are reqwest-level futures; the epoch-interruption mechanism cannot cancel
+    /// the native OS blocking inside the reqwest/hyper/tokio stack frame. Until the connection
+    /// is pinned to a pre-validated address and the plugin bridge adopts an async cancellation
+    /// protocol (RFC Unresolved-Q §6), a hostile approved server can still park this thread
+    /// for up to `request_timeout_secs` regardless of the epoch deadline. Track as M8-5.
     pub request_timeout_secs: u64,
 }
 
@@ -58,8 +73,9 @@ impl Default for HttpLimits {
     fn default() -> Self {
         Self {
             max_response_bytes: 8 * 1024 * 1024,
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
+            // 4 s is below the default epoch ceiling (5 s) to leave headroom for DNS + connect.
+            connect_timeout_secs: 4,
+            request_timeout_secs: 4,
         }
     }
 }
@@ -76,13 +92,16 @@ impl Default for HttpLimits {
 //   192.168.0.0/16   RFC-1918 private
 //   169.254.0.0/16   link-local (AWS metadata endpoint lives here)
 //   100.64.0.0/10    CGNAT shared address space
+//   224.0.0.0/4      IPv4 multicast (RFC 1112 Class D)
 //   240.0.0.0/4      reserved (Class E)
 //   0.0.0.0/8        "this" network
 //
 // IPv6 ranges:
+//   ::               unspecified address (connects to loopback on Linux)
 //   ::1/128          loopback
 //   fc00::/7         unique local (ULA)
 //   fe80::/10        link-local
+//   ff00::/8         IPv6 multicast
 //   ::ffff:0:0/96    IPv4-mapped (catches IPv4-in-IPv6 SSRF)
 
 macro_rules! ipv4net {
@@ -103,21 +122,26 @@ macro_rules! ipv6net {
 pub(crate) fn is_ssrf_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            // `is_unspecified` (0.0.0.0) is covered by 0.0.0.0/8 below, but the explicit
+            // check is clearer and symmetric with the IPv6 path.
+            if v4.is_unspecified() || v4.is_loopback() {
+                return true;
+            }
             let ranges: &[Ipv4Net] = &[
-                ipv4net!("127.0.0.0/8"),
                 ipv4net!("10.0.0.0/8"),
                 ipv4net!("172.16.0.0/12"),
                 ipv4net!("192.168.0.0/16"),
                 ipv4net!("169.254.0.0/16"),
                 ipv4net!("100.64.0.0/10"),
-                ipv4net!("240.0.0.0/4"),
-                ipv4net!("0.0.0.0/8"),
+                ipv4net!("224.0.0.0/4"), // IPv4 multicast (Class D)
+                ipv4net!("240.0.0.0/4"), // reserved (Class E)
+                ipv4net!("0.0.0.0/8"),   // "this" network
             ];
             ranges.iter().any(|net| net.contains(&v4))
         }
         IpAddr::V6(v6) => {
-            // Loopback
-            if v6.is_loopback() {
+            // Unspecified `::` connects to loopback on Linux — block it explicitly.
+            if v6.is_unspecified() || v6.is_loopback() {
                 return true;
             }
             // IPv4-mapped (::ffff:x.x.x.x) — recursively check the embedded IPv4
@@ -127,6 +151,7 @@ pub(crate) fn is_ssrf_blocked_ip(ip: IpAddr) -> bool {
             let ranges: &[Ipv6Net] = &[
                 ipv6net!("fc00::/7"),  // ULA
                 ipv6net!("fe80::/10"), // link-local
+                ipv6net!("ff00::/8"),  // IPv6 multicast
             ];
             ranges.iter().any(|net| net.contains(&v6))
         }
@@ -151,10 +176,22 @@ pub(crate) fn hostname_allowed(host: &str, grants: &[String]) -> bool {
 /// Returns the parsed `Url` on success, or a redacted error string on failure. This is a
 /// **synchronous** pre-flight — it does not perform DNS resolution.
 pub(crate) fn validate_url(req: &HttpRequest, grants: &[String]) -> Result<Url, String> {
-    // Reject non-HTTP(S) schemes immediately.
     let url = Url::parse(&req.url).map_err(|e| format!("invalid URL: {e}"))?;
+
+    // HTTPS-only by default: reject `http://` to prevent brokered credentials and response
+    // data from being exposed to on-path observers. A future `allow-http` manifest grant
+    // (PR-C) will enable plain HTTP for operators who explicitly need it (e.g. internal
+    // services behind a TLS-terminating proxy).
+    // TODO(PR-C): implement per-hostname `allow-http` grant in the manifest loader.
     match url.scheme() {
-        "http" | "https" => {}
+        "https" => {}
+        "http" => {
+            return Err(
+                "http:// is not allowed; use https:// (plain HTTP can be enabled via the \
+                 allow-http grant in PR-C)"
+                    .to_owned(),
+            )
+        }
         other => return Err(format!("disallowed URL scheme: {other}")),
     }
 
@@ -194,14 +231,21 @@ pub(crate) fn validate_url(req: &HttpRequest, grants: &[String]) -> Result<Url, 
 /// `connect_timeout_secs` bounds the DNS lookup; an unresponsive DNS server cannot park the
 /// plugin thread indefinitely.
 ///
-/// # DNS rebinding caveat
+/// # SECURITY (release-gating for M8-5 / PR-C)
 ///
-/// There is an inherent TOCTOU window: reqwest performs its own DNS resolution at TCP connect
-/// time independently of this pre-flight. An attacker who controls the DNS record for a granted
-/// hostname can serve a public IP during this check, then flip to a private IP before reqwest
-/// connects (low-TTL DNS rebinding). Closing this gap requires a custom connector that locks
-/// the connection to the pre-validated `SocketAddr` set; that work is tracked in issue M8-SSRF.
-/// Until then, restrict network grants to hostnames under the operator's full control.
+/// There is an inherent TOCTOU window between this pre-flight and reqwest's own DNS resolution
+/// at TCP connect time. An attacker who controls the DNS record for a granted hostname can serve
+/// a public IP during this check, then flip to a private IP (e.g. `169.254.169.254`) before
+/// reqwest connects (low-TTL DNS rebinding). The window is narrow but non-zero.
+///
+/// **Before PR-C makes `instantiate_with_grants` reachable from the binary by untrusted
+/// plugins, this MUST be resolved** by pinning the connection to the `SocketAddr` set
+/// resolved here: implement a custom `reqwest::dns::Resolve` / `Client::resolve` override
+/// that re-validates the pinned IP before connecting. Bundle SEC-8 (6to4/Teredo/NAT64
+/// embedded-v4 prefix blocks) with that work. Track as M8-5.
+///
+/// Until then: network grants MUST only be issued to hostnames under the operator's full
+/// DNS control.
 pub(crate) async fn check_ssrf_via_dns(
     host: &str,
     port: u16,
@@ -257,6 +301,18 @@ const MAX_RESPONSE_HEADERS: usize = 200;
 /// Headers exceeding this size are treated as malformed responses.
 const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
 
+/// HTTP methods the plugin may use (RFC-0010 §3.2 step 6 closed method list).
+/// CONNECT (proxy tunnel) and TRACE (XST cross-site tracing) are excluded.
+const ALLOWED_METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
+
+/// Maximum combined byte size of all request header names + values. Prevents a plugin from
+/// exfiltrating large data volumes through request headers to a granted upstream.
+const MAX_REQUEST_HEADERS_BYTES: usize = 32 * 1024;
+
+/// Maximum request body size. Rejects oversized bodies before dispatch to prevent a plugin
+/// from forcing the host to buffer 32+ MiB through this path.
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Build a `reqwest::Client` configured for plugin use:
 /// - rustls TLS only (no OpenSSL)
 /// - per-call connect / request timeouts
@@ -297,7 +353,32 @@ pub(crate) async fn execute_fetch(
     client: &Client,
     limits: HttpLimits,
 ) -> Result<HttpResponse, String> {
-    // Parse and validate the HTTP method.
+    // Pre-dispatch caps: reject oversized requests before touching the network (RFC §3.3).
+    let total_header_bytes: usize = req.headers.iter().map(|(n, v)| n.len() + v.len()).sum();
+    if total_header_bytes > MAX_REQUEST_HEADERS_BYTES {
+        return Err(format!(
+            "request headers ({total_header_bytes} B) exceed the {MAX_REQUEST_HEADERS_BYTES} B cap"
+        ));
+    }
+    if let Some(body) = &req.body {
+        if body.len() > MAX_REQUEST_BODY_BYTES {
+            return Err(format!(
+                "request body ({} B) exceeds the {MAX_REQUEST_BODY_BYTES} B cap",
+                body.len()
+            ));
+        }
+    }
+
+    // Closed method allow-list (RFC-0010 §3.2 step 6). CONNECT enables proxy tunnelling;
+    // TRACE enables XST cross-site tracing attacks. Both are excluded.
+    let method_upper = req.method.to_ascii_uppercase();
+    if !ALLOWED_METHODS.contains(&method_upper.as_str()) {
+        return Err(format!(
+            "disallowed HTTP method: {} \
+             (allowed: GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS)",
+            req.method
+        ));
+    }
     let method = reqwest::Method::from_bytes(req.method.as_bytes())
         .map_err(|_| format!("invalid HTTP method: {}", req.method))?;
 
@@ -602,7 +683,7 @@ mod tests {
     #[test]
     fn ip_literal_loopback_is_rejected() {
         let grants = vec!["127.0.0.1".to_owned()]; // even if in grants — IP literal check runs
-        let req = make_req("http://127.0.0.1/secret");
+        let req = make_req("https://127.0.0.1/secret");
         let err = validate_url(&req, &grants).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
@@ -615,7 +696,7 @@ mod tests {
         // IPv6 loopback `::1` is represented in URLs as `[::1]`. The bracket form must be
         // correctly parsed (stripping `[` and `]`) before the SSRF check runs.
         let grants = vec!["[::1]".to_owned()]; // even if in grants — IP literal check runs
-        let req = make_req("http://[::1]/secret");
+        let req = make_req("https://[::1]/secret");
         let err = validate_url(&req, &grants).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
@@ -627,7 +708,7 @@ mod tests {
     fn ipv6_ula_literal_is_rejected() {
         // ULA prefix fc00::/7. Must be blocked even when grant list includes the address.
         let grants = vec!["[fc00::1]".to_owned()];
-        let req = make_req("http://[fc00::1]/");
+        let req = make_req("https://[fc00::1]/");
         let err = validate_url(&req, &grants).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
@@ -636,7 +717,79 @@ mod tests {
     }
 
     #[test]
-    fn non_http_scheme_is_rejected() {
+    fn ipv6_unspecified_is_rejected() {
+        // `::` is the IPv6 unspecified address; on Linux connect() to `::` reaches loopback.
+        let grants = vec!["::".to_owned(), "[::0]".to_owned()];
+        for url in &["https://[::]/", "https://[::0]/"] {
+            let req = make_req(url);
+            let err = validate_url(&req, &grants).unwrap_err();
+            assert!(
+                err.contains("SSRF") || err.contains("blocked") || err.contains("network grant"),
+                "IPv6 unspecified must be blocked, url={url}, err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_multicast_is_rejected() {
+        let grants = vec!["224.0.0.1".to_owned()];
+        let req = make_req("https://224.0.0.1/");
+        let err = validate_url(&req, &grants).unwrap_err();
+        assert!(
+            err.contains("SSRF") || err.contains("blocked"),
+            "IPv4 multicast must be SSRF-blocked, err = {err}"
+        );
+    }
+
+    #[test]
+    fn ipv6_multicast_is_rejected() {
+        let grants = vec!["[ff02::1]".to_owned()];
+        let req = make_req("https://[ff02::1]/");
+        let err = validate_url(&req, &grants).unwrap_err();
+        assert!(
+            err.contains("SSRF") || err.contains("blocked"),
+            "IPv6 multicast must be SSRF-blocked, err = {err}"
+        );
+    }
+
+    #[test]
+    fn http_scheme_is_rejected_by_default() {
+        // Only https:// is allowed; http:// must be rejected even for an allowed host.
+        let grants = vec!["example.com".to_owned()];
+        let req = make_req("http://example.com/data");
+        let err = validate_url(&req, &grants).unwrap_err();
+        assert!(
+            err.contains("http://") || err.contains("https://") || err.contains("scheme"),
+            "http:// must be rejected, err = {err}"
+        );
+    }
+
+    #[test]
+    fn decimal_encoded_ipv4_is_rejected() {
+        // 2130706433 == 0x7f000001 == 127.0.0.1 in 32-bit decimal.
+        // The url crate (WHATWG URL parser) normalises this to 127.0.0.1 in host_str(),
+        // so it is caught by the SSRF block (if the grant has "127.0.0.1") or the grant
+        // check (if the grant has "2130706433", which won't match the normalised form).
+        // Either way, the request is rejected — the test asserts fail-closed behaviour.
+        let grants_decimal = vec!["2130706433".to_owned()];
+        let req = make_req("https://2130706433/secret");
+        let err = validate_url(&req, &grants_decimal).unwrap_err();
+        assert!(
+            err.contains("network grant") || err.contains("SSRF") || err.contains("blocked"),
+            "decimal-encoded IPv4 must be rejected, err = {err}"
+        );
+
+        // With the normalised address in grants, the SSRF check still blocks it.
+        let grants_norm = vec!["127.0.0.1".to_owned()];
+        let err = validate_url(&req, &grants_norm).unwrap_err();
+        assert!(
+            err.contains("SSRF") || err.contains("blocked"),
+            "decimal-encoded IPv4 with normalised grant must still be SSRF-blocked, err = {err}"
+        );
+    }
+
+    #[test]
+    fn ftp_scheme_is_rejected() {
         let grants = vec!["example.com".to_owned()];
         let req = make_req("ftp://example.com/file");
         let err = validate_url(&req, &grants).unwrap_err();
@@ -657,6 +810,36 @@ mod tests {
         let req = make_req("not a url at all !!!");
         let err = validate_url(&req, &grants).unwrap_err();
         assert!(err.contains("invalid URL"), "err = {err}");
+    }
+
+    // ── execute_fetch pre-dispatch caps ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn disallowed_method_is_rejected() {
+        use wiremock::MockServer;
+        // We never need to reach the server; the method check fires before send.
+        let server = MockServer::start().await;
+        let base = server.uri();
+        let host = server.address().ip().to_string();
+        let grants = vec![host.clone()];
+        let limits = HttpLimits::default();
+        let client = build_client(limits).expect("client");
+
+        for method in &["CONNECT", "TRACE", "FOOBAR"] {
+            let req = HttpRequest {
+                method: (*method).to_owned(),
+                url: format!("{base}/"),
+                headers: vec![],
+                body: None,
+            };
+            let err = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("method") || err.contains("disallowed"),
+                "method {method} must be rejected, err = {err}"
+            );
+        }
     }
 
     // ── Wiremock HTTP integration tests ─────────────────────────────────────────────────────

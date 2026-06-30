@@ -303,7 +303,10 @@ pub(crate) fn plugin_stream_limit_error(limit: u64) -> VfsError {
 /// Strip control characters from and length-cap a guest-supplied diagnostic string. Guest error text
 /// reaches logs and the TUI renderer untrusted: control/escape sequences are a terminal-injection
 /// vector and an unbounded string is a memory vector.
-fn sanitize_msg(s: String) -> String {
+///
+/// Also used by `component.rs` to sanitize error strings returned from brokered host functions
+/// (RFC-0010 §3.4) before they cross the WIT ABI back to the guest.
+pub(crate) fn sanitize_msg(s: String) -> String {
     const MAX: usize = 1024;
     s.chars().filter(|c| !c.is_control()).take(MAX).collect()
 }

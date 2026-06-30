@@ -176,9 +176,13 @@ impl cairn::plugin::host::Host for CompState {
             let grants = self.network_grants.clone();
             let limits = self.http_limits;
             // Drive the async fetch from this synchronous plugin thread.
-            handle.block_on(crate::http_fetch::do_http_fetch(
-                &req, &grants, &client, limits,
-            ))
+            // Sanitize error strings (RFC §3.4): strip control chars + cap length before
+            // the string crosses the WIT ABI back to the guest, consistent with other host fns.
+            handle
+                .block_on(crate::http_fetch::do_http_fetch(
+                    &req, &grants, &client, limits,
+                ))
+                .map_err(crate::bridge::sanitize_msg)
         }
 
         #[cfg(not(feature = "plugin-network"))]
@@ -222,9 +226,13 @@ impl cairn::plugin::host::Host for CompState {
         // Delegate to the broker. The broker resolves the secret, performs the action,
         // zeroizes the secret, journals the event (no secret material), and returns the
         // ephemeral artifact. `CredentialBrokerError` is secret-free by design.
+        //
+        // NOTE (SEC-10): credential handle grant lookup is case-sensitive (exact opaque-label
+        // match). The manifest grant label must exactly match the vault entry label — the
+        // comparison intentionally fails closed for any case variant.
         broker
             .use_credential(&self.plugin_name, &handle, &cred_action)
-            .map_err(|e| format!("use-credential failed: {e}"))
+            .map_err(|e| crate::bridge::sanitize_msg(format!("use-credential failed: {e}")))
     }
 }
 
@@ -305,6 +313,14 @@ impl PluginComponent {
             .memory_size(limits.max_memory_bytes)
             .build();
 
+        // SECURITY (release-gating for M8-5 / PR-C): before the plugin loader (PR-C) makes
+        // this function reachable from the binary with untrusted plugins and grant-bearing
+        // config, the DNS rebinding TOCTOU window in `check_ssrf_via_dns` MUST be closed by
+        // pinning each connection to the `SocketAddr` set validated at pre-flight time via a
+        // custom `reqwest::dns::Resolve` override that re-validates the pinned IP at connect.
+        // See `http_fetch::check_ssrf_via_dns` for the full security note.
+        // Bundle SEC-8 (6to4/Teredo/NAT64 embedded-v4 prefix blocks) with that work.
+        //
         // Build the HTTP client when the plugin-network feature is enabled and network grants
         // are non-empty. The tokio runtime handle is captured here (on the calling async task
         // or thread); it is later used by the synchronous plugin thread to drive async reqwest
