@@ -416,69 +416,85 @@ mod tests {
     /// Before RFC-0010, a guest calling `subscribe-duration(∞)` followed by
     /// `poll([p])` would park the plugin thread inside a Tokio `sleep_until` call
     /// that epoch cannot interrupt.  This test instantiates a real component
-    /// (`tests/fixtures/wasi_spin.wasm`) that loops on `subscribe-duration(u64::MAX)`,
-    /// arms the epoch ticker, and asserts that the call is interrupted as
-    /// [`wasmtime::Trap::Interrupt`].
+    /// (`tests/fixtures/wasi_spin.wasm`) whose export loops:
+    /// `subscribe_duration(u64::MAX)` → `poll([p])` → repeat.
     ///
-    /// **Regression signal**: replacing `add_narrowed_wasi_to_linker` with the
-    /// stock `add_to_linker_sync` would restore the blocking `sleep_until` path;
-    /// the test would then hang for several seconds before the ticker fires again
-    /// (because epoch cannot fire inside the native Tokio frame), or the test
-    /// framework kills it — the dead-CI variant of this test is intentional.
+    /// The test runs `spin-poll` on a dedicated thread and joins with a hard 5 s
+    /// wall-clock timeout.  Failure modes:
+    ///
+    /// * **Correct (narrowed linker):** `NbPollTable::poll` returns immediately, the
+    ///   loop back-edge stays in WASM bytecode, the 1 ms epoch ticker fires within
+    ///   2 ticks → `Trap::Interrupt`.  The join completes in ≪ 5 s.
+    /// * **Regression (stock `add_to_linker_sync`):** `poll([p])` calls
+    ///   `block_on(pollable.ready())` and parks the plugin thread in a native Tokio
+    ///   frame for ~584 years.  Epoch can never fire there.  The join times out at
+    ///   5 s, and the test fails with a clear "poll() blocked" message instead of
+    ///   hanging CI indefinitely.
     #[test]
     fn subscribe_duration_loop_is_epoch_interruptible() {
         use wasmtime::component::Component;
+        use wasmtime::Trap;
 
         static WASI_SPIN: &[u8] = include_bytes!("../tests/fixtures/wasi_spin.wasm");
 
+        // Build the engine once; it must be Send so the spawned thread can use it.
         let engine = wasmtime::Engine::new(&crate::engine_config()).expect("engine");
 
-        // Arm the ticker at 1 ms — fast enough to fire within a few loop iterations.
-        // Note: we cannot observe whether the ticker thread spawned from outside
-        // `epoch::tests` (the `handle` field is private).  The test still verifies
-        // the epoch mechanism: if the ticker thread fails to spawn, epoch never
-        // advances and `spin-poll` runs until the process-level CI timeout kills it.
+        // Arm the ticker at 1 ms.  If the ticker thread fails to spawn, epoch
+        // never advances and the 5 s channel timeout catches the regression.
         let _ticker = crate::EpochTicker::spawn(&engine, std::time::Duration::from_millis(1));
 
         let component = Component::new(&engine, WASI_SPIN).expect("load wasi_spin.wasm");
+        let engine_clone = engine.clone();
 
-        let mut linker: Linker<TestState> = Linker::new(&engine);
-        add_narrowed_wasi_to_linker(&mut linker)
-            .expect("narrowed WASI must register without error");
+        // Channel used as a bounded join: the spawned thread sends its result and
+        // the main thread waits at most 5 s before declaring a regression.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-        let mut store = Store::new(&engine, test_state());
-        // Provide essentially unlimited fuel so that only the epoch deadline
-        // (not fuel exhaustion) can stop the loop.  Without this the store
-        // would start with 0 fuel (default when consume_fuel is enabled) and
-        // trap on the very first instruction, never reaching the back-edge that
-        // epoch fires at.
-        let _ = store.set_fuel(u64::MAX);
-        // Deadline of 2 ticks: the ticker fires every 1 ms so the first
-        // increment (at ≈1 ms) still leaves 1 tick, and the second (≈2 ms)
-        // trips the deadline.  Gives the spin loop enough iterations to be
-        // meaningful without ever blocking the test thread more than ~5 ms.
-        store.set_epoch_deadline(2);
+        std::thread::spawn(move || {
+            let result = (|| -> Result<(), String> {
+                let mut linker: Linker<TestState> = Linker::new(&engine_clone);
+                add_narrowed_wasi_to_linker(&mut linker)
+                    .map_err(|e| format!("narrowed WASI registration failed: {e}"))?;
 
-        let instance = linker
-            .instantiate(&mut store, &component)
-            .expect("spin component must instantiate with the narrowed linker");
+                let mut store = Store::new(&engine_clone, test_state());
+                // Unlimited fuel: only epoch (not fuel exhaustion) must stop the loop.
+                let _ = store.set_fuel(u64::MAX);
+                // 2 ticks at 1 ms each → the loop is interrupted in ≈ 2 ms.
+                store.set_epoch_deadline(2);
 
-        let spin_poll = instance
-            .get_typed_func::<(), ()>(&mut store, "spin-poll")
-            .expect("spin-poll export must exist with type () -> ()");
+                let instance = linker
+                    .instantiate(&mut store, &component)
+                    .map_err(|e| format!("instantiation failed: {e}"))?;
 
-        let err = spin_poll
-            .call(&mut store, ())
-            .expect_err("spin-poll must be interrupted by the epoch deadline");
+                let spin_poll = instance
+                    .get_typed_func::<(), ()>(&mut store, "spin-poll")
+                    .map_err(|e| format!("spin-poll export not found: {e}"))?;
 
-        let trap = err
-            .downcast_ref::<wasmtime::Trap>()
-            .expect("error must be a Trap");
-        assert_eq!(
-            *trap,
-            wasmtime::Trap::Interrupt,
-            "epoch deadline must produce Trap::Interrupt"
-        );
+                let err = spin_poll.call(&mut store, ()).expect_err(
+                    "spin-poll must trap — the loop is infinite and only epoch can stop it",
+                );
+                let trap = err
+                    .downcast::<Trap>()
+                    .map_err(|e| format!("error was not a Trap: {e}"))?;
+                if trap != Trap::Interrupt {
+                    return Err(format!("expected Trap::Interrupt, got Trap::{trap:?}"));
+                }
+                Ok(())
+            })();
+            let _ = tx.send(result);
+        });
+
+        // Wait up to 5 s.  If poll() blocks the plugin thread (the regression),
+        // the spawned thread never sends and recv_timeout returns Err(Timeout).
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => {} // Trap::Interrupt received within deadline — pass
+            Ok(Err(msg)) => panic!("spin-poll E2E test failed: {msg}"),
+            Err(_timeout) => panic!(
+                "spin-poll did not complete within 5 s — wasi:io/poll.poll blocked \
+                 the host thread; this is the narrowing-regressed failure mode"
+            ),
+        }
     }
 
     // ── Default-deny: sockets not in the narrowed linker ───────────────────────
