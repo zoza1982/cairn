@@ -1,7 +1,8 @@
 //! Messages, events, and effects — the three families of the TEA loop.
 
-use crate::state::{Side, TransferId};
+use crate::state::{ConnectionChoice, Side, TransferId};
 use cairn_ai::Plan;
+use cairn_secrets::SecretString;
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{ListPage, VfsError};
 
@@ -58,6 +59,9 @@ pub enum Action {
     RunShellAction(usize),
     /// Open the connection switcher (pick a backend to open in the active pane).
     OpenConnections,
+    /// Open the vault-unlock overlay (enter the passphrase to unlock the secrets vault and retry the
+    /// credential-bearing connections that were deferred while it was locked).
+    VaultUnlock,
     /// Open a prompt to create a new directory in the active pane.
     MakeDir,
     /// Open a prompt to rename the entry under the cursor.
@@ -178,6 +182,13 @@ pub enum AppEvent {
         /// Whether it ended in failure (non-zero exit, timeout, or refusal).
         error: bool,
     },
+    /// The vault-unlock effect finished. On success: the connections opened from the previously
+    /// deferred credential-bearing profiles (to add to the switcher) — possibly empty. On failure: a
+    /// secret-free, retryable message (wrong passphrase / missing vault) shown in the overlay.
+    VaultUnlocked {
+        /// `Ok(opened)` with the newly opened connections, or `Err(message)` to keep the overlay open.
+        result: Result<Vec<ConnectionChoice>, String>,
+    },
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -272,4 +283,15 @@ pub enum AppEffect {
     },
     /// Cancel the in-flight AI plan execution, if any.
     CancelAiPlan,
+    /// Unlock the secrets vault with the entered passphrase, then re-open the credential-bearing
+    /// connections that were deferred while it was locked. The runtime opens the vault off the render
+    /// path (`Vault::open` via `spawn_blocking`), installs it into the broker, retries the deferred
+    /// profiles, and reports back via [`AppEvent::VaultUnlocked`].
+    ///
+    /// The passphrase rides in a zeroizing [`SecretString`] — redacted in this effect's `Debug`,
+    /// never logged, and wiped when the effect is dropped.
+    UnlockVault {
+        /// The passphrase to try (zeroized on drop).
+        passphrase: SecretString,
+    },
 }

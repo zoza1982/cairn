@@ -153,6 +153,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "make_dir" => Action::MakeDir,
         "rename" => Action::Rename,
         "open_connections" => Action::OpenConnections,
+        "vault_unlock" => Action::VaultUnlock,
         "ai_propose" => Action::AiPropose,
         "approve_all" => Action::ApproveAll,
         "reject" => Action::Reject,
@@ -241,6 +242,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
             KeyCode::Char('o') => Some(Action::OpenConnections),
             // Ctrl-T opens the transfer-queue view.
             KeyCode::Char('t') => Some(Action::OpenQueue),
+            // Ctrl-U opens the vault-unlock overlay.
+            KeyCode::Char('u') => Some(Action::VaultUnlock),
             _ => None,
         };
     }
@@ -340,6 +343,8 @@ mod tests {
         assert_eq!(action_for(ctrl_a), Some(Action::AiPropose));
         let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
         assert_eq!(action_for(ctrl_o), Some(Action::OpenConnections));
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(action_for(ctrl_u), Some(Action::VaultUnlock));
         // Plain 'a'/'x' drive the plan overlay (no-ops elsewhere).
         assert_eq!(
             action_for(press(KeyCode::Char('a'))),
@@ -537,6 +542,7 @@ mod tests {
             "make_dir",
             "rename",
             "open_connections",
+            "vault_unlock",
             "ai_propose",
             "approve_all",
             "reject",
@@ -548,7 +554,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 28);
+        assert_eq!(names.len(), 29);
     }
 
     #[test]

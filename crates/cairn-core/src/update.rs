@@ -2,8 +2,8 @@
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 use crate::state::{
-    ActiveTransfer, AppState, Listing, Overlay, PromptKind, QueuedTransfer, Side, SortMode,
-    TransferId,
+    ActiveTransfer, AppState, Listing, MaskedInput, Overlay, PromptKind, QueuedTransfer, Side,
+    SortMode, TransferId,
 };
 use cairn_types::{Entry, VfsPath};
 use std::sync::Arc;
@@ -57,6 +57,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 | Action::OpenConnections
                 | Action::OpenQueue
                 | Action::RunShellAction(_)
+                | Action::VaultUnlock
         )
     {
         state.status = Some("The assistant is preparing a plan…".to_owned());
@@ -77,6 +78,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 | Action::OpenConnections
                 | Action::OpenQueue
                 | Action::RunShellAction(_)
+                | Action::VaultUnlock
         )
     {
         state.status = Some("A plan is executing — press Esc to cancel it first".to_owned());
@@ -152,6 +154,17 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 state.status = Some("No other connections configured".to_owned());
             } else {
                 state.overlay = Some(Overlay::Connections { cursor: 0 });
+            }
+            Vec::new()
+        }
+        Action::VaultUnlock => {
+            if state.vault_unlocked {
+                state.status = Some("Vault already unlocked".to_owned());
+            } else {
+                state.overlay = Some(Overlay::VaultUnlock {
+                    input: MaskedInput::new(),
+                    error: None,
+                });
             }
             Vec::new()
         }
@@ -300,11 +313,67 @@ fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
     if matches!(state.overlay, Some(Overlay::Prompt { .. })) {
         return apply_prompt_text(state, edit);
     }
+    if matches!(state.overlay, Some(Overlay::VaultUnlock { .. })) {
+        return apply_vault_unlock_text(state, edit);
+    }
     // Filter editing only owns input when no overlay is open (lock-step with `capturing_text`).
     if state.overlay.is_none() && state.active().filter_editing {
         return apply_filter_text(state, edit);
     }
     Vec::new()
+}
+
+/// Edit the vault-unlock passphrase field. The typed value lives only in the [`MaskedInput`] (no-echo,
+/// redacted in `Debug`, zeroized on drop); this never copies it into the status line or anywhere else.
+fn apply_vault_unlock_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
+    let Some(Overlay::VaultUnlock { input, error }) = &mut state.overlay else {
+        return Vec::new();
+    };
+    match edit {
+        TextEdit::Insert(c) => {
+            // Reject control characters; everything else is part of the passphrase.
+            if !c.is_control() {
+                input.push(c);
+                // Typing dismisses a stale error so the box reads cleanly again.
+                *error = None;
+            }
+            Vec::new()
+        }
+        TextEdit::Backspace => {
+            input.backspace();
+            Vec::new()
+        }
+        // Closing the overlay drops the `MaskedInput`, which zeroizes the buffer.
+        TextEdit::Cancel => {
+            state.overlay = None;
+            Vec::new()
+        }
+        TextEdit::Submit => submit_vault_unlock(state),
+    }
+}
+
+/// Submit the entered passphrase: emit [`AppEffect::UnlockVault`], keeping the overlay open (with the
+/// field wiped) so the async unlock can report success/failure back into it. An empty passphrase is
+/// rejected in-place without an effect.
+fn submit_vault_unlock(state: &mut AppState) -> Vec<AppEffect> {
+    // Ignore a second submit while an unlock is already running: `Vault::open` runs Argon2id (slow),
+    // so without this a quick double-Enter would spawn a duplicate task and double-open connections.
+    if state.vault_unlocking {
+        return Vec::new();
+    }
+    let Some(Overlay::VaultUnlock { input, error }) = &mut state.overlay else {
+        return Vec::new();
+    };
+    if input.is_empty() {
+        *error = Some("Enter the vault passphrase".to_owned());
+        return Vec::new();
+    }
+    // Take the secret out of the field (which wipes it) and hand it to the effect runner.
+    let passphrase = input.take_secret();
+    *error = None;
+    state.vault_unlocking = true;
+    state.status = Some("Unlocking vault…".to_owned());
+    vec![AppEffect::UnlockVault { passphrase }]
 }
 
 /// Edit the open text prompt.
@@ -484,8 +553,9 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
         Some(Overlay::TransferQueue { .. }) => apply_transfer_queue_action(state, action),
-        // A text prompt captures keystrokes as `Msg::Text`; non-quit actions don't reach it.
-        Some(Overlay::Prompt { .. }) | None => Vec::new(),
+        // A text prompt / the vault-unlock field capture keystrokes as `Msg::Text`; non-quit actions
+        // don't reach them.
+        Some(Overlay::Prompt { .. } | Overlay::VaultUnlock { .. }) | None => Vec::new(),
     }
 }
 
@@ -1128,6 +1198,43 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // A shell action may have changed the filesystem (created/removed files), so refresh both
             // panes via the normal op-completion path.
             finish_op(state, &status, error)
+        }
+        AppEvent::VaultUnlocked { result } => {
+            // The attempt is no longer in flight, whatever the outcome.
+            state.vault_unlocking = false;
+            match result {
+                Ok(opened) => {
+                    state.vault_unlocked = true;
+                    state.has_locked_connections = false;
+                    let n = opened.len();
+                    // Surface the now-reachable connections in the switcher.
+                    state.connections.extend(opened);
+                    // Only close *our* overlay: the unlock runs in a detached task, so by the time it
+                    // finishes the user may have closed the unlock box and opened a different one
+                    // (e.g. the connection switcher) — which we must not clobber.
+                    if matches!(state.overlay, Some(Overlay::VaultUnlock { .. })) {
+                        state.overlay = None;
+                    }
+                    state.status = Some(if n == 0 {
+                        "Vault unlocked".to_owned()
+                    } else {
+                        format!("Vault unlocked — {n} connection(s) opened")
+                    });
+                    Vec::new()
+                }
+                Err(msg) => {
+                    // Keep the unlock overlay open with a retryable error and a wiped field; if the
+                    // user has since closed it, fall back to the status line. The message is
+                    // secret-free.
+                    if let Some(Overlay::VaultUnlock { input, error }) = &mut state.overlay {
+                        input.clear();
+                        *error = Some(msg);
+                    } else {
+                        state.status = Some(format!("Vault unlock failed: {msg}"));
+                    }
+                    Vec::new()
+                }
+            }
         }
     }
 }
@@ -3041,5 +3148,194 @@ mod tests {
         );
         assert_eq!(fx.len(), 2);
         assert_eq!(s.status.as_deref(), Some("Copied 1 item"));
+    }
+
+    // ---- M3-7: vault-unlock overlay --------------------------------------------------------------
+
+    #[test]
+    fn vault_unlock_action_opens_and_cancel_closes_the_overlay() {
+        let mut s = state();
+        let fx = update(&mut s, Msg::Action(Action::VaultUnlock));
+        assert!(fx.is_empty());
+        assert!(matches!(s.overlay, Some(Overlay::VaultUnlock { .. })));
+        assert!(
+            s.capturing_text(),
+            "the passphrase field captures keystrokes"
+        );
+        // Esc/Cancel closes it (the masked input is dropped → zeroized).
+        let _ = update(&mut s, Msg::Text(TextEdit::Cancel));
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn vault_unlock_action_is_a_noop_when_already_unlocked() {
+        let mut s = state();
+        s.vault_unlocked = true;
+        let fx = update(&mut s, Msg::Action(Action::VaultUnlock));
+        assert!(fx.is_empty());
+        assert!(
+            s.overlay.is_none(),
+            "no overlay opens when already unlocked"
+        );
+        assert_eq!(s.status.as_deref(), Some("Vault already unlocked"));
+    }
+
+    #[test]
+    fn vault_unlock_passphrase_never_echoes_into_debug_and_submit_carries_the_secret() {
+        use cairn_secrets::ExposeSecret;
+        const SECRET: &str = "correct horse battery staple";
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
+        type_text(&mut s, SECRET);
+        // The typed passphrase must not be visible in a `{:?}` of the whole state (or the overlay).
+        assert!(
+            !format!("{s:?}").contains("staple"),
+            "AppState Debug leaked the passphrase"
+        );
+        // Submitting emits exactly one UnlockVault effect carrying the entered secret…
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        let passphrase = match &fx[..] {
+            [AppEffect::UnlockVault { passphrase }] => passphrase,
+            other => panic!("expected UnlockVault, got {other:?}"),
+        };
+        assert_eq!(passphrase.expose_secret(), SECRET);
+        // …and even the effect's Debug must not reveal it (SecretString redacts).
+        assert!(
+            !format!("{:?}", fx[0]).contains("staple"),
+            "effect Debug leaked the passphrase"
+        );
+        // The overlay stays open (awaiting the async result) with the field wiped.
+        match &s.overlay {
+            Some(Overlay::VaultUnlock { input, error }) => {
+                assert!(input.is_empty(), "field is wiped after submit");
+                assert!(error.is_none());
+            }
+            other => panic!("overlay should remain open, got {other:?}"),
+        }
+        assert_eq!(s.status.as_deref(), Some("Unlocking vault…"));
+    }
+
+    #[test]
+    fn vault_unlock_empty_passphrase_keeps_the_overlay_with_an_error() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty(), "an empty passphrase emits no effect");
+        match &s.overlay {
+            Some(Overlay::VaultUnlock { error, .. }) => {
+                assert_eq!(error.as_deref(), Some("Enter the vault passphrase"));
+            }
+            other => panic!("overlay should stay open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_unlock_failure_keeps_the_overlay_and_shows_the_error() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
+        type_text(&mut s, "wrong-pass");
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        // The async unlock reports a wrong passphrase.
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::VaultUnlocked {
+                result: Err("decryption failed (wrong passphrase or corrupt vault)".to_owned()),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(!s.vault_unlocked);
+        match &s.overlay {
+            Some(Overlay::VaultUnlock { input, error }) => {
+                assert!(input.is_empty(), "the field is wiped for a retry");
+                assert!(error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("wrong passphrase")));
+            }
+            other => panic!("overlay should stay open for a retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_unlock_success_closes_overlay_and_adds_connections() {
+        let mut s = state();
+        s.has_locked_connections = true;
+        let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
+        type_text(&mut s, "right-pass");
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        let opened = vec![crate::ConnectionChoice {
+            conn: cairn_types::ConnectionId(7),
+            label: "ssh: bastion".to_owned(),
+        }];
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::VaultUnlocked { result: Ok(opened) }),
+        );
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none(), "overlay closes on success");
+        assert!(s.vault_unlocked);
+        assert!(!s.vault_unlocking, "the in-flight flag is cleared");
+        assert!(!s.has_locked_connections);
+        assert_eq!(s.connections.len(), 1);
+        assert_eq!(s.connections[0].label, "ssh: bastion");
+        assert_eq!(
+            s.status.as_deref(),
+            Some("Vault unlocked — 1 connection(s) opened")
+        );
+    }
+
+    #[test]
+    fn vault_unlock_double_submit_does_not_spawn_a_second_effect() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
+        type_text(&mut s, "pw");
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert_eq!(fx.len(), 1, "first submit emits the unlock effect");
+        assert!(s.vault_unlocking);
+        // While the unlock is in flight, retyping and submitting again must not spawn a duplicate.
+        type_text(&mut s, "pw");
+        let fx2 = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx2.is_empty(), "a second submit is ignored while unlocking");
+    }
+
+    #[test]
+    fn late_unlock_success_does_not_clobber_a_different_overlay() {
+        let mut s = state();
+        s.connections = vec![crate::ConnectionChoice {
+            conn: cairn_types::ConnectionId(3),
+            label: "local: /".to_owned(),
+        }];
+        let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
+        type_text(&mut s, "pw");
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit)); // unlock task spawned (detached)
+                                                             // User closes the unlock box and opens the connection switcher before the result lands.
+        let _ = update(&mut s, Msg::Text(TextEdit::Cancel));
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        assert!(matches!(s.overlay, Some(Overlay::Connections { .. })));
+        // The late success must update vault state but leave the unrelated overlay untouched.
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::VaultUnlocked {
+                result: Ok(Vec::new()),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(s.vault_unlocked);
+        assert!(!s.vault_unlocking);
+        assert!(
+            matches!(s.overlay, Some(Overlay::Connections { .. })),
+            "the connection switcher must not be closed by a late unlock result"
+        );
+    }
+
+    #[test]
+    fn vault_unlock_blocked_while_a_plan_is_executing() {
+        let mut s = state();
+        s.ai_executing = true;
+        let fx = update(&mut s, Msg::Action(Action::VaultUnlock));
+        assert!(fx.is_empty());
+        assert!(
+            s.overlay.is_none(),
+            "no overlay opens while a plan executes"
+        );
     }
 }

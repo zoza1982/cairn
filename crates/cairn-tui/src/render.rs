@@ -2,7 +2,7 @@
 
 use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
-use cairn_core::{AppState, Listing, Overlay, PaneState, PromptKind, Side};
+use cairn_core::{AppState, Listing, MaskedInput, Overlay, PaneState, PromptKind, Side};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -114,7 +114,44 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
         Overlay::TransferQueue { cursor } => render_transfer_queue(frame, state, *cursor),
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
         Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),
+        Overlay::VaultUnlock { input, error } => {
+            render_vault_unlock(frame, input, error.as_deref(), state.vault_unlocking)
+        }
     }
+}
+
+/// Draw the vault-unlock overlay: a masked passphrase field (one `•` per typed character — the
+/// passphrase itself is never rendered), a status/error line (an in-flight "Unlocking…" note or a
+/// failed-attempt error), and the action hint.
+fn render_vault_unlock(frame: &mut Frame, input: &MaskedInput, error: Option<&str>, busy: bool) {
+    // 7 rows: 2 borders + masked field + blank + error/spacer + hint + breathing room.
+    let area = centered(frame.area(), 50, 7);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Unlock vault ")
+        .border_style(Style::default().fg(Color::Cyan));
+    // One bullet per entered character; a trailing block stands in for the cursor. Never the value.
+    let masked = "\u{2022}".repeat(input.len());
+    let mut lines = vec![Line::from(format!("{masked}\u{258f}")), Line::from("")];
+    // Priority: a live "Unlocking…" note while the async open runs, else a failed-attempt error.
+    if busy {
+        lines.push(Line::styled(
+            "Unlocking…",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if let Some(err) = error {
+        lines.push(Line::styled(
+            err.to_owned(),
+            Style::default().fg(Color::Red),
+        ));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from("[Enter] Unlock    [Esc] Cancel"));
+    let body = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Center);
+    frame.render_widget(body, area);
 }
 
 /// Draw the transfer-queue view: the active transfer(s) plus the pending list, with the selection
@@ -871,6 +908,32 @@ mod tests {
         assert!(text.contains("myfolder"));
         assert!(text.contains("Enter")); // the hint line is not clipped
         assert!(text.contains("Esc"));
+    }
+
+    #[test]
+    fn vault_unlock_overlay_masks_the_passphrase_and_shows_errors() {
+        let mut s = ready_state();
+        let mut input = cairn_core::MaskedInput::new();
+        for c in "topsecret".chars() {
+            input.push(c);
+        }
+        s.overlay = Some(cairn_core::Overlay::VaultUnlock {
+            input,
+            error: Some("decryption failed (wrong passphrase or corrupt vault)".to_owned()),
+        });
+        let text = render_text(&s, 80, 24);
+        assert!(text.contains("Unlock vault"), "dialog title: {text}");
+        // The passphrase characters must never reach the screen — only bullets.
+        assert!(
+            !text.contains("topsecret"),
+            "passphrase leaked to the screen: {text}"
+        );
+        assert!(text.contains('\u{2022}'), "expected masked bullets");
+        assert!(
+            text.contains("wrong passphrase"),
+            "error line shown: {text}"
+        );
+        assert!(text.contains("Enter"), "hint line present: {text}");
     }
 
     #[test]
