@@ -303,7 +303,7 @@ impl ContainerOps for BollardDocker {
 
     /// Stream log output from a container via the Docker `GET /containers/{id}/logs` endpoint.
     ///
-    /// Bollard's [`LogOutput`] decoder already demultiplexes Docker's 8-byte per-frame stream
+    /// Bollard's `LogOutput` decoder already demultiplexes Docker's 8-byte per-frame stream
     /// header (present when no TTY is allocated), so callers receive plain payload [`Bytes`] —
     /// stdout and stderr interleaved in arrival order — without hand-parsing the wire format.
     ///

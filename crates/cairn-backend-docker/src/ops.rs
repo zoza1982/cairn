@@ -64,7 +64,7 @@ pub trait ContainerOps: Send + Sync + 'static {
     /// Stream log output from a container.
     ///
     /// Each item in the returned stream carries one log frame as raw [`Bytes`]. Bollard's
-    /// [`LogOutput`] type already demultiplexes Docker's 8-byte multiplexed stream header (used
+    /// `LogOutput` type already demultiplexes Docker's 8-byte multiplexed stream header (used
     /// when no TTY is allocated), so callers receive plain payload bytes — stdout and stderr
     /// interleaved in arrival order — not raw wire frames.
     ///
