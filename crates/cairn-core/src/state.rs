@@ -1,9 +1,120 @@
 //! The application state model.
 
 use cairn_ai::Plan;
+use cairn_secrets::SecretString;
 use cairn_types::{ConnectionId, Entry, VfsPath};
 use std::collections::{BTreeSet, VecDeque};
+use std::fmt;
 use std::sync::Arc;
+use zeroize::Zeroize;
+
+/// A text field whose contents are a **secret** (the vault passphrase).
+///
+/// It behaves like a tiny line editor (push / backspace), but unlike a plain `String` it never
+/// reveals what was typed:
+/// - its [`Debug`] impl prints a fixed placeholder, so the passphrase can never leak through a
+///   `{:?}` of [`Overlay`]/[`AppState`] (or any `tracing` field that formats them);
+/// - rendering must use [`len`](MaskedInput::len) to draw a mask (e.g. `•`) — the characters are
+///   never exposed;
+/// - the buffer is zeroized when cleared, when the secret is taken, and on drop.
+///
+/// The only way to read the value out is [`take_secret`](MaskedInput::take_secret), which yields a
+/// zeroizing [`SecretString`] and wipes the field.
+///
+/// Defense-in-depth caveat: the backing `String` can, if a long passphrase outgrows the capacity
+/// reserved at construction, reallocate while typing — leaving a freed (un-zeroized) copy of the
+/// partial value in the heap until it is overwritten. We reserve capacity up front so realistic
+/// passphrases never trigger a growth realloc, and [`take_secret`](MaskedInput::take_secret) clones
+/// into an exact-capacity buffer so the `SecretString` conversion never reallocates either. The
+/// remaining (very-long-passphrase) realloc window is a known, accepted gap, not an exposed leak.
+///
+/// [`Clone`] is implemented to return an **empty** field rather than copying the passphrase: `Overlay`
+/// and `AppState` derive `Clone`, and a silent second heap copy of a live secret would defeat the
+/// zeroize-on-drop design. Cloning a field mid-entry is never intended, so dropping its contents is
+/// the safe choice (mirrors why `secrecy`'s `SecretString` does not implement `Clone`).
+pub struct MaskedInput {
+    buf: String,
+}
+
+impl Clone for MaskedInput {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+/// Capacity reserved for the passphrase buffer, chosen so realistic passphrases never trigger a
+/// growth reallocation (which would leave an un-zeroized partial copy in freed heap).
+const MASKED_INPUT_CAPACITY: usize = 128;
+
+impl MaskedInput {
+    /// An empty field.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buf: String::with_capacity(MASKED_INPUT_CAPACITY),
+        }
+    }
+
+    /// Append a typed character.
+    pub fn push(&mut self, c: char) {
+        self.buf.push(c);
+    }
+
+    /// Remove the last typed character, if any.
+    pub fn backspace(&mut self) {
+        self.buf.pop();
+    }
+
+    /// The number of characters entered — for drawing a mask of that width, never the content.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buf.chars().count()
+    }
+
+    /// Whether nothing has been entered yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Take the entered passphrase as a zeroizing [`SecretString`], leaving the field empty and
+    /// wiping the internal buffer.
+    #[must_use]
+    pub fn take_secret(&mut self) -> SecretString {
+        // Clone into an exact-capacity buffer first: `SecretString::from(String)` may `shrink_to_fit`,
+        // which reallocates (freeing an un-zeroized copy) when `capacity > len`. A fresh clone has
+        // `capacity == len`, so the conversion does not reallocate. We then wipe our own buffer.
+        let secret = SecretString::from(self.buf.clone());
+        self.buf.zeroize();
+        secret
+    }
+
+    /// Clear and zeroize the field without producing a secret (e.g. on a failed attempt).
+    pub fn clear(&mut self) {
+        // `zeroize` on a `String` wipes the bytes and sets the length to 0.
+        self.buf.zeroize();
+    }
+}
+
+impl Default for MaskedInput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Never reveal the passphrase — not the characters, and not even the length (which a `{:?}` in a log
+// has no business knowing). The on-screen mask width comes from `len()`, used only by the renderer.
+impl fmt::Debug for MaskedInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MaskedInput(<redacted>)")
+    }
+}
+
+impl Drop for MaskedInput {
+    fn drop(&mut self) {
+        self.buf.zeroize();
+    }
+}
 
 /// A transfer waiting in the queue behind the active one (transfers run one at a time).
 ///
@@ -264,6 +375,16 @@ pub enum Overlay {
         /// How many destinations already exist.
         conflicts: usize,
     },
+    /// Unlock the secrets vault by entering its passphrase (M3-7). The typed passphrase is held in a
+    /// [`MaskedInput`] (no-echo, never logged, wiped on drop); submitting it emits
+    /// [`AppEffect::UnlockVault`](crate::AppEffect::UnlockVault). A failed attempt (wrong passphrase /
+    /// missing vault) keeps the overlay open with [`error`](Overlay::VaultUnlock::error) set.
+    VaultUnlock {
+        /// The passphrase entered so far — masked on screen, redacted in `Debug`, zeroized on drop.
+        input: MaskedInput,
+        /// A retryable error from the last attempt, shown in the overlay; `None` before the first try.
+        error: Option<String>,
+    },
     /// Confirm running a user-defined shell action before it executes (security gate — shell actions
     /// run a local program). Holds what's needed to dispatch on confirm.
     ConfirmShellAction {
@@ -360,6 +481,18 @@ pub struct AppState {
     /// User-defined shell actions, by index (populated from config at startup, like `connections`).
     /// The index aligns with the keymap's `Action::RunShellAction(idx)` and the runtime's action list.
     pub shell_actions: Vec<ShellActionMeta>,
+    /// Whether the secrets vault is currently unlocked. Set by the runtime at startup (always `false`
+    /// — the broker starts locked) and flipped to `true` on a successful unlock. Plain status only;
+    /// no secret material. Used to gate the unlock overlay (no point re-unlocking).
+    pub vault_unlocked: bool,
+    /// Whether an unlock attempt is in flight (the async `Vault::open` is running). Set on submit and
+    /// cleared when the result arrives; it suppresses a duplicate submit and drives the "Unlocking…"
+    /// indicator. No secret material.
+    pub vault_unlocking: bool,
+    /// Whether one or more credential-bearing connections were deferred at startup because the vault
+    /// was locked. Drives the startup status hint that points the user at the unlock flow; cleared
+    /// once the vault is unlocked.
+    pub has_locked_connections: bool,
 }
 
 /// A stable identifier for an in-flight transfer, used to address progress/done events and the
@@ -415,6 +548,9 @@ impl AppState {
             concurrency_limit: 1,
             transfer_queue: VecDeque::new(),
             shell_actions: Vec::new(),
+            vault_unlocked: false,
+            vault_unlocking: false,
+            has_locked_connections: false,
         }
     }
 
@@ -454,9 +590,59 @@ impl AppState {
     #[must_use]
     pub fn capturing_text(&self) -> bool {
         match &self.overlay {
-            Some(Overlay::Prompt { .. }) => true,
+            // Both the text prompt and the vault-unlock field capture keystrokes as `Msg::Text`.
+            Some(Overlay::Prompt { .. } | Overlay::VaultUnlock { .. }) => true,
             Some(_) => false,
             None => self.active().filter_editing,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_secrets::ExposeSecret;
+
+    #[test]
+    fn masked_input_edits_and_reports_length_only() {
+        let mut m = MaskedInput::new();
+        assert!(m.is_empty());
+        for c in "s3cr3t".chars() {
+            m.push(c);
+        }
+        assert_eq!(m.len(), 6);
+        m.backspace();
+        assert_eq!(m.len(), 5);
+        assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn masked_input_debug_never_reveals_the_secret() {
+        let mut m = MaskedInput::new();
+        for c in "hunter2".chars() {
+            m.push(c);
+        }
+        let dbg = format!("{m:?}");
+        assert!(
+            !dbg.contains("hunter2"),
+            "Debug leaked the passphrase: {dbg}"
+        );
+        // Embedding it in an overlay (and thus AppState) must not leak it either.
+        let overlay = Overlay::VaultUnlock {
+            input: m,
+            error: None,
+        };
+        assert!(!format!("{overlay:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn take_secret_yields_the_value_and_empties_the_field() {
+        let mut m = MaskedInput::new();
+        for c in "open-sesame".chars() {
+            m.push(c);
+        }
+        let secret = m.take_secret();
+        assert_eq!(secret.expose_secret(), "open-sesame");
+        assert!(m.is_empty(), "the field is wiped after taking the secret");
     }
 }

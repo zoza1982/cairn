@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cairn_backend_local::LocalVfs;
-use cairn_broker::{Actor, Broker};
-use cairn_config::Config;
+use cairn_broker::{Actor, Broker, BrokerError};
+use cairn_config::{Config, ConnectionProfile};
 use cairn_core::{
     initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, Msg,
     ShellActionMeta, TransferId,
@@ -20,6 +20,7 @@ use cairn_core::{
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
 use cairn_types::{ConnectionId, VfsPath};
+use cairn_vault::Vault;
 use cairn_vfs::{ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -38,6 +39,24 @@ const TRANSFER_PROGRESS_STEP: u64 = 256 * 1024;
 struct Ui {
     keymap: Keymap,
     theme: Theme,
+}
+
+/// A credential-bearing connection profile that could not be opened at startup because the vault was
+/// locked. Its [`ConnectionId`] is reserved up front so the connection keeps a stable slot; the
+/// vault-unlock flow retries exactly these once the broker is unlocked.
+struct DeferredConnection {
+    id: ConnectionId,
+    profile: ConnectionProfile,
+}
+
+/// Runtime-side state for the vault-unlock flow (M3-7): the shared credential [`Broker`] (kept alive
+/// so the unlock overlay can install a decrypted vault into it), the resolved vault file path, and
+/// the connections deferred at startup while the vault was locked. Lives in the effect layer, never
+/// in [`AppState`] — it holds no secret, but it holds the live broker handle.
+struct VaultContext {
+    broker: Arc<Broker>,
+    vault_path: Option<PathBuf>,
+    deferred: Arc<[DeferredConnection]>,
 }
 
 /// Build the runtime and run the application to completion.
@@ -103,19 +122,35 @@ async fn run_async() -> anyhow::Result<()> {
 
     // The capability broker mediates credential resolution for credential-bearing (remote)
     // connections. It starts *locked*, so credential-bearing profiles can't be opened yet — the
-    // opener resolves cleanly to a locked-vault error rather than connecting.
-    //
-    // NOTE (M3-7 handover): this broker is local to `run_async` and drives only the startup pass.
-    // The vault-unlock overlay will need the `Arc<Broker>` stored in shared state (e.g. `AppState`
-    // or a runtime slot) so it can call `.unlock(vault)` and re-open the deferred connections; that
-    // shared wiring does not exist yet.
-    let opener = crate::connect::ConnectionOpener::new(Arc::new(Broker::locked()));
+    // opener resolves cleanly to a locked-vault error rather than connecting. The `Arc<Broker>` is
+    // kept alive in the runtime-side `VaultContext` (below) so the vault-unlock overlay (M3-7) can
+    // `.unlock(vault)` it and re-open the connections deferred here.
+    let broker = Arc::new(Broker::locked());
+    let opener = crate::connect::ConnectionOpener::new(broker.clone());
 
     // Register the switchable connections (Ctrl-O) and record their labels: built-in local roots
     // plus the config profiles. Local profiles mount immediately; credential-bearing profiles (ssh/
-    // s3/gcs/azure) are opened via the broker-backed opener — skipped with a warning when the vault
-    // is locked or their backend feature isn't built into this binary.
-    state.connections = register_connections(&registry, &config, &opener).await;
+    // s3/gcs/azure) are opened via the broker-backed opener. A profile that can't open *because the
+    // vault is locked* is returned as a `deferred` connection (retried after unlock); other failures
+    // (missing field, backend not built) are skipped with a warning.
+    let (choices, deferred) = register_connections(&registry, &config, &opener).await;
+    state.connections = choices;
+    state.vault_unlocked = broker.is_unlocked(); // false at startup; flips on unlock
+    state.has_locked_connections = !deferred.is_empty();
+    if state.has_locked_connections {
+        state.status = Some(format!(
+            "{} connection(s) need the vault — press Ctrl-U to unlock",
+            deferred.len()
+        ));
+    }
+
+    // Runtime-side vault context: the shared broker, the resolved vault file path, and the profiles
+    // deferred above. The unlock effect reads these to open the vault and retry those connections.
+    let vault_ctx = VaultContext {
+        broker,
+        vault_path: config.vault_path(),
+        deferred: deferred.into(),
+    };
 
     // Resolve the color theme from the preset + per-role config overrides.
     let (theme, theme_warnings) = Theme::resolve(&config.ui.theme, &config.ui.colors);
@@ -146,6 +181,7 @@ async fn run_async() -> anyhow::Result<()> {
             &mut startup_controls,
             &mut None,
             &shell_action_defs,
+            &vault_ctx,
         );
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
@@ -159,6 +195,7 @@ async fn run_async() -> anyhow::Result<()> {
         &mut event_rx,
         &mut input_rx,
         &shell_action_defs,
+        &vault_ctx,
     )
     .await;
 
@@ -187,17 +224,21 @@ fn load_config() -> Config {
     cfg
 }
 
-/// Register the connections offered by the switcher and return their UI choices. Built-in local
-/// roots (`/` and `$HOME` when set) and each `scheme = "local"` config profile mount immediately;
-/// each credential-bearing profile (`ssh`/`s3`/`gcs`/`azure`) is opened through the broker-backed
-/// [`ConnectionOpener`](crate::connect::ConnectionOpener) and registered on success. A profile that
-/// can't be opened (locked vault, missing field, or a backend not compiled into this binary) is
-/// skipped with a warning so a single bad profile never blocks startup.
+/// Register the connections offered by the switcher and return their UI choices plus the connections
+/// deferred while the vault is locked. Built-in local roots (`/` and `$HOME` when set) and each
+/// `scheme = "local"` config profile mount immediately; each credential-bearing profile
+/// (`ssh`/`s3`/`gcs`/`azure`) is opened through the broker-backed
+/// [`ConnectionOpener`](crate::connect::ConnectionOpener) and registered on success.
+///
+/// A credential-bearing profile that fails **specifically because the vault is locked** is returned
+/// in the second vec (a [`DeferredConnection`]) so the vault-unlock flow can retry it once unlocked;
+/// any other failure (missing field, or a backend not compiled into this binary) is skipped with a
+/// warning so a single bad profile never blocks startup.
 async fn register_connections(
     registry: &VfsRegistry,
     config: &Config,
     opener: &crate::connect::ConnectionOpener,
-) -> Vec<ConnectionChoice> {
+) -> (Vec<ConnectionChoice>, Vec<DeferredConnection>) {
     // Build the (path, label) local targets: built-in roots first, then `scheme = "local"` profiles.
     let mut targets: Vec<(PathBuf, String)> = vec![(PathBuf::from("/"), "local: /".to_owned())];
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
@@ -233,6 +274,7 @@ async fn register_connections(
 
     // Credential-bearing (remote) profiles, continuing the id sequence. These are user-initiated, so
     // the broker resolution is journaled as `Actor::User`.
+    let mut deferred = Vec::new();
     let mut next_id = base + choices.len() as u64;
     for prof in &config.connections {
         if prof.scheme == "local" {
@@ -252,16 +294,27 @@ async fn register_connections(
                 });
             }
             Err(e) => {
+                // A locked vault is recoverable: keep the (id, profile) so the unlock flow can retry
+                // it. Any other error won't change on unlock, so it's just logged and dropped.
+                let deferrable =
+                    matches!(e, crate::connect::OpenError::Broker(BrokerError::Locked));
                 tracing::warn!(
                     scheme = %prof.scheme,
                     name = %prof.display_name,
                     error = %e,
-                    "skipping connection profile"
+                    deferred = deferrable,
+                    "connection profile not opened at startup"
                 );
+                if deferrable {
+                    deferred.push(DeferredConnection {
+                        id,
+                        profile: prof.clone(),
+                    });
+                }
             }
         }
     }
-    choices
+    (choices, deferred)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,6 +327,7 @@ async fn event_loop(
     event_rx: &mut mpsc::Receiver<AppEvent>,
     input_rx: &mut mpsc::Receiver<Event>,
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
+    vault_ctx: &VaultContext,
 ) -> anyhow::Result<()> {
     // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
     // matching effect can signal them. Each is cleared when its Done event arrives.
@@ -315,6 +369,7 @@ async fn event_loop(
                 &mut transfer_controls,
                 &mut ai_cancel,
                 shell_action_defs,
+                vault_ctx,
             );
         }
     }
@@ -381,6 +436,7 @@ fn dispatch(
     transfer_controls: &mut HashMap<TransferId, TransferControls>,
     ai_cancel: &mut Option<CancellationToken>,
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
+    vault_ctx: &VaultContext,
 ) {
     match effect {
         AppEffect::List {
@@ -576,6 +632,19 @@ fn dispatch(
                 token.cancel();
             }
         }
+        AppEffect::UnlockVault { passphrase } => {
+            let broker = vault_ctx.broker.clone();
+            let vault_path = vault_ctx.vault_path.clone();
+            let deferred = vault_ctx.deferred.clone();
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let result =
+                    run_vault_unlock_effect(&broker, vault_path, &deferred, &registry, passphrase)
+                        .await;
+                let _ = event_tx.send(AppEvent::VaultUnlocked { result }).await;
+            });
+        }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
         other => tracing::warn!(effect = ?other, "unhandled effect"),
     }
@@ -609,6 +678,72 @@ async fn propose_plan(prompt: &str) -> Result<cairn_ai::Plan, String> {
     request_plan(&provider, req)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Unlock the secrets vault with `passphrase`, install it into the shared broker, and retry the
+/// connections deferred at startup while the vault was locked (M3-7).
+///
+/// Returns `Ok(opened)` with the now-reachable connections (possibly empty) to add to the switcher,
+/// or `Err(message)` with a secret-free, retryable reason (missing vault / wrong passphrase). The
+/// passphrase is consumed here and zeroized on drop; it is never logged.
+///
+/// `Vault::open` runs Argon2id key derivation (CPU-bound) plus a file read, so it is offloaded to a
+/// blocking thread to keep the async runtime — and the render path — responsive.
+async fn run_vault_unlock_effect(
+    broker: &Arc<Broker>,
+    vault_path: Option<PathBuf>,
+    deferred: &[DeferredConnection],
+    registry: &VfsRegistry,
+    passphrase: cairn_secrets::SecretString,
+) -> Result<Vec<ConnectionChoice>, String> {
+    let Some(path) = vault_path else {
+        return Err("no vault path configured".to_owned());
+    };
+    // Open + decrypt off the async runtime: `Vault::open` runs Argon2id (CPU-bound) plus a file read,
+    // and the existence check is itself a blocking `stat`, so *all* filesystem I/O is isolated here.
+    // The owned `SecretString` lives in the closure and is zeroized when it returns. Vault CREATION
+    // from the TUI is a follow-up — for now an absent file is a clear message, not a prompt.
+    let vault = match tokio::task::spawn_blocking(move || {
+        if !path.exists() {
+            return Err(
+                "no vault found (creating a vault from the UI is not yet available)".to_owned(),
+            );
+        }
+        // `VaultError`'s Display is secret-free by construction (see its docs), so it is safe to show.
+        Vault::open(&path, &passphrase).map_err(|e| e.to_string())
+    })
+    .await
+    {
+        Ok(Ok(vault)) => vault,
+        Ok(Err(msg)) => return Err(msg),
+        Err(_) => return Err("unlock task failed".to_owned()),
+    };
+    broker.unlock(vault);
+
+    // Retry the deferred profiles now that the broker is unlocked; the opener shares this broker.
+    let opener = crate::connect::ConnectionOpener::new(broker.clone());
+    let mut opened = Vec::new();
+    for d in deferred {
+        match opener.open(Actor::User, d.id, &d.profile).await {
+            Ok(vfs) => {
+                registry.insert(d.id, vfs).await;
+                opened.push(ConnectionChoice {
+                    conn: d.id,
+                    label: format!("{}: {}", d.profile.scheme, d.profile.display_name),
+                });
+            }
+            Err(e) => {
+                // The vault is unlocked but this one still won't open (e.g. bad field); log and skip.
+                tracing::warn!(
+                    scheme = %d.profile.scheme,
+                    name = %d.profile.display_name,
+                    error = %e,
+                    "deferred connection still failed after unlock"
+                );
+            }
+        }
+    }
+    Ok(opened)
 }
 
 /// A compact "N file(s), M dir(s)" summary shared by the success and cancelled status messages.
@@ -1691,6 +1826,164 @@ mod tests {
             }
             _ => panic!("expected ShellActionDone"),
         }
+    }
+
+    // ---- M3-7: vault-unlock effect ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn vault_unlock_effect_opens_a_vault_and_unlocks_the_broker() {
+        use cairn_secrets::SecretString;
+        use cairn_vault::{KdfParams, Vault};
+        let dir = tempfile_dir();
+        let path = dir.path().join("vault.cvlt");
+        Vault::create_with_params(
+            &path,
+            &SecretString::from("open-sesame".to_owned()),
+            KdfParams::fast_for_tests(),
+        )
+        .unwrap();
+        let broker = Arc::new(Broker::locked());
+        let registry = VfsRegistry::new();
+        let res = run_vault_unlock_effect(
+            &broker,
+            Some(path),
+            &[],
+            &registry,
+            SecretString::from("open-sesame".to_owned()),
+        )
+        .await;
+        assert!(res.is_ok(), "unlock should succeed");
+        assert_eq!(res.unwrap().len(), 0, "no deferred connections to open");
+        assert!(broker.is_unlocked(), "the broker must now be unlocked");
+    }
+
+    #[tokio::test]
+    async fn vault_unlock_effect_wrong_passphrase_keeps_the_broker_locked() {
+        use cairn_secrets::SecretString;
+        use cairn_vault::{KdfParams, Vault};
+        let dir = tempfile_dir();
+        let path = dir.path().join("vault.cvlt");
+        Vault::create_with_params(
+            &path,
+            &SecretString::from("right".to_owned()),
+            KdfParams::fast_for_tests(),
+        )
+        .unwrap();
+        let broker = Arc::new(Broker::locked());
+        let registry = VfsRegistry::new();
+        let err = run_vault_unlock_effect(
+            &broker,
+            Some(path),
+            &[],
+            &registry,
+            SecretString::from("wrong".to_owned()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("passphrase") || err.to_lowercase().contains("decryption"),
+            "expected a wrong-passphrase message, got: {err}"
+        );
+        assert!(
+            !broker.is_unlocked(),
+            "a failed unlock must leave the broker locked"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_unlock_effect_no_path_configured_returns_a_clear_error() {
+        use cairn_secrets::SecretString;
+        let broker = Arc::new(Broker::locked());
+        let registry = VfsRegistry::new();
+        let err = run_vault_unlock_effect(
+            &broker,
+            None,
+            &[],
+            &registry,
+            SecretString::from("x".to_owned()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("no vault path"), "got: {err}");
+        assert!(!broker.is_unlocked());
+    }
+
+    #[tokio::test]
+    async fn vault_unlock_effect_missing_file_is_a_clear_message() {
+        use cairn_secrets::SecretString;
+        let broker = Arc::new(Broker::locked());
+        let registry = VfsRegistry::new();
+        let err = run_vault_unlock_effect(
+            &broker,
+            Some(PathBuf::from("/no/such/dir/vault.cvlt")),
+            &[],
+            &registry,
+            SecretString::from("x".to_owned()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("no vault"),
+            "expected a friendly message, got: {err}"
+        );
+        assert!(!broker.is_unlocked());
+    }
+
+    // A locked vault defers a credential-bearing profile; unlocking retries it. Hermetic: the S3
+    // profile references a wrong-family (SSH) credential, which every connector rejects with `Auth`
+    // *before any network*, so the retry exercises the full path without a live server.
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn locked_vault_defers_credentialed_profiles_then_unlock_retries_them() {
+        use cairn_secrets::SecretString;
+        use cairn_vault::{CredentialSecret, KdfParams, SshCredential, Vault};
+        let dir = tempfile_dir();
+        let path = dir.path().join("vault.cvlt");
+        let mut vault = Vault::create_with_params(
+            &path,
+            &SecretString::from("pw".to_owned()),
+            KdfParams::fast_for_tests(),
+        )
+        .unwrap();
+        let cred_id = vault.add(
+            "c",
+            CredentialSecret::Ssh(SshCredential::Password(SecretString::from("k".to_owned()))),
+        );
+        vault.save().unwrap();
+
+        let mut cfg = Config::default();
+        let mut prof = ConnectionProfile::new("s3", "prod");
+        prof.endpoint.insert("bucket".to_owned(), "b".to_owned());
+        prof.secret_ref = Some(cred_id);
+        cfg.connections.push(prof);
+
+        let broker = Arc::new(Broker::locked());
+        let opener = crate::connect::ConnectionOpener::new(broker.clone());
+        let registry = VfsRegistry::new();
+        let (_choices, deferred) = register_connections(&registry, &cfg, &opener).await;
+        assert_eq!(
+            deferred.len(),
+            1,
+            "a locked credentialed profile must be deferred"
+        );
+
+        let opened = run_vault_unlock_effect(
+            &broker,
+            Some(path),
+            &deferred,
+            &registry,
+            SecretString::from("pw".to_owned()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            broker.is_unlocked(),
+            "the broker is unlocked even if a retry fails"
+        );
+        assert!(
+            opened.is_empty(),
+            "the wrong-family credential is rejected pre-network, so nothing connects"
+        );
     }
 
     #[cfg(unix)]

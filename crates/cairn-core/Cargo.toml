@@ -15,6 +15,10 @@ workspace = true
 [dependencies]
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
+# Zeroizing secret types: the vault-unlock overlay holds the typed passphrase in a `SecretString`
+# (masked, never logged, wiped on drop) carried by `AppEffect::UnlockVault` to the effect runner.
+cairn-secrets = { workspace = true }
+zeroize = "1"
 # FIXME(arch): the reducer holds an AI `Plan` in `Overlay::AiPlan`, so it depends on cairn-ai.
 # Consider promoting the pure plan data types to cairn-types so the core stays dependency-light.
 cairn-ai = { workspace = true }

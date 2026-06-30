@@ -43,6 +43,9 @@ pub struct Config {
     /// Transfer-engine preferences.
     #[serde(default)]
     pub transfers: TransfersConfig,
+    /// Secrets-vault preferences.
+    #[serde(default)]
+    pub vault: VaultConfig,
 }
 
 impl Default for Config {
@@ -53,7 +56,30 @@ impl Default for Config {
             connections: Vec::new(),
             shell_actions: Vec::new(),
             transfers: TransfersConfig::default(),
+            vault: VaultConfig::default(),
         }
+    }
+}
+
+/// Secrets-vault preferences (`[vault]`).
+///
+/// Holds only the (non-secret) location of the encrypted vault file. The vault's contents — the
+/// credentials — live exclusively inside that encrypted file, never in this config.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VaultConfig {
+    /// Path to the encrypted vault file. When unset, [`Config::vault_path`] falls back to the
+    /// platform default (`…/cairn/vault.cvlt`, see [`default_vault_path`]).
+    pub path: Option<PathBuf>,
+}
+
+impl Config {
+    /// The resolved vault file path: the configured [`VaultConfig::path`] if set, otherwise the
+    /// platform default (`…/cairn/vault.cvlt`). Returns `None` only when neither is available (no
+    /// configured path *and* no determinable platform config directory).
+    #[must_use]
+    pub fn vault_path(&self) -> Option<PathBuf> {
+        self.vault.path.clone().or_else(default_vault_path)
     }
 }
 
@@ -347,6 +373,16 @@ pub fn default_config_path() -> Option<PathBuf> {
         .map(|d| d.config_dir().join("config.toml"))
 }
 
+/// The default vault file path for this platform (`…/cairn/vault.cvlt`), if it can be determined.
+///
+/// Lives alongside the config file in the platform config directory; the file itself is encrypted,
+/// so storing it there is safe.
+#[must_use]
+pub fn default_vault_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "Cairn", "cairn")
+        .map(|d| d.config_dir().join("vault.cvlt"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +629,42 @@ mod tests {
                 .effective_concurrency(),
             3
         );
+    }
+
+    #[test]
+    fn vault_path_defaults_when_unset_and_uses_config_when_set() {
+        // Unset → falls back to the platform default (which may be None in a sandbox with no config
+        // dir, but must equal `default_vault_path()` either way).
+        let cfg = Config::default();
+        assert_eq!(cfg.vault_path(), default_vault_path());
+        // An explicit path wins and is returned verbatim.
+        let mut cfg = Config::default();
+        cfg.vault.path = Some(PathBuf::from("/custom/vault.cvlt"));
+        assert_eq!(cfg.vault_path(), Some(PathBuf::from("/custom/vault.cvlt")));
+    }
+
+    #[test]
+    fn vault_path_roundtrips_through_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.vault.path = Some(PathBuf::from("/srv/secrets/cairn.cvlt"));
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.vault.path.as_deref(),
+            Some(Path::new("/srv/secrets/cairn.cvlt"))
+        );
+    }
+
+    #[test]
+    fn config_without_vault_section_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\n[ui]\nkeymap = \"mc\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        // A config predating the [vault] section loads with the field absent.
+        assert!(cfg.vault.path.is_none());
     }
 
     #[test]

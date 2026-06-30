@@ -44,6 +44,13 @@ cairn-backend-local = { workspace = true }
 # opener. Always on: it is pure-Rust and pulls no backend SDK (it is the binary's execution-layer
 # secret boundary; the AI/plugin isolation is enforced via the secret-free `cairn-broker-api`).
 cairn-broker = { workspace = true }
+# The secrets vault: opened (decrypted) by the M3-7 vault-unlock flow and installed into the broker.
+# Pure-Rust crypto (Argon2id + XChaCha20-Poly1305); the OS-keychain stack stays behind its own
+# `keychain` feature, so this does not pull a platform secret-store into the default build.
+cairn-vault = { workspace = true }
+# The zeroizing `SecretString` carried by `AppEffect::UnlockVault` (the unlock-effect signature names
+# it directly; same type cairn-core/cairn-vault re-export).
+cairn-secrets = { workspace = true }
 # Credential-bearing backends, behind the features above (off by default so the lean build is SDK-free).
 cairn-backend-ssh = { workspace = true, optional = true }
 cairn-backend-object = { workspace = true, optional = true }
@@ -77,7 +84,6 @@ rustix = { version = "1", features = ["process"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# The connection-opener tests build an unlocked in-memory vault + typed credentials to exercise the
-# resolve → dispatch path hermetically (no live servers). Test-only — not in the shipped binary.
-cairn-vault = { workspace = true }
-cairn-secrets = { workspace = true }
+# The connection-opener / vault-unlock tests build a vault + typed credentials to exercise the
+# resolve → dispatch path hermetically (no live servers). Both `cairn-vault` and `cairn-secrets` are
+# normal dependencies now (the unlock flow opens the vault and names `SecretString`).

@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Vault-unlock TUI flow** (M3-7): the runnable `cairn` binary can now unlock the encrypted secrets
+  vault and bring credential-bearing connections online. A new `Overlay::VaultUnlock` (open with
+  **Ctrl-U**, or the `vault_unlock` keybinding) presents a **no-echo** passphrase field backed by a
+  new `MaskedInput` type — it renders as bullets (`•`), its `Debug` is redacted, and its buffer is
+  zeroized when cleared, when the secret is taken, and on drop, so the typed passphrase never reaches
+  `AppState`'s `Debug` or any log. Submitting emits `AppEffect::UnlockVault { passphrase }` (the
+  passphrase rides in a zeroizing `SecretString`); the effect runner opens the vault off the render
+  path (`Vault::open` via `spawn_blocking` — Argon2id is CPU-bound), installs it into the shared
+  `Broker` (`broker.unlock(vault)`), then retries the credential-bearing connections that were
+  **deferred at startup** because the vault was locked, registering the successes in the switcher and
+  reporting how many connected. A wrong passphrase or a missing vault file keeps the overlay open with
+  a clear, secret-free, retryable message. The `Arc<Broker>` and the deferred profiles now live in a
+  runtime-side `VaultContext` (the secret-free `AppState` gains only two plain flags:
+  `vault_unlocked` and `has_locked_connections`). A new `[vault] path` config setting selects the
+  vault file (default `…/cairn/vault.cvlt`, via `cairn_config::default_vault_path`). Hermetic tests
+  cover the reducer transitions (open/cancel, the no-echo/`Debug` invariant, empty- and
+  wrong-passphrase keeping the overlay, and a successful unlock adding connections), the masked render
+  (passphrase never drawn), and the effect against a temp `fast_for_tests` vault (unlock succeeds and
+  unlocks the broker; wrong passphrase leaves it locked; deferral→unlock→retry under `all-backends`).
+  **Deferred follow-ups:** the vault **creation** UI (an absent vault file currently surfaces a clear
+  non-blocking message) and add/list-credential management UI, plus **auto-lock-on-idle** (zeroizing
+  the broker after inactivity).
 - **Broker-backed connection opener** (M4-5, first integration slice): the runnable `cairn` binary
   can now turn a saved `ConnectionProfile` into a live `Vfs` backend. A new `ConnectionOpener`
   (`crates/cairn/src/connect.rs`) resolves the profile's vault credential reference through the
