@@ -3,8 +3,8 @@
 //! This crate provides the **provider-agnostic core**: the [`ObjectStore`] trait, the listing
 //! synthesis that turns prefix+delimiter results into directory entries (the genuinely tricky,
 //! SDK-independent part — object-vs-prefix semantics, common-prefix→directory, zero-byte markers),
-//! and [`ObjectStoreVfs`] mapping it onto the [`Vfs`](cairn_vfs::Vfs) trait. A [`MockObjectStore`]
-//! exercises it hermetically.
+//! and [`ObjectStoreVfs`] mapping it onto the [`Vfs`](cairn_vfs::Vfs) trait. A `MockObjectStore`
+//! (behind the `test-utils` feature) exercises it hermetically.
 //!
 //! The concrete cloud providers live behind the `s3` / `gcs` / `azure` features and require the
 //! official SDKs plus live or emulated services; they are not part of the default build. See

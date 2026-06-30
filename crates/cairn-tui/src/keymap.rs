@@ -157,6 +157,9 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "ai_propose" => Action::AiPropose,
         "approve_all" => Action::ApproveAll,
         "reject" => Action::Reject,
+        "open_log_viewer" => Action::OpenLogViewer,
+        "page_up" => Action::PageUp,
+        "page_down" => Action::PageDown,
         "quit" => Action::Quit,
         _ => return None,
     })
@@ -281,6 +284,11 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         // resolving actions, so 'a'/'x' type into the field rather than firing here.
         KeyCode::Char('a') => Some(Action::ApproveAll),
         KeyCode::Char('x') => Some(Action::Reject),
+        // 'L' opens the log viewer for the entry under the cursor.
+        KeyCode::Char('L') => Some(Action::OpenLogViewer),
+        // PgUp/PgDn scroll the active overlay.
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
         _ => None,
     }
 }
@@ -546,6 +554,9 @@ mod tests {
             "ai_propose",
             "approve_all",
             "reject",
+            "open_log_viewer",
+            "page_up",
+            "page_down",
             "quit",
         ];
         for name in names {
@@ -554,7 +565,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 29);
+        assert_eq!(names.len(), 32);
     }
 
     #[test]

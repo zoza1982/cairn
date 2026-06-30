@@ -12,7 +12,8 @@ mod update;
 
 pub use msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 pub use state::{
-    ActiveTransfer, AppState, ConnectionChoice, Listing, MaskedInput, Overlay, PaneState,
-    PromptKind, QueuedTransfer, ShellActionMeta, Side, SortMode, TransferId,
+    ActiveTransfer, AppState, ConnectionChoice, Listing, LogViewerId, LogViewerStatus, MaskedInput,
+    Overlay, PaneState, PromptKind, QueuedTransfer, ShellActionMeta, Side, SortMode, TransferId,
+    LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES,
 };
 pub use update::{initial_effects, update};

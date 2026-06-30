@@ -1,6 +1,6 @@
 //! Messages, events, and effects — the three families of the TEA loop.
 
-use crate::state::{ConnectionChoice, Side, TransferId};
+use crate::state::{ConnectionChoice, LogViewerId, Side, TransferId};
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
 use cairn_types::{ConnectionId, VfsPath};
@@ -72,6 +72,12 @@ pub enum Action {
     ApproveAll,
     /// In the plan overlay: reject the step under the review cursor.
     Reject,
+    /// Open the log viewer for the entry under the cursor.
+    OpenLogViewer,
+    /// Scroll the active overlay up one page (log viewer, future overlays).
+    PageUp,
+    /// Scroll the active overlay down one page.
+    PageDown,
     /// Quit the application.
     Quit,
 }
@@ -189,6 +195,20 @@ pub enum AppEvent {
         /// `Ok(opened)` with the newly opened connections, or `Err(message)` to keep the overlay open.
         result: Result<Vec<ConnectionChoice>, String>,
     },
+    /// A decoded chunk of log text from a streaming log-viewer session.
+    LogChunk {
+        /// Which session this belongs to.
+        id: LogViewerId,
+        /// The UTF-8 lossy-decoded text (may span multiple lines).
+        text: String,
+    },
+    /// The log stream ended (cleanly or with an error).
+    LogStreamEnded {
+        /// Which session ended.
+        id: LogViewerId,
+        /// `None` on clean EOF; `Some(redacted_message)` on error.
+        error: Option<String>,
+    },
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -293,5 +313,23 @@ pub enum AppEffect {
     UnlockVault {
         /// The passphrase to try (zeroized on drop).
         passphrase: SecretString,
+    },
+    /// Start streaming logs from a container/pod node. The runtime calls
+    /// `Vfs::invoke(path, "logs", ActionCtx::Logs{follow:true,…})`, reads the
+    /// `ActionOutcome::Stream`, and feeds each chunk back as `AppEvent::LogChunk`.
+    OpenLogViewer {
+        /// Session id minted by the reducer.
+        id: LogViewerId,
+        /// Connection.
+        conn: ConnectionId,
+        /// Path of the container/pod to stream.
+        path: VfsPath,
+        /// Title shown in the overlay border.
+        title: String,
+    },
+    /// Cancel the log-viewer stream with this session id. Fired when Esc closes the overlay.
+    CloseLogViewer {
+        /// Session id to cancel.
+        id: LogViewerId,
     },
 }

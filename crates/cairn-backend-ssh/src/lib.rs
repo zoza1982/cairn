@@ -3,7 +3,7 @@
 //! The product logic — mapping SFTP operations onto the [`Vfs`] trait — lives in [`SftpVfs`], which
 //! is generic over an [`SftpOps`] transport so it is fully unit-testable against an in-memory mock.
 //! The real transport (`russh` + `russh-sftp`) is the thin [`RealSftp`] adapter; establishing the
-//! SSH connection ([`ssh_connect`]) lives in `connect.rs` behind the `ssh` feature (it pulls `russh`),
+//! SSH connection (`ssh_connect`) lives in `connect.rs` behind the `ssh` feature (it pulls `russh`),
 //! while `RealSftp` (over `russh-sftp`, TLS-free) stays unconditional. See `docs/LLD.md` §3.6,
 //! RFC-0003, ADR-0006.
 

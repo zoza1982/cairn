@@ -2,10 +2,11 @@
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 use crate::state::{
-    ActiveTransfer, AppState, Listing, MaskedInput, Overlay, PromptKind, QueuedTransfer, Side,
-    SortMode, TransferId,
+    ActiveTransfer, AppState, Listing, LogViewerStatus, MaskedInput, Overlay, PromptKind,
+    QueuedTransfer, Side, SortMode, TransferId,
 };
 use cairn_types::{Entry, VfsPath};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Apply a message to the state, returning any effects to run. Deterministic and side-effect-free.
@@ -242,12 +243,16 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         Action::RunShellAction(index) => run_shell_action(state, index),
         // No overlay open: confirm/cancel and the plan-only actions are otherwise no-ops.
         // Queue reorder only acts inside the queue overlay; a no-op with no overlay open.
+        // PageUp/PageDown are no-ops when no overlay is open.
         Action::Confirm
         | Action::Cancel
         | Action::ApproveAll
         | Action::Reject
         | Action::QueueMoveUp
-        | Action::QueueMoveDown => Vec::new(),
+        | Action::QueueMoveDown
+        | Action::PageUp
+        | Action::PageDown => Vec::new(),
+        Action::OpenLogViewer => open_log_viewer(state),
         Action::Refresh => reload(state, state.focus),
         Action::CycleSort => {
             let p = state.active_mut();
@@ -553,6 +558,7 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
         Some(Overlay::TransferQueue { .. }) => apply_transfer_queue_action(state, action),
+        Some(Overlay::LogViewer { .. }) => apply_log_viewer_action(state, action),
         // A text prompt / the vault-unlock field capture keystrokes as `Msg::Text`; non-quit actions
         // don't reach them.
         Some(Overlay::Prompt { .. } | Overlay::VaultUnlock { .. }) | None => Vec::new(),
@@ -994,6 +1000,140 @@ fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
     effects
 }
 
+/// Page size for the log viewer scroll actions.
+const LOG_VIEWER_PAGE: usize = 20;
+
+/// Open a log-viewer overlay for the entry under the cursor, minting a fresh session id.
+fn open_log_viewer(state: &mut AppState) -> Vec<AppEffect> {
+    let pane = state.active();
+    let Some(entry) = pane.current() else {
+        state.status = Some("Nothing selected".to_owned());
+        return Vec::new();
+    };
+    let Ok(path) = pane.cwd.join(entry.name.as_ref()) else {
+        state.status = Some("Cannot open log viewer for this entry".to_owned());
+        return Vec::new();
+    };
+    let conn = pane.conn;
+    let title = format!("{} — logs", entry.name);
+    let id = state.next_log_viewer_id;
+    state.next_log_viewer_id += 1;
+
+    state.overlay = Some(Overlay::LogViewer {
+        id,
+        title: title.clone(),
+        lines: VecDeque::new(),
+        partial: String::new(),
+        byte_size: 0,
+        follow: true,
+        scroll: 0,
+        status: crate::state::LogViewerStatus::Streaming,
+    });
+
+    vec![AppEffect::OpenLogViewer {
+        id,
+        conn,
+        path,
+        title,
+    }]
+}
+
+/// Handle actions while the log-viewer overlay is open.
+fn apply_log_viewer_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    let Some(Overlay::LogViewer {
+        id,
+        lines,
+        partial,
+        follow,
+        scroll,
+        ..
+    }) = &mut state.overlay
+    else {
+        return Vec::new();
+    };
+    let total_lines = lines.len() + if partial.is_empty() { 0 } else { 1 };
+    match action {
+        Action::CursorUp => {
+            *scroll = scroll.saturating_sub(1);
+            *follow = false;
+            Vec::new()
+        }
+        Action::PageUp => {
+            *scroll = scroll.saturating_sub(LOG_VIEWER_PAGE);
+            *follow = false;
+            Vec::new()
+        }
+        Action::CursorDown => {
+            if *scroll + 1 < total_lines {
+                *scroll += 1;
+            }
+            Vec::new()
+        }
+        Action::PageDown => {
+            let new_scroll = (*scroll + LOG_VIEWER_PAGE).min(total_lines.saturating_sub(1));
+            *scroll = new_scroll;
+            if new_scroll + 1 >= total_lines {
+                *follow = true;
+            }
+            Vec::new()
+        }
+        Action::CursorTop => {
+            *scroll = 0;
+            *follow = false;
+            Vec::new()
+        }
+        Action::CursorBottom => {
+            *follow = true;
+            Vec::new()
+        }
+        Action::Cancel => {
+            let viewer_id = *id;
+            state.overlay = None;
+            vec![AppEffect::CloseLogViewer { id: viewer_id }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Append a chunk of text into the log buffer (lines + partial), enforcing the byte and line caps.
+///
+/// The chunk may contain zero, one, or many newlines. Lines are accumulated in `lines` (oldest first);
+/// the final unterminated fragment lives in `partial`. `byte_size` tracks the total retained bytes so
+/// the cap check is O(1) rather than summing `lines` every call.
+fn append_log_chunk(
+    lines: &mut VecDeque<String>,
+    partial: &mut String,
+    byte_size: &mut usize,
+    text: &str,
+) {
+    use crate::state::{LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES};
+
+    // Split on newlines. For each full line, append partial+line as one complete line. The last
+    // segment (possibly empty) becomes the new partial.
+    let mut segments = text.split('\n');
+    // The first segment continues the current partial line.
+    if let Some(first) = segments.next() {
+        *byte_size += first.len();
+        partial.push_str(first);
+    }
+    for seg in segments {
+        // We have a newline: flush partial into lines.
+        let complete = std::mem::take(partial);
+        *byte_size += 1; // the '\n' itself (we track it symbolically; line lengths sum to byte_size)
+        lines.push_back(complete);
+        *byte_size += seg.len();
+        partial.push_str(seg);
+        // Enforce caps: evict oldest lines until within limits.
+        while (lines.len() > LOG_VIEWER_MAX_LINES || *byte_size > LOG_VIEWER_MAX_BYTES)
+            && !lines.is_empty()
+        {
+            if let Some(evicted) = lines.pop_front() {
+                *byte_size = byte_size.saturating_sub(evicted.len() + 1); // +1 for '\n'
+            }
+        }
+    }
+}
+
 /// Mint a transfer id, push a fresh [`ActiveTransfer`] tracking it, set the status line, and return
 /// the id. Shared by the initial attempt, the queue drain, and the post-confirm re-issue so they
 /// can't drift. The id is monotonic (no clock/RNG — keeps the reducer pure and tests deterministic).
@@ -1198,6 +1338,46 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // A shell action may have changed the filesystem (created/removed files), so refresh both
             // panes via the normal op-completion path.
             finish_op(state, &status, error)
+        }
+        AppEvent::LogChunk { id, text } => {
+            if let Some(Overlay::LogViewer {
+                id: ov_id,
+                lines,
+                partial,
+                byte_size,
+                follow,
+                scroll,
+                ..
+            }) = &mut state.overlay
+            {
+                if *ov_id == id {
+                    let old_total = lines.len() + if partial.is_empty() { 0 } else { 1 };
+                    append_log_chunk(lines, partial, byte_size, &text);
+                    let new_total = lines.len() + if partial.is_empty() { 0 } else { 1 };
+                    let _ = old_total; // suppress unused warning
+                    if *scroll >= new_total && new_total > 0 {
+                        *scroll = new_total - 1;
+                    }
+                    if *follow {
+                        *scroll = new_total.saturating_sub(1);
+                    }
+                }
+            }
+            Vec::new()
+        }
+        AppEvent::LogStreamEnded { id, error } => {
+            if let Some(Overlay::LogViewer {
+                id: ov_id, status, ..
+            }) = &mut state.overlay
+            {
+                if *ov_id == id {
+                    *status = match error {
+                        Some(msg) => LogViewerStatus::Error(msg),
+                        None => LogViewerStatus::Done,
+                    };
+                }
+            }
+            Vec::new()
         }
         AppEvent::VaultUnlocked { result } => {
             // The attempt is no longer in flight, whatever the outcome.
@@ -3337,5 +3517,175 @@ mod tests {
             s.overlay.is_none(),
             "no overlay opens while a plan executes"
         );
+    }
+
+    // ── Log viewer tests ──────────────────────────────────────────────────────────────
+
+    /// Helper: create state with a LogViewer overlay already open.
+    fn state_with_log_viewer(id: crate::state::LogViewerId) -> AppState {
+        use crate::state::{LogViewerStatus, Overlay};
+        let mut s = state();
+        s.overlay = Some(Overlay::LogViewer {
+            id,
+            title: "test — logs".to_owned(),
+            lines: std::collections::VecDeque::new(),
+            partial: String::new(),
+            byte_size: 0,
+            follow: true,
+            scroll: 0,
+            status: LogViewerStatus::Streaming,
+        });
+        s
+    }
+
+    #[test]
+    fn log_chunk_appends_lines_and_clips_partial() {
+        let mut s = state_with_log_viewer(1);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::LogChunk {
+                id: 1,
+                text: "line1\nline2\npar".to_owned(),
+            }),
+        );
+        {
+            let Some(crate::state::Overlay::LogViewer {
+                ref lines,
+                ref partial,
+                ..
+            }) = s.overlay
+            else {
+                panic!("overlay gone");
+            };
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0], "line1");
+            assert_eq!(lines[1], "line2");
+            assert_eq!(partial, "par");
+        }
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::LogChunk {
+                id: 1,
+                text: "tial\nline4\n".to_owned(),
+            }),
+        );
+        {
+            let Some(crate::state::Overlay::LogViewer {
+                ref lines,
+                ref partial,
+                ..
+            }) = s.overlay
+            else {
+                panic!("overlay gone");
+            };
+            assert_eq!(lines.len(), 4);
+            assert_eq!(lines[2], "partial");
+            assert_eq!(lines[3], "line4");
+            assert_eq!(partial, "");
+        }
+    }
+
+    #[test]
+    fn log_buffer_cap_drops_oldest_lines() {
+        use crate::state::LOG_VIEWER_MAX_LINES;
+        let mut s = state_with_log_viewer(2);
+        // Push LOG_VIEWER_MAX_LINES + 5 lines.
+        let big_chunk = "x\n".repeat(LOG_VIEWER_MAX_LINES + 5);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::LogChunk {
+                id: 2,
+                text: big_chunk,
+            }),
+        );
+        let Some(crate::state::Overlay::LogViewer { ref lines, .. }) = s.overlay else {
+            panic!("overlay gone");
+        };
+        assert!(
+            lines.len() <= LOG_VIEWER_MAX_LINES,
+            "lines.len() = {} > cap {}",
+            lines.len(),
+            LOG_VIEWER_MAX_LINES
+        );
+    }
+
+    #[test]
+    fn log_scroll_up_disables_follow() {
+        let mut s = state_with_log_viewer(3);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::LogChunk {
+                id: 3,
+                text: "a\nb\nc\n".to_owned(),
+            }),
+        );
+        let _ = update(&mut s, Msg::Action(Action::CursorUp));
+        let Some(crate::state::Overlay::LogViewer { follow, .. }) = &s.overlay else {
+            panic!("overlay gone");
+        };
+        assert!(!follow, "CursorUp must disable follow");
+    }
+
+    #[test]
+    fn log_scroll_to_bottom_re_enables_follow() {
+        let mut s = state_with_log_viewer(4);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::LogChunk {
+                id: 4,
+                text: "a\nb\nc\n".to_owned(),
+            }),
+        );
+        let _ = update(&mut s, Msg::Action(Action::CursorUp));
+        let _ = update(&mut s, Msg::Action(Action::CursorBottom));
+        let Some(crate::state::Overlay::LogViewer { follow, .. }) = &s.overlay else {
+            panic!("overlay gone");
+        };
+        assert!(*follow, "CursorBottom must re-enable follow");
+    }
+
+    #[test]
+    fn log_close_emits_cancel_effect() {
+        let mut s = state_with_log_viewer(5);
+        let effects = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(s.overlay.is_none(), "overlay should be closed");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, AppEffect::CloseLogViewer { id: 5 })),
+            "CloseLogViewer effect must be emitted"
+        );
+    }
+
+    #[test]
+    fn log_stream_error_sets_status() {
+        let mut s = state_with_log_viewer(6);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::LogStreamEnded {
+                id: 6,
+                error: Some("connection lost".to_owned()),
+            }),
+        );
+        let Some(crate::state::Overlay::LogViewer { status, .. }) = &s.overlay else {
+            panic!("overlay gone");
+        };
+        assert_eq!(
+            *status,
+            crate::state::LogViewerStatus::Error("connection lost".to_owned())
+        );
+    }
+
+    #[test]
+    fn log_stream_ended_sets_done_status() {
+        let mut s = state_with_log_viewer(7);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::LogStreamEnded { id: 7, error: None }),
+        );
+        let Some(crate::state::Overlay::LogViewer { status, .. }) = &s.overlay else {
+            panic!("overlay gone");
+        };
+        assert_eq!(*status, crate::state::LogViewerStatus::Done);
     }
 }
