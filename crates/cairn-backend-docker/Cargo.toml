@@ -17,10 +17,16 @@ default = []
 # The live Docker engine adapter (bollard). Off by default so the lean, cross-platform build never
 # pulls bollard's hyper stack; the full build (Linux-only in CI) and the dind integration job enable
 # it. See ADR-0006.
-# The live Docker engine adapter. Pulls bollard's hyper stack (off by default), plus tokio `rt` and
-# `sync` features needed to spawn the log-forwarding task and use the mpsc channel.
-# tokio/macros is required for `tokio::select!` in the exec relay task.
-docker = ["dep:bollard", "dep:tar", "tokio/rt", "tokio/sync", "tokio/macros"]
+# tokio features: rt = spawn, sync = mpsc/oneshot, macros = select!, time = sleep (inspect_exec
+# backoff polling after stream close — the daemon races on exit_code for short-lived execs).
+docker = [
+    "dep:bollard",
+    "dep:tar",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/macros",
+    "tokio/time",
+]
 
 [dependencies]
 cairn-types = { workspace = true }

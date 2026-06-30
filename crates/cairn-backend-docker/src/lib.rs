@@ -224,9 +224,8 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
 
     /// Advertise the per-container actions (`logs`, `exec`) anywhere within a container's subtree.
     /// This reflects path *shape*, not existence (it does no I/O, mirroring how the UI calls it on an
-    /// already-navigated node); existence is enforced by `stat`/`invoke`. The action surface is
-    /// discoverable now; live invocation (streaming over the Docker API) is the integration step, so
-    /// the overridden [`Vfs::invoke`] returns `VfsError::Backend { code: "not_implemented" }`.
+    /// already-navigated node); existence is enforced by `stat`/`invoke`. Both actions are live in
+    /// [`Vfs::invoke`]: `logs` returns `ActionOutcome::Stream`; `exec` returns `ActionOutcome::Session`.
     fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
         let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
         match segs.as_slice() {
@@ -304,6 +303,15 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
                         })
                     }
                 };
+                // Validate before the API call so the caller gets a clear error rather than an
+                // opaque daemon 400.
+                if argv.is_empty() {
+                    return Err(VfsError::Backend {
+                        code: "empty_argv".to_owned(),
+                        msg: "exec: argv must be non-empty".to_owned(),
+                        retryable: false,
+                    });
+                }
                 let handle = self.ops.exec(container_name, argv, tty).await?;
                 Ok(ActionOutcome::Session(handle))
             }
@@ -643,6 +651,24 @@ mod tests {
             .expect("done channel must resolve")
             .expect("exit must be Ok");
         assert_eq!(exit, -1, "cancelled session must report exit code -1");
+    }
+
+    /// An empty argv must be rejected before any API call with a typed `empty_argv` error.
+    #[tokio::test]
+    async fn invoke_exec_empty_argv_returns_error() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.invoke(
+                &p("/containers/web"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec![], // deliberately empty
+                    tty: false,
+                },
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "empty_argv"
+        ));
     }
 
     /// Invoking exec on an unknown container must surface VfsError::NotFound from the mock.

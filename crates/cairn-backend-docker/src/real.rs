@@ -73,22 +73,23 @@ fn not_found(path: &str) -> VfsError {
 }
 
 /// Map a bollard error from an exec initiation call (`create_exec` / `start_exec`) to
-/// a [`VfsError`].
+/// a [`VfsError`], carrying the container name for context in `NotFound`/`Forbidden`.
 ///
 /// HTTP 404 → [`VfsError::NotFound`]; 401 → [`VfsError::Auth`]; 403 → [`VfsError::Forbidden`];
 /// all other engine errors → [`VfsError::Backend`]. No credential material appears in any
 /// error message; bollard's API-response messages contain only daemon-provided text.
-fn map_exec_error(e: bollard::errors::Error) -> VfsError {
+fn map_exec_error(e: bollard::errors::Error, container: &str) -> VfsError {
+    let p = VfsPath::parse(container).unwrap_or_else(|_| VfsPath::root());
     match e {
         bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
-        } => VfsError::NotFound(VfsPath::root()),
+        } => VfsError::NotFound(p),
         bollard::errors::Error::DockerResponseServerError {
             status_code: 401, ..
         } => VfsError::Auth,
         bollard::errors::Error::DockerResponseServerError {
             status_code: 403, ..
-        } => VfsError::Forbidden(VfsPath::root()),
+        } => VfsError::Forbidden(p),
         other => backend_err(other),
     }
 }
@@ -400,25 +401,40 @@ impl ContainerOps for BollardDocker {
     /// - **stdout relay**: on each `output.next()` item, forwards the payload bytes (via
     ///   `LogOutput::into_bytes`) to the `stdout` mpsc sender. `StdOut`, `StdErr`, `StdIn`,
     ///   and `Console` variants are all forwarded without discrimination — Docker merges stderr
-    ///   into stdout when `tty: true` (producing `Console` frames), so all variants carry
-    ///   user-visible output.
-    /// - **cancel arm**: when the cancel oneshot fires, breaks out of the loop with `Ok(-1)`.
-    /// - **stream end** (`output.next()` returns `None`): the remote process has exited.
-    ///   Calls `GET /exec/{id}/json` ([`Docker::inspect_exec`]) to retrieve `ExitCode`,
-    ///   then resolves `done` with `Ok(exit_code)`.
+    ///   into stdout when `tty: true` (producing `Console` frames).
+    /// - **cancel arm**: signals stdout EOF (`drop(stdout_tx)`), then breaks with `Ok(-1)`.
+    /// - **stream end** (`output.next()` returns `None`): signals stdout EOF, then calls
+    ///   `GET /exec/{id}/json` ([`Docker::inspect_exec`]) to retrieve the exit code. The daemon
+    ///   can race (`exit_code: null` briefly after the stream closes); this method polls with
+    ///   bounded back-off (up to 5 attempts, 50 ms doubling) before falling back to `Ok(0)`.
+    ///   On a transport error from `inspect_exec`: resolves `done` with `Err(backend_err(…))`.
+    ///
+    /// `stdout_tx` is always dropped **before** `done_tx.send(…)` on all exit paths so that
+    /// consumers that drain stdout before awaiting `done` always see stdout close first.
     ///
     /// The **stdin relay** sub-task drains the `stdin` mpsc receiver and writes each chunk to
-    /// `input` (`AsyncWriteExt::write_all`). Dropping the mpsc sender causes the receiver to
-    /// return `None`, which drops `input` and closes stdin on the remote side.
+    /// `input` via `AsyncWriteExt::write_all`. After the loop exits (sender dropped = EOF, or
+    /// write error), it calls `AsyncWriteExt::shutdown` explicitly on the writer. Bollard's
+    /// `input` is the `WriteHalf` of a split `AsyncUpgraded` connection: dropping `WriteHalf`
+    /// does **not** send a TCP half-close (the `ReadHalf` keeps the connection alive), so the
+    /// remote process would never see stdin EOF without an explicit `shutdown().await`.
     ///
     /// The **resize relay** sub-task (TTY only) reads `(rows, cols)` from the resize channel
     /// and calls `POST /exec/{id}/resize` ([`Docker::resize_exec`]) as a best-effort
     /// fire-and-forget. Errors are silently discarded (the session may have already ended).
     ///
+    /// # Process lifecycle on cancel
+    ///
+    /// Docker has **no kill-exec API**. Cancelling (sending on `cancel`, or dropping it) detaches
+    /// Cairn's relay task from the exec stream but the exec'd process continues running orphaned
+    /// inside the container. This is a Docker Engine limitation. `done` resolves with `Ok(-1)` to
+    /// signal the cancel, but the process is not guaranteed to be gone. Future enhancement: on TTY
+    /// execs, attempt a best-effort Ctrl-C sequence before cancelling — tracked as a follow-up.
+    ///
     /// # Credential safety
     ///
-    /// Container IDs / exec IDs are never included in `VfsError` messages. Bollard's
-    /// API-error messages contain only daemon-provided text.
+    /// Container IDs and exec IDs are never included in `VfsError` messages. Bollard's
+    /// API-response messages contain only daemon-provided text.
     async fn exec(
         &self,
         container: &str,
@@ -427,6 +443,14 @@ impl ContainerOps for BollardDocker {
     ) -> Result<SessionHandle, VfsError> {
         use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
         use tokio::io::AsyncWriteExt as _;
+
+        if argv.is_empty() {
+            return Err(VfsError::Backend {
+                code: "empty_argv".to_owned(),
+                msg: "exec: argv must be non-empty".to_owned(),
+                retryable: false,
+            });
+        }
 
         let docker = self.docker.clone();
         let container = container.to_owned();
@@ -439,15 +463,17 @@ impl ContainerOps for BollardDocker {
                     cmd: Some(argv),
                     attach_stdin: Some(true),
                     attach_stdout: Some(true),
-                    // Docker merges stderr into stdout when tty=true; attach separately only
-                    // for non-TTY execs so stderr is interleaved without double-encoding.
+                    // When tty=true Docker merges stderr into the stdout Console stream.
+                    // Attaching stderr separately would deliver it twice: once in the Console
+                    // stream, once as a StdErr frame. For non-TTY execs, attach stderr so it
+                    // is interleaved in the output stream alongside stdout.
                     attach_stderr: Some(!tty),
                     tty: Some(tty),
                     ..Default::default()
                 },
             )
             .await
-            .map_err(map_exec_error)?;
+            .map_err(|e| map_exec_error(e, &container))?;
 
         let exec_id = exec_result.id;
 
@@ -455,7 +481,7 @@ impl ContainerOps for BollardDocker {
         let (output, input) = match docker
             .start_exec(&exec_id, None)
             .await
-            .map_err(map_exec_error)?
+            .map_err(|e| map_exec_error(e, &container))?
         {
             StartExecResults::Attached { output, input } => (output, input),
             // We never set detach=true, so Detached is a daemon protocol violation rather
@@ -486,17 +512,25 @@ impl ContainerOps for BollardDocker {
         tokio::spawn(async move {
             // --- stdin relay ---
             // A sub-task drains the stdin mpsc receiver and writes each chunk to the exec's
-            // AsyncWrite input handle. When the sender is dropped (EOF), `input` is dropped
-            // here, closing stdin on the remote side.
+            // AsyncWrite input handle. After the loop exits (stdin sender dropped → recv returns
+            // None, or write error), it calls `shutdown()` explicitly. Bollard's `input` writer
+            // is the WriteHalf of a split connection: dropping WriteHalf does NOT half-close the
+            // underlying TCP connection (ReadHalf keeps it alive), so the remote process would
+            // never see stdin EOF without an explicit shutdown().
             let stdin_task = {
                 let mut writer = input;
                 tokio::spawn(async move {
+                    // Drain stdin chunks until the sender is dropped or a write fails.
                     while let Some(chunk) = stdin_rx.recv().await {
                         if writer.write_all(&chunk).await.is_err() {
                             break;
                         }
                     }
-                    // Drop `writer` → closes stdin pipe to the remote process.
+                    // Explicit half-close: signals stdin EOF to the remote process.
+                    // Bollard's `input` writer is the WriteHalf of a split connection;
+                    // dropping WriteHalf does NOT half-close the TCP connection (the
+                    // ReadHalf keeps it alive), so shutdown() is mandatory here.
+                    let _ = writer.shutdown().await;
                 })
             };
 
@@ -527,12 +561,20 @@ impl ContainerOps for BollardDocker {
             // Process the output stream inline, selecting against cancel on every item.
             // All LogOutput variants (StdOut, StdErr, StdIn, Console) carry user-visible bytes;
             // forward them all without discrimination (Docker merges streams on tty=true).
+            //
+            // INVARIANT: `stdout_tx` is dropped BEFORE `done_tx.send(…)` on ALL exit paths so
+            // that consumers see stdout EOF before `done` resolves.
             let mut output = output;
             let exit_result: Result<i32, VfsError> = loop {
                 tokio::select! {
                     biased;
-                    // Cancel path: break with sentinel exit code -1.
-                    _ = &mut cancel_rx => break Ok(-1),
+                    // Cancel path: signal stdout EOF, then break with sentinel -1.
+                    // The exec'd process continues running orphaned in the container (Docker has
+                    // no kill-exec API); this is documented in the method-level rustdoc.
+                    _ = &mut cancel_rx => {
+                        drop(stdout_tx);
+                        break Ok(-1);
+                    }
                     item = output.next() => {
                         match item {
                             Some(Ok(log)) => {
@@ -541,22 +583,49 @@ impl ContainerOps for BollardDocker {
                                 let _ = stdout_tx.send(log.into_bytes()).await;
                             }
                             Some(Err(e)) => {
-                                // Transport error while reading output.
+                                // Transport error while reading output: signal stdout EOF before
+                                // resolving done so consumers see the stream close first.
+                                drop(stdout_tx);
                                 break Err(backend_err(e));
                             }
                             None => {
-                                // Stream ended → the remote process has exited.
-                                // Drop stdout_tx so the consumer's receiver signals EOF.
+                                // Output stream closed → the remote process has exited.
+                                // Signal stdout EOF before inspect_exec so the consumer can drain
+                                // buffered output while we poll for the exit code.
                                 drop(stdout_tx);
-                                // Retrieve the numeric exit code via inspect_exec.
-                                let code = docker
-                                    .inspect_exec(&exec_id)
-                                    .await
-                                    .ok()
-                                    .and_then(|r| r.exit_code)
-                                    .map(|c| c as i32)
-                                    .unwrap_or(0);
-                                break Ok(code);
+                                // Docker races: immediately after the stream closes, inspect_exec
+                                // may return exit_code: null (running still true). Poll with a
+                                // bounded back-off. Cap iterations so done always resolves.
+                                const MAX_POLLS: u8 = 5;
+                                let mut inspect_result: Result<i32, VfsError> = Ok(0);
+                                for attempt in 0..MAX_POLLS {
+                                    match docker.inspect_exec(&exec_id).await {
+                                        Ok(info) if info.exit_code.is_some() => {
+                                            // Safety: checked is_some() above.
+                                            inspect_result =
+                                                Ok(info.exit_code.unwrap() as i32);
+                                            break;
+                                        }
+                                        Ok(_) => {
+                                            // exit_code still null — daemon is transitioning.
+                                            // Back off before retrying (50 ms, 100 ms, …).
+                                            if attempt < MAX_POLLS - 1 {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(
+                                                        50u64 << attempt,
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                            // else: last attempt, fall through to Ok(0)
+                                        }
+                                        Err(e) => {
+                                            inspect_result = Err(backend_err(e));
+                                            break;
+                                        }
+                                    }
+                                }
+                                break inspect_result;
                             }
                         }
                     }
@@ -569,7 +638,8 @@ impl ContainerOps for BollardDocker {
                 t.abort();
             }
 
-            // Resolve done. If the receiver was dropped (session pane torn down), discard.
+            // Resolve done. stdout_tx was already dropped above on all paths.
+            // If the receiver was dropped (session pane torn down), discard the send error.
             let _ = done_tx.send(exit_result);
         });
 

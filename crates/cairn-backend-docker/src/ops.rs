@@ -98,17 +98,32 @@ pub trait ContainerOps: Send + Sync + 'static {
     /// - `container`: container name or ID. The container must be running; a stopped or missing
     ///   container returns [`VfsError::NotFound`] or [`VfsError::Backend`] from the daemon.
     /// - `argv`: argument vector passed directly to the container runtime (not a shell; use
-    ///   `["sh", "-c", "…"]` for shell commands). Must be non-empty.
+    ///   `["sh", "-c", "…"]` for shell commands). **Must be non-empty**; an empty vec returns
+    ///   `VfsError::Backend { code: "empty_argv" }` immediately (before any API call).
     /// - `tty`: allocate a pseudo-TTY. When `true`: stderr is merged into stdout (Docker
     ///   convention), the `resize` channel is populated, and the process sees a PTY. When `false`:
     ///   stderr is interleaved into `stdout`; `resize` is `None`.
+    ///
+    /// # Stdout EOF contract
+    ///
+    /// On all exit paths (natural exit, cancel, transport error), the backend drops the `stdout`
+    /// mpsc sender **before** resolving `done`. Consumers that drain stdout first and then await
+    /// `done` always see the stream close before the exit result.
     ///
     /// # Exit code and `done`
     ///
     /// When the output stream closes naturally (the remote process exits), the backend calls
     /// `GET /exec/{id}/json` (`inspect_exec`) to retrieve the numeric exit code and resolves
-    /// `done` with `Ok(exit_code)`. On cancel before exit: `Ok(-1)`. On transport error: `Err`.
-    /// Credential material is never included in error messages.
+    /// `done` with `Ok(exit_code)`. On cancel before exit: `Ok(-1)`. On transport error from
+    /// `inspect_exec`: `Err(VfsError::Backend)`. Credential material is never included in
+    /// error messages.
+    ///
+    /// # Process lifecycle on cancel
+    ///
+    /// Docker has **no kill-exec API**. Sending on `cancel` (or dropping it) detaches the relay
+    /// task from the exec stream but the exec'd process continues running **orphaned inside the
+    /// container** until it exits naturally or the container is stopped. `done` resolves `Ok(-1)`
+    /// to signal the cancel. Future enhancement: best-effort Ctrl-C on TTY cancel (follow-up).
     ///
     /// # Error mapping
     ///
