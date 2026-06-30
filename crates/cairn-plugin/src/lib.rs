@@ -58,6 +58,12 @@ pub use manifest::{PluginManifest, HOST_API_MAJOR};
 /// [`PluginGrants::default`] and will see deny-stubs for every brokered host function.
 #[derive(Debug, Clone, Default)]
 pub struct PluginGrants {
+    /// Whether the plugin may write to Cairn's log via `host::log`.
+    ///
+    /// When `false` (the default), `host::log` calls are silently dropped — the plugin
+    /// instantiates normally and the call returns without effect. Requires both the manifest
+    /// requesting `[capabilities].log = true` AND the user approving it at install time.
+    pub log: bool,
     /// Hostnames this plugin may reach via `host::http-fetch`.
     ///
     /// Exact hostname match (no scheme, no port, no wildcards in this version). Values are
@@ -76,8 +82,7 @@ pub struct PluginGrants {
 /// component instance (RFC-0010 §3/§4).
 ///
 /// Passed to [`PluginComponent::instantiate_with_grants`]. `Default` produces a zero-grant,
-/// no-broker config; use it for untrusted test fixtures.
-#[derive(Default)]
+/// no-broker config suitable for untrusted test fixtures.
 pub struct PluginHostConfig {
     /// Capability grants for this plugin instance.
     pub grants: PluginGrants,
@@ -91,6 +96,33 @@ pub struct PluginHostConfig {
     /// time). When `Some`, only handles in `grants.credentials` are permitted; others are
     /// rejected before the broker is touched.
     pub credential_broker: Option<Arc<dyn CredentialBroker>>,
+
+    // ── Network limits from manifest `[network]` (RFC-0010 §5.2) ───────────────────────────
+    // These are simple integer/bool fields (no feature gate) so the loader can fill them
+    // without depending on `plugin-network`. `component.rs` builds `HttpLimits` from them
+    // when the feature is enabled.
+    /// Maximum response body size in bytes (from `[network].max_response_bytes`). Default: 8 MiB.
+    pub max_response_bytes: usize,
+    /// TCP connect timeout in seconds, clamped to ≤ epoch ceiling (from `[network].http_connect_timeout_secs`).
+    pub http_connect_timeout_secs: u64,
+    /// Total request timeout in seconds, clamped to ≤ epoch ceiling (from `[network].http_request_timeout_secs`).
+    pub http_request_timeout_secs: u64,
+    /// Whether plain HTTP (`http://`) is permitted (from `[network].allow_http`). Default: `false`.
+    pub allow_http: bool,
+}
+
+impl Default for PluginHostConfig {
+    fn default() -> Self {
+        Self {
+            grants: PluginGrants::default(),
+            plugin_name: String::new(),
+            credential_broker: None,
+            max_response_bytes: 8 * 1024 * 1024,
+            http_connect_timeout_secs: 4,
+            http_request_timeout_secs: 4,
+            allow_http: false,
+        }
+    }
 }
 
 /// Per-instance resource limits.

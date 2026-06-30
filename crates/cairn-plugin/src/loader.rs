@@ -16,7 +16,7 @@
 //! those are follow-up items. Grants are read from config that the approval UI will later
 //! populate; for tests they can be seeded directly into the config.
 
-use crate::manifest::{LimitsConfig, PluginManifest, HOST_API_MAJOR};
+use crate::manifest::{LimitsConfig, NetworkConfig, PluginManifest, HOST_API_MAJOR};
 use crate::{
     Limits, PluginComponent, PluginError, PluginGrants, PluginHostConfig, PluginVfsBackend,
 };
@@ -26,6 +26,11 @@ use cairn_types::ConnectionId;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wasmtime::Engine;
+
+/// The maximum wall-clock epoch ceiling in seconds. Timeouts from the manifest are clamped
+/// to this value so a plugin cannot park the thread past the epoch deadline.
+/// Default epoch: 50 ticks × 100 ms = 5 s.
+const EPOCH_CEILING_SECS: u64 = 5;
 
 /// Discovers and loads plugin components from the plugins directory.
 ///
@@ -53,6 +58,11 @@ impl PluginLoader {
     /// Returns the path if the directory exists and contains both required files
     /// (`plugin.toml` + `component.wasm`), or a [`PluginError::Compile`] otherwise.
     fn locate(&self, name: &str, version: &str) -> Result<PathBuf, PluginError> {
+        // SECURITY: validate name and version BEFORE the path join. A `/` or `..` in
+        // either argument would traverse out of the plugins directory (path injection).
+        // Reuse the manifest name charset for `name`; apply a path-safe check for `version`.
+        validate_plugin_name_arg(name)?;
+        validate_plugin_version_arg(version)?;
         let dir = self.dir.join(format!("{name}-{version}"));
         if !dir.is_dir() {
             return Err(PluginError::Compile(format!(
@@ -138,10 +148,14 @@ impl PluginLoader {
         // 5. Limits from manifest.
         let limits = limits_from_manifest(&manifest.limits);
 
-        // 6. Read component bytes.
+        // 6. Network limits from manifest `[network]`, with epoch-ceiling clamp.
+        let (max_response_bytes, http_connect_timeout_secs, http_request_timeout_secs, allow_http) =
+            http_limits_from_manifest_network(&manifest.network);
+
+        // 7. Read component bytes.
         let wasm_bytes = read_wasm(&dir)?;
 
-        // 7. Build PluginHostConfig: only wire credential_broker if credentials are granted.
+        // 8. Build PluginHostConfig: only wire credential_broker if credentials are granted.
         let credential_broker = if grants.credentials.is_empty() {
             None
         } else {
@@ -152,9 +166,13 @@ impl PluginLoader {
             grants,
             plugin_name: name.to_owned(),
             credential_broker,
+            max_response_bytes,
+            http_connect_timeout_secs,
+            http_request_timeout_secs,
+            allow_http,
         };
 
-        // 8. Instantiate.
+        // 9. Instantiate.
         let component = PluginComponent::instantiate_with_grants(
             &self.engine,
             &wasm_bytes,
@@ -162,12 +180,77 @@ impl PluginLoader {
             host_config,
         )?;
 
-        // 9. Construct the async backend.
+        // 10. Construct the async backend.
         PluginVfsBackend::new(component, limits, connection)
     }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────────────────────
+
+/// Validate that `name` is a safe plugin name argument before a path join.
+///
+/// Uses the same charset as the manifest (`[a-z0-9-_]`, non-empty, max 64) so a `/`, `..`,
+/// or uppercase letter is caught before `self.dir.join(name-version)` can traverse out of the
+/// plugins directory (path injection). This is a defence-in-depth check; the manifest's
+/// `validate()` enforces the same rule on the TOML value, but the `load()`/`locate()` args
+/// could theoretically arrive from a caller other than the loader flow.
+fn validate_plugin_name_arg(name: &str) -> Result<(), PluginError> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(PluginError::Compile(format!(
+            "plugin name argument '{name}' is invalid (must be 1–64 chars of [a-z0-9-_])"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(PluginError::Compile(format!(
+            "plugin name argument '{name}' contains characters outside [a-z0-9-_]"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that `version` is path-safe before a path join.
+///
+/// Permits SemVer characters (`[a-zA-Z0-9._+\-]`) and rejects anything containing `/`, `\`,
+/// or `..` that could escape the plugins directory. The version is not validated as a full
+/// SemVer string here — that check runs on the manifest value via `validate_semver`.
+fn validate_plugin_version_arg(version: &str) -> Result<(), PluginError> {
+    if version.is_empty() {
+        return Err(PluginError::Compile(
+            "plugin version argument must not be empty".to_owned(),
+        ));
+    }
+    // Reject any character that could contribute to path traversal.
+    let has_unsafe = version
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == '\0' || c.is_control());
+    if has_unsafe || version.contains("..") {
+        return Err(PluginError::Compile(format!(
+            "plugin version argument '{version}' contains unsafe path characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Compute the effective HTTP resource limits from the manifest's `[network]` section.
+///
+/// Timeouts are clamped to [`EPOCH_CEILING_SECS`] so a plugin cannot configure a timeout
+/// that outlasts the epoch deadline and parks the plugin thread indefinitely.
+///
+/// Returns `(max_response_bytes, connect_timeout_secs, request_timeout_secs, allow_http)`.
+pub(crate) fn http_limits_from_manifest_network(net: &NetworkConfig) -> (usize, u64, u64, bool) {
+    let max_response_bytes = net.max_response_bytes.min(usize::MAX as u64) as usize;
+    let connect_timeout = net.http_connect_timeout_secs.min(EPOCH_CEILING_SECS);
+    let request_timeout = net.http_request_timeout_secs.min(EPOCH_CEILING_SECS);
+    (
+        max_response_bytes,
+        connect_timeout,
+        request_timeout,
+        net.allow_http,
+    )
+}
 
 /// Read and parse `plugin.toml` from `dir`.
 fn read_manifest(dir: &Path) -> Result<PluginManifest, PluginError> {
@@ -209,6 +292,10 @@ fn grants_from_config(
     };
 
     PluginGrants {
+        // `log` is granted only when BOTH the manifest requests it AND the user approved it.
+        // Declining `log` makes guest `host::log` calls silently no-ops — the plugin
+        // instantiates normally, its log output simply doesn't reach Cairn's log stream.
+        log: manifest.capabilities.log && stored.log,
         // Intersect: only hostnames present in BOTH the manifest request AND the stored grants.
         network: manifest
             .capabilities
@@ -370,6 +457,10 @@ description = "Test plugin"
         };
         let grants = grants_from_config(&fake_manifest, Some(&stored));
         // Only the intersection is granted.
+        assert!(
+            grants.log,
+            "log must be granted when both manifest and stored approve it"
+        );
         assert_eq!(grants.network, vec!["api.example.com"]);
         assert_eq!(grants.credentials, vec!["key-a"]);
     }
@@ -409,5 +500,161 @@ description = "Test plugin"
         let result = loader.load("fixture", "1.0.0", &config, ConnectionId(1), None);
         // The fixture guest requests no network/credentials, so deny-all is fine.
         assert!(result.is_ok(), "fixture should load without grants");
+    }
+
+    // ── Security: charset validation before path join ──────────────────────────────────────
+
+    #[test]
+    fn path_traversal_in_name_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let loader = PluginLoader::new(tmp.path().to_owned(), engine());
+        // A `/` in the name would escape the plugins directory.
+        let err = loader.locate("../../etc/shadow", "1.0.0").unwrap_err();
+        assert!(matches!(err, PluginError::Compile(_)), "err = {err:?}");
+        // Uppercase — rejected by name charset.
+        let err2 = loader.locate("BadPlugin", "1.0.0").unwrap_err();
+        assert!(matches!(err2, PluginError::Compile(_)), "err = {err2:?}");
+    }
+
+    #[test]
+    fn path_traversal_in_version_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let loader = PluginLoader::new(tmp.path().to_owned(), engine());
+        let err = loader.locate("myplugin", "../../1.0.0").unwrap_err();
+        assert!(matches!(err, PluginError::Compile(_)), "err = {err:?}");
+        let err2 = loader.locate("myplugin", "1.0.0/evil").unwrap_err();
+        assert!(matches!(err2, PluginError::Compile(_)), "err = {err2:?}");
+    }
+
+    // ── Manifest name/version mismatch ─────────────────────────────────────────────────────
+
+    #[test]
+    fn manifest_name_mismatch_is_compile_error() {
+        let tmp = TempDir::new().unwrap();
+        // Directory is named "real-plugin-1.0.0" but plugin.toml declares name = "other".
+        let dir = tmp.path().join("real-plugin-1.0.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.toml"),
+            r#"
+[plugin]
+name        = "other"
+version     = "1.0.0"
+api         = "1"
+description = "Mismatched name"
+"#,
+        )
+        .unwrap();
+        let fixture = include_bytes!("../tests/fixtures/backend.wasm");
+        std::fs::write(dir.join("component.wasm"), fixture).unwrap();
+
+        let loader = PluginLoader::new(tmp.path().to_owned(), engine());
+        let config = Config::default();
+        let result = loader.load("real-plugin", "1.0.0", &config, ConnectionId(1), None);
+        assert!(result.is_err(), "name mismatch must be an error");
+        let err = result.err().unwrap();
+        assert!(matches!(err, PluginError::Compile(_)), "err = {err:?}");
+    }
+
+    // ── Network limits threading ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn network_limits_from_manifest_are_clamped_to_epoch_ceiling() {
+        use crate::manifest::NetworkConfig;
+        let net = NetworkConfig {
+            max_response_bytes: 1024,
+            http_connect_timeout_secs: 600, // must be clamped to EPOCH_CEILING_SECS
+            http_request_timeout_secs: 600,
+            allow_http: true,
+        };
+        let (max_resp, conn, req, http) = http_limits_from_manifest_network(&net);
+        assert_eq!(
+            max_resp, 1024,
+            "max_response_bytes must be threaded through"
+        );
+        assert_eq!(conn, EPOCH_CEILING_SECS, "connect_timeout must be clamped");
+        assert_eq!(req, EPOCH_CEILING_SECS, "request_timeout must be clamped");
+        assert!(http, "allow_http must be threaded through");
+    }
+
+    #[test]
+    fn network_limits_below_ceiling_are_not_clamped() {
+        use crate::manifest::NetworkConfig;
+        let net = NetworkConfig {
+            max_response_bytes: 4 * 1024 * 1024,
+            http_connect_timeout_secs: 3,
+            http_request_timeout_secs: 2,
+            allow_http: false,
+        };
+        let (_, conn, req, http) = http_limits_from_manifest_network(&net);
+        assert_eq!(conn, 3, "timeout below ceiling must not be modified");
+        assert_eq!(req, 2, "timeout below ceiling must not be modified");
+        assert!(!http);
+    }
+
+    // ── Log grant propagation ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn log_denied_when_manifest_denies_even_if_stored_approves() {
+        // manifest requests log = false; stored approves log = true → intersection = false
+        let fake_manifest = PluginManifest {
+            plugin: crate::manifest::PluginMeta {
+                name: "test".to_owned(),
+                version: "1.0.0".to_owned(),
+                api: "1".to_owned(),
+                description: "test".to_owned(),
+                homepage: None,
+                authors: None,
+            },
+            capabilities: CapabilitiesConfig {
+                log: false, // manifest does NOT request log
+                network: vec![],
+                credentials: vec![],
+            },
+            network: crate::manifest::NetworkConfig::default(),
+            limits: crate::manifest::LimitsConfig::default(),
+        };
+        let stored = PluginGrantsRecord {
+            log: true, // user approved log (from a previous manifest version?)
+            network: vec![],
+            credentials: vec![],
+        };
+        let grants = grants_from_config(&fake_manifest, Some(&stored));
+        assert!(
+            !grants.log,
+            "log must be false when manifest does not request it, even if stored approves"
+        );
+    }
+
+    #[test]
+    fn log_denied_when_stored_denies_even_if_manifest_requests() {
+        // manifest requests log = true; stored approves log = false → intersection = false
+        let fake_manifest = PluginManifest {
+            plugin: crate::manifest::PluginMeta {
+                name: "test".to_owned(),
+                version: "1.0.0".to_owned(),
+                api: "1".to_owned(),
+                description: "test".to_owned(),
+                homepage: None,
+                authors: None,
+            },
+            capabilities: CapabilitiesConfig {
+                log: true, // manifest requests log
+                network: vec![],
+                credentials: vec![],
+            },
+            network: crate::manifest::NetworkConfig::default(),
+            limits: crate::manifest::LimitsConfig::default(),
+        };
+        let stored = PluginGrantsRecord {
+            log: false, // user did NOT approve log
+            network: vec![],
+            credentials: vec![],
+        };
+        let grants = grants_from_config(&fake_manifest, Some(&stored));
+        assert!(
+            !grants.log,
+            "log must be false when stored record does not approve it"
+        );
     }
 }

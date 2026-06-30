@@ -65,6 +65,9 @@ struct CompState {
     table: ResourceTable,
 
     // ── Capability grants (RFC-0010 §3/§4) ─────────────────────────────────────────────────
+    /// Whether the plugin may emit log messages via `host::log`. When `false`, log calls are
+    /// silently dropped (the call succeeds but nothing is written). Default: `false`.
+    log_grant: bool,
     /// Hostnames this plugin may reach via `host::http-fetch`. Compared case-insensitively
     /// at call time; not normalized at storage time. Empty → deny-stub.
     network_grants: Vec<String>,
@@ -98,12 +101,18 @@ impl WasiView for CompState {
     }
 }
 
-// The granted `host` interface. `log`/`now-secs` are always safe (no I/O, no secrets).
-// `http-fetch` and `use-credential` are capability-gated and broker-backed (RFC-0010 §3/§4).
-// When the plugin has no matching grant, or when the broker is absent, the function returns
-// an error string — the plugin instantiates but the call is denied at runtime.
+// The granted `host` interface. `now-secs` is always safe (no I/O, no secrets).
+// `log` is gated by `CompState::log_grant`; `http-fetch` and `use-credential` are capability-
+// gated and broker-backed (RFC-0010 §3/§4). When the plugin has no matching grant, or when the
+// broker is absent, the function returns an error string (or is a no-op for `log`) — the plugin
+// instantiates but the call is denied at runtime.
 impl cairn::plugin::host::Host for CompState {
     fn log(&mut self, level: u8, msg: String) {
+        // Gate on the `log` grant. When not granted, drop the message silently — the plugin
+        // instantiates normally, but its log output never enters Cairn's log stream.
+        if !self.log_grant {
+            return;
+        }
         let level = match level {
             0 => tracing::Level::ERROR,
             1 => tracing::Level::WARN,
@@ -261,11 +270,7 @@ impl PluginComponent {
             engine,
             bytes,
             limits,
-            crate::PluginHostConfig {
-                grants: crate::PluginGrants::default(),
-                plugin_name: String::new(),
-                credential_broker: None,
-            },
+            crate::PluginHostConfig::default(),
         )
     }
 
@@ -326,7 +331,14 @@ impl PluginComponent {
         // futures via `Handle::block_on`.
         #[cfg(feature = "plugin-network")]
         let (http_client, http_limits, tokio_handle) = {
-            let h_limits = crate::http_fetch::HttpLimits::default();
+            // Build HttpLimits from the PluginHostConfig fields, which the loader populates from
+            // the manifest's `[network]` section with timeouts clamped to the epoch ceiling.
+            let h_limits = crate::http_fetch::HttpLimits {
+                max_response_bytes: config.max_response_bytes,
+                connect_timeout_secs: config.http_connect_timeout_secs,
+                request_timeout_secs: config.http_request_timeout_secs,
+                allow_http: config.allow_http,
+            };
             let handle = tokio::runtime::Handle::try_current().ok();
             let client = if !config.grants.network.is_empty() && handle.is_some() {
                 match crate::http_fetch::build_client(h_limits) {
@@ -361,6 +373,7 @@ impl PluginComponent {
                 // (M8-5) will stub the blocking methods with ImmediatelyReady semantics.
                 wasi: WasiCtx::builder().build(),
                 table: ResourceTable::new(),
+                log_grant: config.grants.log,
                 network_grants: config.grants.network,
                 credential_grants: config.grants.credentials,
                 plugin_name: config.plugin_name,

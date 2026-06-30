@@ -155,12 +155,8 @@ pub struct LimitsConfig {
     pub max_call_ticks: u64,
     /// Maximum total bytes a single read stream may yield before it is forcibly errored.
     /// Default: 4 GiB.
-    #[serde(default = "default_stream_bytes")]
+    #[serde(default = "default_max_stream_bytes")]
     pub max_stream_bytes: u64,
-}
-
-fn default_stream_bytes() -> u64 {
-    default_max_stream_bytes()
 }
 
 impl Default for LimitsConfig {
@@ -199,8 +195,13 @@ impl PluginManifest {
     /// Checks that `serde` cannot enforce:
     /// - `name` charset (`[a-z0-9-_]`), non-empty, max 64 chars.
     /// - `version` parses as SemVer (`MAJOR.MINOR.PATCH`, pre-release/build ignored).
-    /// - `api` major matches [`HOST_API_MAJOR`] (§5.3).
     /// - `description` max 256 chars.
+    ///
+    /// **Note on `api` major:** The `api` field is intentionally NOT checked here. API major
+    /// compatibility is enforced by [`PluginLoader`](crate::PluginLoader) (§5.3) with an
+    /// actionable error message. Checking it in `validate()` would be unreachable code (the
+    /// loader calls `validate()` before its own ABI check) and would produce a less helpful
+    /// error that omits the host's supported version.
     ///
     /// # Errors
     /// [`PluginError::Compile`] with a human-readable message.
@@ -232,16 +233,6 @@ impl PluginManifest {
         // version: must be parseable as SemVer (MAJOR.MINOR.PATCH with optional pre/build)
         validate_semver(&self.plugin.version)?;
 
-        // api major: must match host
-        let api = self.plugin.api.trim();
-        if api != HOST_API_MAJOR {
-            return Err(PluginError::Compile(format!(
-                "plugin.toml: [plugin].api '{}' does not match host API major '{}'; \
-                 this plugin was built for a different version of the Cairn plugin ABI",
-                api, HOST_API_MAJOR
-            )));
-        }
-
         // description: max 256 chars
         if self.plugin.description.len() > 256 {
             return Err(PluginError::Compile(format!(
@@ -257,15 +248,18 @@ impl PluginManifest {
 /// Validate that `s` is a parseable SemVer string (`MAJOR.MINOR.PATCH`, with optional
 /// pre-release and build-metadata suffixes as per semver.org).
 ///
-/// We implement a minimal parser rather than pulling in the `semver` crate (which is not yet
-/// in the workspace dep tree). Only syntactic validity is checked; semantics (compatibility,
-/// ordering) are handled by the caller.
+/// We implement a minimal inline parser. Adding a direct `semver = "1"` dep is deferred;
+/// `semver` is in Cargo.lock transitively (via wasmtime), but this check covers all expected
+/// manifest inputs without a new direct dependency. Only syntactic validity is checked;
+/// semantics (compatibility, ordering) are handled by the caller.
 fn validate_semver(s: &str) -> Result<(), PluginError> {
     // Strip optional pre-release (`-alpha.1`) and build metadata (`+build.123`).
     let base = s.split('+').next().unwrap_or(s);
     let base = base.split('-').next().unwrap_or(base);
     let parts: Vec<&str> = base.split('.').collect();
-    if parts.len() < 3 {
+    // Require exactly 3 dot-separated components (MAJOR.MINOR.PATCH).
+    // `parts.len() < 3` would accept `1.2.3.4` — use `!= 3` to enforce the spec.
+    if parts.len() != 3 {
         return Err(PluginError::Compile(format!(
             "plugin.toml: [plugin].version '{s}' is not a valid SemVer string \
              (expected MAJOR.MINOR.PATCH)"
@@ -360,12 +354,15 @@ mystery_future_key = "oops"
     }
 
     #[test]
-    fn api_major_mismatch_is_rejected() {
+    fn api_major_mismatch_passes_validate_is_caught_by_loader() {
+        // `validate()` no longer checks `api` — that check lives in `PluginLoader::load` (§5.3)
+        // which produces a more actionable error citing both the plugin's api and the host's.
+        // A manifest with api = "2" must parse and pass validate() here; the loader test
+        // `api_major_mismatch_is_compile_error` asserts the loader catches it.
         let src = minimal_toml("ok", "1.0.0", "2", "test");
         let m = PluginManifest::from_toml(&src).expect("parse");
-        let err = m.validate().unwrap_err();
-        assert!(err.to_string().contains("api"), "err = {err}");
-        assert!(err.to_string().contains("2"), "err = {err}");
+        m.validate()
+            .expect("api check is the loader's responsibility, not validate()");
     }
 
     #[test]
@@ -401,7 +398,8 @@ mystery_future_key = "oops"
 
     #[test]
     fn invalid_semver_is_rejected() {
-        for bad in &["1.0", "1", "abc", "1.x.0", ""] {
+        // "1.2.3.4" must be rejected: exactly 3 components required, not `len() >= 3`.
+        for bad in &["1.0", "1", "abc", "1.x.0", "", "1.2.3.4"] {
             let src = minimal_toml("ok", bad, "1", "test");
             let m = PluginManifest::from_toml(&src).expect("parse");
             let err = m.validate().unwrap_err();
