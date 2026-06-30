@@ -13,12 +13,15 @@
 //! **Scope / SECURITY (important):** epoch checks are only emitted at instrumented points in *guest
 //! WebAssembly* (loop back-edges, function entries). Neither epoch nor fuel is observed while control
 //! is inside a **native host frame**, so a guest blocked *inside* a host or WASI call is **not**
-//! interrupted by this mechanism. Today that is benign — the granted `host` imports are non-blocking
-//! (`log`/`now-secs`) or immediate deny-stubs — but the broadly-linked WASI surface includes a
-//! blocking `wasi:io/poll`, which a malicious guest could use to park the plugin thread past the
-//! deadline. Bounding that requires narrowing the linked WASI subset (and/or an async, cooperatively
-//! preemptible linker); both are gated before exposing untrusted plugins live (M8-4/M8-5). Until then
-//! this bounds *spinning* guests, not *blocking* ones.
+//! interrupted by this mechanism. The granted `host` imports are non-blocking (`log`/`now-secs`) or
+//! immediate deny-stubs. The WASI surface is limited to the RFC-0010 §1 allow-list
+//! (`crate::wasi_narrowing`), which replaces the blocking `wasi:io/poll` and
+//! `wasi:clocks/monotonic-clock` implementations with non-blocking stubs. A guest calling
+//! `subscribe-duration(far_future)` receives an immediately-ready pollable that returns without
+//! suspending the host thread; subsequent `poll` calls likewise return all indices immediately.
+//! Epoch now reliably bounds *both* spinning and WASI-clock-evasion attacks. The remaining hazard is
+//! `wasi:io/streams` blocking methods, which are mitigated by the empty `WasiCtx` (no accessible
+//! streams today); PR-B (M8-5) will close that gap with stub implementations.
 //!
 //! Each [`EpochTicker`] increments the engine-global epoch. **One ticker per `Engine`**: the
 //! `PluginVfsBackend` bridge currently builds one engine per instance and spawns one ticker for it.

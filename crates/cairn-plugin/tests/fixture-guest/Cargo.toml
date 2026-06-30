@@ -14,6 +14,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen-rt = { version = "0.44", features = ["bitflags"] }
+# Provides GlobalDlmalloc: a wasm32-compatible allocator that uses `memory.grow` (no WASI
+# imports). Required for the no_std build: without std, Rust does not supply a global allocator.
+dlmalloc = { version = "0.2", features = ["global"] }
 
 [package.metadata.component]
 package = "cairn:plugin-fixture"

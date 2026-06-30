@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **WASI subset narrowing** (RFC-0010 PR-A, M8-3b): replaced the blanket
+  `wasmtime_wasi::p2::add_to_linker_sync` with an explicit per-interface allow-list. Only
+  `wasi:io/{error,streams,poll}`, `wasi:clocks/{wall-clock,monotonic-clock}`, and
+  `wasi:random/{random,insecure,insecure-seed}` are registered; `wasi:sockets/*`,
+  `wasi:filesystem/*`, and `wasi:cli/*` are absent. A component importing any excluded interface
+  fails instantiation (default-deny). Non-blocking stubs for `wasi:io/poll` and
+  `wasi:clocks/monotonic-clock` close the epoch-vs-blocking-WASI evasion gap: the stubs return
+  all pollables immediately-ready without entering the Tokio scheduler, so a malicious guest
+  cannot park the plugin thread inside a native frame that epoch cannot interrupt. The fixture
+  guest is rebuilt as `#![no_std]` (uses `dlmalloc` + `core::arch::wasm32::unreachable()` panic
+  handler) so the committed `backend.wasm` imports no `wasi:cli/*` interfaces and can be
+  instantiated with the narrowed linker. All 44 unit + integration tests pass.
+
 ### Added
 
 - **Kubernetes port-forward** (M6-6, RFC-0009 §3): `KubeVfs::invoke("port-forward")` with
