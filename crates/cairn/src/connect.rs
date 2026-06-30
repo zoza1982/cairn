@@ -13,9 +13,10 @@
 //! compiled (it only needs the broker), so the lean build still has a real opener that cleanly
 //! reports "not built into this binary".
 //!
+//! Docker/K8s are also dispatched here, but connect *without* a vault credential (local socket /
+//! kubeconfig), so they skip the broker.
+//!
 //! **Deferred (follow-ups), noted so the gaps are visible:**
-//! - Docker/K8s connect *without* a vault credential (local socket / kubeconfig), so they are not
-//!   handled here; they join `all-backends` and the opener when their transport lands.
 //! - The new-connection TUI (M4-5) that would let a user create/trigger a remote profile, and the
 //!   `Overlay::VaultUnlock` flow (M3-7) that unlocks the broker. Until the latter lands the runtime
 //!   wires a *locked* broker, so a real connect attempt returns [`BrokerError::Locked`] — the
@@ -42,8 +43,8 @@ pub(crate) enum OpenError {
     #[error("no backend for scheme '{0}' is built into this binary")]
     BackendNotBuilt(String),
 
-    /// The scheme is not one the credential broker opens (e.g. `local`, or the deferred
-    /// `docker`/`k8s`, which connect without a vault credential).
+    /// The scheme is not one this opener handles (e.g. `local`, handled by the local backend, or an
+    /// unrecognized scheme). Docker/K8s ARE handled — without a vault credential.
     #[error("scheme '{0}' is not opened by the connection broker")]
     UnsupportedScheme(String),
 
@@ -128,6 +129,9 @@ impl ConnectionOpener {
             "s3" => self.open_s3(actor, conn, profile).await,
             "gcs" => self.open_gcs(actor, conn, profile).await,
             "azure" => self.open_azure(actor, conn, profile).await,
+            // Docker/K8s connect without a vault credential (local socket / kubeconfig).
+            "docker" => self.open_docker(conn).await,
+            "kubernetes" | "k8s" => self.open_k8s(conn).await,
             other => Err(OpenError::UnsupportedScheme(other.to_owned())),
         }
     }
@@ -233,6 +237,36 @@ impl ConnectionOpener {
         _profile: &ConnectionProfile,
     ) -> Result<Arc<dyn Vfs>, OpenError> {
         Err(OpenError::BackendNotBuilt("azure".to_owned()))
+    }
+
+    // ---- Docker ------------------------------------------------------------
+
+    /// Docker connects to the local engine (socket / named pipe / env) — no vault credential.
+    #[cfg(feature = "docker")]
+    async fn open_docker(&self, conn: ConnectionId) -> Result<Arc<dyn Vfs>, OpenError> {
+        let docker = cairn_backend_docker::BollardDocker::connect_local()?;
+        Ok(Arc::new(cairn_backend_docker::DockerVfs::new(conn, docker)))
+    }
+
+    #[cfg(not(feature = "docker"))]
+    async fn open_docker(&self, _conn: ConnectionId) -> Result<Arc<dyn Vfs>, OpenError> {
+        Err(OpenError::BackendNotBuilt("docker".to_owned()))
+    }
+
+    // ---- Kubernetes --------------------------------------------------------
+
+    /// Kubernetes reads the kubeconfig (context resolved per call) — no vault credential.
+    #[cfg(feature = "k8s")]
+    async fn open_k8s(&self, conn: ConnectionId) -> Result<Arc<dyn Vfs>, OpenError> {
+        Ok(Arc::new(cairn_backend_k8s::KubeVfs::new(
+            conn,
+            cairn_backend_k8s::KubeRsOps::new(),
+        )))
+    }
+
+    #[cfg(not(feature = "k8s"))]
+    async fn open_k8s(&self, _conn: ConnectionId) -> Result<Arc<dyn Vfs>, OpenError> {
+        Err(OpenError::BackendNotBuilt("k8s".to_owned()))
     }
 }
 
@@ -461,13 +495,38 @@ mod tests {
     #[tokio::test]
     async fn unknown_and_local_schemes_are_unsupported() {
         let opener = ConnectionOpener::new(Arc::new(Broker::locked()));
-        for scheme in ["local", "ftp", "docker", "k8s"] {
+        // `local` is handled by the local backend, not the opener; an unknown scheme is rejected.
+        // (Docker/K8s are known schemes — see the feature-gated test below.)
+        for scheme in ["local", "ftp"] {
             let err = open_err(&opener, ConnectionId(9), &profile(scheme, &[])).await;
             assert!(
                 matches!(err, OpenError::UnsupportedScheme(ref s) if s == scheme),
                 "{scheme}: {err}"
             );
         }
+    }
+
+    /// Docker/K8s are recognized schemes; without their feature they report "not built in" (lean).
+    #[cfg(not(feature = "docker"))]
+    #[tokio::test]
+    async fn docker_without_feature_is_not_built() {
+        let opener = ConnectionOpener::new(Arc::new(Broker::locked()));
+        let err = open_err(&opener, ConnectionId(9), &profile("docker", &[])).await;
+        assert!(
+            matches!(err, OpenError::BackendNotBuilt(ref s) if s == "docker"),
+            "{err}"
+        );
+    }
+
+    #[cfg(not(feature = "k8s"))]
+    #[tokio::test]
+    async fn k8s_without_feature_is_not_built() {
+        let opener = ConnectionOpener::new(Arc::new(Broker::locked()));
+        let err = open_err(&opener, ConnectionId(9), &profile("kubernetes", &[])).await;
+        assert!(
+            matches!(err, OpenError::BackendNotBuilt(ref s) if s == "k8s"),
+            "{err}"
+        );
     }
 
     // ---- lean build: every credential-bearing scheme reports "not built in" -------------------

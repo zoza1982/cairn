@@ -30,10 +30,13 @@ ssh = ["dep:cairn-backend-ssh", "cairn-backend-ssh/ssh"]
 s3 = ["dep:cairn-backend-object", "cairn-backend-object/s3"]
 gcs = ["dep:cairn-backend-object", "cairn-backend-object/gcs"]
 azure = ["dep:cairn-backend-object", "cairn-backend-object/azure"]
-# Convenience umbrellas. Docker/K8s connect without a vault credential (local socket / kubeconfig)
-# and join `all-backends` when their opener lands (a tracked follow-up).
+# Docker/K8s connect without a vault credential (local socket / kubeconfig).
+docker = ["dep:cairn-backend-docker", "cairn-backend-docker/docker"]
+k8s = ["dep:cairn-backend-k8s", "cairn-backend-k8s/k8s"]
+# Convenience umbrellas.
 cloud = ["s3", "gcs", "azure"]
-all-backends = ["ssh", "cloud"]
+containers = ["docker", "k8s"]
+all-backends = ["ssh", "cloud", "containers"]
 
 [dependencies]
 cairn-core = { workspace = true }
@@ -54,6 +57,8 @@ cairn-secrets = { workspace = true }
 # Credential-bearing backends, behind the features above (off by default so the lean build is SDK-free).
 cairn-backend-ssh = { workspace = true, optional = true }
 cairn-backend-object = { workspace = true, optional = true }
+cairn-backend-docker = { workspace = true, optional = true }
+cairn-backend-k8s = { workspace = true, optional = true }
 cairn-transfer = { workspace = true }
 cairn-tui = { workspace = true }
 cairn-ai = { workspace = true }

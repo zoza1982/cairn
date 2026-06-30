@@ -1212,6 +1212,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cairn-ai",
+ "cairn-backend-docker",
+ "cairn-backend-k8s",
  "cairn-backend-local",
  "cairn-backend-object",
  "cairn-backend-ssh",
