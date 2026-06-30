@@ -3,7 +3,8 @@
 use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{
-    AppState, Listing, LogViewerStatus, MaskedInput, Overlay, PaneState, PromptKind, Side,
+    AppState, Listing, LogViewerStatus, MaskedInput, Overlay, PaneState, PromptKind, SessionEnd,
+    SessionRecord, Side,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -127,6 +128,21 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             status,
             ..
         } => render_log_viewer(frame, title, lines, *follow, *scroll, status),
+        Overlay::ExecPane {
+            id,
+            input,
+            scroll,
+            follow,
+        } => {
+            if let Some(rec) = state.sessions.get(id) {
+                render_exec_pane(frame, rec, input, *scroll, *follow);
+            }
+        }
+        Overlay::PortForwardStatus { id } => {
+            if let Some(rec) = state.sessions.get(id) {
+                render_port_forward_status(frame, rec);
+            }
+        }
     }
 }
 
@@ -626,6 +642,127 @@ fn pane_count_label(pane: &PaneState) -> String {
     }
 }
 
+/// Draw the interactive exec-session pane: a scrollable output buffer (stdout/stderr combined) and
+/// a single-line input field at the bottom for cooked-mode (non-TTY) line input.
+///
+/// The layout mirrors the log viewer: the same 80 % wide, nearly full-height area, but with an
+/// extra input row pinned at the bottom. `scroll` is the 0-based topmost visible line; `follow`
+/// keeps it pinned to the last page when new output arrives.
+fn render_exec_pane(
+    frame: &mut Frame,
+    rec: &SessionRecord,
+    input: &str,
+    scroll: usize,
+    follow: bool,
+) {
+    let area = centered(
+        frame.area(),
+        80,
+        frame.area().height.saturating_sub(2).max(3),
+    );
+    frame.render_widget(Clear, area);
+
+    // Status suffix: show exit code / error when the session has ended.
+    let status_label = match &rec.ended {
+        None => " Running ".to_owned(),
+        Some(SessionEnd {
+            exit_code: Some(0),
+            error: None,
+        }) => " Exited (0) ".to_owned(),
+        Some(SessionEnd {
+            exit_code: Some(n),
+            error: None,
+        }) => format!(" Exited ({n}) "),
+        Some(SessionEnd { error: Some(e), .. }) => format!(" Error: {e} "),
+        Some(_) => " Ended ".to_owned(),
+    };
+    let follow_hint = if follow { " [follow] " } else { "" };
+    let hint_bottom = if rec.ended.is_none() {
+        " [Enter] send  [^D] close stdin  [^]] detach  [^C] quit "
+    } else {
+        " [Esc] close "
+    };
+    let block = Block::bordered()
+        .title(format!(" {} ", rec.title))
+        .title_bottom(Line::from(format!("{follow_hint}{status_label}")).right_aligned())
+        .title_bottom(Line::from(hint_bottom).left_aligned())
+        .border_style(Style::default().fg(Color::Green));
+
+    // Viewport: subtract 2 for borders + 1 for the input row.
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let output_rows = inner.height.saturating_sub(1);
+    let viewport = usize::from(output_rows);
+    let lines = &rec.output_lines;
+    let top = scroll.min(lines.len().saturating_sub(1));
+    let end = (top + viewport).min(lines.len());
+    let visible: Vec<ListItem> = lines
+        .iter()
+        .skip(top)
+        .take(end.saturating_sub(top))
+        .map(|l| ListItem::new(l.as_str()))
+        .collect();
+    let output_area = Rect {
+        height: output_rows,
+        ..inner
+    };
+    frame.render_widget(List::new(visible), output_area);
+
+    // Input row pinned at the bottom of the inner area.
+    let input_area = Rect {
+        y: inner.y + output_rows,
+        height: 1,
+        ..inner
+    };
+    // `▏` block cursor at the end of the field (same pattern as `render_prompt`).
+    frame.render_widget(
+        Paragraph::new(Line::from(format!("> {input}\u{258f}"))),
+        input_area,
+    );
+}
+
+/// Draw the port-forward status overlay: shows the title, the bound local port (or "binding…"
+/// until [`AppEvent::PortForwardBound`] arrives), and the ended state if applicable.
+fn render_port_forward_status(frame: &mut Frame, rec: &SessionRecord) {
+    // 7 rows: 2 borders + title/port row + blank + status + blank + hint.
+    let area = centered(frame.area(), 56, 7);
+    frame.render_widget(Clear, area);
+
+    let block = Block::bordered()
+        .title(format!(" {} ", rec.title))
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let port_line = match rec.local_port {
+        Some(p) => format!("Forwarding local port {p}"),
+        None => "Binding…".to_owned(),
+    };
+    let status_line = match &rec.ended {
+        None => String::new(),
+        Some(SessionEnd {
+            exit_code: Some(0),
+            error: None,
+        }) => "Closed cleanly".to_owned(),
+        Some(SessionEnd { error: Some(e), .. }) => format!("Error: {e}"),
+        Some(_) => "Ended".to_owned(),
+    };
+    let hint = if rec.ended.is_none() {
+        "[Esc] close forward"
+    } else {
+        "[Esc] dismiss"
+    };
+    let body = Paragraph::new(vec![
+        Line::from(port_line),
+        Line::from(""),
+        Line::styled(status_line, Style::default().fg(Color::Yellow)),
+        Line::from(""),
+        Line::from(hint),
+    ])
+    .block(block)
+    .alignment(Alignment::Center);
+    frame.render_widget(body, area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,5 +1243,104 @@ mod tests {
         assert!(text.contains("line two"), "second log line: {text}");
         assert!(text.contains("Streaming"), "status indicator: {text}");
         assert!(text.contains("follow"), "follow indicator: {text}");
+    }
+
+    fn make_session_record(title: &str) -> SessionRecord {
+        SessionRecord {
+            path: VfsPath::root(),
+            title: title.to_owned(),
+            output_lines: std::collections::VecDeque::new(),
+            output_partial: String::new(),
+            output_byte_size: 0,
+            local_port: None,
+            ended: None,
+        }
+    }
+
+    #[test]
+    fn exec_pane_overlay_shows_title_and_input_field() {
+        use cairn_types::SessionId;
+        let mut s = ready_state();
+        let id = SessionId(1);
+        s.sessions.insert(id, make_session_record("my-pod — exec"));
+        s.overlay = Some(cairn_core::Overlay::ExecPane {
+            id,
+            input: "ls -la".to_owned(),
+            scroll: 0,
+            follow: true,
+        });
+        let text = render_text(&s, 100, 30);
+        assert!(text.contains("my-pod"), "title in border: {text}");
+        assert!(text.contains("ls -la"), "input field content: {text}");
+        assert!(text.contains("Running"), "running status: {text}");
+    }
+
+    #[test]
+    fn exec_pane_shows_output_lines() {
+        use cairn_types::SessionId;
+        let mut s = ready_state();
+        let id = SessionId(2);
+        let mut rec = make_session_record("bash — exec");
+        rec.output_lines.push_back("hello world".to_owned());
+        rec.output_lines.push_back("second line".to_owned());
+        s.sessions.insert(id, rec);
+        s.overlay = Some(cairn_core::Overlay::ExecPane {
+            id,
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+        });
+        let text = render_text(&s, 100, 30);
+        assert!(text.contains("hello world"), "output line 1: {text}");
+        assert!(text.contains("second line"), "output line 2: {text}");
+    }
+
+    #[test]
+    fn exec_pane_shows_exit_code_when_ended() {
+        use cairn_types::SessionId;
+        let mut s = ready_state();
+        let id = SessionId(3);
+        let mut rec = make_session_record("job — exec");
+        rec.ended = Some(SessionEnd {
+            exit_code: Some(42),
+            error: None,
+        });
+        s.sessions.insert(id, rec);
+        s.overlay = Some(cairn_core::Overlay::ExecPane {
+            id,
+            input: String::new(),
+            scroll: 0,
+            follow: false,
+        });
+        let text = render_text(&s, 100, 30);
+        assert!(text.contains("42"), "exit code in status: {text}");
+    }
+
+    #[test]
+    fn port_forward_overlay_shows_port() {
+        use cairn_types::SessionId;
+        let mut s = ready_state();
+        let id = SessionId(10);
+        let mut rec = make_session_record("postgres — port-forward");
+        rec.local_port = Some(15432);
+        s.sessions.insert(id, rec);
+        s.overlay = Some(cairn_core::Overlay::PortForwardStatus { id });
+        let text = render_text(&s, 100, 30);
+        assert!(text.contains("15432"), "local port in overlay: {text}");
+    }
+
+    #[test]
+    fn port_forward_overlay_shows_binding_when_no_port() {
+        use cairn_types::SessionId;
+        let mut s = ready_state();
+        let id = SessionId(11);
+        s.sessions
+            .insert(id, make_session_record("svc — port-forward"));
+        s.overlay = Some(cairn_core::Overlay::PortForwardStatus { id });
+        let text = render_text(&s, 100, 30);
+        assert!(
+            text.contains("Bind") || text.contains("bind"),
+            "binding indicator: {text}"
+        );
     }
 }

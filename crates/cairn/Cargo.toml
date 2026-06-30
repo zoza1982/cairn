@@ -65,6 +65,9 @@ cairn-ai = { workspace = true }
 cairn-config = { workspace = true }
 thiserror = "2"
 anyhow = "1"
+# `bytes::Bytes` is the stdin channel payload type on `SessionHandle` (cairn-vfs); the effect runner
+# forwards it directly from `SendSessionInput` — no copy needed.
+bytes = "1"
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

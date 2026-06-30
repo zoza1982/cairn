@@ -44,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TUI exec/port-forward session pane** (M6-7, RFC-0009 PR-4): `SessionId`, `SessionRecord`,
+  `SessionEnd`, `SESSION_OUTPUT_MAX_LINES`, and `SESSION_OUTPUT_MAX_BYTES` are added to
+  `cairn-types`/`cairn-core`. The reducer gains `Overlay::ExecPane` (cooked-mode line I/O with
+  scroll, follow, and a detach-without-kill `Ctrl-]` binding) and `Overlay::PortForwardStatus`
+  (bound-port display with one-key teardown). Five new `AppEffect` variants —
+  `OpenExecSession`, `OpenPortForward`, `CloseSession`, `SendSessionInput`, `ResizeSession` — and
+  three new `AppEvent` variants — `SessionOutput`, `SessionEnded`, `PortForwardBound` — complete
+  the TEA loop. The app effect runner adds `SessionControls` (cancel token + stdin relay channel)
+  and the `run_exec_session_effect`/`run_port_forward_effect` async functions that invoke the
+  backend, relay stdout chunks, and forward `SendSessionInput` bytes to the backend's stdin pipe.
+  `TextEdit::CloseStdin` (`Ctrl-D`) and `Ctrl-]` detach are wired in `map_input`. `render_exec_pane`
+  and `render_port_forward_status` mirror the log-viewer pattern. 10 unit tests in
+  `cairn-core::update::session_tests` and 5 render tests cover the new paths.
+
 - **Docker interactive exec** (M6-3, RFC-0009 §2): `DockerVfs::invoke("exec")` with
   `ActionCtx::Exec { argv, tty }` now returns `ActionOutcome::Session(SessionHandle)` backed by
   bollard 0.21's `create_exec` → `start_exec` → relay-task pipeline. `ContainerOps::exec` is
