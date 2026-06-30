@@ -2,8 +2,9 @@
 
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
+use cairn_types::SessionId;
 use cairn_types::{ConnectionId, Entry, VfsPath};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use zeroize::Zeroize;
@@ -422,6 +423,32 @@ pub enum Overlay {
         /// Current stream status.
         status: LogViewerStatus,
     },
+    /// An interactive cooked-mode exec session (v1: line-oriented, no TTY emulation, `tty: false`).
+    ///
+    /// Renders `SessionRecord.output_lines` as scrollable text (like [`Overlay::LogViewer`]) plus a
+    /// single-line input field at the bottom. Key input is routed here while this overlay is active,
+    /// bypassing the file-manager keymap. `Enter` submits the line. `Ctrl-D` (`TextEdit::CloseStdin`)
+    /// closes stdin. `Ctrl-]` (mapped to `Action::Cancel` before the text-capture path) detaches
+    /// without killing the remote process.
+    ExecPane {
+        /// Session id — output and state live in [`AppState::sessions`].
+        id: SessionId,
+        /// The text the user is currently typing; submitted on `Enter`.
+        input: String,
+        /// Index of the topmost visible output line.
+        scroll: usize,
+        /// When `true`, auto-scrolls to the most recent output line.
+        follow: bool,
+    },
+    /// A read-only status overlay for a port-forward session.
+    ///
+    /// Shows the title, local address (`127.0.0.1:<port>` once bound, otherwise "binding…"), and the
+    /// ended state. `Esc` or `q` (`Action::Cancel`) closes the overlay AND fires `CloseSession` to
+    /// tear down the forward.
+    PortForwardStatus {
+        /// Session id — state lives in [`AppState::sessions`].
+        id: SessionId,
+    },
 }
 
 /// What submitting a [`Overlay::Prompt`] text field will do.
@@ -520,6 +547,15 @@ pub struct AppState {
     pub has_locked_connections: bool,
     /// Monotonic id counter for log-viewer sessions (like `next_transfer_id`). Starts at 1.
     pub next_log_viewer_id: LogViewerId,
+    /// Active exec and port-forward sessions, keyed by stable [`SessionId`].
+    ///
+    /// A record is inserted when `OpenExecSession`/`OpenPortForward` is emitted by the reducer and
+    /// removed when `CloseSession` is emitted (or cleaned up on `SessionEnded` when the overlay is
+    /// already closed). The overlay (`ExecPane`/`PortForwardStatus`) stores only the id; the renderer
+    /// and effect runner look up the record here.
+    pub sessions: HashMap<SessionId, SessionRecord>,
+    /// Monotonic id counter for session records (like `next_transfer_id`). Starts at 1; 0 is sentinel.
+    pub next_session_id: SessionId,
 }
 
 /// A stable identifier for an in-flight transfer, used to address progress/done events and the
@@ -533,6 +569,40 @@ pub type LogViewerId = u64;
 pub const LOG_VIEWER_MAX_LINES: usize = 100_000;
 /// Max decoded bytes the log viewer keeps in memory (~4 MiB).
 pub const LOG_VIEWER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The recorded end-state of a session (exec or port-forward).
+#[derive(Debug, Clone)]
+pub struct SessionEnd {
+    /// Process exit code for an exec session (`None` for port-forward teardown or unknown).
+    pub exit_code: Option<i32>,
+    /// A redacted (secret-free) error message if the session ended abnormally.
+    pub error: Option<String>,
+}
+
+/// Runtime state for a single exec or port-forward session, keyed by [`SessionId`] in
+/// [`AppState::sessions`]. The overlay holds only the id; the renderer fetches the record by id.
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    /// The VFS path the session was opened on.
+    pub path: cairn_types::VfsPath,
+    /// Human-readable title, e.g. `"exec sh /web-1/app"` or `"pf 127.0.0.1:5432→5432"`.
+    pub title: String,
+    /// Accumulated output lines (stdout/stderr, lossily decoded), oldest-first.
+    pub output_lines: VecDeque<String>,
+    /// Incomplete last line (not yet newline-terminated).
+    pub output_partial: String,
+    /// Total retained bytes (for the byte-cap check, avoids summing `output_lines` each chunk).
+    pub output_byte_size: usize,
+    /// The bound local TCP port for port-forward sessions; `None` until bound (or for exec).
+    pub local_port: Option<u16>,
+    /// Set when the session has ended.
+    pub ended: Option<SessionEnd>,
+}
+
+/// Max lines the session output ring buffer keeps in memory (same policy as the log viewer).
+pub const SESSION_OUTPUT_MAX_LINES: usize = 100_000;
+/// Max decoded bytes the session output keeps in memory (~4 MiB, same policy as the log viewer).
+pub const SESSION_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Status of an [`Overlay::LogViewer`] stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,6 +668,8 @@ impl AppState {
             vault_unlocking: false,
             has_locked_connections: false,
             next_log_viewer_id: 1,
+            sessions: HashMap::new(),
+            next_session_id: SessionId(1),
         }
     }
 
@@ -638,7 +710,9 @@ impl AppState {
     pub fn capturing_text(&self) -> bool {
         match &self.overlay {
             // Both the text prompt and the vault-unlock field capture keystrokes as `Msg::Text`.
-            Some(Overlay::Prompt { .. } | Overlay::VaultUnlock { .. }) => true,
+            Some(
+                Overlay::Prompt { .. } | Overlay::VaultUnlock { .. } | Overlay::ExecPane { .. },
+            ) => true,
             Some(_) => false,
             None => self.active().filter_editing,
         }

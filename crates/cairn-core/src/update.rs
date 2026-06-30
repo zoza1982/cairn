@@ -3,9 +3,10 @@
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 use crate::state::{
     ActiveTransfer, AppState, Listing, LogViewerStatus, MaskedInput, Overlay, PromptKind,
-    QueuedTransfer, Side, SortMode, TransferId,
+    QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId,
+    SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
-use cairn_types::{Entry, VfsPath};
+use cairn_types::{Entry, SessionId, VfsPath};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -253,6 +254,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         | Action::PageUp
         | Action::PageDown => Vec::new(),
         Action::OpenLogViewer => open_log_viewer(state),
+        Action::OpenExecSession => open_exec_session(state),
         Action::Refresh => reload(state, state.focus),
         Action::CycleSort => {
             let p = state.active_mut();
@@ -321,6 +323,9 @@ fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
     if matches!(state.overlay, Some(Overlay::VaultUnlock { .. })) {
         return apply_vault_unlock_text(state, edit);
     }
+    if matches!(state.overlay, Some(Overlay::ExecPane { .. })) {
+        return apply_exec_pane_text(state, edit);
+    }
     // Filter editing only owns input when no overlay is open (lock-step with `capturing_text`).
     if state.overlay.is_none() && state.active().filter_editing {
         return apply_filter_text(state, edit);
@@ -354,6 +359,8 @@ fn apply_vault_unlock_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffec
             Vec::new()
         }
         TextEdit::Submit => submit_vault_unlock(state),
+        // `CloseStdin` is only meaningful inside `ExecPane`; ignore it everywhere else.
+        TextEdit::CloseStdin => Vec::new(),
     }
 }
 
@@ -381,6 +388,74 @@ fn submit_vault_unlock(state: &mut AppState) -> Vec<AppEffect> {
     vec![AppEffect::UnlockVault { passphrase }]
 }
 
+/// Route text-editing keystrokes to the exec pane's input field.
+///
+/// `Enter` submits the current line (appending `\n`) as a [`AppEffect::SendSessionInput`]; `Esc`
+/// clears the field (to cancel in-progress typing, not to close the overlay — that is `Ctrl-]`,
+/// mapped to `Action::Cancel` upstream). `CloseStdin` (`Ctrl-D`) closes the session's stdin.
+fn apply_exec_pane_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
+    // Read the session id with a shared borrow that ends here.
+    let session_id = match &state.overlay {
+        Some(Overlay::ExecPane { id, .. }) => *id,
+        _ => return Vec::new(),
+    };
+
+    match edit {
+        TextEdit::Insert(c) => {
+            if !c.is_control() {
+                if let Some(Overlay::ExecPane { input, .. }) = &mut state.overlay {
+                    input.push(c);
+                }
+            }
+            Vec::new()
+        }
+        TextEdit::Backspace => {
+            if let Some(Overlay::ExecPane { input, .. }) = &mut state.overlay {
+                input.pop();
+            }
+            Vec::new()
+        }
+        // Esc clears the field (doesn't close the overlay — Ctrl-] closes it via Action::Cancel).
+        TextEdit::Cancel => {
+            if let Some(Overlay::ExecPane { input, .. }) = &mut state.overlay {
+                input.clear();
+            }
+            Vec::new()
+        }
+        TextEdit::Submit => {
+            // Take the input line from the overlay (short-lived mutable borrow).
+            let line = match &mut state.overlay {
+                Some(Overlay::ExecPane { input, .. }) => std::mem::take(input),
+                _ => return Vec::new(),
+            };
+            if line.is_empty() {
+                return Vec::new();
+            }
+            // Do not emit input to a session that has already ended — the process is gone
+            // and the bytes would be silently discarded by the relay task anyway.
+            if state
+                .sessions
+                .get(&session_id)
+                .is_none_or(|r| r.ended.is_some())
+            {
+                return Vec::new();
+            }
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            vec![AppEffect::SendSessionInput {
+                id: session_id,
+                bytes,
+            }]
+        }
+        TextEdit::CloseStdin => {
+            // Signal EOF to the remote process by dropping stdin — the process may exit
+            // on EOF (e.g. a shell's `exit`). Unlike `CloseSession`, the overlay stays open
+            // to show remaining output; `SessionEnded` arrives when the process exits.
+            vec![AppEffect::CloseStdin { id: session_id }]
+        }
+    }
+}
+
 /// Edit the open text prompt.
 fn apply_prompt_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
     let Some(Overlay::Prompt { input, kind }) = &mut state.overlay else {
@@ -404,6 +479,8 @@ fn apply_prompt_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
             Vec::new()
         }
         TextEdit::Submit => submit_prompt(state),
+        // `CloseStdin` is only meaningful inside `ExecPane`; ignore it everywhere else.
+        TextEdit::CloseStdin => Vec::new(),
     }
 }
 
@@ -444,6 +521,8 @@ fn apply_filter_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
             p.marked.clear();
             p.cursor = 0;
         }
+        // `CloseStdin` is only meaningful inside `ExecPane`; ignore it everywhere else.
+        TextEdit::CloseStdin => {}
     }
     state.active_mut().clamp_cursor();
     Vec::new()
@@ -559,6 +638,8 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
         Some(Overlay::TransferQueue { .. }) => apply_transfer_queue_action(state, action),
         Some(Overlay::LogViewer { .. }) => apply_log_viewer_action(state, action),
+        Some(Overlay::ExecPane { .. }) => apply_exec_pane_action(state, action),
+        Some(Overlay::PortForwardStatus { .. }) => apply_port_forward_status_action(state, action),
         // A text prompt / the vault-unlock field capture keystrokes as `Msg::Text`; non-quit actions
         // don't reach them.
         Some(Overlay::Prompt { .. } | Overlay::VaultUnlock { .. }) | None => Vec::new(),
@@ -979,7 +1060,23 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
 /// While a modal overlay is open we start nothing new (a `ConfirmOverwrite` is a question about
 /// existing work) — already-running transfers in other slots are untouched.
 fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
-    if state.overlay.is_some() {
+    // Block queue advancement only while a modal overlay demands immediate user attention.
+    // Passive/long-lived overlays (LogViewer, ExecPane, PortForwardStatus) coexist with
+    // ongoing transfers — they must not starve the queue.
+    let blocks_queue = matches!(
+        &state.overlay,
+        Some(
+            Overlay::ConfirmDelete { .. }
+                | Overlay::ConfirmOverwrite { .. }
+                | Overlay::ConfirmShellAction { .. }
+                | Overlay::AiPlan { .. }
+                | Overlay::Connections { .. }
+                | Overlay::TransferQueue { .. }
+                | Overlay::Prompt { .. }
+                | Overlay::VaultUnlock { .. }
+        )
+    );
+    if blocks_queue {
         return Vec::new();
     }
     let mut effects = Vec::new();
@@ -1038,6 +1135,54 @@ fn open_log_viewer(state: &mut AppState) -> Vec<AppEffect> {
     }]
 }
 
+/// Open a cooked exec session on the entry under the cursor.
+///
+/// Mints a fresh [`SessionId`], inserts a [`SessionRecord`] into [`AppState::sessions`], opens
+/// the [`Overlay::ExecPane`], and emits [`AppEffect::OpenExecSession`] with `argv = ["sh"]`.
+/// Backend startup failures arrive later as [`AppEvent::SessionEnded`] with an error.
+fn open_exec_session(state: &mut AppState) -> Vec<AppEffect> {
+    let pane = state.active();
+    let Some(entry) = pane.current() else {
+        state.status = Some("Nothing selected".to_owned());
+        return Vec::new();
+    };
+    let Ok(path) = pane.cwd.join(entry.name.as_ref()) else {
+        state.status = Some("Cannot open exec session for this entry".to_owned());
+        return Vec::new();
+    };
+    let conn = pane.conn;
+    let title = format!("{} — exec", entry.name);
+    let id = state.next_session_id;
+    state.next_session_id = SessionId(id.0 + 1);
+
+    state.sessions.insert(
+        id,
+        SessionRecord {
+            path: path.clone(),
+            title: title.clone(),
+            output_lines: VecDeque::new(),
+            output_partial: String::new(),
+            output_byte_size: 0,
+            local_port: None,
+            ended: None,
+        },
+    );
+    state.overlay = Some(Overlay::ExecPane {
+        id,
+        input: String::new(),
+        scroll: 0,
+        follow: true,
+    });
+    vec![AppEffect::OpenExecSession {
+        id,
+        conn,
+        path,
+        argv: vec!["sh".to_owned()],
+        tty: false,
+        title,
+    }]
+}
+
 /// Handle actions while the log-viewer overlay is open.
 fn apply_log_viewer_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     let Some(Overlay::LogViewer {
@@ -1074,6 +1219,7 @@ fn apply_log_viewer_action(state: &mut AppState, action: Action) -> Vec<AppEffec
             *scroll = new_scroll;
             if new_scroll + 1 >= total_lines {
                 *follow = true;
+                *scroll = total_lines.saturating_sub(LOG_VIEWER_PAGE);
             }
             Vec::new()
         }
@@ -1095,43 +1241,227 @@ fn apply_log_viewer_action(state: &mut AppState, action: Action) -> Vec<AppEffec
     }
 }
 
-/// Append a chunk of text into the log buffer (lines + partial), enforcing the byte and line caps.
+/// Page size for exec pane scroll actions (mirrors log viewer).
+const EXEC_PANE_PAGE: usize = 20;
+
+/// Handle non-text actions while the exec pane overlay is open.
 ///
-/// The chunk may contain zero, one, or many newlines. Lines are accumulated in `lines` (oldest first);
-/// the final unterminated fragment lives in `partial`. `byte_size` tracks the total retained bytes so
-/// the cap check is O(1) rather than summing `lines` every call.
-fn append_log_chunk(
+/// While `ExecPane` is active, most key events are routed as `Msg::Text` (the overlay captures
+/// text). The only actions that reach here are: `Quit` (handled by the shared path before this
+/// function), and `Action::Cancel` — the explicit detach chord (`Ctrl-]`) intercepted in
+/// `map_input` before the text-capture path, or forwarded from the overlay for Esc-outside-field.
+///
+/// `Cancel` detaches the pane: the overlay closes but the remote process keeps running. No
+/// `CloseSession` effect is emitted; the session record stays alive in `AppState::sessions` until
+/// `SessionEnded` arrives (which cleans it up regardless of whether the overlay is open).
+fn apply_exec_pane_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        Action::Cancel => {
+            // Detach: close the overlay, leave the remote process running. If the session has
+            // already ended there is no relay task left, so clean up the record now.
+            if let Some(Overlay::ExecPane { id, .. }) = state.overlay.take() {
+                if state.sessions.get(&id).is_some_and(|r| r.ended.is_some()) {
+                    state.sessions.remove(&id);
+                }
+            }
+            Vec::new()
+        }
+        Action::PageUp => {
+            if let Some(Overlay::ExecPane { scroll, follow, .. }) = &mut state.overlay {
+                *scroll = scroll.saturating_sub(EXEC_PANE_PAGE);
+                *follow = false;
+            }
+            Vec::new()
+        }
+        Action::PageDown => {
+            let total = exec_pane_total_lines(state);
+            if let Some(Overlay::ExecPane { scroll, follow, .. }) = &mut state.overlay {
+                let new_scroll = (*scroll + EXEC_PANE_PAGE).min(total.saturating_sub(1));
+                *scroll = new_scroll;
+                if new_scroll + 1 >= total {
+                    *follow = true;
+                    *scroll = total.saturating_sub(EXEC_PANE_PAGE);
+                }
+            }
+            Vec::new()
+        }
+        Action::CursorUp => {
+            if let Some(Overlay::ExecPane { scroll, follow, .. }) = &mut state.overlay {
+                *scroll = scroll.saturating_sub(1);
+                *follow = false;
+            }
+            Vec::new()
+        }
+        Action::CursorDown => {
+            let total = exec_pane_total_lines(state);
+            if let Some(Overlay::ExecPane { scroll, follow, .. }) = &mut state.overlay {
+                if *scroll + 1 < total {
+                    *scroll += 1;
+                }
+                if *scroll + 1 >= total {
+                    *follow = true;
+                    *scroll = total.saturating_sub(EXEC_PANE_PAGE);
+                }
+            }
+            Vec::new()
+        }
+        Action::CursorBottom => {
+            if let Some(Overlay::ExecPane { follow, .. }) = &mut state.overlay {
+                *follow = true;
+            }
+            Vec::new()
+        }
+        Action::CursorTop => {
+            if let Some(Overlay::ExecPane { scroll, follow, .. }) = &mut state.overlay {
+                *scroll = 0;
+                *follow = false;
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Total visible lines in the exec pane (complete lines + 1 for partial if non-empty).
+fn exec_pane_total_lines(state: &AppState) -> usize {
+    let Some(Overlay::ExecPane { id, .. }) = &state.overlay else {
+        return 0;
+    };
+    let Some(rec) = state.sessions.get(id) else {
+        return 0;
+    };
+    rec.output_lines.len() + if rec.output_partial.is_empty() { 0 } else { 1 }
+}
+
+/// Handle actions while the port-forward status overlay is open.
+///
+/// `Confirm`/`Enter` are intentional no-ops: the status pane is informational and a live
+/// port-forward must not be torn down by accident. Only an explicit `Cancel` (Esc) closes it.
+fn apply_port_forward_status_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        Action::Confirm | Action::Enter => Vec::new(),
+        Action::Cancel => {
+            let Some(Overlay::PortForwardStatus { id }) = state.overlay.take() else {
+                return Vec::new();
+            };
+            // If the session has already ended (relay task gone), clean up the record.
+            if state.sessions.get(&id).is_some_and(|r| r.ended.is_some()) {
+                state.sessions.remove(&id);
+            }
+            vec![AppEffect::CloseSession { id }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Append decoded text into a ring-buffered line store.
+///
+/// Splits `text` on `'\n'`, accumulating complete lines in `lines` and the final
+/// unterminated fragment in `partial`. Both `lines` and `partial` contribute to
+/// `byte_size`; the caller must initialise all three consistently.
+///
+/// Returns the number of complete lines evicted from the front to enforce the caps.
+/// The caller should subtract this from any stored scroll offset to prevent view drift.
+///
+/// # OOM safety
+///
+/// When a chunk arrives with **no newline** (binary output, `\r`-only progress bars,
+/// `yes | tr -d '\n'`), the `partial` buffer absorbs all bytes without the eviction loop
+/// ever running — breaking the documented byte cap. This function detects that case and
+/// force-flushes `partial` as a synthetic complete line so eviction can proceed.
+fn append_to_ring(
     lines: &mut VecDeque<String>,
     partial: &mut String,
     byte_size: &mut usize,
     text: &str,
-) {
-    use crate::state::{LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES};
-
-    // Split on newlines. For each full line, append partial+line as one complete line. The last
-    // segment (possibly empty) becomes the new partial.
+    max_lines: usize,
+    max_bytes: usize,
+) -> usize {
+    let mut evicted = 0usize;
     let mut segments = text.split('\n');
+
     // The first segment continues the current partial line.
     if let Some(first) = segments.next() {
         *byte_size += first.len();
         partial.push_str(first);
     }
+
     for seg in segments {
-        // We have a newline: flush partial into lines.
+        // A newline was found: flush partial into a complete line.
         let complete = std::mem::take(partial);
-        *byte_size += 1; // the '\n' itself (we track it symbolically; line lengths sum to byte_size)
+        *byte_size += 1; // the '\n' itself
         lines.push_back(complete);
         *byte_size += seg.len();
         partial.push_str(seg);
-        // Enforce caps: evict oldest lines until within limits.
-        while (lines.len() > LOG_VIEWER_MAX_LINES || *byte_size > LOG_VIEWER_MAX_BYTES)
-            && !lines.is_empty()
-        {
-            if let Some(evicted) = lines.pop_front() {
-                *byte_size = byte_size.saturating_sub(evicted.len() + 1); // +1 for '\n'
+
+        // Evict oldest complete lines until within both caps.
+        while (lines.len() > max_lines || *byte_size > max_bytes) && !lines.is_empty() {
+            if let Some(e) = lines.pop_front() {
+                *byte_size = byte_size.saturating_sub(e.len() + 1);
+                evicted += 1;
             }
         }
     }
+
+    // OOM guard: if `partial` has grown past the byte cap (no `\n` in the entire chunk),
+    // force-flush it as a synthetic complete line so the eviction loop above can bound it.
+    // Without this, a single large no-newline chunk bypasses the cap entirely.
+    if *byte_size > max_bytes && !partial.is_empty() {
+        let complete = std::mem::take(partial);
+        *byte_size += 1; // synthetic newline
+        lines.push_back(complete);
+        while (*byte_size > max_bytes || lines.len() > max_lines) && !lines.is_empty() {
+            if let Some(e) = lines.pop_front() {
+                *byte_size = byte_size.saturating_sub(e.len() + 1);
+                evicted += 1;
+            }
+        }
+        // If lines is now empty but byte_size is still > 0 (the evicted line was larger
+        // than max_bytes), byte_size is now the residual of the synthetic newline. Clear it.
+        if lines.is_empty() {
+            *byte_size = 0;
+        }
+    }
+
+    evicted
+}
+
+/// Append a decoded text chunk from a log stream into the log-viewer ring buffer.
+///
+/// Delegates to [`append_to_ring`] with [`LOG_VIEWER_MAX_LINES`] / [`LOG_VIEWER_MAX_BYTES`].
+/// Returns the number of complete lines evicted; the log-viewer scroll handler can use this
+/// to adjust the stored scroll offset (scroll drift prevention).
+fn append_log_chunk(
+    lines: &mut VecDeque<String>,
+    partial: &mut String,
+    byte_size: &mut usize,
+    text: &str,
+) -> usize {
+    use crate::state::{LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES};
+    append_to_ring(
+        lines,
+        partial,
+        byte_size,
+        text,
+        LOG_VIEWER_MAX_LINES,
+        LOG_VIEWER_MAX_BYTES,
+    )
+}
+
+/// Append a decoded text chunk from an exec session into the session output ring buffer.
+///
+/// Delegates to [`append_to_ring`] with [`SESSION_OUTPUT_MAX_LINES`] / [`SESSION_OUTPUT_MAX_BYTES`].
+/// Returns the number of complete lines evicted from the front; the [`AppEvent::SessionOutput`]
+/// handler subtracts this from the stored scroll offset to prevent view drift.
+fn append_session_output(rec: &mut SessionRecord, text: &str) -> usize {
+    append_to_ring(
+        &mut rec.output_lines,
+        &mut rec.output_partial,
+        &mut rec.output_byte_size,
+        text,
+        SESSION_OUTPUT_MAX_LINES,
+        SESSION_OUTPUT_MAX_BYTES,
+    )
 }
 
 /// Mint a transfer id, push a fresh [`ActiveTransfer`] tracking it, set the status line, and return
@@ -1351,15 +1681,16 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             }) = &mut state.overlay
             {
                 if *ov_id == id {
-                    let old_total = lines.len() + if partial.is_empty() { 0 } else { 1 };
-                    append_log_chunk(lines, partial, byte_size, &text);
+                    let evicted = append_log_chunk(lines, partial, byte_size, &text);
+                    // Adjust scroll for front-evictions to prevent view drift.
+                    *scroll = scroll.saturating_sub(evicted);
                     let new_total = lines.len() + if partial.is_empty() { 0 } else { 1 };
-                    let _ = old_total; // suppress unused warning
                     if *scroll >= new_total && new_total > 0 {
                         *scroll = new_total - 1;
                     }
                     if *follow {
-                        *scroll = new_total.saturating_sub(1);
+                        // Approximate the last-page top so un-follow transitions feel natural when scroll is restored.
+                        *scroll = new_total.saturating_sub(LOG_VIEWER_PAGE);
                     }
                 }
             }
@@ -1415,6 +1746,53 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                     Vec::new()
                 }
             }
+        }
+        AppEvent::SessionOutput { id, text } => {
+            if let Some(rec) = state.sessions.get_mut(&id) {
+                let evicted = append_session_output(rec, &text);
+                let new_total =
+                    rec.output_lines.len() + if rec.output_partial.is_empty() { 0 } else { 1 };
+                if let Some(Overlay::ExecPane {
+                    id: ov_id,
+                    scroll,
+                    follow,
+                    ..
+                }) = &mut state.overlay
+                {
+                    if *ov_id == id {
+                        *scroll = scroll.saturating_sub(evicted);
+                        if *follow {
+                            *scroll = new_total.saturating_sub(EXEC_PANE_PAGE);
+                        } else if *scroll >= new_total && new_total > 0 {
+                            *scroll = new_total - 1;
+                        }
+                    }
+                }
+            }
+            Vec::new()
+        }
+        AppEvent::SessionEnded {
+            id,
+            exit_code,
+            error,
+        } => {
+            if let Some(rec) = state.sessions.get_mut(&id) {
+                rec.ended = Some(SessionEnd { exit_code, error });
+            }
+            // If the overlay is still showing this session the user can read the exit code; it will
+            // be cleaned up when they close the overlay. Otherwise clean up immediately.
+            let showing = matches!(&state.overlay, Some(Overlay::ExecPane { id: ov_id, .. }) if *ov_id == id)
+                || matches!(&state.overlay, Some(Overlay::PortForwardStatus { id: ov_id }) if *ov_id == id);
+            if !showing {
+                state.sessions.remove(&id);
+            }
+            Vec::new()
+        }
+        AppEvent::PortForwardBound { id, local_port } => {
+            if let Some(rec) = state.sessions.get_mut(&id) {
+                rec.local_port = Some(local_port);
+            }
+            Vec::new()
         }
     }
 }
@@ -3687,5 +4065,386 @@ mod tests {
             panic!("overlay gone");
         };
         assert_eq!(*status, crate::state::LogViewerStatus::Done);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use cairn_types::{ConnectionId, VfsPath};
+    use std::collections::VecDeque;
+
+    fn base_state() -> AppState {
+        AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root())
+    }
+
+    fn insert_session(state: &mut AppState, id: SessionId) {
+        state.sessions.insert(
+            id,
+            SessionRecord {
+                path: VfsPath::root(),
+                title: "test session".to_owned(),
+                output_lines: VecDeque::new(),
+                output_partial: String::new(),
+                output_byte_size: 0,
+                local_port: None,
+                ended: None,
+            },
+        );
+    }
+
+    #[test]
+    fn session_output_appends_lines() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+
+        let effects = update(
+            &mut state,
+            Msg::Event(AppEvent::SessionOutput {
+                id,
+                text: "hello\nworld\n".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty());
+        let rec = state.sessions.get(&id).unwrap();
+        assert_eq!(rec.output_lines.len(), 2);
+        assert_eq!(rec.output_lines[0], "hello");
+        assert_eq!(rec.output_lines[1], "world");
+        assert_eq!(rec.output_partial, "");
+    }
+
+    #[test]
+    fn session_output_partial_accumulates_until_newline() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+
+        let _ = update(
+            &mut state,
+            Msg::Event(AppEvent::SessionOutput {
+                id,
+                text: "hel".to_owned(),
+            }),
+        );
+        let _ = update(
+            &mut state,
+            Msg::Event(AppEvent::SessionOutput {
+                id,
+                text: "lo\n".to_owned(),
+            }),
+        );
+        let rec = state.sessions.get(&id).unwrap();
+        assert_eq!(rec.output_lines.len(), 1);
+        assert_eq!(rec.output_lines[0], "hello");
+    }
+
+    #[test]
+    fn session_output_ring_evicts_oldest_beyond_line_cap() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+        // Push slightly more than the cap via repeated single-line chunks.
+        let chunk = "x".repeat(10) + "\n";
+        let over_cap = SESSION_OUTPUT_MAX_LINES + 10;
+        for _ in 0..over_cap {
+            let _ = update(
+                &mut state,
+                Msg::Event(AppEvent::SessionOutput {
+                    id,
+                    text: chunk.clone(),
+                }),
+            );
+        }
+        let rec = state.sessions.get(&id).unwrap();
+        assert!(
+            rec.output_lines.len() <= SESSION_OUTPUT_MAX_LINES,
+            "ring buffer must not exceed the line cap: got {}",
+            rec.output_lines.len()
+        );
+    }
+
+    #[test]
+    fn session_ended_sets_exit_code_and_error() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+        // Set up an ExecPane overlay showing this session so the record is preserved
+        // when SessionEnded arrives (Fix 4a: records without a visible overlay are
+        // cleaned up immediately on SessionEnded).
+        state.overlay = Some(Overlay::ExecPane {
+            id,
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+        });
+
+        let effects = update(
+            &mut state,
+            Msg::Event(AppEvent::SessionEnded {
+                id,
+                exit_code: Some(1),
+                error: Some("process exited".to_owned()),
+            }),
+        );
+        assert!(effects.is_empty());
+        let rec = state.sessions.get(&id).unwrap();
+        let ended = rec.ended.as_ref().expect("ended must be set");
+        assert_eq!(ended.exit_code, Some(1));
+        assert_eq!(ended.error.as_deref(), Some("process exited"));
+    }
+
+    #[test]
+    fn session_ended_with_no_overlay_removes_record() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+        // No overlay — Fix 4a removes the record immediately when no pane is showing it.
+
+        let effects = update(
+            &mut state,
+            Msg::Event(AppEvent::SessionEnded {
+                id,
+                exit_code: Some(0),
+                error: None,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(
+            !state.sessions.contains_key(&id),
+            "session record should be cleaned up when no overlay is showing it"
+        );
+    }
+
+    #[test]
+    fn port_forward_bound_sets_port() {
+        let mut state = base_state();
+        let id = SessionId(2);
+        insert_session(&mut state, id);
+
+        let _ = update(
+            &mut state,
+            Msg::Event(AppEvent::PortForwardBound {
+                id,
+                local_port: 5432,
+            }),
+        );
+        let rec = state.sessions.get(&id).unwrap();
+        assert_eq!(rec.local_port, Some(5432));
+    }
+
+    #[test]
+    fn exec_pane_text_appends_to_input_field() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+        state.overlay = Some(Overlay::ExecPane {
+            id,
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+        });
+
+        // Character keys route to the field.
+        let _ = update(&mut state, Msg::Text(TextEdit::Insert('h')));
+        let _ = update(&mut state, Msg::Text(TextEdit::Insert('i')));
+        if let Some(Overlay::ExecPane { input, .. }) = &state.overlay {
+            assert_eq!(input, "hi");
+        } else {
+            panic!("overlay should still be open");
+        }
+    }
+
+    #[test]
+    fn exec_pane_enter_emits_send_session_input_and_clears_field() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+        state.overlay = Some(Overlay::ExecPane {
+            id,
+            input: "ls".to_owned(),
+            scroll: 0,
+            follow: true,
+        });
+
+        let effects = update(&mut state, Msg::Text(TextEdit::Submit));
+        assert_eq!(effects.len(), 1, "expected exactly one effect");
+        match &effects[0] {
+            AppEffect::SendSessionInput {
+                id: eff_id, bytes, ..
+            } => {
+                assert_eq!(*eff_id, id);
+                assert_eq!(bytes, b"ls\n");
+            }
+            other => panic!("expected SendSessionInput, got {other:?}"),
+        }
+        // Field is cleared.
+        if let Some(Overlay::ExecPane { input, .. }) = &state.overlay {
+            assert!(
+                input.is_empty(),
+                "input field should be cleared after submit"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_pane_cancel_action_detaches_without_close_session() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+        state.overlay = Some(Overlay::ExecPane {
+            id,
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+        });
+
+        // Action::Cancel = Ctrl-] detach: closes overlay, no CloseSession effect.
+        let effects = update(&mut state, Msg::Action(Action::Cancel));
+        assert!(
+            effects.is_empty(),
+            "detach must not emit CloseSession: {effects:?}"
+        );
+        assert!(
+            state.overlay.is_none(),
+            "overlay should be closed after detach"
+        );
+        // Session record survives (the remote process is still running).
+        assert!(
+            state.sessions.contains_key(&id),
+            "session record must survive detach"
+        );
+    }
+
+    #[test]
+    fn exec_pane_close_stdin_signals_eof_and_keeps_overlay_open() {
+        let mut state = base_state();
+        let id = SessionId(1);
+        insert_session(&mut state, id);
+        state.overlay = Some(Overlay::ExecPane {
+            id,
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+        });
+
+        let effects = update(&mut state, Msg::Text(TextEdit::CloseStdin));
+        // Overlay stays open to show remaining output; SessionEnded arrives when the process exits.
+        assert!(
+            state.overlay.is_some(),
+            "overlay must stay open after CloseStdin (process may still be running)"
+        );
+        assert_eq!(effects.len(), 1);
+        assert!(
+            matches!(&effects[0], AppEffect::CloseStdin { id: eid } if *eid == id),
+            "expected CloseStdin effect (not CloseSession): {effects:?}"
+        );
+    }
+
+    #[test]
+    fn port_forward_status_cancel_emits_close_session() {
+        let mut state = base_state();
+        let id = SessionId(3);
+        insert_session(&mut state, id);
+        state.overlay = Some(Overlay::PortForwardStatus { id });
+
+        let effects = update(&mut state, Msg::Action(Action::Cancel));
+        assert!(state.overlay.is_none(), "overlay must close");
+        assert_eq!(effects.len(), 1);
+        assert!(
+            matches!(&effects[0], AppEffect::CloseSession { id: eid } if *eid == id),
+            "expected CloseSession on PortForwardStatus cancel: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn open_exec_session_mints_id_and_opens_overlay() {
+        use cairn_types::{Entry, EntryKind};
+        use std::sync::Arc;
+
+        let mut state = base_state();
+        // Populate the active pane with one entry so the action has a cursor target.
+        state.panes[0].listing =
+            Listing::Ready(Arc::new(vec![Entry::new("web-1", EntryKind::Dir)]));
+        state.panes[0].cursor = 0;
+
+        let effects = update(&mut state, Msg::Action(Action::OpenExecSession));
+
+        // Exactly one effect: OpenExecSession with the minted id and default argv.
+        assert_eq!(effects.len(), 1, "expected exactly one effect: {effects:?}");
+        match &effects[0] {
+            AppEffect::OpenExecSession { id, argv, .. } => {
+                assert_eq!(*id, SessionId(1), "first session must have id 1");
+                assert_eq!(argv, &["sh"], "default argv must be [\"sh\"]");
+            }
+            other => panic!("expected OpenExecSession, got {other:?}"),
+        }
+
+        // The overlay must be ExecPane with the new session id.
+        assert!(
+            matches!(&state.overlay, Some(Overlay::ExecPane { id, .. }) if *id == SessionId(1)),
+            "overlay must be ExecPane(SessionId(1)), got {:?}",
+            state.overlay,
+        );
+
+        // The session record must be inserted.
+        assert!(
+            state.sessions.contains_key(&SessionId(1)),
+            "session record must be inserted into state.sessions"
+        );
+
+        // The id counter must have been advanced.
+        assert_eq!(
+            state.next_session_id,
+            SessionId(2),
+            "next_session_id must be incremented to 2"
+        );
+    }
+
+    #[test]
+    fn append_to_ring_oom_guard_caps_partial() {
+        use crate::state::{SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES};
+        let mut lines: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut partial = String::new();
+        let mut byte_size: usize = 0;
+        // One chunk of max_bytes + 1 bytes with no newline — must not let partial grow unbounded.
+        let big = "x".repeat(SESSION_OUTPUT_MAX_BYTES + 1);
+        append_to_ring(
+            &mut lines,
+            &mut partial,
+            &mut byte_size,
+            &big,
+            SESSION_OUTPUT_MAX_LINES,
+            SESSION_OUTPUT_MAX_BYTES,
+        );
+        // After the OOM guard fires, the total retained bytes must be within the cap.
+        let retained = lines.iter().map(|l| l.len() + 1).sum::<usize>() + partial.len();
+        assert!(
+            retained <= SESSION_OUTPUT_MAX_BYTES,
+            "retained {retained} bytes exceeds cap {SESSION_OUTPUT_MAX_BYTES}"
+        );
+    }
+
+    #[test]
+    fn append_to_ring_scroll_drift_corrected() {
+        let mut lines: std::collections::VecDeque<String> =
+            (0..10).map(|i| format!("line {i}")).collect();
+        let mut partial = String::new();
+        let mut byte_size: usize = lines.iter().map(|l| l.len() + 1).sum();
+        let mut scroll = 5usize;
+
+        // Deliver a chunk that forces 3 evictions (max_lines = 10, so adding 3 new lines evicts 3).
+        let evicted = append_to_ring(
+            &mut lines,
+            &mut partial,
+            &mut byte_size,
+            "a\nb\nc\n",
+            10,         // max_lines
+            usize::MAX, // no byte cap
+        );
+
+        assert_eq!(evicted, 3, "should evict 3 lines");
+        scroll = scroll.saturating_sub(evicted);
+        assert_eq!(scroll, 2, "scroll should decrease by 3");
     }
 }

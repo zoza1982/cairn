@@ -75,6 +75,17 @@ impl std::fmt::Display for Scheme {
     }
 }
 
+/// A stable identifier for an interactive session (exec or port-forward), keyed in
+/// `AppState::sessions` (in `cairn-core`). Minted monotonically by the reducer; never 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(pub u64);
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session:{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

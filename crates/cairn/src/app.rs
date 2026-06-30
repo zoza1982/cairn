@@ -15,10 +15,11 @@ use cairn_broker::{Actor, Broker, BrokerError};
 use cairn_config::{Config, ConnectionProfile};
 use cairn_core::{
     initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, LogViewerId,
-    Msg, ShellActionMeta, TransferId,
+    Msg, Overlay, ShellActionMeta, TransferId,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
+use cairn_types::SessionId;
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vault::Vault;
 use cairn_vfs::{ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
@@ -174,6 +175,7 @@ async fn run_async() -> anyhow::Result<()> {
     );
     let mut startup_controls = HashMap::new();
     let mut startup_log_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
+    let mut startup_session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
     for effect in initial {
         dispatch(
             effect,
@@ -182,6 +184,7 @@ async fn run_async() -> anyhow::Result<()> {
             &mut startup_controls,
             &mut None,
             &mut startup_log_controls,
+            &mut startup_session_controls,
             &shell_action_defs,
             &vault_ctx,
         );
@@ -339,6 +342,7 @@ async fn event_loop(
     let mut transfer_controls: HashMap<TransferId, TransferControls> = HashMap::new();
     let mut ai_cancel: Option<CancellationToken> = None;
     let mut log_viewer_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
+    let mut session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -362,6 +366,12 @@ async fn event_loop(
         if let Msg::Event(AppEvent::LogStreamEnded { id, .. }) = &msg {
             log_viewer_controls.remove(id);
         }
+        // Session cleanup: remove the controls entry when the session ends so the oneshot/mpsc
+        // senders are dropped (closing stdin and signalling the relay task) if they haven't been
+        // consumed already. The session record in `AppState::sessions` is cleaned up by the reducer.
+        if let Msg::Event(AppEvent::SessionEnded { id, .. }) = &msg {
+            session_controls.remove(id);
+        }
         let effects = update(state, msg);
         if state.should_quit {
             break;
@@ -375,6 +385,7 @@ async fn event_loop(
                 &mut transfer_controls,
                 &mut ai_cancel,
                 &mut log_viewer_controls,
+                &mut session_controls,
                 shell_action_defs,
                 vault_ctx,
             );
@@ -414,15 +425,83 @@ impl Drop for TransferDoneGuard {
     }
 }
 
+/// Emits a synthetic [`AppEvent::SessionEnded`] if dropped without being disarmed.
+///
+/// Guards `run_exec_session_effect` and `run_port_forward_effect` against task panics:
+/// if the spawned task exits abnormally (panic, cancelled future), the guard fires so the
+/// UI overlay does not freeze in a permanently un-closeable "Running" state.
+struct SessionDoneGuard {
+    id: SessionId,
+    event_tx: mpsc::Sender<AppEvent>,
+    armed: bool,
+}
+
+impl SessionDoneGuard {
+    fn new(id: SessionId, event_tx: mpsc::Sender<AppEvent>) -> Self {
+        Self {
+            id,
+            event_tx,
+            armed: true,
+        }
+    }
+
+    /// Disarm before normal completion — the caller will emit `SessionEnded` itself.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionDoneGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: if the event channel is full, the UI is probably shutting down.
+            let _ = self.event_tx.try_send(AppEvent::SessionEnded {
+                id: self.id,
+                exit_code: None,
+                error: Some("session relay interrupted unexpectedly".to_owned()),
+            });
+        }
+    }
+}
+
+/// Runtime-side handles for an active exec or port-forward session, keyed by [`SessionId`].
+///
+/// Held by the effect runner for the session's lifetime. [`AppEffect::CloseSession`] cancels the
+/// token (which the relay task watches) and drops the stdin sender (EOF to the remote process).
+/// [`AppEvent::SessionEnded`] removes the entry, dropping remaining senders.
+struct SessionControls {
+    /// Fires to signal the relay task to cancel the backend session.
+    cancel: CancellationToken,
+    /// Stdin relay channel: the event loop forwards `SendSessionInput` bytes here; the relay task
+    /// sends them on to the backend's stdin pipe. `None` for port-forward sessions.
+    stdin: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    /// TTY resize sink; `None` for v1 non-TTY exec and all port-forward sessions.
+    resize: Option<tokio::sync::mpsc::Sender<(u16, u16)>>,
+}
+
 /// Translate a terminal event into a reducer message (or `None` to ignore).
 ///
 /// While a text prompt is capturing input, keys are routed to the field as [`Msg::Text`] rather than
 /// resolved to actions — except `Ctrl-C`, which always quits so the user is never trapped in a field.
 fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
+    use cairn_core::TextEdit;
     match input {
         Event::Key(key) if state.capturing_text() => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            // Ctrl-C always quits — the user must never be trapped in any capturing field.
+            if ctrl && key.code == KeyCode::Char('c') {
                 return Some(Msg::Action(Action::Quit));
+            }
+            // Inside an ExecPane:
+            //   Ctrl-] → detach (close overlay, leave remote process running) → Action::Cancel
+            //   Ctrl-D → close stdin (EOF signal to the remote process) → TextEdit::CloseStdin
+            if matches!(&state.overlay, Some(Overlay::ExecPane { .. })) {
+                if ctrl && key.code == KeyCode::Char(']') {
+                    return Some(Msg::Action(Action::Cancel));
+                }
+                if ctrl && key.code == KeyCode::Char('d') {
+                    return Some(Msg::Text(TextEdit::CloseStdin));
+                }
             }
             text_edit_for(key).map(Msg::Text)
         }
@@ -444,6 +523,7 @@ fn dispatch(
     transfer_controls: &mut HashMap<TransferId, TransferControls>,
     ai_cancel: &mut Option<CancellationToken>,
     log_viewer_controls: &mut HashMap<LogViewerId, CancellationToken>,
+    session_controls: &mut HashMap<SessionId, SessionControls>,
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
     vault_ctx: &VaultContext,
 ) {
@@ -671,6 +751,102 @@ fn dispatch(
         AppEffect::CloseLogViewer { id } => {
             if let Some(token) = log_viewer_controls.remove(&id) {
                 token.cancel();
+            }
+        }
+        AppEffect::OpenExecSession {
+            id,
+            conn,
+            path,
+            argv,
+            tty,
+            title: _,
+        } => {
+            let cancel = CancellationToken::new();
+            // v1: cooked mode (non-TTY), so resize is not wired.
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
+            session_controls.insert(
+                id,
+                SessionControls {
+                    cancel: cancel.clone(),
+                    stdin: Some(stdin_tx),
+                    resize: None,
+                },
+            );
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                run_exec_session_effect(
+                    registry, id, conn, path, argv, tty, stdin_rx, cancel, event_tx,
+                )
+                .await;
+            });
+        }
+        AppEffect::OpenPortForward {
+            id,
+            conn,
+            path,
+            local_port,
+            remote_port,
+            title: _,
+        } => {
+            let cancel = CancellationToken::new();
+            session_controls.insert(
+                id,
+                SessionControls {
+                    cancel: cancel.clone(),
+                    stdin: None,
+                    resize: None,
+                },
+            );
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                run_port_forward_effect(
+                    registry,
+                    id,
+                    conn,
+                    path,
+                    local_port,
+                    remote_port,
+                    cancel,
+                    event_tx,
+                )
+                .await;
+            });
+        }
+        AppEffect::CloseSession { id } => {
+            // Cancel the relay task and drop the stdin/resize senders (closing those channels).
+            if let Some(ctrl) = session_controls.remove(&id) {
+                ctrl.cancel.cancel();
+                // `ctrl.stdin` and `ctrl.resize` are dropped here, closing the relay channels.
+            }
+        }
+        AppEffect::SendSessionInput { id, bytes } => {
+            if let Some(ctrl) = session_controls.get(&id) {
+                if let Some(stdin) = &ctrl.stdin {
+                    if stdin.try_send(bytes::Bytes::from(bytes)).is_err() {
+                        // Channel full or relay task exited. Log so the operator can diagnose;
+                        // we cannot block the event loop here with send().await.
+                        tracing::warn!(
+                            session = %id,
+                            "SendSessionInput dropped — stdin relay channel full or closed"
+                        );
+                    }
+                }
+            }
+        }
+        AppEffect::CloseStdin { id } => {
+            // Drop only the stdin sender; the cancel token stays live so the relay task keeps
+            // draining stdout until the process exits.
+            if let Some(ctrl) = session_controls.get_mut(&id) {
+                ctrl.stdin = None;
+            }
+        }
+        AppEffect::ResizeSession { id, rows, cols } => {
+            if let Some(ctrl) = session_controls.get(&id) {
+                if let Some(resize) = &ctrl.resize {
+                    let _ = resize.try_send((rows, cols));
+                }
             }
         }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
@@ -1479,6 +1655,335 @@ fn install_terminal_panic_hook() {
     }));
 }
 
+/// Decode as much valid UTF-8 as possible from `carry ++ bytes`, returning the decoded
+/// text. Any trailing incomplete codepoint bytes (1–3) are left in `carry` for the next call.
+/// This prevents the `U+FFFD` mojibake that `from_utf8_lossy` produces when a multi-byte
+/// character straddles a chunk boundary.
+fn decode_utf8_chunk(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
+    carry.extend_from_slice(bytes);
+    match std::str::from_utf8(carry) {
+        Ok(s) => {
+            let text = s.to_owned();
+            carry.clear();
+            text
+        }
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            let text = String::from_utf8_lossy(&carry[..valid_up_to]).into_owned();
+            carry.drain(..valid_up_to);
+            // carry now holds only the 1–3 trailing incomplete bytes.
+            text
+        }
+    }
+}
+
+/// Run an interactive cooked-mode exec session.
+///
+/// Calls `Vfs::invoke(path, "exec", ActionCtx::Exec { argv, tty })`, receives the
+/// `ActionOutcome::Session(SessionHandle)`, and runs three relay loops concurrently:
+///
+/// 1. **stdout relay** — reads `handle.stdout` chunks and emits [`AppEvent::SessionOutput`].
+/// 2. **stdin relay** — forwards bytes from `stdin_rx` (fed by `SendSessionInput` effects) to
+///    `handle.stdin`. Ends when the sender is dropped (i.e., after [`AppEffect::CloseSession`]).
+/// 3. **done sentinel** — awaits `handle.done` and emits [`AppEvent::SessionEnded`].
+///
+/// Any of the three terminating, or the `cancel` token firing, shuts down all of them cleanly.
+#[allow(clippy::too_many_arguments)]
+async fn run_exec_session_effect(
+    registry: VfsRegistry,
+    id: SessionId,
+    conn: cairn_types::ConnectionId,
+    path: cairn_types::VfsPath,
+    argv: Vec<String>,
+    tty: bool,
+    mut stdin_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    cancel: CancellationToken,
+    event_tx: mpsc::Sender<AppEvent>,
+) {
+    use cairn_vfs::{ActionCtx, ActionId, ActionOutcome};
+
+    // RAII guard: if this task panics or is dropped before it reaches the normal completion
+    // path, the guard's Drop impl emits a synthetic SessionEnded so the reducer and UI are
+    // never left waiting for an event that will never arrive.
+    let mut guard = SessionDoneGuard::new(id, event_tx.clone());
+
+    let Some(vfs) = registry.get(conn).await else {
+        let _ = event_tx
+            .send(AppEvent::SessionEnded {
+                id,
+                exit_code: None,
+                error: Some("connection unavailable".to_owned()),
+            })
+            .await;
+        return;
+    };
+    let outcome = vfs
+        .invoke(&path, ActionId::new("exec"), ActionCtx::Exec { argv, tty })
+        .await;
+    let handle = match outcome {
+        Ok(ActionOutcome::Session(h)) => h,
+        Ok(_) => {
+            let _ = event_tx
+                .send(AppEvent::SessionEnded {
+                    id,
+                    exit_code: None,
+                    error: Some("exec action returned unexpected outcome".to_owned()),
+                })
+                .await;
+            return;
+        }
+        Err(e) => {
+            let _ = event_tx
+                .send(AppEvent::SessionEnded {
+                    id,
+                    exit_code: None,
+                    error: Some(e.redacted().to_string()),
+                })
+                .await;
+            return;
+        }
+    };
+
+    // Destructure the handle; the backend's cancel sender fires when dropped, so we must not drop
+    // it until we are ready to tear down.
+    let cairn_vfs::SessionHandle {
+        cancel: backend_cancel,
+        done,
+        stdout,
+        stdin: backend_stdin,
+        ..
+    } = handle;
+
+    // Stdin relay: forward bytes from the event loop to the backend's stdin channel.
+    // Spawned as an independent task so it can run concurrently with stdout draining.
+    if let Some(backend_stdin_tx) = backend_stdin {
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = cancel_clone.cancelled() => break,
+                    maybe = stdin_rx.recv() => match maybe {
+                        Some(bytes) => {
+                            // Best-effort: if the backend dropped its receiver, stop relaying.
+                            if backend_stdin_tx.send(bytes).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break, // sender dropped (CloseSession or process exit)
+                    },
+                }
+            }
+        });
+    }
+
+    // Stdout + done relay on the current task.
+    let mut stdout = stdout;
+    let mut done = done;
+    let mut exit_code_result: Option<Result<i32, cairn_vfs::VfsError>> = None;
+    // Carry buffer for cross-chunk UTF-8 stitching: avoids U+FFFD replacement characters when a
+    // multibyte codepoint is split across two consecutive stdout chunks.
+    let mut utf8_carry: Vec<u8> = Vec::new();
+
+    loop {
+        // Poll stdout chunks (if present) and the done receiver concurrently, with cancel.
+        match &mut stdout {
+            Some(rx) => {
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        // Fire the backend cancel signal; backend cleans up.
+                        let _ = backend_cancel.send(());
+                        break;
+                    }
+                    maybe_bytes = rx.recv() => match maybe_bytes {
+                        Some(bytes) => {
+                            let text = decode_utf8_chunk(&mut utf8_carry, &bytes);
+                            if !text.is_empty() {
+                                let _ = event_tx
+                                    .send(AppEvent::SessionOutput { id, text })
+                                    .await;
+                            }
+                        }
+                        None => {
+                            // stdout channel closed; drain done.
+                            break;
+                        }
+                    },
+                    result = &mut done => {
+                        exit_code_result = Some(result.unwrap_or(Err(cairn_vfs::VfsError::Backend {
+                            code: "done-channel-closed".to_owned(),
+                            msg: "session done channel closed unexpectedly".to_owned(),
+                            retryable: false,
+                        })));
+                        break;
+                    }
+                }
+            }
+            None => {
+                // No stdout (unusual for exec, but handle it): just wait for done or cancel.
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        let _ = backend_cancel.send(());
+                        break;
+                    }
+                    result = &mut done => {
+                        exit_code_result = Some(result.unwrap_or(Err(cairn_vfs::VfsError::Backend {
+                            code: "done-channel-closed".to_owned(),
+                            msg: "session done channel closed unexpectedly".to_owned(),
+                            retryable: false,
+                        })));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Drain any remaining stdout that arrived before or concurrently with the done signal.
+    // Uses an async recv loop (not try_recv) so in-flight chunks are not dropped; bounded by a
+    // 5-second timeout so a stuck stdout producer cannot block the task indefinitely.
+    if let Some(rx) = &mut stdout {
+        let drain = async {
+            while let Some(bytes) = rx.recv().await {
+                let text = decode_utf8_chunk(&mut utf8_carry, &bytes);
+                if !text.is_empty() {
+                    let _ = event_tx.send(AppEvent::SessionOutput { id, text }).await;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
+    }
+    // Flush any incomplete multibyte sequence left in the carry buffer (e.g. when the
+    // stdout channel was closed mid-codepoint).
+    if !utf8_carry.is_empty() {
+        let text = String::from_utf8_lossy(&utf8_carry).into_owned();
+        let _ = event_tx.send(AppEvent::SessionOutput { id, text }).await;
+        utf8_carry.clear();
+    }
+
+    // Wait for the done receiver if we broke out of the stdout drain before it resolved.
+    let (exit_code, error) = match exit_code_result {
+        Some(Ok(code)) => (Some(code), None),
+        Some(Err(e)) => (None, Some(e.redacted().to_string())),
+        None => match done.await {
+            Ok(Ok(code)) => (Some(code), None),
+            Ok(Err(e)) => (None, Some(e.redacted().to_string())),
+            Err(_) => (None, None),
+        },
+    };
+    guard.disarm();
+    let _ = event_tx
+        .send(AppEvent::SessionEnded {
+            id,
+            exit_code,
+            error,
+        })
+        .await;
+}
+
+/// Run a port-forward session.
+///
+/// Calls `Vfs::invoke(path, "port-forward", ActionCtx::PortForward { local, remote })`, receives
+/// the `ActionOutcome::Session(SessionHandle)`, emits [`AppEvent::PortForwardBound`] (using
+/// `handle.local_port`), and then waits for the session to end (via [`AppEvent::SessionEnded`]).
+#[allow(clippy::too_many_arguments)]
+async fn run_port_forward_effect(
+    registry: VfsRegistry,
+    id: SessionId,
+    conn: cairn_types::ConnectionId,
+    path: cairn_types::VfsPath,
+    local_port: u16,
+    remote_port: u16,
+    cancel: CancellationToken,
+    event_tx: mpsc::Sender<AppEvent>,
+) {
+    use cairn_vfs::{ActionCtx, ActionId, ActionOutcome};
+
+    // RAII guard: emits a synthetic SessionEnded if this task panics or is dropped early.
+    let mut guard = SessionDoneGuard::new(id, event_tx.clone());
+
+    let Some(vfs) = registry.get(conn).await else {
+        let _ = event_tx
+            .send(AppEvent::SessionEnded {
+                id,
+                exit_code: None,
+                error: Some("connection unavailable".to_owned()),
+            })
+            .await;
+        return;
+    };
+    let outcome = vfs
+        .invoke(
+            &path,
+            ActionId::new("port-forward"),
+            ActionCtx::PortForward {
+                local: local_port,
+                remote: remote_port,
+            },
+        )
+        .await;
+    let handle = match outcome {
+        Ok(ActionOutcome::Session(h)) => h,
+        Ok(_) => {
+            let _ = event_tx
+                .send(AppEvent::SessionEnded {
+                    id,
+                    exit_code: None,
+                    error: Some("port-forward action returned unexpected outcome".to_owned()),
+                })
+                .await;
+            return;
+        }
+        Err(e) => {
+            let _ = event_tx
+                .send(AppEvent::SessionEnded {
+                    id,
+                    exit_code: None,
+                    error: Some(e.redacted().to_string()),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let cairn_vfs::SessionHandle {
+        cancel: backend_cancel,
+        mut done,
+        local_port: bound_port,
+        ..
+    } = handle;
+
+    // Emit PortForwardBound so the UI can display the actual local port (especially when 0 was
+    // requested and the OS assigned an ephemeral one).
+    let actual_port = bound_port.unwrap_or(local_port);
+    let _ = event_tx
+        .send(AppEvent::PortForwardBound {
+            id,
+            local_port: actual_port,
+        })
+        .await;
+
+    // Wait for the session to end or the cancel token to fire.
+    let (exit_code, error) = tokio::select! {
+        () = cancel.cancelled() => {
+            let _ = backend_cancel.send(());
+            (Some(0), None)
+        }
+        result = &mut done => match result {
+            Ok(Ok(code)) => (Some(code), None),
+            Ok(Err(e)) => (None, Some(e.redacted().to_string())),
+            Err(_) => (None, None),
+        },
+    };
+    guard.disarm();
+    let _ = event_tx
+        .send(AppEvent::SessionEnded {
+            id,
+            exit_code,
+            error,
+        })
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1766,6 +2271,41 @@ mod tests {
         assert_eq!(
             effective_elapsed(Duration::ZERO, Duration::ZERO),
             Duration::ZERO
+        );
+    }
+
+    /// Verifies that Ctrl-] and Ctrl-D are routed correctly when an exec-pane overlay is active:
+    /// Ctrl-] → `Action::Cancel` (detach/close overlay), Ctrl-D → `TextEdit::CloseStdin` (EOF).
+    #[test]
+    fn map_input_routes_ctrl_bracket_and_ctrl_d_when_exec_pane_active() {
+        use cairn_core::{Overlay, TextEdit};
+        let km = Keymap::default();
+        let mut st = AppState::new(LEFT, RIGHT, VfsPath::root());
+        st.overlay = Some(Overlay::ExecPane {
+            id: SessionId(1),
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+        });
+
+        // Ctrl-] → detach (Action::Cancel), not Quit
+        let ctrl_bracket = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(
+                map_input(ctrl_bracket, &km, &st),
+                Some(Msg::Action(Action::Cancel))
+            ),
+            "Ctrl-] must cancel/detach the exec pane"
+        );
+
+        // Ctrl-D → CloseStdin (EOF to remote process), not Quit
+        let ctrl_d = Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(
+                map_input(ctrl_d, &km, &st),
+                Some(Msg::Text(TextEdit::CloseStdin))
+            ),
+            "Ctrl-D must send CloseStdin when exec pane is active"
         );
     }
 

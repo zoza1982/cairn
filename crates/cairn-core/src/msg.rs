@@ -3,7 +3,7 @@
 use crate::state::{ConnectionChoice, LogViewerId, Side, TransferId};
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
-use cairn_types::{ConnectionId, VfsPath};
+use cairn_types::{ConnectionId, SessionId, VfsPath};
 use cairn_vfs::{ListPage, VfsError};
 
 /// A high-level user action, resolved from input by the TUI keymap. Kept independent of any terminal
@@ -74,6 +74,10 @@ pub enum Action {
     Reject,
     /// Open the log viewer for the entry under the cursor.
     OpenLogViewer,
+    /// Open a cooked exec session on the entry under the cursor. Available on backends that support
+    /// the `"exec"` action (e.g. Kubernetes/Docker exec, SSH). The reducer uses `["sh"]` as the
+    /// default argv. Wired to a configurable key once exec-capable backends land.
+    OpenExecSession,
     /// Scroll the active overlay up one page (log viewer, future overlays).
     PageUp,
     /// Scroll the active overlay down one page.
@@ -108,6 +112,9 @@ pub enum TextEdit {
     Submit,
     /// Discard the prompt.
     Cancel,
+    /// Close stdin on an active exec session pane (`Ctrl-D` inside `Overlay::ExecPane`).
+    /// Handled by the text-routing path; a no-op outside an active session pane.
+    CloseStdin,
 }
 
 /// Results flowing back from the async world.
@@ -208,6 +215,33 @@ pub enum AppEvent {
         id: LogViewerId,
         /// `None` on clean EOF; `Some(redacted_message)` on error.
         error: Option<String>,
+    },
+    /// A decoded chunk of output from an exec session (stdout/stderr combined).
+    SessionOutput {
+        /// Which session produced this output.
+        id: SessionId,
+        /// The UTF-8 decoded output text (cross-chunk multibyte sequences are correctly
+        /// stitched in the effect runner; incomplete trailing bytes are carried over to
+        /// the next chunk).
+        text: String,
+    },
+    /// An exec or port-forward session has ended.
+    SessionEnded {
+        /// Which session ended.
+        id: SessionId,
+        /// Process exit code (exec), or `0` for clean port-forward teardown, or `None` if unknown.
+        exit_code: Option<i32>,
+        /// A redacted (secret-free) error message; `None` on clean exit.
+        error: Option<String>,
+    },
+    /// A port-forward session has bound its local TCP port and is ready to accept connections.
+    ///
+    /// Sent once, immediately after the listener is bound; may arrive before or after the overlay opens.
+    PortForwardBound {
+        /// Which session is now bound.
+        id: SessionId,
+        /// The local port that was bound (may differ from the requested port if `0` was used).
+        local_port: u16,
     },
 }
 
@@ -331,5 +365,68 @@ pub enum AppEffect {
     CloseLogViewer {
         /// Session id to cancel.
         id: LogViewerId,
+    },
+    /// Start an interactive cooked exec session and open an `Overlay::ExecPane` for it.
+    ///
+    /// The effect runner calls `Vfs::invoke(path, "exec", ActionCtx::Exec { argv, tty })`, receives
+    /// the `ActionOutcome::Session(SessionHandle)`, and spawns relay tasks that feed `SessionOutput`
+    /// and `SessionEnded` events into the loop. The `id` is minted by the reducer.
+    OpenExecSession {
+        /// Session id minted by the reducer.
+        id: SessionId,
+        /// Connection to exec on.
+        conn: ConnectionId,
+        /// Path of the container/pod (or workspace node) to exec in.
+        path: VfsPath,
+        /// Argument vector.
+        argv: Vec<String>,
+        /// Whether to allocate a PTY. `false` for v1 (cooked mode); `true` is reserved for v2.
+        tty: bool,
+        /// Display title shown in the overlay border.
+        title: String,
+    },
+    /// Start a port-forward session and open an `Overlay::PortForwardStatus` for it.
+    OpenPortForward {
+        /// Session id minted by the reducer.
+        id: SessionId,
+        /// Connection to port-forward on.
+        conn: ConnectionId,
+        /// Path of the pod/service to forward to.
+        path: VfsPath,
+        /// Local port (`0` = OS-assigned ephemeral).
+        local_port: u16,
+        /// Remote port on the pod/service.
+        remote_port: u16,
+        /// Display title.
+        title: String,
+    },
+    /// Cancel and tear down the session with this id (closes stdin + fires the cancel sender).
+    CloseSession {
+        /// The session to close.
+        id: SessionId,
+    },
+    /// Send bytes into an exec session's stdin.
+    SendSessionInput {
+        /// Target session.
+        id: SessionId,
+        /// The bytes to send (e.g. a line plus `\n`, or `\x04` for Ctrl-D).
+        bytes: Vec<u8>,
+    },
+    /// Drop the stdin sender for an exec session, signalling EOF to the remote process without
+    /// cancelling the session. The overlay stays open to show remaining output; `SessionEnded`
+    /// arrives when the process exits. Unlike `CloseSession`, this does NOT fire the cancel token.
+    CloseStdin {
+        /// Target session.
+        id: SessionId,
+    },
+    /// Propagate a terminal-window resize to a TTY exec session. No-op in v1 (always `tty: false`);
+    /// the variant is present for forward-compatibility so v2 can wire this without an API break.
+    ResizeSession {
+        /// Target session.
+        id: SessionId,
+        /// New terminal rows.
+        rows: u16,
+        /// New terminal columns.
+        cols: u16,
     },
 }

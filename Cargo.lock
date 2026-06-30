@@ -1211,6 +1211,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "cairn-ai",
  "cairn-backend-docker",
  "cairn-backend-k8s",
