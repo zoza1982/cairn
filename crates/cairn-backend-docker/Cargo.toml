@@ -19,7 +19,8 @@ default = []
 # it. See ADR-0006.
 # The live Docker engine adapter. Pulls bollard's hyper stack (off by default), plus tokio `rt` and
 # `sync` features needed to spawn the log-forwarding task and use the mpsc channel.
-docker = ["dep:bollard", "dep:tar", "tokio/rt", "tokio/sync"]
+# tokio/macros is required for `tokio::select!` in the exec relay task.
+docker = ["dep:bollard", "dep:tar", "tokio/rt", "tokio/sync", "tokio/macros"]
 
 [dependencies]
 cairn-types = { workspace = true }

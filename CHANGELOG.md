@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Docker interactive exec** (M6-3, RFC-0009 §2): `DockerVfs::invoke("exec")` with
+  `ActionCtx::Exec { argv, tty }` now returns `ActionOutcome::Session(SessionHandle)` backed by
+  bollard 0.21's `create_exec` → `start_exec` → relay-task pipeline. `ContainerOps::exec` is
+  added to the trait seam; `BollardDocker::exec` spawns three sub-tasks — a stdin relay writing to
+  the exec's `AsyncWrite` handle, a resize relay calling `resize_exec` (TTY sessions only), and a
+  main `tokio::select!` loop that drains the `LogOutput` stream and selects against the cancel
+  oneshot. When the output stream closes naturally, `inspect_exec` retrieves the numeric exit code
+  and resolves `done` with `Ok(exit_code)`; on cancel, `done` is `Ok(-1)`. `attach_stderr` is
+  wired for non-TTY sessions (Docker merges stderr into stdout when `tty: true`). `MockDocker::exec`
+  is an echo-style implementation with a resize-drain sub-task, cancellation support, and
+  `VfsError::NotFound` for unknown containers. Four new hermetic unit tests: wrong-ctx returns
+  `invalid_ctx`, non-tty echo round-trip (stdin→stdout, no resize, `done Ok(0)`), tty resize
+  channel + cancel→`Ok(-1)`, unknown-container `NotFound`. One new env-guarded dind integration
+  test (`docker_container_exec_round_trip`, `CAIRN_IT_DOCKER`-gated): execs `echo CAIRN_EXEC_MARKER`
+  in busybox, asserts the marker appears in stdout and exit code is 0.
+
 - **Kubernetes port-forward** (M6-6, RFC-0009 §3): `KubeVfs::invoke("port-forward")` with
   `ActionCtx::PortForward { local, remote }` now returns `ActionOutcome::Session(SessionHandle)`
   backed by `kube 4.0`'s `Api::<Pod>::portforward`. `KubeRsOps::port_forward` binds a

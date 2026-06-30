@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bytes::Bytes;
 use cairn_types::{Caps, ContainerState, EntryKind, VfsPath};
-use cairn_vfs::VfsError;
+use cairn_vfs::{SessionHandle, VfsError};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::collections::BTreeSet;
@@ -70,6 +70,27 @@ fn backend_err(e: impl std::fmt::Display) -> VfsError {
 /// error site infallible).
 fn not_found(path: &str) -> VfsError {
     VfsError::NotFound(VfsPath::parse(path).unwrap_or_else(|_| VfsPath::root()))
+}
+
+/// Map a bollard error from an exec initiation call (`create_exec` / `start_exec`) to
+/// a [`VfsError`].
+///
+/// HTTP 404 → [`VfsError::NotFound`]; 401 → [`VfsError::Auth`]; 403 → [`VfsError::Forbidden`];
+/// all other engine errors → [`VfsError::Backend`]. No credential material appears in any
+/// error message; bollard's API-response messages contain only daemon-provided text.
+fn map_exec_error(e: bollard::errors::Error) -> VfsError {
+    match e {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        } => VfsError::NotFound(VfsPath::root()),
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 401, ..
+        } => VfsError::Auth,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 403, ..
+        } => VfsError::Forbidden(VfsPath::root()),
+        other => backend_err(other),
+    }
 }
 
 /// Map bollard's container-state enum to the cairn-types state.
@@ -359,6 +380,207 @@ impl ContainerOps for BollardDocker {
             rx.recv().await.map(|item| (item, rx))
         })
         .boxed()
+    }
+
+    /// Open an interactive exec session in a running container via the Docker Engine API.
+    ///
+    /// # API flow (bollard 0.21)
+    ///
+    /// 1. `POST /containers/{container}/exec` ([`Docker::create_exec`]) — creates the exec
+    ///    instance and returns an `exec_id`.
+    /// 2. `POST /exec/{id}/start` ([`Docker::start_exec`]) with no detach options — upgrades
+    ///    the connection and returns `StartExecResults::Attached { output, input }`, where
+    ///    `output` is a `Stream<Item = Result<LogOutput, Error>>` and `input` is an
+    ///    `AsyncWrite` handle for stdin.
+    ///
+    /// # Task model
+    ///
+    /// A single Tokio task is spawned that owns `output` and `input`. It runs a `select!` loop:
+    ///
+    /// - **stdout relay**: on each `output.next()` item, forwards the payload bytes (via
+    ///   `LogOutput::into_bytes`) to the `stdout` mpsc sender. `StdOut`, `StdErr`, `StdIn`,
+    ///   and `Console` variants are all forwarded without discrimination — Docker merges stderr
+    ///   into stdout when `tty: true` (producing `Console` frames), so all variants carry
+    ///   user-visible output.
+    /// - **cancel arm**: when the cancel oneshot fires, breaks out of the loop with `Ok(-1)`.
+    /// - **stream end** (`output.next()` returns `None`): the remote process has exited.
+    ///   Calls `GET /exec/{id}/json` ([`Docker::inspect_exec`]) to retrieve `ExitCode`,
+    ///   then resolves `done` with `Ok(exit_code)`.
+    ///
+    /// The **stdin relay** sub-task drains the `stdin` mpsc receiver and writes each chunk to
+    /// `input` (`AsyncWriteExt::write_all`). Dropping the mpsc sender causes the receiver to
+    /// return `None`, which drops `input` and closes stdin on the remote side.
+    ///
+    /// The **resize relay** sub-task (TTY only) reads `(rows, cols)` from the resize channel
+    /// and calls `POST /exec/{id}/resize` ([`Docker::resize_exec`]) as a best-effort
+    /// fire-and-forget. Errors are silently discarded (the session may have already ended).
+    ///
+    /// # Credential safety
+    ///
+    /// Container IDs / exec IDs are never included in `VfsError` messages. Bollard's
+    /// API-error messages contain only daemon-provided text.
+    async fn exec(
+        &self,
+        container: &str,
+        argv: Vec<String>,
+        tty: bool,
+    ) -> Result<SessionHandle, VfsError> {
+        use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
+        use tokio::io::AsyncWriteExt as _;
+
+        let docker = self.docker.clone();
+        let container = container.to_owned();
+
+        // Step 1: create the exec instance.
+        let exec_result = docker
+            .create_exec(
+                &container,
+                CreateExecOptions {
+                    cmd: Some(argv),
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    // Docker merges stderr into stdout when tty=true; attach separately only
+                    // for non-TTY execs so stderr is interleaved without double-encoding.
+                    attach_stderr: Some(!tty),
+                    tty: Some(tty),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(map_exec_error)?;
+
+        let exec_id = exec_result.id;
+
+        // Step 2: start the exec and obtain attached I/O streams.
+        let (output, input) = match docker
+            .start_exec(&exec_id, None)
+            .await
+            .map_err(map_exec_error)?
+        {
+            StartExecResults::Attached { output, input } => (output, input),
+            // We never set detach=true, so Detached is a daemon protocol violation rather
+            // than a panic-worthy unreachable — surface it as a typed error.
+            StartExecResults::Detached => {
+                return Err(VfsError::Backend {
+                    code: "exec-io".to_owned(),
+                    msg: "exec: daemon returned Detached unexpectedly".to_owned(),
+                    retryable: false,
+                });
+            }
+        };
+
+        // Session channels.
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<i32, VfsError>>();
+
+        // Resize channel: present iff tty=true.
+        let (resize_tx, resize_rx) = if tty {
+            let (t, r) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+            (Some(t), Some(r))
+        } else {
+            (None, None)
+        };
+
+        tokio::spawn(async move {
+            // --- stdin relay ---
+            // A sub-task drains the stdin mpsc receiver and writes each chunk to the exec's
+            // AsyncWrite input handle. When the sender is dropped (EOF), `input` is dropped
+            // here, closing stdin on the remote side.
+            let stdin_task = {
+                let mut writer = input;
+                tokio::spawn(async move {
+                    while let Some(chunk) = stdin_rx.recv().await {
+                        if writer.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Drop `writer` → closes stdin pipe to the remote process.
+                })
+            };
+
+            // --- resize relay (TTY only) ---
+            // A sub-task reads (rows, cols) and calls resize_exec as best-effort fire-and-forget.
+            let resize_task = if let Some(mut rr) = resize_rx {
+                let docker_r = docker.clone();
+                let exec_id_r = exec_id.clone();
+                Some(tokio::spawn(async move {
+                    while let Some((rows, cols)) = rr.recv().await {
+                        // Errors are silently ignored — the session may have already ended.
+                        let _ = docker_r
+                            .resize_exec(
+                                &exec_id_r,
+                                ResizeExecOptions {
+                                    height: rows,
+                                    width: cols,
+                                },
+                            )
+                            .await;
+                    }
+                }))
+            } else {
+                None
+            };
+
+            // --- stdout relay + main exit-code logic ---
+            // Process the output stream inline, selecting against cancel on every item.
+            // All LogOutput variants (StdOut, StdErr, StdIn, Console) carry user-visible bytes;
+            // forward them all without discrimination (Docker merges streams on tty=true).
+            let mut output = output;
+            let exit_result: Result<i32, VfsError> = loop {
+                tokio::select! {
+                    biased;
+                    // Cancel path: break with sentinel exit code -1.
+                    _ = &mut cancel_rx => break Ok(-1),
+                    item = output.next() => {
+                        match item {
+                            Some(Ok(log)) => {
+                                // Best-effort: continue draining even if the consumer dropped
+                                // stdout_rx (send error is silently ignored).
+                                let _ = stdout_tx.send(log.into_bytes()).await;
+                            }
+                            Some(Err(e)) => {
+                                // Transport error while reading output.
+                                break Err(backend_err(e));
+                            }
+                            None => {
+                                // Stream ended → the remote process has exited.
+                                // Drop stdout_tx so the consumer's receiver signals EOF.
+                                drop(stdout_tx);
+                                // Retrieve the numeric exit code via inspect_exec.
+                                let code = docker
+                                    .inspect_exec(&exec_id)
+                                    .await
+                                    .ok()
+                                    .and_then(|r| r.exit_code)
+                                    .map(|c| c as i32)
+                                    .unwrap_or(0);
+                                break Ok(code);
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Tear down relay sub-tasks.
+            stdin_task.abort();
+            if let Some(t) = resize_task {
+                t.abort();
+            }
+
+            // Resolve done. If the receiver was dropped (session pane torn down), discard.
+            let _ = done_tx.send(exit_result);
+        });
+
+        Ok(SessionHandle::new(
+            cancel_tx,
+            done_rx,
+            None, // local_port: exec never binds a port
+            Some(stdin_tx),
+            Some(stdout_rx),
+            resize_tx,
+        ))
     }
 }
 

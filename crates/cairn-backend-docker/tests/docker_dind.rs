@@ -16,6 +16,7 @@
 
 use bollard::models::ContainerCreateBody;
 use bollard::Docker;
+use bytes::Bytes;
 use cairn_backend_docker::{BollardDocker, DockerVfs};
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{action_ids, ActionCtx, ActionId, ActionOutcome, ListOpts, Vfs, VfsError};
@@ -27,8 +28,12 @@ const TEST_IMAGE: &str = "busybox:latest";
 const CONTAINER_NAME: &str = "cairn-it-docker-fs-test";
 /// Separate stable name for the log streaming test container.
 const LOG_CONTAINER_NAME: &str = "cairn-it-docker-logs-test";
+/// Stable name for the exec integration test container.
+const EXEC_CONTAINER_NAME: &str = "cairn-it-docker-exec-test";
 /// Marker printed by the log test container — chosen to be unique and easily grepped.
 const LOG_MARKER: &str = "CAIRN_LOG_STREAM_MARKER";
+/// Marker used by the exec integration test — distinct from the log marker.
+const EXEC_MARKER: &str = "CAIRN_EXEC_MARKER";
 
 fn p(s: &str) -> VfsPath {
     VfsPath::parse(s).unwrap()
@@ -319,4 +324,139 @@ async fn docker_container_log_streaming() {
     )
     .await
     .expect("force-remove log-test container");
+}
+
+/// Live exec round-trip: invoke `DockerVfs::invoke("exec")` with `echo CAIRN_EXEC_MARKER`,
+/// collect all stdout bytes, assert the marker is present, and assert exit code 0.
+///
+/// Uses `tty: false` and a short-lived command so the output stream closes naturally,
+/// letting `inspect_exec` return the real exit code without any manual cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docker_container_exec_round_trip() {
+    if std::env::var("CAIRN_IT_DOCKER").is_err() {
+        eprintln!("CAIRN_IT_DOCKER unset — skipping live Docker exec integration test");
+        return;
+    }
+
+    let raw =
+        Docker::connect_with_local_defaults().expect("connect to Docker daemon for scaffolding");
+
+    // Pull the image (no-op when the dind sidecar has already cached it).
+    {
+        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
+            .from_image(TEST_IMAGE)
+            .build();
+        let mut pull = raw.create_image(Some(pull_opts), None, None);
+        while let Some(item) = pull.next().await {
+            item.expect("image pull progress should not error");
+        }
+    }
+
+    // Remove any leftover container from a previous failed run.
+    let _ = raw
+        .remove_container(
+            EXEC_CONTAINER_NAME,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                    .force(true)
+                    .build(),
+            ),
+        )
+        .await;
+
+    // Create and start a sleeping container — exec requires the container to be running.
+    raw.create_container(
+        Some(
+            bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                .name(EXEC_CONTAINER_NAME)
+                .build(),
+        ),
+        ContainerCreateBody {
+            image: Some(TEST_IMAGE.to_owned()),
+            cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create exec-test container");
+
+    raw.start_container(
+        EXEC_CONTAINER_NAME,
+        None::<bollard::query_parameters::StartContainerOptions>,
+    )
+    .await
+    .expect("start exec-test container");
+
+    // Build the Vfs under test using the real BollardDocker adapter.
+    let ops = BollardDocker::connect_local().expect("BollardDocker::connect_local");
+    let vfs = DockerVfs::new(ConnectionId(99), ops);
+
+    // Invoke exec — echo the marker and exit immediately. non-TTY so the output stream
+    // terminates and inspect_exec can retrieve the exit code.
+    let exec_path = format!("/containers/{EXEC_CONTAINER_NAME}");
+    let outcome = vfs
+        .invoke(
+            &p(&exec_path),
+            ActionId::new(action_ids::EXEC),
+            ActionCtx::Exec {
+                argv: vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    format!("echo {EXEC_MARKER}"),
+                ],
+                tty: false,
+            },
+        )
+        .await
+        .expect("invoke exec must succeed on a running container");
+
+    let mut handle = match outcome {
+        ActionOutcome::Session(h) => h,
+        _ => panic!("expected ActionOutcome::Session from invoke exec"),
+    };
+
+    // Non-TTY exec: no resize, no local_port.
+    assert!(
+        handle.resize.is_none(),
+        "non-tty exec must have no resize channel"
+    );
+    assert!(
+        handle.local_port.is_none(),
+        "exec sessions never bind a port"
+    );
+
+    // Collect all stdout bytes until the stream closes (the echo process has exited).
+    let mut collected: Vec<Bytes> = Vec::new();
+    if let Some(stdout_rx) = handle.stdout.as_mut() {
+        while let Some(chunk) = stdout_rx.recv().await {
+            collected.push(chunk);
+        }
+    }
+
+    let combined: Vec<u8> = collected.iter().flat_map(|b| b.iter().copied()).collect();
+    let text = String::from_utf8_lossy(&combined);
+    assert!(
+        text.contains(EXEC_MARKER),
+        "exec output must contain the marker '{EXEC_MARKER}'; got: {text:?}"
+    );
+
+    // done must resolve with exit code 0 (echo always exits cleanly).
+    let exit = handle
+        .done
+        .await
+        .expect("done channel must resolve")
+        .expect("exit result must be Ok");
+    assert_eq!(exit, 0, "echo command must exit with code 0; got {exit}");
+
+    // Cleanup.
+    raw.remove_container(
+        EXEC_CONTAINER_NAME,
+        Some(
+            bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                .force(true)
+                .build(),
+        ),
+    )
+    .await
+    .expect("force-remove exec-test container");
 }

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::{ContainerState, EntryKind};
-use cairn_vfs::VfsError;
+use cairn_vfs::{SessionHandle, VfsError};
 use futures::stream::BoxStream;
 
 /// Summary of a container.
@@ -81,6 +81,45 @@ pub trait ContainerOps: Send + Sync + 'static {
         follow: bool,
         tail: &str,
     ) -> BoxStream<'static, Result<Bytes, VfsError>>;
+
+    /// Open an interactive exec session in a running container.
+    ///
+    /// Returns a [`SessionHandle`] immediately; the remote process starts concurrently in a
+    /// spawned task. The caller drives the session via the handle's channels:
+    ///
+    /// - Write to `stdin` to send bytes to the process's stdin.
+    /// - Read from `stdout` to receive combined stdout (and, when `tty: false`, stderr) output.
+    /// - Send `(rows, cols)` to `resize` (present only when `tty: true`) to propagate terminal
+    ///   resize events to the running process via `POST /exec/{id}/resize`.
+    /// - Drop or send on `cancel` to request teardown; `done` resolves with the exit code.
+    ///
+    /// # Parameters
+    ///
+    /// - `container`: container name or ID. The container must be running; a stopped or missing
+    ///   container returns [`VfsError::NotFound`] or [`VfsError::Backend`] from the daemon.
+    /// - `argv`: argument vector passed directly to the container runtime (not a shell; use
+    ///   `["sh", "-c", "…"]` for shell commands). Must be non-empty.
+    /// - `tty`: allocate a pseudo-TTY. When `true`: stderr is merged into stdout (Docker
+    ///   convention), the `resize` channel is populated, and the process sees a PTY. When `false`:
+    ///   stderr is interleaved into `stdout`; `resize` is `None`.
+    ///
+    /// # Exit code and `done`
+    ///
+    /// When the output stream closes naturally (the remote process exits), the backend calls
+    /// `GET /exec/{id}/json` (`inspect_exec`) to retrieve the numeric exit code and resolves
+    /// `done` with `Ok(exit_code)`. On cancel before exit: `Ok(-1)`. On transport error: `Err`.
+    /// Credential material is never included in error messages.
+    ///
+    /// # Error mapping
+    ///
+    /// 404 → [`VfsError::NotFound`]; 401 → [`VfsError::Auth`]; 403 → [`VfsError::Forbidden`];
+    /// other engine errors → [`VfsError::Backend`].
+    async fn exec(
+        &self,
+        container: &str,
+        argv: Vec<String>,
+        tty: bool,
+    ) -> Result<SessionHandle, VfsError>;
 }
 
 #[cfg(test)]
@@ -89,7 +128,7 @@ pub(crate) mod mock {
     use async_trait::async_trait;
     use bytes::Bytes;
     use cairn_types::{ContainerState, EntryKind, VfsPath};
-    use cairn_vfs::VfsError;
+    use cairn_vfs::{SessionHandle, VfsError};
     use futures::stream::{self, BoxStream};
     use futures::StreamExt as _;
     use std::collections::BTreeMap;
@@ -248,6 +287,82 @@ pub(crate) mod mock {
                 );
                 stream::iter(vec![Err(err)]).boxed()
             }
+        }
+
+        /// Echo-style exec mock: relays each stdin chunk back to stdout, then exits with code 0.
+        ///
+        /// Matches the shape of [`super::super::real::BollardDocker::exec`]:
+        /// - An unknown container returns [`VfsError::NotFound`].
+        /// - When `tty: true`, the `resize` channel is present and accepted (events are discarded).
+        /// - The `cancel` signal (drop or explicit send) is honoured cooperatively: the relay
+        ///   loop selects between `cancel` and `stdin.recv()`. On cancel, `done` resolves with
+        ///   `Ok(-1)`. On stdin-close (sender dropped), `done` resolves with `Ok(0)`.
+        async fn exec(
+            &self,
+            container: &str,
+            _argv: Vec<String>,
+            tty: bool,
+        ) -> Result<SessionHandle, VfsError> {
+            if !self.containers.iter().any(|c| c.name == container) {
+                return Err(VfsError::NotFound(
+                    VfsPath::parse(container).unwrap_or_else(|_| VfsPath::root()),
+                ));
+            }
+
+            let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+            let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<i32, VfsError>>();
+
+            // TTY-only resize channel — accepted and drained; the mock ignores resize geometry.
+            let (resize_tx, resize_rx) = if tty {
+                let (t, r) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
+                (Some(t), Some(r))
+            } else {
+                (None, None)
+            };
+
+            tokio::spawn(async move {
+                // Drain the resize channel in a background task so backpressure never stalls
+                // the main echo loop (the TTY resize sender would block otherwise).
+                if let Some(mut rr) = resize_rx {
+                    tokio::spawn(async move { while rr.recv().await.is_some() {} });
+                }
+
+                // Echo loop: relay stdin → stdout until stdin closes or cancel fires.
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel_rx => {
+                            let _ = done_tx.send(Ok(-1));
+                            return;
+                        }
+                        chunk = stdin_rx.recv() => {
+                            match chunk {
+                                Some(c) => {
+                                    // Best-effort echo; stop if the stdout receiver was dropped.
+                                    if stdout_tx.send(c).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break, // stdin sender dropped → EOF
+                            }
+                        }
+                    }
+                }
+
+                // Exit code 0 regardless of how the loop ended.
+                let _ = done_tx.send(Ok(0));
+            });
+
+            Ok(SessionHandle::new(
+                cancel_tx,
+                done_rx,
+                None, // local_port: exec sessions never bind a port
+                Some(stdin_tx),
+                Some(stdout_rx),
+                resize_tx,
+            ))
         }
     }
 }
