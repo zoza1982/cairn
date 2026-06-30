@@ -9,11 +9,18 @@
 //! - **Hostname grant**: only `grants.network` hosts may be contacted. Any other hostname
 //!   (including after redirect) is rejected with an error string that does not include
 //!   grant-list contents.
-//! - **SSRF guards** (RFC-0010 §3.3):
+//! - **SSRF guards** (RFC-0010 §3.3, SEC-1 fix — issue #103):
 //!   - URL-level: rejects IP literals in the URL that fall in private/reserved ranges.
-//!   - DNS-level: resolves the hostname before sending; if *any* resolved IP is private,
-//!     the request is aborted. Pre-flight ensures a DNS-rebinding attack window is as
-//!     narrow as possible (reqwest re-resolves at connect, but we check first).
+//!   - DNS-pinning: [`PinnedSsrfDnsResolver`] is installed as the sole DNS authority for
+//!     the plugin's `reqwest::Client`. When hyper asks it to resolve a hostname, it resolves
+//!     via Tokio, classifies every returned IP against the SSRF block list, and returns only
+//!     the validated IPs (or errors if all are blocked). Because reqwest's `HttpConnector`
+//!     uses the custom resolver directly and does **not** re-resolve at connect time, there is
+//!     no TOCTOU window for a DNS-rebinding attack. This replaces the old `check_ssrf_via_dns`
+//!     pre-flight (which had an inherent race between the pre-flight DNS query and reqwest's
+//!     own DNS resolution at connect time).
+//!   - SEC-8: 6to4 (`2002::/16`), Teredo (`2001::/32`), and NAT64 (`64:ff9b::/96`) tunnel
+//!     prefixes are classified by extracting and re-checking the embedded IPv4 address.
 //! - **Response size cap**: `HttpLimits::max_response_bytes` (default 8 MiB). Streams are
 //!   truncated and the call errors rather than letting a large response exhaust the host.
 //! - **Header hygiene**: `Set-Cookie` is stripped from responses before returning to the
@@ -37,10 +44,16 @@
 use crate::component::{WitHttpRequest as HttpRequest, WitHttpResponse as HttpResponse};
 use ipnet::{Ipv4Net, Ipv6Net};
 use reqwest::{
+    dns::{Addrs, Name, Resolve, Resolving},
     header::{HeaderMap, HeaderName, HeaderValue},
     redirect, Client, Url,
 };
-use std::{net::IpAddr, time::Duration};
+use std::{
+    error::Error as StdError,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 use tracing::{debug, warn};
 
 // ── Per-request limits ─────────────────────────────────────────────────────────────────────────
@@ -67,6 +80,10 @@ pub(crate) struct HttpLimits {
     /// protocol (RFC Unresolved-Q §6), a hostile approved server can still park this thread
     /// for up to `request_timeout_secs` regardless of the epoch deadline. Track as M8-5.
     pub request_timeout_secs: u64,
+    /// Whether `http://` (plain HTTP) URLs are permitted for the plugin's granted hostnames.
+    /// Requires an explicit user grant at install time (`[capabilities] allow_http = true` AND
+    /// approved by the user in the approval UI). Default: `false` (HTTPS-only).
+    pub allow_http: bool,
 }
 
 impl Default for HttpLimits {
@@ -76,6 +93,7 @@ impl Default for HttpLimits {
             // 4 s is below the default epoch ceiling (5 s) to leave headroom for DNS + connect.
             connect_timeout_secs: 4,
             request_timeout_secs: 4,
+            allow_http: false,
         }
     }
 }
@@ -83,7 +101,10 @@ impl Default for HttpLimits {
 // ── SSRF guard: blocked IP ranges (RFC-0010 §3.3) ─────────────────────────────────────────────
 
 // RFC-1918 private + special-use ranges that must never be contacted by a plugin.
-// Defined once at module level so each call doesn't re-parse CIDR strings.
+//
+// The statics are initialised once (on first call) via `LazyLock` — the old inline-array
+// approach re-parsed the CIDR strings on every invocation of `is_ssrf_blocked_ip`, which
+// contradicts the module-doc promise that they are "parsed once at module scope".
 //
 // IPv4 ranges:
 //   127.0.0.0/8      loopback
@@ -95,18 +116,24 @@ impl Default for HttpLimits {
 //   224.0.0.0/4      IPv4 multicast (RFC 1112 Class D)
 //   240.0.0.0/4      reserved (Class E)
 //   0.0.0.0/8        "this" network
+//   192.0.0.0/24     IETF Protocol Assignments (RFC 6890)
+//   198.18.0.0/15    Network Interconnect Device Benchmarking (RFC 2544)
 //
 // IPv6 ranges:
 //   ::               unspecified address (connects to loopback on Linux)
 //   ::1/128          loopback
+//   ::a.b.c.d        IPv4-compatible (deprecated, RFC 4291 §2.5.5.1) — checked inline
+//   ::ffff:0:0/96    IPv4-mapped (catches IPv4-in-IPv6 SSRF) — checked inline via to_ipv4_mapped
 //   fc00::/7         unique local (ULA)
 //   fe80::/10        link-local
 //   ff00::/8         IPv6 multicast
-//   ::ffff:0:0/96    IPv4-mapped (catches IPv4-in-IPv6 SSRF)
+//   2002::/16        6to4 (SEC-8: embedded IPv4 extracted and recursed)
+//   2001::/32        Teredo (SEC-8: embedded IPv4 extracted and recursed)
+//   64:ff9b::/96     NAT64 (SEC-8: embedded IPv4 extracted and recursed)
 
 macro_rules! ipv4net {
     ($s:literal) => {{
-        // safe: compile-time literal — parse errors are test-caught
+        // safe: compile-time string literal — parse errors are caught at startup
         $s.parse::<Ipv4Net>().expect("valid IPv4 CIDR")
     }};
 }
@@ -117,8 +144,93 @@ macro_rules! ipv6net {
     }};
 }
 
-/// Returns `true` if `ip` falls in any private, loopback, link-local, or reserved range and must
-/// not be contacted by a plugin (SSRF guard).
+/// IPv4 ranges blocked for SSRF (RFC-0010 §3.3). Initialised once at first call.
+static SSRF_BLOCKED_V4: LazyLock<Vec<Ipv4Net>> = LazyLock::new(|| {
+    vec![
+        ipv4net!("10.0.0.0/8"),
+        ipv4net!("172.16.0.0/12"),
+        ipv4net!("192.168.0.0/16"),
+        ipv4net!("169.254.0.0/16"), // link-local (AWS metadata endpoint)
+        ipv4net!("100.64.0.0/10"),  // CGNAT
+        ipv4net!("224.0.0.0/4"),    // IPv4 multicast (Class D)
+        ipv4net!("240.0.0.0/4"),    // reserved (Class E)
+        ipv4net!("0.0.0.0/8"),      // "this" network
+        ipv4net!("192.0.0.0/24"),   // IETF Protocol Assignments (RFC 6890)
+        ipv4net!("198.18.0.0/15"),  // Benchmarking (RFC 2544)
+    ]
+});
+
+/// IPv6 ranges blocked for SSRF (loopback, ULA, link-local, multicast). Initialised once.
+/// IPv4-mapped, IPv4-compatible, and tunnel prefixes are handled inline in `is_ssrf_blocked_ip`.
+static SSRF_BLOCKED_V6: LazyLock<Vec<Ipv6Net>> = LazyLock::new(|| {
+    vec![
+        ipv6net!("fc00::/7"),  // unique local (ULA)
+        ipv6net!("fe80::/10"), // link-local
+        ipv6net!("ff00::/8"),  // IPv6 multicast
+    ]
+});
+
+/// Extract the embedded IPv4 address from an IPv6 tunnel-prefix address (SEC-8, issue #103).
+///
+/// Returns `Some(v4)` for the three tunnel families that carry a potentially-private IPv4:
+///
+/// - **6to4** (`2002::/16`, RFC 3056): the embedded IPv4 is octets 2–5 of the IPv6 address.
+/// - **Teredo** (`2001::/32`, RFC 4380): octets 12–15 of the IPv6 address are the client IPv4,
+///   XOR'd with `0xFFFF_FFFF`.
+/// - **NAT64** (`64:ff9b::/96`, RFC 6052): the embedded IPv4 is octets 12–15.
+///
+/// Returns `None` for all other IPv6 prefixes.
+fn embedded_v4_from_tunnel(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = v6.octets();
+    // 6to4: 2002::/16 → embedded IPv4 at bytes [2..6].
+    if octets[0] == 0x20 && octets[1] == 0x02 {
+        return Some(Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
+    }
+    // Teredo: 2001:0000::/32 → client IPv4 at bytes [12..16] XOR 0xFF each byte.
+    // (Note: 2001:0000::/32 is specifically Teredo; 2001:db8::/32 is documentation space
+    // and does not contain embedded addresses in this sense.)
+    if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x00 && octets[3] == 0x00 {
+        return Some(Ipv4Addr::new(
+            octets[12] ^ 0xff,
+            octets[13] ^ 0xff,
+            octets[14] ^ 0xff,
+            octets[15] ^ 0xff,
+        ));
+    }
+    // NAT64: 64:ff9b::/96 → embedded IPv4 at bytes [12..16].
+    if octets[0] == 0x00
+        && octets[1] == 0x64
+        && octets[2] == 0xff
+        && octets[3] == 0x9b
+        && octets[4] == 0x00
+        && octets[5] == 0x00
+        && octets[6] == 0x00
+        && octets[7] == 0x00
+        && octets[8] == 0x00
+        && octets[9] == 0x00
+        && octets[10] == 0x00
+        && octets[11] == 0x00
+    {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
+}
+
+/// Returns `true` if `ip` falls in any private, loopback, link-local, reserved, or tunnel-embedded
+/// private range and must not be contacted by a plugin (SSRF guard, SEC-1/SEC-8).
+///
+/// In addition to the direct range checks, IPv6 forms that carry an embedded IPv4 address are
+/// classified by extracting and re-checking the embedded IPv4:
+///
+/// - **IPv4-mapped** (`::ffff:a.b.c.d`) — handled by `to_ipv4_mapped()`.
+/// - **IPv4-compatible** (`::a.b.c.d`, deprecated RFC 4291 §2.5.5.1) — detected by all-zero
+///   prefix bytes; embedded IPv4 extracted from octets[12..16].
+/// - **6to4** (`2002::/16`), **Teredo** (`2001::/32`), **NAT64** (`64:ff9b::/96`) — SEC-8.
+///
+/// All CIDR sets are built once into module-level [`LazyLock`] statics; this function does not
+/// parse strings.
 pub(crate) fn is_ssrf_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -127,33 +239,32 @@ pub(crate) fn is_ssrf_blocked_ip(ip: IpAddr) -> bool {
             if v4.is_unspecified() || v4.is_loopback() {
                 return true;
             }
-            let ranges: &[Ipv4Net] = &[
-                ipv4net!("10.0.0.0/8"),
-                ipv4net!("172.16.0.0/12"),
-                ipv4net!("192.168.0.0/16"),
-                ipv4net!("169.254.0.0/16"),
-                ipv4net!("100.64.0.0/10"),
-                ipv4net!("224.0.0.0/4"), // IPv4 multicast (Class D)
-                ipv4net!("240.0.0.0/4"), // reserved (Class E)
-                ipv4net!("0.0.0.0/8"),   // "this" network
-            ];
-            ranges.iter().any(|net| net.contains(&v4))
+            SSRF_BLOCKED_V4.iter().any(|net| net.contains(&v4))
         }
         IpAddr::V6(v6) => {
             // Unspecified `::` connects to loopback on Linux — block it explicitly.
             if v6.is_unspecified() || v6.is_loopback() {
                 return true;
             }
-            // IPv4-mapped (::ffff:x.x.x.x) — recursively check the embedded IPv4
+            // IPv4-mapped (::ffff:x.x.x.x) — recursively check the embedded IPv4.
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_ssrf_blocked_ip(IpAddr::V4(v4));
             }
-            let ranges: &[Ipv6Net] = &[
-                ipv6net!("fc00::/7"),  // ULA
-                ipv6net!("fe80::/10"), // link-local
-                ipv6net!("ff00::/8"),  // IPv6 multicast
-            ];
-            ranges.iter().any(|net| net.contains(&v6))
+            // IPv4-compatible (deprecated ::a.b.c.d, RFC 4291 §2.5.5.1).
+            // Octets[0..12] are all zero; bytes[10..12] are [0,0] (not [0xff,0xff] which is
+            // IPv4-mapped, already handled above). `::` and `::1` are blocked before this point.
+            let octets = v6.octets();
+            if octets[..12].iter().all(|&b| b == 0) {
+                return is_ssrf_blocked_ip(IpAddr::V4(Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                )));
+            }
+            // SEC-8 (issue #103): tunnel mechanisms (6to4, Teredo, NAT64) embed a
+            // potentially-private IPv4 address. Extract it and recurse.
+            if let Some(v4) = embedded_v4_from_tunnel(v6) {
+                return is_ssrf_blocked_ip(IpAddr::V4(v4));
+            }
+            SSRF_BLOCKED_V6.iter().any(|net| net.contains(&v6))
         }
     }
 }
@@ -173,24 +284,26 @@ pub(crate) fn hostname_allowed(host: &str, grants: &[String]) -> bool {
 /// Validate the request URL: parse it, check hostname against the grant list, and reject IP
 /// literals that are in the SSRF block list.
 ///
+/// `allow_http` mirrors the manifest's `[network].allow_http` field (propagated via
+/// [`HttpLimits::allow_http`]). When `false` (the default), only `https://` is permitted;
+/// `http://` is rejected to prevent credentials and response data from being exposed on-path.
+///
 /// Returns the parsed `Url` on success, or a redacted error string on failure. This is a
 /// **synchronous** pre-flight — it does not perform DNS resolution.
-pub(crate) fn validate_url(req: &HttpRequest, grants: &[String]) -> Result<Url, String> {
+pub(crate) fn validate_url(
+    req: &HttpRequest,
+    grants: &[String],
+    allow_http: bool,
+) -> Result<Url, String> {
     let url = Url::parse(&req.url).map_err(|e| format!("invalid URL: {e}"))?;
 
-    // HTTPS-only by default: reject `http://` to prevent brokered credentials and response
-    // data from being exposed to on-path observers. A future `allow-http` manifest grant
-    // (PR-C) will enable plain HTTP for operators who explicitly need it (e.g. internal
-    // services behind a TLS-terminating proxy).
-    // TODO(PR-C): implement per-hostname `allow-http` grant in the manifest loader.
     match url.scheme() {
         "https" => {}
+        "http" if allow_http => {}
         "http" => {
-            return Err(
-                "http:// is not allowed; use https:// (plain HTTP can be enabled via the \
-                 allow-http grant in PR-C)"
-                    .to_owned(),
-            )
+            return Err("http:// is not allowed; the plugin manifest must set \
+                 [network].allow_http = true and the user must approve it at install time"
+                .to_owned())
         }
         other => return Err(format!("disallowed URL scheme: {other}")),
     }
@@ -221,64 +334,87 @@ pub(crate) fn validate_url(req: &HttpRequest, grants: &[String]) -> Result<Url, 
     Ok(url)
 }
 
-// ── DNS SSRF pre-flight ────────────────────────────────────────────────────────────────────────
+// ── Pinned SSRF DNS resolver (SEC-1, issue #103) ──────────────────────────────────────────────
 
-/// Resolve `host` and check every resulting IP against the SSRF block list.
+/// A `reqwest::dns::Resolve` implementation that closes the DNS-rebinding TOCTOU window.
 ///
-/// This is an async operation; the caller drives it with `Handle::block_on`. Returns `Ok(())`
-/// if all resolved IPs are public, or an error if any resolved IP is blocked.
+/// The old `check_ssrf_via_dns` pre-flight resolved the hostname, validated the IPs, then
+/// discarded those IPs — reqwest performed a **second, independent** DNS resolution at TCP
+/// connect time. An attacker with DNS control over a granted hostname could serve a public IP
+/// during our pre-flight, then flip to `169.254.169.254` (or any private range) before reqwest
+/// connected. This is a classic low-TTL DNS-rebinding attack.
 ///
-/// `connect_timeout_secs` bounds the DNS lookup; an unresponsive DNS server cannot park the
-/// plugin thread indefinitely.
+/// `PinnedSsrfDnsResolver` closes this gap: because reqwest's `HttpConnector` uses the custom
+/// resolver as the **sole DNS authority** (no system re-resolve at connect time), the IP
+/// returned by our resolver is exactly the IP that is connected to. The SSRF check is embedded
+/// directly in the resolution step, validated at the exact moment the connection is established.
 ///
-/// # SECURITY (release-gating for M8-5 / PR-C)
-///
-/// There is an inherent TOCTOU window between this pre-flight and reqwest's own DNS resolution
-/// at TCP connect time. An attacker who controls the DNS record for a granted hostname can serve
-/// a public IP during this check, then flip to a private IP (e.g. `169.254.169.254`) before
-/// reqwest connects (low-TTL DNS rebinding). The window is narrow but non-zero.
-///
-/// **Before PR-C makes `instantiate_with_grants` reachable from the binary by untrusted
-/// plugins, this MUST be resolved** by pinning the connection to the `SocketAddr` set
-/// resolved here: implement a custom `reqwest::dns::Resolve` / `Client::resolve` override
-/// that re-validates the pinned IP before connecting. Bundle SEC-8 (6to4/Teredo/NAT64
-/// embedded-v4 prefix blocks) with that work. Track as M8-5.
-///
-/// Until then: network grants MUST only be issued to hostnames under the operator's full
-/// DNS control.
-pub(crate) async fn check_ssrf_via_dns(
-    host: &str,
-    port: u16,
-    connect_timeout_secs: u64,
-) -> Result<(), String> {
-    // tokio's `lookup_host` performs a real DNS query (AAAA + A in parallel).
-    let addr_str = format!("{host}:{port}");
-    let addrs = tokio::time::timeout(
-        Duration::from_secs(connect_timeout_secs),
-        tokio::net::lookup_host(&addr_str),
-    )
-    .await
-    .map_err(|_| format!("DNS lookup timed out for {host}"))?
-    .map_err(|e| format!("DNS resolution failed: {e}"))?;
+/// Per-call behaviour:
+/// 1. Resolve `name` via `tokio::net::lookup_host` (with a timeout).
+/// 2. Classify every resulting IP with [`is_ssrf_blocked_ip`] (covers loopback, RFC-1918,
+///    CGNAT, link-local, ULA, IPv4-mapped, IPv4-multicast, and SEC-8 tunnel prefixes).
+/// 3. If **any** IP is blocked, the entire resolution is rejected (fail-closed).
+/// 4. If **none** resolved, the resolution is rejected.
+/// 5. Return the validated IPs to hyper, which connects to them directly.
+pub(crate) struct PinnedSsrfDnsResolver {
+    /// DNS lookup timeout; matches `HttpLimits::connect_timeout_secs`.
+    timeout: Duration,
+}
 
-    let mut found_any = false;
-    for addr in addrs {
-        found_any = true;
-        if is_ssrf_blocked_ip(addr.ip()) {
-            warn!(
-                target: "cairn_plugin::http_fetch",
-                host = host,
-                "SSRF: DNS resolved to a blocked IP, aborting plugin request"
-            );
-            return Err("SSRF: hostname resolved to a blocked IP".to_owned());
+impl PinnedSsrfDnsResolver {
+    pub(crate) fn new(connect_timeout_secs: u64) -> Self {
+        Self {
+            timeout: Duration::from_secs(connect_timeout_secs),
         }
     }
+}
 
-    if !found_any {
-        return Err("DNS: no addresses resolved".to_owned());
+impl Resolve for PinnedSsrfDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let timeout = self.timeout;
+        Box::pin(async move {
+            let host = name.as_str();
+            // Port 0 is a placeholder — `lookup_host` needs a port but we only use the IP.
+            let addr_str = format!("{host}:0");
+
+            let addrs = tokio::time::timeout(timeout, tokio::net::lookup_host(&addr_str))
+                .await
+                .map_err(|_| {
+                    Box::new(std::io::Error::other(format!(
+                        "DNS lookup timed out for {host}"
+                    ))) as Box<dyn StdError + Send + Sync>
+                })?
+                .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
+
+            let mut found_any = false;
+            let mut validated: Vec<SocketAddr> = Vec::new();
+
+            for addr in addrs {
+                found_any = true;
+                if is_ssrf_blocked_ip(addr.ip()) {
+                    warn!(
+                        target: "cairn_plugin::http_fetch",
+                        host = host,
+                        ip = %addr.ip(),
+                        "SSRF: DNS resolved to a blocked IP, rejecting connection (SEC-1)"
+                    );
+                    return Err(Box::new(std::io::Error::other(
+                        "SSRF: hostname resolved to a blocked IP".to_owned(),
+                    )) as Box<dyn StdError + Send + Sync>);
+                }
+                validated.push(addr);
+            }
+
+            if !found_any {
+                return Err(
+                    Box::new(std::io::Error::other("DNS: no addresses resolved"))
+                        as Box<dyn StdError + Send + Sync>,
+                );
+            }
+
+            Ok(Box::new(validated.into_iter()) as Addrs)
+        })
     }
-
-    Ok(())
 }
 
 // ── reqwest Client construction ────────────────────────────────────────────────────────────────
@@ -317,17 +453,24 @@ const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// - rustls TLS only (no OpenSSL)
 /// - per-call connect / request timeouts
 /// - **no redirect following** (`Policy::none()`)
+/// - **[`PinnedSsrfDnsResolver`]** as the sole DNS authority (SEC-1, issue #103)
+///
+/// The pinned DNS resolver closes the DNS-rebinding TOCTOU window. By installing it as the
+/// `dns_resolver`, reqwest's `HttpConnector` calls it for every hostname resolution and does
+/// **not** perform an additional system-level DNS query at connect time. The IP address we
+/// validate in the resolver is exactly the IP that is connected to.
 ///
 /// Redirects are intentionally disabled. A custom redirect-following policy that re-checks
 /// the grant list on each hop would still be vulnerable to SSRF via DNS rebinding on the
 /// redirect target (no async DNS pre-flight can run inside reqwest's synchronous redirect
 /// closure). Returning the 3xx response to the plugin is the safe choice: the plugin can
 /// inspect the `Location` header and issue a new `http-fetch` call, which goes through the
-/// full pipeline including DNS SSRF pre-flight.
+/// full pipeline including the pinned DNS SSRF resolver.
 ///
 /// The client is built once per plugin instance and shared across calls (it holds a
 /// connection pool internally, which is safe to reuse from a single thread via `block_on`).
 pub(crate) fn build_client(limits: HttpLimits) -> Result<Client, String> {
+    let resolver = Arc::new(PinnedSsrfDnsResolver::new(limits.connect_timeout_secs));
     Client::builder()
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(limits.connect_timeout_secs))
@@ -335,6 +478,15 @@ pub(crate) fn build_client(limits: HttpLimits) -> Result<Client, String> {
         // Redirects are NOT followed; the plugin receives the 3xx and handles it explicitly.
         // This prevents SSRF via redirect chaining (a server could redirect to a private IP).
         .redirect(redirect::Policy::none())
+        // Install the pinned SSRF DNS resolver (SEC-1). This is the sole DNS authority for
+        // this client — reqwest will not re-resolve at connect time.
+        .dns_resolver(resolver)
+        // SECURITY: disable system proxy inheritance. If the host has HTTPS_PROXY/ALL_PROXY set,
+        // ambient proxy config would tunnel requests through the proxy, which performs its own
+        // DNS resolution — completely bypassing the PinnedSsrfDnsResolver and re-opening the
+        // SSRF/rebinding window against internal targets. A brokered client must never inherit
+        // ambient proxy configuration.
+        .no_proxy()
         // Disable connection-level debug output (reqwest/hyper verbose logging).
         .connection_verbose(false)
         .build()
@@ -489,9 +641,9 @@ fn redact_url_error(e: reqwest::Error) -> String {
 // ── Public entry points ────────────────────────────────────────────────────────────────────────
 
 /// Full brokered HTTP fetch pipeline:
-/// 1. Validate URL + hostname grant (sync).
-/// 2. SSRF DNS pre-flight (async).
-/// 3. Execute the HTTP call (async).
+/// 1. Validate URL + hostname grant (sync); reject bad schemes, unlisted hosts, IP-literal SSRF.
+/// 2. Execute the HTTP call (async); [`PinnedSsrfDnsResolver`] validates every IP at connect
+///    time inside reqwest (SEC-1, issue #103) — no separate DNS pre-flight step.
 ///
 /// Called from `CompState::http_fetch` via `Handle::block_on`.
 pub(crate) async fn do_http_fetch(
@@ -500,21 +652,19 @@ pub(crate) async fn do_http_fetch(
     client: &Client,
     limits: HttpLimits,
 ) -> Result<HttpResponse, String> {
-    let url = validate_url(req, grants)?;
-
-    let host = url.host_str().ok_or("URL has no host")?;
-    // `port_or_known_default` returns `None` only for unknown schemes; the scheme check above
-    // guarantees http/https, so `unwrap_or(80)` is unreachable dead-code safety net.
-    let port = url.port_or_known_default().unwrap_or(80);
-    check_ssrf_via_dns(host, port, limits.connect_timeout_secs).await?;
-
+    let url = validate_url(req, grants, limits.allow_http)?;
+    // The `PinnedSsrfDnsResolver` installed in `client` resolves hostnames, validates every
+    // returned IP against the SSRF block list, and feeds only validated IPs to hyper's connector.
+    // No TOCTOU window: reqwest uses the resolver's output directly without a second system
+    // DNS query. A blocked IP triggers a connect-time error, surfaced here as a reqwest error.
     execute_fetch(req, url, client, limits).await
 }
 
-/// Test-only variant that skips the DNS SSRF pre-flight so wiremock servers (which bind to
-/// `127.0.0.1`) can be used as mock targets. The hostname-grant check still runs; IP-literal
-/// SSRF validation from `validate_url` still runs for URL-embedded IPs, but the DNS check that
-/// would block `127.0.0.1` is suppressed.
+/// Test-only variant that bypasses the [`PinnedSsrfDnsResolver`] so wiremock servers (which
+/// bind to `127.0.0.1`, a loopback address blocked by the resolver) can be used as mock
+/// targets. The caller must pass a client built without the pinned resolver (built via
+/// [`build_client_no_ssrf_resolver`]). The hostname-grant check still runs; IP-literal SSRF
+/// validation from `validate_url` still runs for URL-embedded IPs.
 ///
 /// **Do not use this outside tests.** It is gated behind `#[cfg(test)]`.
 #[cfg(test)]
@@ -541,12 +691,31 @@ pub(crate) async fn do_http_fetch_no_dns_ssrf(
     execute_fetch(req, url, client, limits).await
 }
 
+/// Test-only client builder that omits the [`PinnedSsrfDnsResolver`] so the reqwest client
+/// can connect to loopback addresses used by wiremock in tests.
+///
+/// **Do not use this outside tests.**
+#[cfg(test)]
+pub(crate) fn build_client_no_ssrf_resolver(limits: HttpLimits) -> Result<Client, String> {
+    Client::builder()
+        .use_rustls_tls()
+        .connect_timeout(Duration::from_secs(limits.connect_timeout_secs))
+        .timeout(Duration::from_secs(limits.request_timeout_secs))
+        .redirect(redirect::Policy::none())
+        // Disable system proxy even in tests so wiremock connections don't leak through
+        // a developer's HTTPS_PROXY env var.
+        .no_proxy()
+        .connection_verbose(false)
+        .build()
+        .map_err(|e| format!("failed to build test HTTP client: {e}"))
+}
+
 // ── Unit tests ─────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     // ── is_ssrf_blocked_ip ──────────────────────────────────────────────────────────────────
 
@@ -622,6 +791,171 @@ mod tests {
         assert!(!is_ssrf_blocked_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
     }
 
+    // ── SEC-8: tunnel-embedded IPv4 ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn sec8_6to4_embedding_private_is_blocked() {
+        // 6to4: 2002:AABB:CCDD::/48 where AA.BB.CC.DD is the embedded IPv4.
+        // 2002:0a00:0001:: encodes 10.0.0.1 (RFC-1918) → must be blocked.
+        let addr: Ipv6Addr = "2002:0a00:0001::".parse().unwrap();
+        assert!(
+            is_ssrf_blocked_ip(IpAddr::V6(addr)),
+            "6to4 with embedded 10.0.0.1 must be blocked"
+        );
+        // 2002:7f00:0001:: encodes 127.0.0.1 (loopback) → must be blocked.
+        let loopback: Ipv6Addr = "2002:7f00:0001::".parse().unwrap();
+        assert!(
+            is_ssrf_blocked_ip(IpAddr::V6(loopback)),
+            "6to4 with embedded 127.0.0.1 must be blocked"
+        );
+        // 2002:08080808:: encodes 8.8.8.8 (public) → must NOT be blocked.
+        let public: Ipv6Addr = "2002:0808:0808::".parse().unwrap();
+        assert!(
+            !is_ssrf_blocked_ip(IpAddr::V6(public)),
+            "6to4 with embedded 8.8.8.8 should be allowed"
+        );
+    }
+
+    #[test]
+    fn sec8_nat64_embedding_private_is_blocked() {
+        // NAT64: 64:ff9b::/96, last 4 bytes are the IPv4.
+        // 64:ff9b::c0a8:0001 = 64:ff9b::192.168.0.1 → must be blocked.
+        let addr: Ipv6Addr = "64:ff9b::c0a8:0001".parse().unwrap();
+        assert!(
+            is_ssrf_blocked_ip(IpAddr::V6(addr)),
+            "NAT64 with embedded 192.168.0.1 must be blocked"
+        );
+        // 64:ff9b::7f00:0001 = 64:ff9b::127.0.0.1 → must be blocked.
+        let loopback: Ipv6Addr = "64:ff9b::7f00:0001".parse().unwrap();
+        assert!(
+            is_ssrf_blocked_ip(IpAddr::V6(loopback)),
+            "NAT64 with embedded 127.0.0.1 must be blocked"
+        );
+        // 64:ff9b::0808:0808 = 64:ff9b::8.8.8.8 → must NOT be blocked.
+        let public: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+        assert!(
+            !is_ssrf_blocked_ip(IpAddr::V6(public)),
+            "NAT64 with embedded 8.8.8.8 should be allowed"
+        );
+    }
+
+    #[test]
+    fn sec8_teredo_embedding_private_is_blocked() {
+        // Teredo: 2001:0000::/32, client IPv4 at octets [12..16] XOR 0xFF each.
+        // To embed 127.0.0.1 (loopback): XOR gives 0x80, 0xFF, 0xFF, 0xFE → bytes 12..16.
+        // Build manually: 2001:0000:<server_v4>:<udp_port>:<flags>:<client_v4_xored>
+        // We just construct the octets directly.
+        let mut octets = [0u8; 16];
+        octets[0] = 0x20;
+        octets[1] = 0x01;
+        // Bytes 12..16: 127.0.0.1 XOR 0xFF = 0x80, 0xFF, 0xFF, 0xFE
+        octets[12] = 0x80;
+        octets[13] = 0xff;
+        octets[14] = 0xff;
+        octets[15] = 0xfe;
+        let addr = Ipv6Addr::from(octets);
+        assert!(
+            is_ssrf_blocked_ip(IpAddr::V6(addr)),
+            "Teredo with embedded 127.0.0.1 (XOR'd) must be blocked"
+        );
+        // Embed 8.8.8.8 (public): XOR gives 0xF7, 0xF7, 0xF7, 0xF7
+        let mut octets2 = [0u8; 16];
+        octets2[0] = 0x20;
+        octets2[1] = 0x01;
+        octets2[12] = 0xf7;
+        octets2[13] = 0xf7;
+        octets2[14] = 0xf7;
+        octets2[15] = 0xf7;
+        let public = Ipv6Addr::from(octets2);
+        assert!(
+            !is_ssrf_blocked_ip(IpAddr::V6(public)),
+            "Teredo with embedded 8.8.8.8 should be allowed"
+        );
+    }
+
+    #[test]
+    fn pinned_ssrf_resolver_is_correct_type() {
+        // Verify PinnedSsrfDnsResolver can be constructed and upcast to Arc<dyn Resolve>.
+        let resolver = PinnedSsrfDnsResolver::new(4);
+        let _: Arc<dyn Resolve> = Arc::new(resolver);
+    }
+
+    /// SEC-1 behavioral test: the resolver must reject a hostname that resolves to loopback.
+    ///
+    /// `localhost` is expected to resolve to `127.0.0.1` or `::1` on any standard system —
+    /// both are loopback addresses and both are in the SSRF block list. The resolver must
+    /// return `Err`, not a list of `SocketAddr`. This closes the TOCTOU path: the only IPs
+    /// we pass to reqwest are ones that passed `is_ssrf_blocked_ip` at resolve time.
+    #[tokio::test]
+    async fn pinned_resolver_rejects_loopback_hostname() {
+        use std::str::FromStr;
+        let resolver = PinnedSsrfDnsResolver::new(4);
+        let name = Name::from_str("localhost").expect("'localhost' is a valid DNS name");
+        let result = resolver.resolve(name).await;
+        assert!(
+            result.is_err(),
+            "localhost resolves to a loopback address; the pinned resolver must reject it"
+        );
+    }
+
+    /// SEC-6: IPv4-compatible `::a.b.c.d` form (deprecated, RFC 4291 §2.5.5.1).
+    /// Must be blocked when the embedded IPv4 is in a private/loopback range.
+    #[test]
+    fn ipv4_compatible_loopback_is_blocked() {
+        // ::127.0.0.1 in IPv4-compatible form — all of octets[0..12] are 0, last 4 are 127.0.0.1.
+        let addr: Ipv6Addr = "::7f00:0001".parse().unwrap(); // ::127.0.0.1
+        assert!(
+            is_ssrf_blocked_ip(IpAddr::V6(addr)),
+            "::127.0.0.1 (IPv4-compatible loopback) must be blocked"
+        );
+        // ::10.0.0.1 — RFC-1918 embedded
+        let private: Ipv6Addr = "::a00:0001".parse().unwrap(); // ::10.0.0.1
+        assert!(
+            is_ssrf_blocked_ip(IpAddr::V6(private)),
+            "::10.0.0.1 (IPv4-compatible private) must be blocked"
+        );
+        // ::8.8.8.8 — public address, must be allowed
+        let public: Ipv6Addr = "::808:808".parse().unwrap(); // ::8.8.8.8
+        assert!(
+            !is_ssrf_blocked_ip(IpAddr::V6(public)),
+            "::8.8.8.8 (IPv4-compatible public) must not be blocked"
+        );
+    }
+
+    /// SEC-6 extra ranges: 192.0.0.0/24 (IETF protocol assignments) and 198.18.0.0/15 (benchmarking).
+    #[test]
+    fn extra_blocked_ranges_are_blocked() {
+        assert!(
+            is_ssrf_blocked_ip("192.0.0.1".parse().unwrap()),
+            "192.0.0.1 (IETF protocol assignments) must be blocked"
+        );
+        assert!(
+            is_ssrf_blocked_ip("198.18.0.1".parse().unwrap()),
+            "198.18.0.1 (benchmarking RFC 2544) must be blocked"
+        );
+        assert!(
+            is_ssrf_blocked_ip("198.19.255.255".parse().unwrap()),
+            "198.19.255.255 (benchmarking RFC 2544, end) must be blocked"
+        );
+    }
+
+    /// `allow_http = true` allows an http:// URL through `validate_url`.
+    #[test]
+    fn allow_http_permits_plain_http_url() {
+        let grants = vec!["example.com".to_owned()];
+        let req = make_req("http://example.com/data");
+        // With allow_http = false (default), http:// is rejected.
+        let err = validate_url(&req, &grants, false).unwrap_err();
+        assert!(
+            err.contains("http://") || err.contains("https://") || err.contains("allow_http"),
+            "http:// must be rejected when allow_http=false, err = {err}"
+        );
+        // With allow_http = true, http:// passes validate_url (DNS-SSRF check still runs at connect).
+        let url = validate_url(&req, &grants, true)
+            .expect("http:// must be allowed when allow_http=true");
+        assert_eq!(url.scheme(), "http");
+    }
+
     // ── hostname_allowed ────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -664,14 +998,14 @@ mod tests {
     fn valid_url_passes() {
         let grants = vec!["api.example.com".to_owned()];
         let req = make_req("https://api.example.com/v1/data");
-        assert!(validate_url(&req, &grants).is_ok());
+        assert!(validate_url(&req, &grants, false).is_ok());
     }
 
     #[test]
     fn unlisted_host_is_rejected() {
         let grants = vec!["api.example.com".to_owned()];
         let req = make_req("https://evil.com/steal");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         // Error must not reveal the grant list contents.
         assert!(
             !err.contains("api.example.com"),
@@ -684,7 +1018,7 @@ mod tests {
     fn ip_literal_loopback_is_rejected() {
         let grants = vec!["127.0.0.1".to_owned()]; // even if in grants — IP literal check runs
         let req = make_req("https://127.0.0.1/secret");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
             "err = {err}"
@@ -697,7 +1031,7 @@ mod tests {
         // correctly parsed (stripping `[` and `]`) before the SSRF check runs.
         let grants = vec!["[::1]".to_owned()]; // even if in grants — IP literal check runs
         let req = make_req("https://[::1]/secret");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
             "IPv6 loopback must be SSRF-blocked, err = {err}"
@@ -709,7 +1043,7 @@ mod tests {
         // ULA prefix fc00::/7. Must be blocked even when grant list includes the address.
         let grants = vec!["[fc00::1]".to_owned()];
         let req = make_req("https://[fc00::1]/");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
             "IPv6 ULA must be SSRF-blocked, err = {err}"
@@ -720,9 +1054,9 @@ mod tests {
     fn ipv6_unspecified_is_rejected() {
         // `::` is the IPv6 unspecified address; on Linux connect() to `::` reaches loopback.
         let grants = vec!["::".to_owned(), "[::0]".to_owned()];
-        for url in &["https://[::]/", "https://[::0]/"] {
+        for url in ["https://[::]/", "https://[::0]/"] {
             let req = make_req(url);
-            let err = validate_url(&req, &grants).unwrap_err();
+            let err = validate_url(&req, &grants, false).unwrap_err();
             assert!(
                 err.contains("SSRF") || err.contains("blocked") || err.contains("network grant"),
                 "IPv6 unspecified must be blocked, url={url}, err={err}"
@@ -734,7 +1068,7 @@ mod tests {
     fn ipv4_multicast_is_rejected() {
         let grants = vec!["224.0.0.1".to_owned()];
         let req = make_req("https://224.0.0.1/");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
             "IPv4 multicast must be SSRF-blocked, err = {err}"
@@ -745,7 +1079,7 @@ mod tests {
     fn ipv6_multicast_is_rejected() {
         let grants = vec!["[ff02::1]".to_owned()];
         let req = make_req("https://[ff02::1]/");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
             "IPv6 multicast must be SSRF-blocked, err = {err}"
@@ -757,7 +1091,7 @@ mod tests {
         // Only https:// is allowed; http:// must be rejected even for an allowed host.
         let grants = vec!["example.com".to_owned()];
         let req = make_req("http://example.com/data");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(
             err.contains("http://") || err.contains("https://") || err.contains("scheme"),
             "http:// must be rejected, err = {err}"
@@ -773,7 +1107,7 @@ mod tests {
         // Either way, the request is rejected — the test asserts fail-closed behaviour.
         let grants_decimal = vec!["2130706433".to_owned()];
         let req = make_req("https://2130706433/secret");
-        let err = validate_url(&req, &grants_decimal).unwrap_err();
+        let err = validate_url(&req, &grants_decimal, false).unwrap_err();
         assert!(
             err.contains("network grant") || err.contains("SSRF") || err.contains("blocked"),
             "decimal-encoded IPv4 must be rejected, err = {err}"
@@ -781,7 +1115,7 @@ mod tests {
 
         // With the normalised address in grants, the SSRF check still blocks it.
         let grants_norm = vec!["127.0.0.1".to_owned()];
-        let err = validate_url(&req, &grants_norm).unwrap_err();
+        let err = validate_url(&req, &grants_norm, false).unwrap_err();
         assert!(
             err.contains("SSRF") || err.contains("blocked"),
             "decimal-encoded IPv4 with normalised grant must still be SSRF-blocked, err = {err}"
@@ -792,7 +1126,7 @@ mod tests {
     fn ftp_scheme_is_rejected() {
         let grants = vec!["example.com".to_owned()];
         let req = make_req("ftp://example.com/file");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(err.contains("scheme"), "err = {err}");
     }
 
@@ -800,7 +1134,7 @@ mod tests {
     fn file_scheme_is_rejected() {
         let grants = vec!["example.com".to_owned()];
         let req = make_req("file:///etc/passwd");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(err.contains("scheme"), "err = {err}");
     }
 
@@ -808,7 +1142,7 @@ mod tests {
     fn invalid_url_is_rejected() {
         let grants = vec!["example.com".to_owned()];
         let req = make_req("not a url at all !!!");
-        let err = validate_url(&req, &grants).unwrap_err();
+        let err = validate_url(&req, &grants, false).unwrap_err();
         assert!(err.contains("invalid URL"), "err = {err}");
     }
 
@@ -823,7 +1157,8 @@ mod tests {
         let host = server.address().ip().to_string();
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits).expect("client");
+        // Use the non-SSRF resolver client so wiremock (127.0.0.1) is reachable.
+        let client = build_client_no_ssrf_resolver(limits).expect("client");
 
         for method in &["CONNECT", "TRACE", "FOOBAR"] {
             let req = HttpRequest {
@@ -868,7 +1203,7 @@ mod tests {
         let host = server.address().ip().to_string();
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits).expect("client");
+        let client = build_client_no_ssrf_resolver(limits).expect("client");
 
         let req = make_req(&format!("{base}/hello"));
         let resp = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
@@ -890,7 +1225,7 @@ mod tests {
         let base = server.uri();
         let grants = vec!["api.allowed.example.com".to_owned()];
         let limits = HttpLimits::default();
-        let client = build_client(limits).expect("client");
+        let client = build_client_no_ssrf_resolver(limits).expect("client");
 
         let req = make_req(&format!("{base}/should-not-reach"));
         let err = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
@@ -932,7 +1267,7 @@ mod tests {
             max_response_bytes: 1024,
             ..HttpLimits::default()
         };
-        let client = build_client(limits).expect("client");
+        let client = build_client_no_ssrf_resolver(limits).expect("client");
 
         let req = make_req(&format!("{base}/big"));
         let err = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
@@ -969,7 +1304,7 @@ mod tests {
         let host = server.address().ip().to_string();
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits).expect("client");
+        let client = build_client_no_ssrf_resolver(limits).expect("client");
 
         let req = make_req(&format!("{base}/cookies"));
         let resp = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
@@ -1013,7 +1348,7 @@ mod tests {
         let host = server.address().ip().to_string();
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits).expect("client");
+        let client = build_client_no_ssrf_resolver(limits).expect("client");
 
         let req = HttpRequest {
             method: "POST".to_owned(),
@@ -1031,8 +1366,8 @@ mod tests {
     /// Redirects are not followed (Policy::none()); the 3xx response is returned to the plugin.
     ///
     /// The plugin is responsible for inspecting the `Location` header and issuing a new
-    /// `http-fetch` call, which will go through the full SSRF pre-flight pipeline. This prevents
-    /// redirect-chaining SSRF attacks where a server redirects to a private IP.
+    /// `http-fetch` call, which will go through the full SSRF pipeline (pinned DNS resolver).
+    /// This prevents redirect-chaining SSRF attacks where a server redirects to a private IP.
     #[tokio::test]
     async fn redirect_is_returned_not_followed() {
         use wiremock::{
@@ -1054,7 +1389,7 @@ mod tests {
         let host = server.address().ip().to_string();
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits).expect("client");
+        let client = build_client_no_ssrf_resolver(limits).expect("client");
 
         let req = make_req(&format!("{base}/redir"));
         let resp = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)

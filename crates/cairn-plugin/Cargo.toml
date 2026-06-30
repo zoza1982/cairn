@@ -26,11 +26,18 @@ cairn-vfs = { workspace = true }
 # isolation contract) — never on `cairn-broker`, `cairn-vault`, or `cairn-secrets`
 # (enforced by the dep-closure CI test in `cairn-broker-api/tests/isolation.rs`).
 cairn-broker-api = { workspace = true }
+# Plugin grants storage: the loader reads approved capability grants from cairn-config
+# (RFC-0010 §5.4). cairn-config has no secret-holding transitive deps so this is safe.
+cairn-config = { workspace = true }
 async-trait = "0.1"
 # `WriteSink::write_chunk` takes a `bytes::Bytes`; same crate/version cairn-vfs uses for that trait.
 bytes = "1"
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# Manifest parsing: plugin.toml uses toml format (same crate version as cairn-config).
+# `serde` is used with `deny_unknown_fields` to reject unrecognised manifest keys (RFC-0010 §5.2).
+toml = "1"
 tracing = "0.1"
 tokio = { version = "1", features = ["sync"] }
 wasmtime = { version = "46.0.1", default-features = false, features = [
@@ -65,3 +72,5 @@ futures = "0.3"
 # Hermetic HTTP mock server for the brokered http-fetch tests (no real network, no TLS).
 # Same pattern as cairn-ai/tests. Only active under the `plugin-network` feature.
 wiremock = "0.6"
+# Temporary directories for loader tests (plugin directory fixture).
+tempfile = "3"
