@@ -17,7 +17,9 @@ default = []
 # The live Docker engine adapter (bollard). Off by default so the lean, cross-platform build never
 # pulls bollard's hyper stack; the full build (Linux-only in CI) and the dind integration job enable
 # it. See ADR-0006.
-docker = ["dep:bollard", "dep:tar", "dep:bytes"]
+# The live Docker engine adapter. Pulls bollard's hyper stack (off by default), plus tokio `rt` and
+# `sync` features needed to spawn the log-forwarding task and use the mpsc channel.
+docker = ["dep:bollard", "dep:tar", "tokio/rt", "tokio/sync"]
 
 [dependencies]
 cairn-types = { workspace = true }
@@ -25,12 +27,14 @@ cairn-vfs = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 bollard = { version = "0.21", optional = true }
-# The Docker archive API returns a tar stream; `tar` parses it to browse a container's filesystem,
-# `bytes` collects the streamed chunks. Both are pulled only by the live `docker` adapter.
+# The Docker archive API returns a tar stream; `tar` parses it to browse a container's filesystem.
+# Pulled only by the live `docker` adapter.
 tar = { version = "0.4", optional = true }
-bytes = { version = "1", optional = true }
+# `bytes` is an unconditional dep: `ContainerOps::logs` and `ActionOutcome::Stream` both carry
+# `Bytes` payloads, so the trait and mock need it even without the live bollard adapter.
+bytes = "1"
 smol_str = "0.3"
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }

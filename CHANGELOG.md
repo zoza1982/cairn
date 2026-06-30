@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Docker container log streaming** (M6-3 first slice): `DockerVfs::invoke("logs")` now returns
+  `ActionOutcome::Stream(BoxStream<'static, Result<Bytes, VfsError>>)` backed by bollard's
+  `Docker::logs` endpoint. Bollard's `LogOutput` decoder handles Docker's 8-byte multiplexed stream
+  header (present when no TTY) so callers receive plain payload bytes without hand-parsing wire
+  frames. The implementation spawns a Tokio task owning the Docker client clone + bollard stream and
+  forwards frames over a bounded `mpsc` channel (capacity 64), producing a `'static` `BoxStream`
+  and providing natural cancellation when the consumer drops the stream. `follow` and `tail` are
+  read from `ActionCtx::Logs`; defaults are `follow: false / tail: "100"` so a hermetic or dind
+  test terminates without a timeout. `exec` (interactive `Session`) remains deferred (M6-3/M6-6
+  follow-up). `ContainerOps::logs` is a new seam method implemented by both `BollardDocker` and
+  `MockContainerOps` (canned two-line output). `bytes` is now an unconditional dep of
+  `cairn-backend-docker` (the trait and mock use it; `bollard`/`tar` remain `docker`-feature-only).
+  New hermetic tests: `invoke_logs_returns_stream_with_canned_output`,
+  `invoke_logs_on_non_container_path_errors`, `invoke_exec_is_deferred_not_implemented`,
+  `invoke_logs_ctx_follow_is_forwarded`. New env-guarded dind test: `docker_container_log_streaming`
+  (creates a busybox container that emits `CAIRN_LOG_STREAM_MARKER`, collects the `invoke("logs")`
+  stream, and asserts the marker is present).
 - **Docker & Kubernetes connection-opener arms** (M4-5): the binary's `ConnectionOpener` now also
   opens `docker` and `kubernetes`/`k8s` profiles (no vault credential — local socket / kubeconfig),
   behind new `docker`/`k8s` binary features and a `containers` umbrella (`all-backends` now =

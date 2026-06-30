@@ -248,19 +248,62 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
         }
     }
 
+    /// Invoke a per-container action.
+    ///
+    /// **Implemented:**
+    /// - `logs` — streams container log output as a `BoxStream<'static, Result<Bytes, VfsError>>`
+    ///   (`ActionOutcome::Stream`). Stdout and stderr are interleaved in arrival order; bollard
+    ///   demultiplexes the Docker 8-byte stream header so callers receive plain payload bytes.
+    ///   `follow` is taken from [`ActionCtx::Logs`] when present; the default is `false` (bounded
+    ///   history, so a hermetic/dind test terminates). `tail` defaults to `"100"` for the same reason.
+    ///
+    /// **Deferred (follow-up M6-3/M6-6):**
+    /// - `exec` — interactive bidirectional `ActionOutcome::Session` (TTY, stdin/stdout); requires
+    ///   bollard's `exec` + WebSocket attach. Tracked as M6-3 follow-up.
     async fn invoke(
         &self,
-        _path: &VfsPath,
+        path: &VfsPath,
         action: ActionId,
-        _ctx: ActionCtx,
+        ctx: ActionCtx,
     ) -> Result<ActionOutcome, VfsError> {
-        // The actions are advertised by `actions_at`; live invocation over the Docker API (streaming
-        // exec/logs) is the integration step — report that distinctly from a truly-unknown action.
-        Err(VfsError::Backend {
-            code: "not_implemented".to_owned(),
-            msg: format!("action '{}' is not yet available", action.as_str()),
-            retryable: false,
-        })
+        let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
+
+        // Only container paths expose actions; anything else (including unknown paths under
+        // /images or /containers that are not the per-container row) is an unsupported action.
+        let container_name = match segs.as_slice() {
+            ["containers", name, ..] => *name,
+            _ => {
+                return Err(VfsError::Backend {
+                    code: "not_implemented".to_owned(),
+                    msg: format!("action '{}' is not available at this path", action.as_str()),
+                    retryable: false,
+                })
+            }
+        };
+
+        match action.as_str() {
+            action_ids::LOGS => {
+                let (follow, tail) = match &ctx {
+                    ActionCtx::Logs { follow, .. } => (*follow, "100"),
+                    _ => (false, "100"),
+                };
+                let stream = self.ops.logs(container_name, follow, tail);
+                Ok(ActionOutcome::Stream(stream))
+            }
+            // exec (interactive Session) is deferred: it requires bollard's `exec` endpoint,
+            // a WebSocket attach for bidirectional I/O, and stdout/stderr demux with TTY.
+            // Follow-up: M6-3 exec slice + M6-6 K8s streaming.
+            action_ids::EXEC => Err(VfsError::Backend {
+                code: "not_implemented".to_owned(),
+                msg: "exec (interactive Session) is deferred — follow-up M6-3".to_owned(),
+                retryable: false,
+            }),
+            other => Err(VfsError::Backend {
+                code: "not_implemented".to_owned(),
+                msg: format!("action '{other}' is not available"),
+                retryable: false,
+            }),
+        }
     }
 }
 
@@ -430,11 +473,85 @@ mod tests {
         assert!(vfs.actions_at(&p("/images/nginx:latest")).is_empty());
         // Reflects path shape, not existence (a phantom container still lists actions).
         assert!(!vfs.actions_at(&p("/containers/ghost")).is_empty());
-        // Invocation is the integration step — advertised but not yet implemented.
+    }
+
+    #[tokio::test]
+    async fn invoke_logs_returns_stream_with_canned_output() {
+        let vfs = backend();
+        // invoke("logs") on a known mock container yields ActionOutcome::Stream.
+        let outcome = vfs
+            .invoke(
+                &p("/containers/web"),
+                ActionId::new(action_ids::LOGS),
+                ActionCtx::None,
+            )
+            .await
+            .expect("invoke logs on a known container must succeed");
+
+        let stream = match outcome {
+            ActionOutcome::Stream(s) => s,
+            _ => panic!("expected ActionOutcome::Stream"),
+        };
+
+        let chunks: Vec<Vec<u8>> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("stream item must be Ok").to_vec())
+            .collect();
+        let combined = chunks.concat();
+        let text = String::from_utf8(combined).expect("mock log output must be valid UTF-8");
+        assert!(text.contains("[mock] log line 1\n"), "got: {text:?}");
+        assert!(text.contains("[mock] log line 2\n"), "got: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn invoke_logs_on_non_container_path_errors() {
+        let vfs = backend();
+        // invoke("logs") on /images/… is not a container path — must be a backend error.
         assert!(matches!(
-            vfs.invoke(&p("/containers/web"), ActionId::new(action_ids::LOGS), ActionCtx::None)
-                .await,
+            vfs.invoke(
+                &p("/images/nginx:latest"),
+                ActionId::new(action_ids::LOGS),
+                ActionCtx::None
+            )
+            .await,
             Err(VfsError::Backend { code, .. }) if code == "not_implemented"
         ));
+    }
+
+    #[tokio::test]
+    async fn invoke_exec_is_deferred_not_implemented() {
+        let vfs = backend();
+        // exec remains deferred (M6-3 follow-up); invoking it must still return the "not_implemented"
+        // backend error — distinct from VfsError::Unsupported — so callers can detect the deferral.
+        assert!(matches!(
+            vfs.invoke(
+                &p("/containers/web"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::None
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invoke_logs_ctx_follow_is_forwarded() {
+        let vfs = backend();
+        // ActionCtx::Logs{follow: true} must also return a stream (the mock ignores follow).
+        let outcome = vfs
+            .invoke(
+                &p("/containers/web"),
+                ActionId::new(action_ids::LOGS),
+                ActionCtx::Logs {
+                    follow: true,
+                    since: None,
+                    container: None,
+                },
+            )
+            .await
+            .expect("invoke logs with follow=true must succeed");
+        assert!(matches!(outcome, ActionOutcome::Stream(_)));
     }
 }
