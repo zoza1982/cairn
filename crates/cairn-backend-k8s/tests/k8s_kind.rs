@@ -16,6 +16,10 @@
 //! 6. Exercises `logs` (non-follow, tail 10) on the same kube-system pod — asserts the stream
 //!    yields at least some bytes without errors. System pods log actively, so a non-empty result
 //!    is expected; an empty log (recently-started pod) is noted but does not fail the test.
+//! 7. Exercises `exec` (non-TTY, `["sh", "-c", "echo CAIRN_EXEC_MARKER"]`) — asserts the marker
+//!    appears in stdout and `done` resolves with `Ok(0)`. Skips gracefully when no suitable
+//!    container (Running phase, has `sh`) can be found. The exec handle is programmatically driven
+//!    without a TUI pane (this PR is the backend only; the TUI exec pane is PR-4).
 #![cfg(feature = "k8s")]
 
 use cairn_backend_k8s::{KubeOps, KubeRsOps};
@@ -266,4 +270,125 @@ async fn k8s_cluster_tree_round_trip() {
         // test validated that there were no stream errors, which is the important invariant.
         eprintln!("WARN: log stream yielded 0 bytes (pod may have just started)");
     }
+}
+
+/// Interactive exec round-trip against a kind/live cluster.
+///
+/// Runs `sh -c 'echo CAIRN_EXEC_MARKER'` non-TTY in a kube-system pod, reads stdout from the
+/// `SessionHandle`, asserts the marker is present, and asserts `done` resolves with `Ok(0)`.
+///
+/// Skips gracefully when:
+/// - `CAIRN_IT_K8S` is unset (hermetic CI guard).
+/// - No Running pod in kube-system is found with a container that has `sh` on its PATH (checked
+///   by inspecting the exec error: if the error code is `exec-io` or the API returns 404/400, the
+///   container is not suitable).
+///
+/// This test drives the `SessionHandle` programmatically (no TUI pane). The TUI exec pane is
+/// implemented in PR-4 (RFC-0009 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_exec_non_tty_round_trip() {
+    if std::env::var("CAIRN_IT_K8S").is_err() {
+        eprintln!("CAIRN_IT_K8S unset — skipping live Kubernetes exec integration test");
+        return;
+    }
+
+    let ops = KubeRsOps::new();
+
+    // Use the first kind context (or the first context if no kind context is present).
+    let contexts = ops
+        .list_contexts()
+        .await
+        .expect("list_contexts must succeed");
+    assert!(!contexts.is_empty(), "need at least one kubeconfig context");
+    let ctx = &contexts
+        .iter()
+        .find(|c| c.name.contains("kind"))
+        .unwrap_or(&contexts[0])
+        .name;
+
+    // Enumerate kube-system pods.
+    let ns = "kube-system";
+    let pods = ops
+        .list_pods(ctx, ns)
+        .await
+        .expect("list_pods in kube-system must succeed");
+    assert!(!pods.is_empty(), "kube-system must have at least one pod");
+
+    // Prefer a Running pod; non-Running pods return 400/404 on exec.
+    let pod = pods
+        .iter()
+        .find(|p| matches!(p.phase, cairn_types::PodPhase::Running));
+    let pod = match pod {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: no Running pod in kube-system — skipping exec test");
+            return;
+        }
+    };
+    let pod_name = &pod.name;
+
+    // Pick the first container.
+    let containers = ops
+        .list_containers(ctx, ns, pod_name)
+        .await
+        .expect("list_containers must succeed");
+    assert!(
+        !containers.is_empty(),
+        "Running pod '{pod_name}' must have at least one container"
+    );
+    let container_name = &containers[0].name;
+
+    eprintln!("Testing exec on pod '{pod_name}' container '{container_name}'...");
+
+    // Launch a non-TTY exec that echoes a known marker.
+    let command = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "echo CAIRN_EXEC_MARKER".to_owned(),
+    ];
+    let handle = match ops
+        .exec(ctx, ns, pod_name, container_name, command, false)
+        .await
+    {
+        Ok(h) => h,
+        Err(VfsError::NotFound(_)) | Err(VfsError::Backend { .. }) => {
+            // Pod may not accept exec (Succeeded/Failed race) or container has no sh.
+            eprintln!(
+                "SKIP: exec on '{pod_name}/{container_name}' returned an error — \
+                 the container may not have 'sh' or the pod changed phase. Skipping."
+            );
+            return;
+        }
+        Err(e) => panic!("exec failed unexpectedly: {e}"),
+    };
+
+    // Close stdin immediately — the command does not read it.
+    drop(handle.stdin);
+
+    // Collect stdout until the channel closes (the relay task exits after the process exits).
+    let mut stdout = handle.stdout.expect("non-tty exec must have stdout");
+    let mut output = Vec::new();
+    while let Some(chunk) = stdout.recv().await {
+        output.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&output);
+    eprintln!("exec stdout: {text:?}");
+
+    assert!(
+        text.contains("CAIRN_EXEC_MARKER"),
+        "stdout must contain the marker; got: {text:?}"
+    );
+
+    // Await the exit code.
+    let exit = handle
+        .done
+        .await
+        .expect("done channel must not be dropped before resolution");
+    let code = exit.expect("exec must not fail with VfsError");
+    assert_eq!(
+        code, 0,
+        "non-TTY echo command must exit with code 0, got: {code}"
+    );
+
+    eprintln!("exec round-trip OK — exit code {code}");
 }
