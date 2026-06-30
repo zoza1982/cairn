@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Panes now root at the OS filesystem root** (`/` on Unix, drive root on Windows) so `..`
+  navigation is unrestricted all the way up. Cairn still opens at the launch directory, but
+  the user can navigate above it without hitting an artificial ceiling. The `LocalVfs` base is
+  now the platform root derived from `std::path::Component` rather than `current_dir()`.
+
+- **MC-style `..` parent entry**: every non-root directory listing now shows a synthetic `..`
+  entry at position 0. Arrowing onto it and pressing Enter (or the existing Backspace/h/Left
+  bindings) navigates to the parent directory. The `..` entry is never markable, never a target
+  for copy/move/delete/rename, never included in filtered-away results (it stays visible at the
+  top regardless of the active name filter), and never stored as a `VfsPath` containing `..` —
+  it is a pure UI affordance that routes through the existing `leave_dir` path.
+
 ### Security
 
 - **DNS connection pinning and IPv6 tunnel classification** (SEC-1 / issue #103, RFC-0010 PR-C1,

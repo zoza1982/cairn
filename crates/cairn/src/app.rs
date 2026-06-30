@@ -60,6 +60,56 @@ struct VaultContext {
     deferred: Arc<[DeferredConnection]>,
 }
 
+/// Split an absolute OS path into its root prefix (the `LocalVfs` base) and the remaining
+/// segments as a [`VfsPath`].
+///
+/// On Unix `/home/user/projects` → `(PathBuf("/"), VfsPath("/home/user/projects"))`.
+/// On Windows `C:\Users\me` → `(PathBuf("C:\"), VfsPath("/Users/me"))`.
+///
+/// Falls back to `(PathBuf("/"), VfsPath::root())` when:
+/// - the path is relative (no root component),
+/// - a segment is not valid UTF-8,
+/// - a segment contains a `/` or control character (rejected by `VfsPath::join`), or
+/// - a `..` component appears (should never happen from `current_dir()` but guarded).
+fn split_cwd_root(cwd: &std::path::Path) -> (std::path::PathBuf, VfsPath) {
+    use std::path::Component;
+
+    let mut root = std::path::PathBuf::new();
+    let mut vfs = VfsPath::root();
+
+    for component in cwd.components() {
+        match component {
+            // Prefix (e.g. `C:` on Windows) and RootDir (`/` on Unix, `\` on Windows)
+            // together form the LocalVfs base directory.
+            Component::Prefix(_) | Component::RootDir => {
+                root.push(component.as_os_str());
+            }
+            // Each Normal segment becomes one VfsPath level.
+            Component::Normal(name) => {
+                let Some(s) = name.to_str() else {
+                    // Non-UTF-8 path component: fall back so the UI still opens.
+                    return (root, VfsPath::root());
+                };
+                match vfs.join(s) {
+                    Ok(p) => vfs = p,
+                    Err(_) => return (root, VfsPath::root()),
+                }
+            }
+            // `.` is a no-op in an absolute path.
+            Component::CurDir => {}
+            // `..` should never appear in a canonical `current_dir()` result, but guard it.
+            Component::ParentDir => return (root, VfsPath::root()),
+        }
+    }
+
+    if root.as_os_str().is_empty() {
+        // Relative path — fall back to the OS filesystem root.
+        return (std::path::PathBuf::from("/"), VfsPath::root());
+    }
+
+    (root, vfs)
+}
+
 /// Build the runtime and run the application to completion.
 pub(crate) fn run() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -74,17 +124,23 @@ async fn run_async() -> anyhow::Result<()> {
         anyhow::bail!("cairn requires an interactive terminal (stdout is not a TTY)");
     }
 
-    // Both panes browse the local filesystem rooted at the current directory.
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    // Root both default panes at the OS filesystem root so the user can navigate all the way up
+    // to `/` (Unix) or the drive root (Windows). `split_cwd_root` splits the launch directory
+    // into the root prefix (the `LocalVfs` base) and the remaining path segments (the initial
+    // `VfsPath`), so Cairn opens at the launch directory but `..` navigation is unrestricted.
+    let (fs_root, initial_cwd) = {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        split_cwd_root(&cwd)
+    };
     let registry = VfsRegistry::new();
     registry
-        .insert(LEFT, Arc::new(LocalVfs::new(LEFT, root.clone())))
+        .insert(LEFT, Arc::new(LocalVfs::new(LEFT, fs_root.clone())))
         .await;
     registry
-        .insert(RIGHT, Arc::new(LocalVfs::new(RIGHT, root)))
+        .insert(RIGHT, Arc::new(LocalVfs::new(RIGHT, fs_root)))
         .await;
 
-    let mut state = AppState::new(LEFT, RIGHT, VfsPath::root());
+    let mut state = AppState::new(LEFT, RIGHT, initial_cwd);
 
     // Load user config (keybinding overrides, connection profiles, …); fall back to defaults.
     let config = load_config();
@@ -2659,5 +2715,38 @@ mod tests {
             !dir.path().join("pwned").exists(),
             "a shell would have created 'pwned'; argv exec must not"
         );
+    }
+
+    // --- split_cwd_root ---
+
+    #[test]
+    fn split_cwd_root_unix_absolute_path() {
+        // /a/b/c → base "/" + VfsPath "/a/b/c"
+        let (base, vfs) = split_cwd_root(std::path::Path::new("/a/b/c"));
+        assert_eq!(base, std::path::PathBuf::from("/"));
+        assert_eq!(vfs, VfsPath::parse("/a/b/c").unwrap());
+    }
+
+    #[test]
+    fn split_cwd_root_unix_filesystem_root() {
+        // "/" → base "/" + VfsPath "/" (root)
+        let (base, vfs) = split_cwd_root(std::path::Path::new("/"));
+        assert_eq!(base, std::path::PathBuf::from("/"));
+        assert!(vfs.is_root());
+    }
+
+    #[test]
+    fn split_cwd_root_relative_path_falls_back() {
+        // A relative path has no root component → fall back to ("/" , root).
+        let (base, vfs) = split_cwd_root(std::path::Path::new("a/b"));
+        assert_eq!(base, std::path::PathBuf::from("/"));
+        assert!(vfs.is_root());
+    }
+
+    #[test]
+    fn split_cwd_root_empty_path_falls_back() {
+        let (base, vfs) = split_cwd_root(std::path::Path::new(""));
+        assert_eq!(base, std::path::PathBuf::from("/"));
+        assert!(vfs.is_root());
     }
 }
