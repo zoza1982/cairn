@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Broker-backed connection opener** (M4-5, first integration slice): the runnable `cairn` binary
+  can now turn a saved `ConnectionProfile` into a live `Vfs` backend. A new `ConnectionOpener`
+  (`crates/cairn/src/connect.rs`) resolves the profile's vault credential reference through the
+  `Broker`, builds the scheme's `*ConnectParams` from the profile's non-secret `endpoint` fields, and
+  dispatches to the matching connector (`ssh_connect`/`s3_connect`/`gcs_connect`/`azure_connect`),
+  returning an `Arc<dyn Vfs>`. The binary gains per-backend feature umbrellas — `ssh`, `s3`, `gcs`,
+  `azure`, plus convenience `cloud = [s3, gcs, azure]` and `all-backends = [ssh, cloud]` — each
+  pulling its backend crate (an optional dep) and live-transport feature. The **default build stays
+  lean** (no backends, no cloud/SSH SDKs), preserving the cross-platform lean build (ADR-0006); a
+  profile whose scheme's feature is off fails fast with a "not built into this binary" error rather
+  than attempting any I/O. At startup, credential-bearing config profiles are opened through this
+  path (journaled as `Actor::User`) and registered in the switcher; a profile that can't be opened
+  (locked vault, missing field, or a backend not built in) is skipped with a warning so startup never
+  breaks. Hermetic tests cover scheme dispatch, profile→params construction, and the resolve→connect
+  credential path (an S3 profile pointing at an SSH credential is rejected as `Auth` before any
+  network I/O). **Deferred follow-ups:** the Docker/K8s opener (they connect without a vault
+  credential), the new-connection TUI (M4-5), and the `Overlay::VaultUnlock` flow (M3-7) — until the
+  latter lands the broker is wired *locked*. The assistant's `open_connection` tool also stays
+  deferred (it requires the M7 authorize→confirm mediation).
 - **MCP client foundation** (M7, `RFC-mcp-client`): a new standalone `cairn-mcp` crate — a thin,
   documented wrapper over the official **`rmcp` 2.0** SDK that lets Cairn act as a **client** of an
   external Model Context Protocol server. `McpClient` connects over **stdio** (`connect_stdio`, spawning

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cairn_backend_local::LocalVfs;
+use cairn_broker::{Actor, Broker};
 use cairn_config::Config;
 use cairn_core::{
     initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, Msg,
@@ -100,10 +101,21 @@ async fn run_async() -> anyhow::Result<()> {
         tracing::warn!("{w}");
     }
 
+    // The capability broker mediates credential resolution for credential-bearing (remote)
+    // connections. It starts *locked*, so credential-bearing profiles can't be opened yet — the
+    // opener resolves cleanly to a locked-vault error rather than connecting.
+    //
+    // NOTE (M3-7 handover): this broker is local to `run_async` and drives only the startup pass.
+    // The vault-unlock overlay will need the `Arc<Broker>` stored in shared state (e.g. `AppState`
+    // or a runtime slot) so it can call `.unlock(vault)` and re-open the deferred connections; that
+    // shared wiring does not exist yet.
+    let opener = crate::connect::ConnectionOpener::new(Arc::new(Broker::locked()));
+
     // Register the switchable connections (Ctrl-O) and record their labels: built-in local roots
-    // plus any `scheme = "local"` profiles from config. Non-local profiles need live transport and
-    // are not yet connectable.
-    state.connections = register_connections(&registry, &config).await;
+    // plus the config profiles. Local profiles mount immediately; credential-bearing profiles (ssh/
+    // s3/gcs/azure) are opened via the broker-backed opener — skipped with a warning when the vault
+    // is locked or their backend feature isn't built into this binary.
+    state.connections = register_connections(&registry, &config, &opener).await;
 
     // Resolve the color theme from the preset + per-role config overrides.
     let (theme, theme_warnings) = Theme::resolve(&config.ui.theme, &config.ui.colors);
@@ -176,10 +188,17 @@ fn load_config() -> Config {
 }
 
 /// Register the connections offered by the switcher and return their UI choices. Built-in local
-/// roots (`/` and `$HOME` when set) plus each `scheme = "local"` config profile (using its
-/// `endpoint.path`). Non-local profiles require live transport and are skipped for now.
-async fn register_connections(registry: &VfsRegistry, config: &Config) -> Vec<ConnectionChoice> {
-    // Build the (path, label) targets: built-in roots first, then local config profiles.
+/// roots (`/` and `$HOME` when set) and each `scheme = "local"` config profile mount immediately;
+/// each credential-bearing profile (`ssh`/`s3`/`gcs`/`azure`) is opened through the broker-backed
+/// [`ConnectionOpener`](crate::connect::ConnectionOpener) and registered on success. A profile that
+/// can't be opened (locked vault, missing field, or a backend not compiled into this binary) is
+/// skipped with a warning so a single bad profile never blocks startup.
+async fn register_connections(
+    registry: &VfsRegistry,
+    config: &Config,
+    opener: &crate::connect::ConnectionOpener,
+) -> Vec<ConnectionChoice> {
+    // Build the (path, label) local targets: built-in roots first, then `scheme = "local"` profiles.
     let mut targets: Vec<(PathBuf, String)> = vec![(PathBuf::from("/"), "local: /".to_owned())];
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         targets.push((
@@ -189,8 +208,16 @@ async fn register_connections(registry: &VfsRegistry, config: &Config) -> Vec<Co
     }
     for prof in &config.connections {
         if prof.scheme == "local" {
-            if let Some(path) = prof.endpoint.get("path") {
-                targets.push((PathBuf::from(path), format!("local: {}", prof.display_name)));
+            match prof.endpoint.get("path") {
+                Some(path) => {
+                    targets.push((PathBuf::from(path), format!("local: {}", prof.display_name)));
+                }
+                // Surface the misconfiguration rather than dropping it silently — every other
+                // un-registerable profile already gets a warning.
+                None => tracing::warn!(
+                    name = %prof.display_name,
+                    "skipping local connection profile: missing endpoint.path"
+                ),
             }
         }
     }
@@ -202,6 +229,37 @@ async fn register_connections(registry: &VfsRegistry, config: &Config) -> Vec<Co
         let id = ConnectionId(base + i as u64);
         registry.insert(id, Arc::new(LocalVfs::new(id, path))).await;
         choices.push(ConnectionChoice { conn: id, label });
+    }
+
+    // Credential-bearing (remote) profiles, continuing the id sequence. These are user-initiated, so
+    // the broker resolution is journaled as `Actor::User`.
+    let mut next_id = base + choices.len() as u64;
+    for prof in &config.connections {
+        if prof.scheme == "local" {
+            continue;
+        }
+        // The id is reserved even when the open fails, so a profile keeps a positionally stable
+        // slot across runs of the same config (a failed open just leaves a harmless gap — ids are
+        // opaque u64 handles, not a contiguous space).
+        let id = ConnectionId(next_id);
+        next_id += 1;
+        match opener.open(Actor::User, id, prof).await {
+            Ok(vfs) => {
+                registry.insert(id, vfs).await;
+                choices.push(ConnectionChoice {
+                    conn: id,
+                    label: format!("{}: {}", prof.scheme, prof.display_name),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    scheme = %prof.scheme,
+                    name = %prof.display_name,
+                    error = %e,
+                    "skipping connection profile"
+                );
+            }
+        }
     }
     choices
 }
