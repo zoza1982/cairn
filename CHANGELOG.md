@@ -64,9 +64,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while `ExecPane`/`PortForwardStatus`/`LogViewer` are open (passive overlays coexist with
   transfers); trailing stdout is drained after the `done` receiver resolves; `SessionEnded`
   cleans up the `sessions` map immediately when no overlay is displaying the session; scroll is
-  adjusted for front-eviction in the ring buffer to prevent view drift. 14 unit tests in
-  `cairn-core::update::session_tests` and 5 render tests cover the new paths. 228 tests pass
-  across the workspace.
+  adjusted for front-eviction in the ring buffer to prevent view drift. A second quality-gate
+  pass (bug-bot + code-review) found eight additional items, all addressed: the `output_partial`
+  OOM bypass (no-newline output growing the partial buffer past the byte cap without triggering
+  eviction) is plugged by a force-flush in the new shared `append_to_ring` helper, which
+  unifies `append_log_chunk` and `append_session_output` into one place; the post-`done` stdout
+  drain switches from `try_recv` to `recv().await` with a 5 s timeout so in-flight final chunks
+  are never lost; UTF-8 multibyte chars split across chunk boundaries are correctly stitched via
+  a per-session `utf8_carry: Vec<u8>` buffer in the relay task (`AppEvent::SessionOutput` now
+  carries `text: String` instead of `bytes: Vec<u8>`, matching the `LogChunk` pattern); `Submit`
+  is a no-op when `rec.ended.is_some()` so no bytes are sent to a dead process; `SendSessionInput`
+  `try_send` failure is surfaced via `tracing::warn` rather than silently discarded;
+  `SessionDoneGuard` (RAII, mirroring `TransferDoneGuard`) emits a synthetic `SessionEnded` on
+  relay-task panic so the `ExecPane` overlay cannot freeze permanently; the misleading "80 %"
+  comment in `render_exec_pane` is corrected to "80-column-wide". New tests:
+  `append_to_ring_oom_guard_caps_partial`, `append_to_ring_scroll_drift_corrected`, and
+  `map_input_routes_ctrl_bracket_and_ctrl_d_when_exec_pane_active`. 657 tests pass across the
+  workspace.
 
 - **Docker interactive exec** (M6-3, RFC-0009 §2): `DockerVfs::invoke("exec")` with
   `ActionCtx::Exec { argv, tty }` now returns `ActionOutcome::Session(SessionHandle)` backed by

@@ -220,8 +220,10 @@ pub enum AppEvent {
     SessionOutput {
         /// Which session produced this output.
         id: SessionId,
-        /// The raw bytes — decoded lossily by the reducer before buffering.
-        bytes: Vec<u8>,
+        /// The UTF-8 decoded output text (cross-chunk multibyte sequences are correctly
+        /// stitched in the effect runner; incomplete trailing bytes are carried over to
+        /// the next chunk).
+        text: String,
     },
     /// An exec or port-forward session has ended.
     SessionEnded {

@@ -425,6 +425,45 @@ impl Drop for TransferDoneGuard {
     }
 }
 
+/// Emits a synthetic [`AppEvent::SessionEnded`] if dropped without being disarmed.
+///
+/// Guards `run_exec_session_effect` and `run_port_forward_effect` against task panics:
+/// if the spawned task exits abnormally (panic, cancelled future), the guard fires so the
+/// UI overlay does not freeze in a permanently un-closeable "Running" state.
+struct SessionDoneGuard {
+    id: SessionId,
+    event_tx: mpsc::Sender<AppEvent>,
+    armed: bool,
+}
+
+impl SessionDoneGuard {
+    fn new(id: SessionId, event_tx: mpsc::Sender<AppEvent>) -> Self {
+        Self {
+            id,
+            event_tx,
+            armed: true,
+        }
+    }
+
+    /// Disarm before normal completion — the caller will emit `SessionEnded` itself.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionDoneGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: if the event channel is full, the UI is probably shutting down.
+            let _ = self.event_tx.try_send(AppEvent::SessionEnded {
+                id: self.id,
+                exit_code: None,
+                error: Some("session relay interrupted unexpectedly".to_owned()),
+            });
+        }
+    }
+}
+
 /// Runtime-side handles for an active exec or port-forward session, keyed by [`SessionId`].
 ///
 /// Held by the effect runner for the session's lifetime. [`AppEffect::CloseSession`] cancels the
@@ -785,8 +824,14 @@ fn dispatch(
         AppEffect::SendSessionInput { id, bytes } => {
             if let Some(ctrl) = session_controls.get(&id) {
                 if let Some(stdin) = &ctrl.stdin {
-                    // Best-effort: if the channel is full or the task has exited, drop silently.
-                    let _ = stdin.try_send(bytes::Bytes::from(bytes));
+                    if stdin.try_send(bytes::Bytes::from(bytes)).is_err() {
+                        // Channel full or relay task exited. Log so the operator can diagnose;
+                        // we cannot block the event loop here with send().await.
+                        tracing::warn!(
+                            session = %id,
+                            "SendSessionInput dropped — stdin relay channel full or closed"
+                        );
+                    }
                 }
             }
         }
@@ -1610,6 +1655,28 @@ fn install_terminal_panic_hook() {
     }));
 }
 
+/// Decode as much valid UTF-8 as possible from `carry ++ bytes`, returning the decoded
+/// text. Any trailing incomplete codepoint bytes (1–3) are left in `carry` for the next call.
+/// This prevents the `U+FFFD` mojibake that `from_utf8_lossy` produces when a multi-byte
+/// character straddles a chunk boundary.
+fn decode_utf8_chunk(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
+    carry.extend_from_slice(bytes);
+    match std::str::from_utf8(carry) {
+        Ok(s) => {
+            let text = s.to_owned();
+            carry.clear();
+            text
+        }
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            let text = String::from_utf8_lossy(&carry[..valid_up_to]).into_owned();
+            carry.drain(..valid_up_to);
+            // carry now holds only the 1–3 trailing incomplete bytes.
+            text
+        }
+    }
+}
+
 /// Run an interactive cooked-mode exec session.
 ///
 /// Calls `Vfs::invoke(path, "exec", ActionCtx::Exec { argv, tty })`, receives the
@@ -1634,6 +1701,11 @@ async fn run_exec_session_effect(
     event_tx: mpsc::Sender<AppEvent>,
 ) {
     use cairn_vfs::{ActionCtx, ActionId, ActionOutcome};
+
+    // RAII guard: if this task panics or is dropped before it reaches the normal completion
+    // path, the guard's Drop impl emits a synthetic SessionEnded so the reducer and UI are
+    // never left waiting for an event that will never arrive.
+    let mut guard = SessionDoneGuard::new(id, event_tx.clone());
 
     let Some(vfs) = registry.get(conn).await else {
         let _ = event_tx
@@ -1708,6 +1780,9 @@ async fn run_exec_session_effect(
     let mut stdout = stdout;
     let mut done = done;
     let mut exit_code_result: Option<Result<i32, cairn_vfs::VfsError>> = None;
+    // Carry buffer for cross-chunk UTF-8 stitching: avoids U+FFFD replacement characters when a
+    // multibyte codepoint is split across two consecutive stdout chunks.
+    let mut utf8_carry: Vec<u8> = Vec::new();
 
     loop {
         // Poll stdout chunks (if present) and the done receiver concurrently, with cancel.
@@ -1721,9 +1796,12 @@ async fn run_exec_session_effect(
                     }
                     maybe_bytes = rx.recv() => match maybe_bytes {
                         Some(bytes) => {
-                            let _ = event_tx
-                                .send(AppEvent::SessionOutput { id, bytes: bytes.to_vec() })
-                                .await;
+                            let text = decode_utf8_chunk(&mut utf8_carry, &bytes);
+                            if !text.is_empty() {
+                                let _ = event_tx
+                                    .send(AppEvent::SessionOutput { id, text })
+                                    .await;
+                            }
                         }
                         None => {
                             // stdout channel closed; drain done.
@@ -1761,15 +1839,25 @@ async fn run_exec_session_effect(
     }
 
     // Drain any remaining stdout that arrived before or concurrently with the done signal.
+    // Uses an async recv loop (not try_recv) so in-flight chunks are not dropped; bounded by a
+    // 5-second timeout so a stuck stdout producer cannot block the task indefinitely.
     if let Some(rx) = &mut stdout {
-        while let Ok(bytes) = rx.try_recv() {
-            let _ = event_tx
-                .send(AppEvent::SessionOutput {
-                    id,
-                    bytes: bytes.to_vec(),
-                })
-                .await;
-        }
+        let drain = async {
+            while let Some(bytes) = rx.recv().await {
+                let text = decode_utf8_chunk(&mut utf8_carry, &bytes);
+                if !text.is_empty() {
+                    let _ = event_tx.send(AppEvent::SessionOutput { id, text }).await;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
+    }
+    // Flush any incomplete multibyte sequence left in the carry buffer (e.g. when the
+    // stdout channel was closed mid-codepoint).
+    if !utf8_carry.is_empty() {
+        let text = String::from_utf8_lossy(&utf8_carry).into_owned();
+        let _ = event_tx.send(AppEvent::SessionOutput { id, text }).await;
+        utf8_carry.clear();
     }
 
     // Wait for the done receiver if we broke out of the stdout drain before it resolved.
@@ -1782,6 +1870,7 @@ async fn run_exec_session_effect(
             Err(_) => (None, None),
         },
     };
+    guard.disarm();
     let _ = event_tx
         .send(AppEvent::SessionEnded {
             id,
@@ -1808,6 +1897,9 @@ async fn run_port_forward_effect(
     event_tx: mpsc::Sender<AppEvent>,
 ) {
     use cairn_vfs::{ActionCtx, ActionId, ActionOutcome};
+
+    // RAII guard: emits a synthetic SessionEnded if this task panics or is dropped early.
+    let mut guard = SessionDoneGuard::new(id, event_tx.clone());
 
     let Some(vfs) = registry.get(conn).await else {
         let _ = event_tx
@@ -1882,6 +1974,7 @@ async fn run_port_forward_effect(
             Err(_) => (None, None),
         },
     };
+    guard.disarm();
     let _ = event_tx
         .send(AppEvent::SessionEnded {
             id,
@@ -2178,6 +2271,41 @@ mod tests {
         assert_eq!(
             effective_elapsed(Duration::ZERO, Duration::ZERO),
             Duration::ZERO
+        );
+    }
+
+    /// Verifies that Ctrl-] and Ctrl-D are routed correctly when an exec-pane overlay is active:
+    /// Ctrl-] → `Action::Cancel` (detach/close overlay), Ctrl-D → `TextEdit::CloseStdin` (EOF).
+    #[test]
+    fn map_input_routes_ctrl_bracket_and_ctrl_d_when_exec_pane_active() {
+        use cairn_core::{Overlay, TextEdit};
+        let km = Keymap::default();
+        let mut st = AppState::new(LEFT, RIGHT, VfsPath::root());
+        st.overlay = Some(Overlay::ExecPane {
+            id: SessionId(1),
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+        });
+
+        // Ctrl-] → detach (Action::Cancel), not Quit
+        let ctrl_bracket = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(
+                map_input(ctrl_bracket, &km, &st),
+                Some(Msg::Action(Action::Cancel))
+            ),
+            "Ctrl-] must cancel/detach the exec pane"
+        );
+
+        // Ctrl-D → CloseStdin (EOF to remote process), not Quit
+        let ctrl_d = Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(
+                map_input(ctrl_d, &km, &st),
+                Some(Msg::Text(TextEdit::CloseStdin))
+            ),
+            "Ctrl-D must send CloseStdin when exec pane is active"
         );
     }
 

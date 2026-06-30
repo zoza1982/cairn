@@ -394,30 +394,50 @@ fn submit_vault_unlock(state: &mut AppState) -> Vec<AppEffect> {
 /// clears the field (to cancel in-progress typing, not to close the overlay — that is `Ctrl-]`,
 /// mapped to `Action::Cancel` upstream). `CloseStdin` (`Ctrl-D`) closes the session's stdin.
 fn apply_exec_pane_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
-    let Some(Overlay::ExecPane { id, input, .. }) = &mut state.overlay else {
-        return Vec::new();
+    // Read the session id with a shared borrow that ends here.
+    let session_id = match &state.overlay {
+        Some(Overlay::ExecPane { id, .. }) => *id,
+        _ => return Vec::new(),
     };
-    let session_id: SessionId = *id;
+
     match edit {
         TextEdit::Insert(c) => {
             if !c.is_control() {
-                input.push(c);
+                if let Some(Overlay::ExecPane { input, .. }) = &mut state.overlay {
+                    input.push(c);
+                }
             }
             Vec::new()
         }
         TextEdit::Backspace => {
-            input.pop();
+            if let Some(Overlay::ExecPane { input, .. }) = &mut state.overlay {
+                input.pop();
+            }
             Vec::new()
         }
         // Esc clears the field (doesn't close the overlay — Ctrl-] closes it via Action::Cancel).
         TextEdit::Cancel => {
-            input.clear();
+            if let Some(Overlay::ExecPane { input, .. }) = &mut state.overlay {
+                input.clear();
+            }
             Vec::new()
         }
         TextEdit::Submit => {
-            // Take the input line, clear the field, and emit SendSessionInput with a newline.
-            let line = std::mem::take(input);
+            // Take the input line from the overlay (short-lived mutable borrow).
+            let line = match &mut state.overlay {
+                Some(Overlay::ExecPane { input, .. }) => std::mem::take(input),
+                _ => return Vec::new(),
+            };
             if line.is_empty() {
+                return Vec::new();
+            }
+            // Do not emit input to a session that has already ended — the process is gone
+            // and the bytes would be silently discarded by the relay task anyway.
+            if state
+                .sessions
+                .get(&session_id)
+                .is_none_or(|r| r.ended.is_some())
+            {
                 return Vec::new();
             }
             let mut bytes = line.into_bytes();
@@ -428,9 +448,9 @@ fn apply_exec_pane_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> 
             }]
         }
         TextEdit::CloseStdin => {
-            // Signal EOF to the remote process by dropping stdin — the process may exit on EOF
-            // (e.g. a shell's `exit`). Unlike `CloseSession`, the overlay stays open to show
-            // remaining output; `SessionEnded` arrives when the process exits.
+            // Signal EOF to the remote process by dropping stdin — the process may exit
+            // on EOF (e.g. a shell's `exit`). Unlike `CloseSession`, the overlay stays open
+            // to show remaining output; `SessionEnded` arrives when the process exits.
             vec![AppEffect::CloseStdin { id: session_id }]
         }
     }
@@ -1334,76 +1354,114 @@ fn apply_port_forward_status_action(state: &mut AppState, action: Action) -> Vec
     }
 }
 
-/// Append a chunk of text into the log buffer (lines + partial), enforcing the byte and line caps.
+/// Append decoded text into a ring-buffered line store.
 ///
-/// The chunk may contain zero, one, or many newlines. Lines are accumulated in `lines` (oldest first);
-/// the final unterminated fragment lives in `partial`. `byte_size` tracks the total retained bytes so
-/// the cap check is O(1) rather than summing `lines` every call.
-fn append_log_chunk(
+/// Splits `text` on `'\n'`, accumulating complete lines in `lines` and the final
+/// unterminated fragment in `partial`. Both `lines` and `partial` contribute to
+/// `byte_size`; the caller must initialise all three consistently.
+///
+/// Returns the number of complete lines evicted from the front to enforce the caps.
+/// The caller should subtract this from any stored scroll offset to prevent view drift.
+///
+/// # OOM safety
+///
+/// When a chunk arrives with **no newline** (binary output, `\r`-only progress bars,
+/// `yes | tr -d '\n'`), the `partial` buffer absorbs all bytes without the eviction loop
+/// ever running — breaking the documented byte cap. This function detects that case and
+/// force-flushes `partial` as a synthetic complete line so eviction can proceed.
+fn append_to_ring(
     lines: &mut VecDeque<String>,
     partial: &mut String,
     byte_size: &mut usize,
     text: &str,
-) {
-    use crate::state::{LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES};
-
-    // Split on newlines. For each full line, append partial+line as one complete line. The last
-    // segment (possibly empty) becomes the new partial.
+    max_lines: usize,
+    max_bytes: usize,
+) -> usize {
+    let mut evicted = 0usize;
     let mut segments = text.split('\n');
+
     // The first segment continues the current partial line.
     if let Some(first) = segments.next() {
         *byte_size += first.len();
         partial.push_str(first);
     }
-    for seg in segments {
-        // We have a newline: flush partial into lines.
-        let complete = std::mem::take(partial);
-        *byte_size += 1; // the '\n' itself (we track it symbolically; line lengths sum to byte_size)
-        lines.push_back(complete);
-        *byte_size += seg.len();
-        partial.push_str(seg);
-        // Enforce caps: evict oldest lines until within limits.
-        while (lines.len() > LOG_VIEWER_MAX_LINES || *byte_size > LOG_VIEWER_MAX_BYTES)
-            && !lines.is_empty()
-        {
-            if let Some(evicted) = lines.pop_front() {
-                *byte_size = byte_size.saturating_sub(evicted.len() + 1); // +1 for '\n'
-            }
-        }
-    }
-}
 
-/// Append a decoded text chunk into the session output ring buffer.
-///
-/// Returns the number of complete lines that were evicted from the front to enforce the size
-/// caps. The caller must subtract this from any stored `scroll` offset to prevent the scroll
-/// position from drifting after eviction.
-fn append_session_output(rec: &mut SessionRecord, text: &str) -> usize {
-    let lines = &mut rec.output_lines;
-    let partial = &mut rec.output_partial;
-    let byte_size = &mut rec.output_byte_size;
-    let mut evicted = 0usize;
-    let mut segments = text.split('\n');
-    if let Some(first) = segments.next() {
-        *byte_size += first.len();
-        partial.push_str(first);
-    }
     for seg in segments {
+        // A newline was found: flush partial into a complete line.
         let complete = std::mem::take(partial);
-        *byte_size += 1;
+        *byte_size += 1; // the '\n' itself
         lines.push_back(complete);
         *byte_size += seg.len();
         partial.push_str(seg);
-        while (lines.len() > SESSION_OUTPUT_MAX_LINES || *byte_size > SESSION_OUTPUT_MAX_BYTES)
-            && !lines.is_empty()
-        {
+
+        // Evict oldest complete lines until within both caps.
+        while (lines.len() > max_lines || *byte_size > max_bytes) && !lines.is_empty() {
             if let Some(e) = lines.pop_front() {
                 *byte_size = byte_size.saturating_sub(e.len() + 1);
                 evicted += 1;
             }
         }
     }
+
+    // OOM guard: if `partial` has grown past the byte cap (no `\n` in the entire chunk),
+    // force-flush it as a synthetic complete line so the eviction loop above can bound it.
+    // Without this, a single large no-newline chunk bypasses the cap entirely.
+    if *byte_size > max_bytes && !partial.is_empty() {
+        let complete = std::mem::take(partial);
+        *byte_size += 1; // synthetic newline
+        lines.push_back(complete);
+        while (*byte_size > max_bytes || lines.len() > max_lines) && !lines.is_empty() {
+            if let Some(e) = lines.pop_front() {
+                *byte_size = byte_size.saturating_sub(e.len() + 1);
+                evicted += 1;
+            }
+        }
+        // If lines is now empty but byte_size is still > 0 (the evicted line was larger
+        // than max_bytes), byte_size is now the residual of the synthetic newline. Clear it.
+        if lines.is_empty() {
+            *byte_size = 0;
+        }
+    }
+
     evicted
+}
+
+/// Append a decoded text chunk from a log stream into the log-viewer ring buffer.
+///
+/// Delegates to [`append_to_ring`] with [`LOG_VIEWER_MAX_LINES`] / [`LOG_VIEWER_MAX_BYTES`].
+/// Returns the number of complete lines evicted; the log-viewer scroll handler can use this
+/// to adjust the stored scroll offset (scroll drift prevention).
+fn append_log_chunk(
+    lines: &mut VecDeque<String>,
+    partial: &mut String,
+    byte_size: &mut usize,
+    text: &str,
+) -> usize {
+    use crate::state::{LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES};
+    append_to_ring(
+        lines,
+        partial,
+        byte_size,
+        text,
+        LOG_VIEWER_MAX_LINES,
+        LOG_VIEWER_MAX_BYTES,
+    )
+}
+
+/// Append a decoded text chunk from an exec session into the session output ring buffer.
+///
+/// Delegates to [`append_to_ring`] with [`SESSION_OUTPUT_MAX_LINES`] / [`SESSION_OUTPUT_MAX_BYTES`].
+/// Returns the number of complete lines evicted from the front; the [`AppEvent::SessionOutput`]
+/// handler subtracts this from the stored scroll offset to prevent view drift.
+fn append_session_output(rec: &mut SessionRecord, text: &str) -> usize {
+    append_to_ring(
+        &mut rec.output_lines,
+        &mut rec.output_partial,
+        &mut rec.output_byte_size,
+        text,
+        SESSION_OUTPUT_MAX_LINES,
+        SESSION_OUTPUT_MAX_BYTES,
+    )
 }
 
 /// Mint a transfer id, push a fresh [`ActiveTransfer`] tracking it, set the status line, and return
@@ -1623,7 +1681,9 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             }) = &mut state.overlay
             {
                 if *ov_id == id {
-                    append_log_chunk(lines, partial, byte_size, &text);
+                    let evicted = append_log_chunk(lines, partial, byte_size, &text);
+                    // Adjust scroll for front-evictions to prevent view drift.
+                    *scroll = scroll.saturating_sub(evicted);
                     let new_total = lines.len() + if partial.is_empty() { 0 } else { 1 };
                     if *scroll >= new_total && new_total > 0 {
                         *scroll = new_total - 1;
@@ -1687,9 +1747,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 }
             }
         }
-        AppEvent::SessionOutput { id, bytes } => {
-            // Decode lossily and append to the ring buffer, same mechanism as the log viewer.
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+        AppEvent::SessionOutput { id, text } => {
             if let Some(rec) = state.sessions.get_mut(&id) {
                 let evicted = append_session_output(rec, &text);
                 let new_total =
@@ -1702,7 +1760,6 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 }) = &mut state.overlay
                 {
                     if *ov_id == id {
-                        // Adjust scroll for evicted lines to prevent view drift.
                         *scroll = scroll.saturating_sub(evicted);
                         if *follow {
                             *scroll = new_total.saturating_sub(EXEC_PANE_PAGE);
@@ -4046,7 +4103,7 @@ mod session_tests {
             &mut state,
             Msg::Event(AppEvent::SessionOutput {
                 id,
-                bytes: b"hello\nworld\n".to_vec(),
+                text: "hello\nworld\n".to_owned(),
             }),
         );
         assert!(effects.is_empty());
@@ -4067,14 +4124,14 @@ mod session_tests {
             &mut state,
             Msg::Event(AppEvent::SessionOutput {
                 id,
-                bytes: b"hel".to_vec(),
+                text: "hel".to_owned(),
             }),
         );
         let _ = update(
             &mut state,
             Msg::Event(AppEvent::SessionOutput {
                 id,
-                bytes: b"lo\n".to_vec(),
+                text: "lo\n".to_owned(),
             }),
         );
         let rec = state.sessions.get(&id).unwrap();
@@ -4095,7 +4152,7 @@ mod session_tests {
                 &mut state,
                 Msg::Event(AppEvent::SessionOutput {
                     id,
-                    bytes: chunk.as_bytes().to_vec(),
+                    text: chunk.clone(),
                 }),
             );
         }
@@ -4342,5 +4399,52 @@ mod session_tests {
             SessionId(2),
             "next_session_id must be incremented to 2"
         );
+    }
+
+    #[test]
+    fn append_to_ring_oom_guard_caps_partial() {
+        use crate::state::{SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES};
+        let mut lines: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut partial = String::new();
+        let mut byte_size: usize = 0;
+        // One chunk of max_bytes + 1 bytes with no newline — must not let partial grow unbounded.
+        let big = "x".repeat(SESSION_OUTPUT_MAX_BYTES + 1);
+        append_to_ring(
+            &mut lines,
+            &mut partial,
+            &mut byte_size,
+            &big,
+            SESSION_OUTPUT_MAX_LINES,
+            SESSION_OUTPUT_MAX_BYTES,
+        );
+        // After the OOM guard fires, the total retained bytes must be within the cap.
+        let retained = lines.iter().map(|l| l.len() + 1).sum::<usize>() + partial.len();
+        assert!(
+            retained <= SESSION_OUTPUT_MAX_BYTES,
+            "retained {retained} bytes exceeds cap {SESSION_OUTPUT_MAX_BYTES}"
+        );
+    }
+
+    #[test]
+    fn append_to_ring_scroll_drift_corrected() {
+        let mut lines: std::collections::VecDeque<String> =
+            (0..10).map(|i| format!("line {i}")).collect();
+        let mut partial = String::new();
+        let mut byte_size: usize = lines.iter().map(|l| l.len() + 1).sum();
+        let mut scroll = 5usize;
+
+        // Deliver a chunk that forces 3 evictions (max_lines = 10, so adding 3 new lines evicts 3).
+        let evicted = append_to_ring(
+            &mut lines,
+            &mut partial,
+            &mut byte_size,
+            "a\nb\nc\n",
+            10,         // max_lines
+            usize::MAX, // no byte cap
+        );
+
+        assert_eq!(evicted, 3, "should evict 3 lines");
+        scroll = scroll.saturating_sub(evicted);
+        assert_eq!(scroll, 2, "scroll should decrease by 3");
     }
 }

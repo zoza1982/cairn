@@ -650,7 +650,7 @@ fn pane_count_label(pane: &PaneState) -> String {
 /// Draw the interactive exec-session pane: a scrollable output buffer (stdout/stderr combined) and
 /// a single-line input field at the bottom for cooked-mode (non-TTY) line input.
 ///
-/// The layout mirrors the log viewer: the same 80 % wide, nearly full-height area, but with an
+/// The layout mirrors the log viewer: the same 80-column-wide, nearly full-height area, but with an
 /// extra input row pinned at the bottom. `scroll` is the 0-based topmost visible line; `follow`
 /// keeps it pinned to the last page when new output arrives.
 fn render_exec_pane(
