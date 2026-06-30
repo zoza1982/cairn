@@ -19,15 +19,39 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Per-backend feature umbrellas. Each turns on the backend crate (an optional dep) *and* its own
+# live-transport feature, so the lean default build (no backends) never pulls a backend SDK
+# (russh / aws-sdk / google-cloud / azure) — preserving the cross-platform lean build (ADR-0006).
+# The broker-backed connection opener (`src/connect.rs`) is always compiled; only the per-scheme
+# connect calls are gated by these features.
+ssh = ["dep:cairn-backend-ssh", "cairn-backend-ssh/ssh"]
+s3 = ["dep:cairn-backend-object", "cairn-backend-object/s3"]
+gcs = ["dep:cairn-backend-object", "cairn-backend-object/gcs"]
+azure = ["dep:cairn-backend-object", "cairn-backend-object/azure"]
+# Convenience umbrellas. Docker/K8s connect without a vault credential (local socket / kubeconfig)
+# and join `all-backends` when their opener lands (a tracked follow-up).
+cloud = ["s3", "gcs", "azure"]
+all-backends = ["ssh", "cloud"]
+
 [dependencies]
 cairn-core = { workspace = true }
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
 cairn-backend-local = { workspace = true }
+# The capability broker resolves a profile's credential reference to a secret for the connection
+# opener. Always on: it is pure-Rust and pulls no backend SDK (it is the binary's execution-layer
+# secret boundary; the AI/plugin isolation is enforced via the secret-free `cairn-broker-api`).
+cairn-broker = { workspace = true }
+# Credential-bearing backends, behind the features above (off by default so the lean build is SDK-free).
+cairn-backend-ssh = { workspace = true, optional = true }
+cairn-backend-object = { workspace = true, optional = true }
 cairn-transfer = { workspace = true }
 cairn-tui = { workspace = true }
 cairn-ai = { workspace = true }
 cairn-config = { workspace = true }
+thiserror = "2"
 anyhow = "1"
 async-trait = "0.1"
 futures = "0.3"
@@ -53,3 +77,7 @@ rustix = { version = "1", features = ["process"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# The connection-opener tests build an unlocked in-memory vault + typed credentials to exercise the
+# resolve → dispatch path hermetically (no live servers). Test-only — not in the shipped binary.
+cairn-vault = { workspace = true }
+cairn-secrets = { workspace = true }

@@ -7,8 +7,10 @@
 //! backend. The `exec` action tool routes through [`cairn_vfs::Vfs::invoke`] (RFC-0007 Gap 1), so it
 //! reaches whichever backend the connection resolves to — local backends report Unsupported and the
 //! container/cluster backends report `not_implemented` until their live transport lands, but the
-//! routing itself is real. `open_connection` still returns a clear "not yet available" error pending
-//! the broker-backed connection opener (M5/M7 auth).
+//! routing itself is real. The broker-backed connection opener now exists (see `crate::connect`) and
+//! drives the binary's own (user-initiated) connection flow, but the assistant's `open_connection`
+//! tool stays deferred: letting the model open a vault-credentialed connection requires the M7
+//! authorize→confirm mediation, so it still returns a clear "not yet available" error here.
 
 use async_trait::async_trait;
 use cairn_ai::{PlanStep, StepExecutor};
@@ -246,7 +248,9 @@ impl StepExecutor for BinaryStepExecutor {
                     Err(e) => Err(e.redacted().to_string()),
                 }
             }
-            // The broker-backed connection opener is the integration step (M7/M5 auth).
+            // The connection opener exists (`crate::connect`) and powers the user-initiated connect
+            // flow, but the *assistant*-initiated path is gated on the M7 authorize→confirm
+            // mediation, so this tool stays deferred.
             "open_connection" => Err("'open_connection' is not yet available".to_owned()),
             other => Err(format!("unroutable tool '{other}'")),
         }
