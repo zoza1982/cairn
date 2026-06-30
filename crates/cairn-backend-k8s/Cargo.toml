@@ -17,7 +17,7 @@ default = []
 # The live Kubernetes adapter (kube-rs). Off by default so the lean, cross-platform build never pulls
 # kube's TLS/HTTP stack; the full build (Linux-only in CI) and the kind integration job enable it.
 # Pinned to rustls (no OpenSSL); `ws` is for the exec-based pod-fs path. See ADR-0006 / RFC-0005.
-k8s = ["dep:kube", "dep:k8s-openapi", "dep:rustls", "dep:tar"]
+k8s = ["dep:kube", "dep:k8s-openapi", "dep:rustls", "dep:tar", "tokio/rt", "tokio/sync"]
 
 [dependencies]
 cairn-types = { workspace = true }
@@ -25,6 +25,9 @@ cairn-vfs = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 smol_str = "0.3"
+# `bytes` is an unconditional dep: `KubeOps::logs` and `ActionOutcome::Stream` carry `Bytes`
+# payloads, so the trait and mock need it even without the live `kube-rs` adapter.
+bytes = "1"
 tokio = { version = "1", features = ["io-util"] }
 # kube-rs client for the live adapter (behind `k8s`). rustls (not openssl); `ring` selects the
 # crypto provider (matches kube's own default); `ws` enables pod exec.
@@ -43,4 +46,6 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 tar = { version = "0.4", optional = true }
 
 [dev-dependencies]
+bytes = "1"
+futures = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }

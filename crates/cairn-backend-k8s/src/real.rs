@@ -18,23 +18,35 @@
 //! [`VfsError::Backend`] with `code = "exec_unavailable"` — a clear, user-surfaceable error
 //! rather than a misleading [`VfsError::NotFound`].
 //!
-//! # Remaining streaming work (M6-6)
+//! # Log streaming (M6-6 first slice)
 //!
-//! Interactive exec (TTY `Session`), log streaming (`follow`/`since`), and port-forwarding are
-//! **not** implemented here — they require the `ActionOutcome::Session`/`ActionOutcome::Stream`
-//! surface defined in M6-6 and are the next integration step.
+//! [`KubeOps::logs`] is implemented via `Api::<Pod>::log_stream`, which returns an
+//! `impl futures::io::AsyncBufRead + use<K>` over hyper's response body. Because the concrete
+//! type may not implement `Unpin`, `Box::pin` is used to produce a pinned wrapper that does.
+//! Frames are drained over a bounded `mpsc` channel from a spawned Tokio task, mirroring the
+//! Docker adapter's log-streaming pattern. The task exits when the server closes the stream
+//! (non-follow mode) or the receiver is dropped (caller cancelled).
+//!
+//! # Remaining streaming work (M6-6 follow-ups)
+//!
+//! Interactive exec (TTY `Session`) and port-forwarding are **not** yet implemented — they
+//! require the `ActionOutcome::Session`/`SessionHandle` surface and are tracked as M6-6
+//! follow-ups in `docs/IMPLEMENTATION_PLAN.md`.
 
 use crate::ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta};
 use crate::tar_exec::{
     not_found, parse_list_dir, parse_read_tar, parse_stat_tar, tar_basename, tar_parent,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use cairn_types::{PodPhase, VfsPath};
 use cairn_vfs::VfsError;
+use futures::stream::BoxStream;
+use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use kube::{
-    api::{AttachParams, ListParams},
+    api::{AttachParams, ListParams, LogParams},
     config::{KubeConfigOptions, Kubeconfig},
     Api, Client, ResourceExt,
 };
@@ -187,19 +199,7 @@ impl KubeRsOps {
 
     /// Build a `kube::Client` scoped to the given context name.
     async fn client_for(&self, ctx: &str) -> Result<Client, VfsError> {
-        // rustls 0.23 no longer auto-installs a process-wide crypto provider, so kube's TLS client
-        // build would panic without one. Install the ring provider once (idempotent: a later call,
-        // or another backend having already installed a provider, is harmless).
-        ensure_crypto_provider();
-
-        let opts = KubeConfigOptions {
-            context: Some(ctx.to_owned()),
-            ..Default::default()
-        };
-        let config = kube::Config::from_kubeconfig(&opts)
-            .await
-            .map_err(|e| VfsError::Connection(Box::new(e)))?;
-        Client::try_from(config).map_err(|e| VfsError::Connection(Box::new(e)))
+        build_client_for(ctx.to_owned()).await
     }
 
     /// Execute `command` in `container` inside `pod`/`ns`/`ctx` and collect stdout, stderr, and
@@ -295,6 +295,27 @@ impl Default for KubeRsOps {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Client builder (free function, callable from spawned tasks)
+// ---------------------------------------------------------------------------
+
+/// Build a `kube::Client` scoped to the given context name.
+///
+/// Takes an owned `String` so it can be called from inside a `tokio::spawn` closure without
+/// borrowing `&self` — `KubeRsOps` is a unit struct, so there is no data to borrow anyway.
+async fn build_client_for(ctx: String) -> Result<Client, VfsError> {
+    // rustls 0.23 requires a process-wide `CryptoProvider`; install the ring provider once.
+    ensure_crypto_provider();
+    let opts = KubeConfigOptions {
+        context: Some(ctx),
+        ..Default::default()
+    };
+    let config = kube::Config::from_kubeconfig(&opts)
+        .await
+        .map_err(|e| VfsError::Connection(Box::new(e)))?;
+    Client::try_from(config).map_err(|e| VfsError::Connection(Box::new(e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +646,110 @@ impl KubeOps for KubeRsOps {
         }
 
         Err(out.into_vfs_err(path))
+    }
+
+    /// Stream log output from a pod's container via `Api::<Pod>::log_stream`.
+    ///
+    /// The kube 4.0 `log_stream` method returns `impl futures::io::AsyncBufRead + use<K>`,
+    /// where `use<K>` (precise capturing) means the returned reader does not borrow `&self` —
+    /// it is effectively `'static`. However, the concrete type (hyper body wrapped in
+    /// `futures_util::io::IntoAsyncRead`) is typically not `Unpin`, so `Box::pin` is applied
+    /// to obtain a `Pin<Box<T>>` which is always `Unpin` and thus usable with
+    /// `futures::io::AsyncReadExt::read`.
+    ///
+    /// The client build and `log_stream` call happen inside a `tokio::spawn` task that owns
+    /// all parameters, forwarding 8 KiB chunks over a bounded `mpsc` channel (capacity 64).
+    /// The task exits when the server closes the stream (EOF in non-follow mode or daemon
+    /// restart) or the receiver is dropped (caller cancelled the stream).
+    ///
+    /// Error mapping: connection/config failures and API errors (`map_api_error`) become `Err`
+    /// items in the stream; the stream never panics.
+    ///
+    /// **Note:** The `since` field of [`crate::ActionCtx::Logs`] maps to `LogParams::since_time`
+    /// or `since_seconds`; its conversion is deferred to a follow-up slice.
+    fn logs(
+        &self,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        container: Option<&str>,
+        follow: bool,
+        tail: Option<i64>,
+    ) -> BoxStream<'static, Result<Bytes, VfsError>> {
+        let ctx = ctx.to_owned();
+        let ns = ns.to_owned();
+        let pod = pod.to_owned();
+        let container = container.map(ToOwned::to_owned);
+
+        // 64-frame buffer: ample back-pressure at typical log line sizes.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, VfsError>>(64);
+
+        tokio::spawn(async move {
+            // Build a client scoped to this context.
+            let client = match build_client_for(ctx).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+
+            let api: Api<Pod> = Api::namespaced(client, &ns);
+            let lp = LogParams {
+                container,
+                follow,
+                tail_lines: tail,
+                ..Default::default()
+            };
+
+            // `log_stream` returns `impl futures::io::AsyncBufRead + use<K>`.
+            // The return type is effectively 'static (use<K> captures only the type param Pod,
+            // not &self or the name/lp references). The concrete type is not guaranteed to be
+            // Unpin, so we Box::pin it: `Pin<Box<T>>` is always Unpin, enabling the
+            // `futures::io::AsyncReadExt::read` convenience method.
+            let reader = match api.log_stream(&pod, &lp).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(map_api_error(e))).await;
+                    return;
+                }
+            };
+            let mut reader = Box::pin(reader);
+
+            let mut buf = [0u8; 8192];
+            loop {
+                use futures::io::AsyncReadExt as _;
+                match reader.read(&mut buf).await {
+                    Ok(0) => break, // EOF — stream ended (non-follow) or server closed it
+                    Ok(n) => {
+                        // If the receiver was dropped (caller cancelled), stop producing.
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(VfsError::Backend {
+                                code: "k8s-logs".to_owned(),
+                                msg: e.to_string(),
+                                retryable: false,
+                            }))
+                            .await;
+                        break;
+                    }
+                }
+            }
+            // Task exits here; dropping `tx` closes the channel, signalling EOF to the consumer.
+        });
+
+        futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .boxed()
     }
 }
 

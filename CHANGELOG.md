@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Kubernetes pod/container log streaming** (M6-6 first slice): `KubeVfs::invoke("logs")`
+  now returns `ActionOutcome::Stream(BoxStream<'static, Result<Bytes, VfsError>>)` backed by
+  `kube 4.0`'s `Api::<Pod>::log_stream`. The `log_stream` method returns an
+  `impl futures::io::AsyncBufRead + use<K>` (a hyper body wrapped in `IntoAsyncRead`); since
+  the concrete type is not guaranteed to be `Unpin`, `Box::pin` is applied to produce a
+  `Pin<Box<T>>` which is always `Unpin`, enabling `futures::io::AsyncReadExt::read`. Chunks
+  are forwarded over a bounded `mpsc` channel (capacity 64) from a spawned Tokio task, producing
+  a `'static` stream with natural cancellation when the consumer drops it. `follow` and `tail`
+  are read from `ActionCtx::Logs`; defaults are `follow: false / tail: Some(100)` so history
+  reads and integration tests terminate without a timeout. `KubeOps::logs` is a new seam method
+  (non-async, returns `BoxStream`) implemented by `KubeRsOps` (live) and `MockKube` (canned
+  two-line output). `bytes` is now an unconditional dep of `cairn-backend-k8s` (the trait and
+  mock need it regardless of the `k8s` feature); `tokio/rt` and `tokio/sync` are added to the
+  `k8s` feature for the spawned task and `mpsc` channel. New hermetic unit tests (5):
+  `invoke_logs_pod_path_returns_stream_with_canned_output`,
+  `invoke_logs_container_path_returns_stream`,
+  `invoke_logs_ctx_follow_is_forwarded`,
+  `invoke_logs_on_navigation_path_errors`,
+  `invoke_exec_and_port_forward_are_deferred`. The kind integration test
+  (`CAIRN_IT_K8S`) is extended with log streaming: `ops.logs` (non-follow, tail 10) is driven
+  to completion and asserts zero stream errors; a non-empty result is expected for active
+  kube-system pods. `exec` (interactive TTY `Session`) and `port-forward` (`Session`) remain
+  M6-6 follow-ups — they are advertised by `actions_at` but return `not_implemented`.
+
 ### Changed
 
 ### Fixed

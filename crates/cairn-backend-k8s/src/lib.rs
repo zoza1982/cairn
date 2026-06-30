@@ -5,9 +5,10 @@
 //! seam and is fully unit-tested against an in-memory mock. Capabilities vary by depth
 //! ([`CapabilityProvider::caps_at`]): listing everywhere, file read only inside a container.
 //!
-//! This crate ships the read-only mapping core. The live `kube-rs` adapter (kubeconfig/exec-plugin
-//! auth via the broker, tar-over-`exec` filesystem access) and the action surface (log streaming,
-//! interactive `exec`, port-forward) are the integration step; see `docs/LLD.md` and RFC-0005.
+//! This crate ships the read-only mapping core plus the **logs streaming action** (M6-6 first
+//! slice). The live `kube-rs` adapter provides `KubeOps::logs` over `Api::<Pod>::log_stream`;
+//! `KubeVfs::invoke("logs")` wires it to `ActionOutcome::Stream`. Interactive `exec` (TTY
+//! `Session`) and `port-forward` are M6-6 follow-ups; see `docs/LLD.md` and RFC-0005.
 
 mod ops;
 #[cfg(feature = "k8s")]
@@ -301,19 +302,96 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
         }
     }
 
+    /// Invoke a per-node Kubernetes action.
+    ///
+    /// **Implemented (M6-6 first slice):**
+    /// - `logs` — streams pod/container log output as `ActionOutcome::Stream(BoxStream<'static,
+    ///   Result<Bytes, VfsError>>)`. For a pod path (`/<ctx>/<ns>/<pod>`) the container is taken
+    ///   from `ActionCtx::Logs { container }` (or the API server's default when `None`). For a
+    ///   container path (`/<ctx>/<ns>/<pod>/<container>` or deeper) the container is taken
+    ///   directly from the path. `follow` defaults to `false` (bounded history); `tail` defaults
+    ///   to `Some(100)` in non-follow mode so the stream terminates predictably for history reads
+    ///   and integration tests.
+    ///
+    /// **Deferred (M6-6 follow-ups):**
+    /// - `exec` — interactive bidirectional `ActionOutcome::Session` with a TTY; requires the
+    ///   WebSocket attach surface and the `SessionHandle` pattern.
+    /// - `port-forward` — long-lived `ActionOutcome::Session` binding a local TCP port; requires
+    ///   `kube::api::Portforwarder` and lifecycle management.
     async fn invoke(
         &self,
-        _path: &VfsPath,
+        path: &VfsPath,
         action: ActionId,
-        _ctx: ActionCtx,
+        ctx: ActionCtx,
     ) -> Result<ActionOutcome, VfsError> {
-        // Advertised by `actions_at`; live invocation (log/exec streams, port-forward sessions over
-        // the cluster API) is the integration step — reported distinctly from an unknown action.
-        Err(VfsError::Backend {
-            code: "not_implemented".to_owned(),
-            msg: format!("action '{}' is not yet available", action.as_str()),
-            retryable: false,
-        })
+        let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
+
+        match action.as_str() {
+            action_ids::LOGS => {
+                // Parse the kube context, namespace, pod, and (optionally) container from the
+                // path segments. The container may also come from `ActionCtx::Logs`.
+                let (kube_ctx, ns, pod, path_container) = match segs.as_slice() {
+                    // Pod-level logs: container comes from ActionCtx or API-server default.
+                    [kube_ctx, ns, pod] => (*kube_ctx, *ns, *pod, None::<&str>),
+                    // Container or deeper: container is the fourth segment.
+                    [kube_ctx, ns, pod, container, ..] => (*kube_ctx, *ns, *pod, Some(*container)),
+                    _ => {
+                        return Err(VfsError::Backend {
+                            code: "not_implemented".to_owned(),
+                            msg: format!(
+                                "action '{}' is not available at this path",
+                                action.as_str()
+                            ),
+                            retryable: false,
+                        })
+                    }
+                };
+
+                // `ActionCtx::Logs` carries `follow` and an optional per-call container
+                // override. The path container takes priority; the ctx container is the
+                // fallback for pod-level paths.
+                let (follow, log_container) = match &ctx {
+                    ActionCtx::Logs {
+                        follow,
+                        container: ctx_container,
+                        ..
+                    } => {
+                        let effective = path_container.or(ctx_container.as_deref());
+                        (*follow, effective)
+                    }
+                    _ => (false, path_container),
+                };
+
+                // Bound non-follow mode so history reads terminate without a timeout; follow
+                // mode streams until the caller drops the stream.
+                let tail = if follow { None } else { Some(100) };
+
+                let stream = self
+                    .ops
+                    .logs(kube_ctx, ns, pod, log_container, follow, tail);
+                Ok(ActionOutcome::Stream(stream))
+            }
+
+            // exec and port-forward are advertised by `actions_at` but live invocation is
+            // deferred — reported distinctly from an unknown action so callers can detect the
+            // deferral.
+            action_ids::EXEC => Err(VfsError::Backend {
+                code: "not_implemented".to_owned(),
+                msg: "exec (interactive TTY Session) is a M6-6 follow-up".to_owned(),
+                retryable: false,
+            }),
+            action_ids::PORT_FORWARD => Err(VfsError::Backend {
+                code: "not_implemented".to_owned(),
+                msg: "port-forward (Session) is a M6-6 follow-up".to_owned(),
+                retryable: false,
+            }),
+
+            other => Err(VfsError::Backend {
+                code: "not_implemented".to_owned(),
+                msg: format!("action '{other}' is not available"),
+                retryable: false,
+            }),
+        }
     }
 }
 
@@ -524,10 +602,106 @@ mod tests {
         // The navigation tree above a pod has no actions.
         assert!(vfs.actions_at(&p("/prod/default")).is_empty());
         assert!(vfs.actions_at(&p("/")).is_empty());
-        // Invocation is the integration step — advertised but not yet implemented.
+    }
+
+    #[tokio::test]
+    async fn invoke_logs_pod_path_returns_stream_with_canned_output() {
+        let vfs = backend();
+        // Pod-level path: container unspecified → mock returns canned lines.
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0"),
+                ActionId::new(action_ids::LOGS),
+                ActionCtx::None,
+            )
+            .await
+            .expect("invoke logs on a known pod must succeed");
+
+        let stream = match outcome {
+            ActionOutcome::Stream(s) => s,
+            _ => panic!("expected ActionOutcome::Stream"),
+        };
+
+        let chunks: Vec<Vec<u8>> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("stream item must be Ok").to_vec())
+            .collect();
+        let text = String::from_utf8(chunks.concat()).expect("mock log output must be valid UTF-8");
+        assert!(text.contains("[mock] k8s log line 1\n"), "got: {text:?}");
+        assert!(text.contains("[mock] k8s log line 2\n"), "got: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn invoke_logs_container_path_returns_stream() {
+        let vfs = backend();
+        // Container-level path: container taken from the path segment.
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0/app"),
+                ActionId::new(action_ids::LOGS),
+                ActionCtx::None,
+            )
+            .await
+            .expect("invoke logs on a container path must succeed");
+        assert!(matches!(outcome, ActionOutcome::Stream(_)));
+    }
+
+    #[tokio::test]
+    async fn invoke_logs_ctx_follow_is_forwarded() {
+        let vfs = backend();
+        // ActionCtx::Logs { follow: true } must still return a stream (the mock ignores follow).
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0"),
+                ActionId::new(action_ids::LOGS),
+                ActionCtx::Logs {
+                    follow: true,
+                    since: None,
+                    container: None,
+                },
+            )
+            .await
+            .expect("invoke logs with follow=true must succeed");
+        assert!(matches!(outcome, ActionOutcome::Stream(_)));
+    }
+
+    #[tokio::test]
+    async fn invoke_logs_on_navigation_path_errors() {
+        let vfs = backend();
+        // A namespace path has no pod to target → not_implemented.
         assert!(matches!(
-            vfs.invoke(&p("/prod/default/web-0"), ActionId::new(action_ids::LOGS), ActionCtx::None)
-                .await,
+            vfs.invoke(
+                &p("/prod/default"),
+                ActionId::new(action_ids::LOGS),
+                ActionCtx::None
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invoke_exec_and_port_forward_are_deferred() {
+        let vfs = backend();
+        // exec and port-forward are advertised but not yet live — must return not_implemented.
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default/web-0/app"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::None
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
+        ));
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default/web-0"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::None
+            )
+            .await,
             Err(VfsError::Backend { code, .. }) if code == "not_implemented"
         ));
     }
