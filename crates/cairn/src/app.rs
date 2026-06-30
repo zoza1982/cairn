@@ -74,6 +74,18 @@ struct VaultContext {
 fn split_cwd_root(cwd: &std::path::Path) -> (std::path::PathBuf, VfsPath) {
     use std::path::Component;
 
+    // Any exit that hasn't yet accumulated a root component (Prefix or RootDir) must
+    // fall back to "/" — otherwise the empty PathBuf makes `LocalVfs` fail closed and
+    // both panes show nothing. This applies to relative-path inputs and any in-loop
+    // early return that fires before the first root component is seen.
+    let or_default = |r: std::path::PathBuf| -> std::path::PathBuf {
+        if r.as_os_str().is_empty() {
+            std::path::PathBuf::from("/")
+        } else {
+            r
+        }
+    };
+
     let mut root = std::path::PathBuf::new();
     let mut vfs = VfsPath::root();
 
@@ -88,22 +100,25 @@ fn split_cwd_root(cwd: &std::path::Path) -> (std::path::PathBuf, VfsPath) {
             Component::Normal(name) => {
                 let Some(s) = name.to_str() else {
                     // Non-UTF-8 path component: fall back so the UI still opens.
-                    return (root, VfsPath::root());
+                    return (or_default(root), VfsPath::root());
                 };
                 match vfs.join(s) {
                     Ok(p) => vfs = p,
-                    Err(_) => return (root, VfsPath::root()),
+                    // Segment contains a control character or other disallowed byte (e.g. the
+                    // OS accepted it but VfsPath cannot represent it). Fall back gracefully.
+                    Err(_) => return (or_default(root), VfsPath::root()),
                 }
             }
             // `.` is a no-op in an absolute path.
             Component::CurDir => {}
             // `..` should never appear in a canonical `current_dir()` result, but guard it.
-            Component::ParentDir => return (root, VfsPath::root()),
+            Component::ParentDir => return (or_default(root), VfsPath::root()),
         }
     }
 
     if root.as_os_str().is_empty() {
-        // Relative path — fall back to the OS filesystem root.
+        // Relative path or empty input: no Prefix/RootDir was ever pushed.
+        // Fall back entirely so neither the base nor the VfsPath is stale.
         return (std::path::PathBuf::from("/"), VfsPath::root());
     }
 
@@ -2747,6 +2762,21 @@ mod tests {
     fn split_cwd_root_empty_path_falls_back() {
         let (base, vfs) = split_cwd_root(std::path::Path::new(""));
         assert_eq!(base, std::path::PathBuf::from("/"));
+        assert!(vfs.is_root());
+    }
+
+    #[test]
+    fn split_cwd_root_in_loop_early_return_normalizes_empty_root() {
+        // A relative path that triggers an in-loop early return (via a control character in a
+        // segment that VfsPath::join rejects) must still produce "/" as the base, not an
+        // empty PathBuf.  Without the fix, the in-loop `return (root, …)` fired before any
+        // Prefix/RootDir component was pushed, leaving `root` empty and breaking LocalVfs.
+        let (base, vfs) = split_cwd_root(std::path::Path::new("a/\u{1}b"));
+        assert_eq!(
+            base,
+            std::path::PathBuf::from("/"),
+            "in-loop early return must normalize empty base to /"
+        );
         assert!(vfs.is_root());
     }
 }

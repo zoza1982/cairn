@@ -280,7 +280,7 @@ impl PaneState {
         let entries = self.listing.entries();
         // Peel off the synthetic `..` sentinel (position 0 when not at the VFS root).
         let (dot_dot, real) = match entries.first() {
-            Some(e) if e.name.as_str() == ".." => (Some(&entries[0]), &entries[1..]),
+            Some(e) if e.is_dotdot_sentinel() => (Some(e), &entries[1..]),
             _ => (None, entries),
         };
         let filtered: Vec<&Entry> = match &self.filter {
@@ -318,7 +318,7 @@ impl PaneState {
     pub fn is_empty(&self) -> bool {
         let entries = self.listing.entries();
         // If `..` is present, there is always at least one visible entry.
-        if entries.first().is_some_and(|e| e.name.as_str() == "..") {
+        if entries.first().is_some_and(|e| e.is_dotdot_sentinel()) {
             return false;
         }
         match &self.filter {

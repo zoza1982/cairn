@@ -49,6 +49,18 @@ impl Entry {
     pub fn is_dir(&self) -> bool {
         matches!(self.kind, EntryKind::Dir)
     }
+
+    /// Whether this entry is the synthetic `..` parent-navigation sentinel.
+    ///
+    /// The `..` entry is injected by the UI layer as a navigation affordance (MC convention). It is
+    /// never a real VFS path and must be excluded from all bulk operations (copy/move/delete/mark)
+    /// and from operations that resolve the name via [`VfsPath::join`]. Every call site that
+    /// special-cases `..` by name should call this method so the sentinel check remains auditable
+    /// in one place.
+    #[must_use]
+    pub fn is_dotdot_sentinel(&self) -> bool {
+        self.name.as_str() == ".."
+    }
 }
 
 /// The kind of a directory entry.

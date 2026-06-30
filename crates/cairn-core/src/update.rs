@@ -132,7 +132,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             let p = state.active_mut();
             // Never mark the synthetic `..` entry — it is a navigation affordance only and
             // must not be included in copy/move/delete selections.
-            let on_dotdot = p.current().is_some_and(|e| e.name.as_str() == "..");
+            let on_dotdot = p.current().is_some_and(|e| e.is_dotdot_sentinel());
             if !on_dotdot && p.cursor < p.len() && !p.marked.remove(&p.cursor) {
                 p.marked.insert(p.cursor);
             }
@@ -186,6 +186,11 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 state.status = Some("Nothing to rename".to_owned());
                 return Vec::new();
             };
+            // The synthetic `..` sentinel is not a real entry — silently ignore Rename on it,
+            // consistent with the no-op behaviour of ToggleMark, Copy, and Delete on `..`.
+            if entry.is_dotdot_sentinel() {
+                return Vec::new();
+            }
             let name = entry.name.to_string();
             let Ok(from) = state.active().cwd.join(&name) else {
                 state.status = Some("Cannot rename this entry".to_owned());
@@ -270,17 +275,11 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             // it transiently between frames), so a 100k-entry pane isn't copied on every keypress.
             if let Listing::Ready(entries) = &mut p.listing {
                 let v: &mut Vec<Entry> = Arc::make_mut(entries);
-                // Extract the synthetic `..` sentinel before sorting so it always stays first,
-                // regardless of sort mode (size/modified/type would otherwise scatter it).
-                let dot_dot = if v.first().map(|e| e.name.as_str()) == Some("..") {
-                    Some(v.remove(0))
-                } else {
-                    None
-                };
-                sort_entries(v, new_sort);
-                if let Some(dd) = dot_dot {
-                    v.insert(0, dd);
-                }
+                // Skip the synthetic `..` sentinel at position 0 (when present) so it always
+                // stays first regardless of sort mode. Sort only the real entries via a slice,
+                // avoiding two O(n) shifts from remove(0)/insert(0, ..).
+                let offset = usize::from(v.first().is_some_and(|e| e.is_dotdot_sentinel()));
+                sort_entries(&mut v[offset..], new_sort);
             }
             // Marks are positional; a re-order invalidates them.
             p.marked.clear();
@@ -975,7 +974,14 @@ fn op_targets(state: &AppState, side: Side) -> Vec<(VfsPath, String)> {
     indices
         .into_iter()
         .filter_map(|i| {
-            let name = entries[i].name.to_string();
+            let e = entries[i];
+            // Explicit guard so the exclusion of `..` is auditable here, not solely
+            // reliant on `VfsPath::join` continuing to reject traversal (a future
+            // symlink-following backend might relax that).
+            if e.is_dotdot_sentinel() {
+                return None;
+            }
+            let name = e.name.to_string();
             pane.cwd.join(&name).ok().map(|full| (full, name))
         })
         .collect()
@@ -1513,14 +1519,14 @@ fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
 
 fn enter_dir(state: &mut AppState) -> Vec<AppEffect> {
     let side = state.focus;
-    // The synthetic `..` entry is a navigation affordance: pressing Enter on it is identical
-    // to pressing Backspace/h/Left (leave_dir). We must NOT call `join("..")` — that is
-    // rejected by `VfsPath::join` and would be a no-op anyway. Route through `leave_dir` so
-    // cursor-placement (on the child we came from) is consistent.
+    // The synthetic `..` sentinel is a navigation affordance: pressing Enter on it is
+    // identical to pressing Backspace/h/Left (leave_dir). We must NOT call `join("..")` —
+    // that is rejected by `VfsPath::join`. Route through `leave_dir`; the cursor lands on
+    // the `..` row of the new listing (index 0), which is the MC-consistent behaviour.
     if state
         .pane(side)
         .current()
-        .is_some_and(|e| e.name.as_str() == "..")
+        .is_some_and(|e| e.is_dotdot_sentinel())
     {
         return leave_dir(state);
     }
@@ -1597,11 +1603,16 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             match result {
                 Ok(page) => {
                     let mut entries = page.entries;
+                    // Strip any literal `..` or `.` entries a misbehaving (or mock) backend
+                    // might return — they would collide with the synthetic sentinel we inject
+                    // below and confuse the guard logic throughout the reducer.
+                    entries.retain(|e| e.name.as_str() != ".." && e.name.as_str() != ".");
                     sort_entries(&mut entries, p.sort);
                     // Inject a synthetic `..` entry at position 0 when not at the VFS root.
                     // This is a pure UI affordance (MC convention): the entry name is `..` and
                     // kind is `Dir`, but it never becomes a real `VfsPath`. `enter_dir` detects
-                    // it by name and delegates to `leave_dir` instead of calling `join("..")`.
+                    // it via `is_dotdot_sentinel()` and delegates to `leave_dir` rather than
+                    // calling `join("..")`.
                     if !dir.is_root() {
                         entries.insert(
                             0,
@@ -4483,8 +4494,6 @@ mod session_tests {
     }
 }
 
-// end of session_tests
-
 #[cfg(test)]
 mod navigation_dotdot_tests {
     use super::*;
@@ -4703,6 +4712,121 @@ mod navigation_dotdot_tests {
         assert!(
             fx.is_empty() && s.overlay.is_none(),
             "Delete with cursor on `..` must not open ConfirmDelete"
+        );
+    }
+
+    #[test]
+    fn rename_on_dotdot_is_a_no_op() {
+        // Rename bypasses op_targets and uses `current()` directly, so it needs its own guard.
+        // Pressing Rename with cursor on `..` must silently return with no overlay and no
+        // error status — consistent with ToggleMark/Copy/Delete on `..`.
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(&mut s, vec![Entry::new("file.txt", EntryKind::File)]);
+        // cursor 0 = `..`.
+        assert_eq!(s.pane(Side::Left).cursor, 0);
+        let _ = update(&mut s, Msg::Action(Action::Rename));
+        assert!(
+            s.overlay.is_none(),
+            "Rename on `..` must not open a Prompt overlay"
+        );
+        assert!(
+            s.status.is_none(),
+            "Rename on `..` must not set an error status"
+        );
+    }
+
+    #[test]
+    fn marks_offset_correctness() {
+        // With visible ["..","f1","f2"] in /a, marking visible index 2 (f2) and then issuing
+        // Copy must target /a/f2 — proves the `..`-at-index-0 offset doesn't shift the
+        // resolved path to the wrong file.
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(
+            &mut s,
+            vec![
+                Entry::new("f1", EntryKind::File),
+                Entry::new("f2", EntryKind::File),
+            ],
+        );
+        // visible: ["..", "f1", "f2"] — move cursor to index 2 (f2).
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        assert_eq!(
+            s.pane(Side::Left).current().map(|e| e.name.as_str()),
+            Some("f2")
+        );
+        // Mark f2.
+        let _ = update(&mut s, Msg::Action(Action::ToggleMark));
+        // Copy must target /a/f2.
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        let has_f2_target = fx.iter().any(|e| {
+            if let AppEffect::Transfer { items, .. } = e {
+                items.iter().any(|(src, _)| src.as_str() == "/a/f2")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_f2_target,
+            "Copy of marked f2 must target /a/f2, not /a/f1 (off-by-one from .. offset)"
+        );
+    }
+
+    #[test]
+    fn empty_non_root_dir_only_dotdot() {
+        // An empty listing in a non-root directory produces exactly one entry (`..`).
+        // The pane must report current()="..", len()==1, is_empty()==false, and neither
+        // CycleSort nor CursorDown must panic.
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(&mut s, vec![]);
+        {
+            let pane = s.pane(Side::Left);
+            assert_eq!(
+                pane.current().map(|e| e.name.as_str()),
+                Some(".."),
+                "only entry must be `..`"
+            );
+            assert_eq!(pane.len(), 1, "len must be 1 (just `..`)");
+            assert!(
+                !pane.is_empty(),
+                "is_empty must be false when `..` is present"
+            );
+        }
+        // Neither action must panic.
+        let _ = update(&mut s, Msg::Action(Action::CycleSort));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+    }
+
+    #[test]
+    fn filter_collapses_to_only_dotdot() {
+        // When a filter matches no real entries, visible() == [".."], cursor clamps to 0,
+        // current() is `..`, and op_targets is empty (Copy produces no Transfer effect).
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(
+            &mut s,
+            vec![
+                Entry::new("alpha", EntryKind::File),
+                Entry::new("beta", EntryKind::File),
+            ],
+        );
+        // Move cursor to a real entry so the clamp is meaningful.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        // Activate filter.
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        type_text(&mut s, "zzz"); // matches nothing
+        {
+            let pane = s.pane(Side::Left);
+            assert_eq!(pane.cursor, 0, "cursor must clamp to 0 after filter");
+            assert_eq!(
+                pane.current().map(|e| e.name.as_str()),
+                Some(".."),
+                "current must be `..` when filter matches nothing"
+            );
+        }
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        assert!(
+            fx.is_empty(),
+            "op_targets must be empty when only `..` is visible"
         );
     }
 }
