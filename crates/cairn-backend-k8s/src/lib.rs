@@ -14,8 +14,13 @@
 //!   tasks wire `AttachedProcess` stdin/stdout/stderr to the handle channels; a TTY resize relay
 //!   forwards `(rows, cols)` to `AttachedProcess::terminal_size`. See RFC-0009 §3.
 //!
-//! **Deferred (M6-6 follow-up):** `port-forward` — `Portforwarder`-based `Session` binding a
-//! local TCP port (RFC-0009 §3). The TUI exec pane (RFC-0009 §4) is PR-4.
+//! **Implemented actions (M6-6, continued):**
+//!
+//! - `port-forward` — `KubeOps::port_forward` over `Api::<Pod>::portforward` + a local
+//!   `TcpListener`; `KubeVfs::invoke("port-forward")` with `ActionCtx::PortForward { local, remote }`
+//!   returns `ActionOutcome::Session(SessionHandle)`. See RFC-0009 §3.
+//!
+//! **Deferred (follow-up PR):** The TUI exec pane (RFC-0009 §4) is PR-4.
 
 mod ops;
 #[cfg(feature = "k8s")]
@@ -421,14 +426,45 @@ impl<O: KubeOps> Vfs for KubeVfs<O> {
                 Ok(ActionOutcome::Session(handle))
             }
 
-            // port-forward is advertised by `actions_at` but live invocation is deferred to a
-            // follow-up PR (RFC-0009 §3 port-forward section). Reported distinctly from an
-            // unknown action so callers can detect the deferral.
-            action_ids::PORT_FORWARD => Err(VfsError::Backend {
-                code: "not_implemented".to_owned(),
-                msg: "port-forward (Session) is a M6-6 follow-up (RFC-0009 §3)".to_owned(),
-                retryable: false,
-            }),
+            action_ids::PORT_FORWARD => {
+                // Port-forward requires depth >= 3: [ctx, ns, pod, ...].
+                // Deeper paths (container level) are also valid — the forward targets the pod.
+                let (kube_ctx, ns, pod) = match segs.as_slice() {
+                    [kube_ctx, ns, pod, ..] => (*kube_ctx, *ns, *pod),
+                    _ => {
+                        return Err(VfsError::Backend {
+                            code: "not_available".to_owned(),
+                            msg: "port-forward is only available at pod paths \
+                                  (/<ctx>/<ns>/<pod> or deeper)"
+                                .to_owned(),
+                            retryable: false,
+                        });
+                    }
+                };
+
+                // Extract local and remote ports from the action context.
+                let (local, remote) = match ctx {
+                    ActionCtx::PortForward { local, remote } => (local, remote),
+                    _ => {
+                        return Err(VfsError::Backend {
+                            code: "invalid_ctx".to_owned(),
+                            msg: "port-forward requires \
+                                  ActionCtx::PortForward { local, remote }"
+                                .to_owned(),
+                            retryable: false,
+                        });
+                    }
+                };
+
+                // local == 0 → let the OS choose an ephemeral port (documented convention).
+                let local_port = if local == 0 { None } else { Some(local) };
+
+                let handle = self
+                    .ops
+                    .port_forward(kube_ctx, ns, pod, remote, local_port)
+                    .await?;
+                Ok(ActionOutcome::Session(handle))
+            }
 
             other => Err(VfsError::Backend {
                 code: "not_implemented".to_owned(),
@@ -727,10 +763,15 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // Port-forward session tests (mock, hermetic)
+    // -----------------------------------------------------------------------
+
+    /// `invoke("port-forward")` on a pod path with `ActionCtx::None` must return
+    /// `invalid_ctx` — the action requires `ActionCtx::PortForward { local, remote }`.
     #[tokio::test]
-    async fn invoke_port_forward_is_deferred() {
+    async fn invoke_port_forward_with_wrong_ctx_returns_invalid_ctx() {
         let vfs = backend();
-        // port-forward is advertised but not yet live — must return not_implemented.
         assert!(matches!(
             vfs.invoke(
                 &p("/prod/default/web-0"),
@@ -738,7 +779,110 @@ mod tests {
                 ActionCtx::None
             )
             .await,
-            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
+            Err(VfsError::Backend { code, .. }) if code == "invalid_ctx"
+        ));
+    }
+
+    /// `invoke("port-forward")` on a shallow path (namespace depth) must return `not_available`.
+    #[tokio::test]
+    async fn invoke_port_forward_on_shallow_path_returns_not_available() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::PortForward { local: 0, remote: 8080 }
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "not_available"
+        ));
+    }
+
+    /// `invoke("port-forward")` with `local: 0` binds an ephemeral port, returns a
+    /// `Session` with `local_port` set, and the port is reachable via TCP.
+    ///
+    /// This test also verifies the echo semantics of `MockKube::port_forward`: bytes written
+    /// to the local port are echoed back, and `cancel` resolves `done` with `Ok(0)`.
+    #[tokio::test]
+    async fn invoke_port_forward_ephemeral_port_and_echo_round_trip() {
+        let vfs = backend();
+        let outcome = vfs
+            .invoke(
+                &p("/prod/default/web-0"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::PortForward {
+                    local: 0,
+                    remote: 8080,
+                },
+            )
+            .await
+            .expect("invoke port-forward on a known pod must succeed");
+
+        let handle = match outcome {
+            ActionOutcome::Session(h) => h,
+            _ => panic!("expected ActionOutcome::Session from invoke port-forward"),
+        };
+
+        // local_port must be set (the mock bound a real listener).
+        let bound_port = handle
+            .local_port
+            .expect("port-forward must report the bound local_port");
+        assert!(bound_port > 0, "bound_port must be a valid port number");
+
+        // Port-forward sessions have no stdin/stdout/resize (relay is at TCP level).
+        assert!(handle.stdin.is_none(), "port-forward must have no stdin");
+        assert!(handle.stdout.is_none(), "port-forward must have no stdout");
+        assert!(handle.resize.is_none(), "port-forward must have no resize");
+
+        // Connect a TcpStream to the bound port and verify the echo.
+        let mut stream = tokio::net::TcpStream::connect(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            bound_port,
+        )))
+        .await
+        .expect("TcpStream::connect to mock port-forward must succeed");
+
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        stream
+            .write_all(b"hello port-forward\n")
+            .await
+            .expect("write to mock port-forward must succeed");
+
+        let mut echo = [0u8; 19];
+        stream
+            .read_exact(&mut echo)
+            .await
+            .expect("read from mock port-forward (echo) must succeed");
+        assert_eq!(&echo, b"hello port-forward\n");
+
+        // Cancel the session: accept loop exits, done resolves with Ok(0).
+        handle
+            .cancel
+            .send(())
+            .expect("cancel send must succeed while session is running");
+
+        let exit = handle.done.await.expect("done channel must not be dropped");
+        assert!(
+            matches!(exit, Ok(0)),
+            "port-forward clean teardown must resolve done with Ok(0), got: {exit:?}"
+        );
+    }
+
+    /// `invoke("port-forward")` on an unknown pod returns `VfsError::NotFound`.
+    #[tokio::test]
+    async fn invoke_port_forward_unknown_pod_returns_not_found() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.invoke(
+                &p("/prod/default/no-such-pod"),
+                ActionId::new(action_ids::PORT_FORWARD),
+                ActionCtx::PortForward {
+                    local: 0,
+                    remote: 8080
+                }
+            )
+            .await,
+            Err(VfsError::NotFound(_))
         ));
     }
 

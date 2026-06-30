@@ -27,11 +27,15 @@
 //! Docker adapter's log-streaming pattern. The task exits when the server closes the stream
 //! (non-follow mode) or the receiver is dropped (caller cancelled).
 //!
-//! # Remaining streaming work (M6-6 follow-ups)
+//! # Port-forwarding (M6-6, RFC-0009 §3)
 //!
-//! Interactive exec (TTY `Session`) and port-forwarding are **not** yet implemented — they
-//! require the `ActionOutcome::Session`/`SessionHandle` surface and are tracked as M6-6
-//! follow-ups in `docs/IMPLEMENTATION_PLAN.md`.
+//! [`KubeOps::port_forward`] binds a local `TcpListener` on `127.0.0.1:<port>` and, for each
+//! accepted TCP connection, opens a fresh `Portforwarder` via `Api::<Pod>::portforward` and
+//! relays bytes bidirectionally with `tokio::io::copy_bidirectional`. One `Portforwarder` per
+//! connection is the documented kube-rs pattern (each `Portforwarder` is a single WebSocket; a
+//! single forwarder cannot multiplex concurrent connections). The accept loop runs in a spawned
+//! Tokio task and exits when the `cancel` signal fires; `done` resolves with `Ok(0)` on clean
+//! teardown. In-flight relay tasks drain naturally when their TCP connections close.
 
 use crate::ops::{ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta};
 use crate::tar_exec::{
@@ -51,6 +55,7 @@ use kube::{
     Api, Client, ResourceExt,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpListener;
 
 // ---------------------------------------------------------------------------
 // Collected output from a single exec invocation
@@ -986,6 +991,155 @@ impl KubeOps for KubeRsOps {
             Some(stdin_tx),
             Some(stdout_rx),
             resize_tx,
+        ))
+    }
+
+    /// Forward a local TCP port to `remote_port` on a running pod.
+    ///
+    /// Binds a `TcpListener` on `127.0.0.1:<local_port>` (or an ephemeral port when
+    /// `local_port` is `None` or `Some(0)`). Returns a [`SessionHandle`] with `local_port`
+    /// set to the actually-bound port immediately — before any connection arrives — so the
+    /// TUI can display the address at once.
+    ///
+    /// # Accept loop and relay model
+    ///
+    /// A single Tokio task owns the listener and loops, accepting connections with
+    /// `tokio::select!` between `cancel` and `listener.accept()`. For each accepted TCP
+    /// connection, an independent relay sub-task is spawned that:
+    ///
+    /// 1. Builds a `kube::Client` for the context (auth/TLS handled by kube-rs).
+    /// 2. Calls `Api::<Pod>::portforward(pod, &[remote_port])` to open a WebSocket to the
+    ///    API server (one WebSocket per connection — the documented kube-rs pattern).
+    /// 3. Takes the port stream via `Portforwarder::take_stream(remote_port)`.
+    /// 4. Relays bytes bidirectionally with `tokio::io::copy_bidirectional`.
+    /// 5. Drops the upstream stream, then joins the `Portforwarder` task.
+    ///
+    /// Relay sub-tasks are fire-and-forget; they complete naturally when their TCP peer
+    /// disconnects. The accept loop does not wait for them on cancel — a cancel stops new
+    /// connections, not in-flight relays. `done` resolves `Ok(0)` immediately after the
+    /// accept loop exits.
+    ///
+    /// # Credential safety
+    ///
+    /// No credential material appears in `VfsError` messages. Bind-failure messages omit
+    /// the port number (it is already surfaced in `SessionHandle.local_port`).
+    async fn port_forward(
+        &self,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        remote_port: u16,
+        local_port: Option<u16>,
+    ) -> Result<SessionHandle, VfsError> {
+        let port = local_port.unwrap_or(0);
+        let listener = TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .map_err(|e| VfsError::Backend {
+                code: if e.kind() == std::io::ErrorKind::AddrInUse {
+                    "port_in_use".to_owned()
+                } else {
+                    "bind_failed".to_owned()
+                },
+                // Omit the address: the port is surfaced via SessionHandle.local_port;
+                // including it here would duplicate it and potentially leak intent.
+                msg: "port-forward: failed to bind local port".to_owned(),
+                retryable: false,
+            })?;
+
+        let bound_port = listener
+            .local_addr()
+            .map_err(|e| VfsError::Backend {
+                code: "bind_failed".to_owned(),
+                msg: e.to_string(),
+                retryable: false,
+            })?
+            .port();
+
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<i32, VfsError>>();
+
+        // Clone owned values for the accept-loop task.
+        let ctx = ctx.to_owned();
+        let ns = ns.to_owned();
+        let pod = pod.to_owned();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    // Cancel path: stop accepting; in-flight relay tasks drain naturally.
+                    _ = &mut cancel_rx => break,
+                    accept = listener.accept() => {
+                        match accept {
+                            Ok((conn, _peer)) => {
+                                // Spawn an independent relay task per connection.
+                                // Clone cheaply — all values are either `String` (cheap clone
+                                // for small context/ns/pod names) or `u16`.
+                                let ctx = ctx.clone();
+                                let ns = ns.clone();
+                                let pod = pod.clone();
+                                tokio::spawn(async move {
+                                    // Build a fresh client for the context (auth/TLS is handled
+                                    // by kube-rs; no credential material touches this task).
+                                    let client = match build_client_for(ctx).await {
+                                        Ok(c) => c,
+                                        // Transport or config failure: silently drop the
+                                        // connection. The error has already been logged by
+                                        // kube-rs; surfacing it to the accept loop would
+                                        // terminate the listener, harming other connections.
+                                        Err(_) => return,
+                                    };
+
+                                    let api: Api<Pod> = Api::namespaced(client, &ns);
+
+                                    // One Portforwarder per connection (each is a WebSocket).
+                                    let mut forwarder =
+                                        match api.portforward(&pod, &[remote_port]).await {
+                                            Ok(f) => f,
+                                            Err(_) => return,
+                                        };
+
+                                    // take_stream() returns None only when the port was not
+                                    // included in the portforward() call (impossible here) or
+                                    // when called a second time — safe to drop silently.
+                                    let mut upstream =
+                                        match forwarder.take_stream(remote_port) {
+                                            Some(s) => s,
+                                            None => return,
+                                        };
+
+                                    let mut client_conn = conn;
+                                    // Relay bytes in both directions until either side closes.
+                                    let _ = tokio::io::copy_bidirectional(
+                                        &mut client_conn,
+                                        &mut upstream,
+                                    )
+                                    .await;
+
+                                    // Explicit drop signals EOF on the upstream write half
+                                    // before joining the Portforwarder WebSocket task.
+                                    drop(upstream);
+                                    let _ = forwarder.join().await;
+                                });
+                            }
+                            // Listener error (e.g. OS resource exhaustion): exit the loop.
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            // Resolve done with Ok(0) — clean teardown regardless of cancellation trigger.
+            // If the receiver was dropped (session pane torn down), discard the send error.
+            let _ = done_tx.send(Ok(0));
+        });
+
+        Ok(SessionHandle::new(
+            cancel_tx,
+            done_rx,
+            Some(bound_port),
+            None, // port-forward has no stdin/stdout — relay is transparent TCP
+            None,
+            None, // no TTY resize for port-forward
         ))
     }
 }

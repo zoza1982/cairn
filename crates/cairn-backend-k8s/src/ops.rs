@@ -180,6 +180,50 @@ pub trait KubeOps: Send + Sync + 'static {
         command: Vec<String>,
         tty: bool,
     ) -> Result<SessionHandle, VfsError>;
+
+    /// Forward a local TCP port to a remote port on a pod.
+    ///
+    /// Binds a `TcpListener` on `127.0.0.1:<local_port>` (or an ephemeral OS-assigned port when
+    /// `local_port` is `None` or `Some(0)`). Returns a [`SessionHandle`] with `local_port` set to
+    /// the actual bound port so the TUI can display the address before any connection arrives.
+    ///
+    /// Each accepted TCP connection opens a fresh `Portforwarder` WebSocket to the API server and
+    /// relays bytes bidirectionally between the local stream and the pod's port stream (one
+    /// `Portforwarder` per connection, as per the kube-rs documented pattern). Multiple simultaneous
+    /// connections are fully multiplexed by the Kubernetes API server.
+    ///
+    /// # Cancellation
+    ///
+    /// Drop or send `()` on `cancel` to stop the accept loop. New connections are rejected; `done`
+    /// resolves with `Ok(0)` on clean teardown. In-flight relay connections are not forcibly
+    /// terminated — they drain naturally when the TCP peers close.
+    ///
+    /// # Parameters
+    ///
+    /// - `ctx`: kubeconfig context name.
+    /// - `ns`: namespace.
+    /// - `pod`: pod name.
+    /// - `remote_port`: port to forward on the pod side.
+    /// - `local_port`: local TCP port to bind. `None` or `Some(0)` → OS assigns an ephemeral port.
+    ///
+    /// # Error mapping
+    ///
+    /// - `EADDRINUSE` on an explicit port → [`VfsError::Backend`] with `code = "port_in_use"`.
+    /// - 404 (pod not found when the first connection opens) → relay task drops the connection
+    ///   silently; the listener continues accepting (the pod may appear later).
+    /// - Transport/API errors → [`VfsError::Backend`] or [`VfsError::Connection`] on a per-relay
+    ///   basis; the accept loop is not terminated.
+    /// - Bind failure (other than `EADDRINUSE`) → [`VfsError::Backend`] with `code = "bind_failed"`.
+    ///
+    /// Credential material is never included in error messages.
+    async fn port_forward(
+        &self,
+        ctx: &str,
+        ns: &str,
+        pod: &str,
+        remote_port: u16,
+        local_port: Option<u16>,
+    ) -> Result<SessionHandle, VfsError>;
 }
 
 #[cfg(test)]
@@ -464,6 +508,91 @@ pub(crate) mod mock {
                 );
                 stream::iter(vec![Err(err)]).boxed()
             }
+        }
+
+        /// Echo-style port-forward mock: binds a local `TcpListener` on `127.0.0.1:port` (or
+        /// an ephemeral port when `local_port` is `None`/`Some(0)`) and, for each accepted TCP
+        /// connection, echoes bytes back to the sender. Returns a [`SessionHandle`] with
+        /// `local_port` set to the actually-bound port. Honors the `cancel` signal: the accept
+        /// loop exits and `done` resolves with `Ok(0)`.
+        ///
+        /// Unknown pods return [`VfsError::NotFound`].
+        async fn port_forward(
+            &self,
+            _ctx: &str,
+            _ns: &str,
+            pod: &str,
+            _remote_port: u16,
+            local_port: Option<u16>,
+        ) -> Result<SessionHandle, VfsError> {
+            if !self.pods.values().flatten().any(|p| p.name == pod) {
+                return Err(Self::nf(pod));
+            }
+
+            let port = local_port.unwrap_or(0);
+            let listener =
+                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+                    .await
+                    .map_err(|e| VfsError::Backend {
+                        code: if e.kind() == std::io::ErrorKind::AddrInUse {
+                            "port_in_use".to_owned()
+                        } else {
+                            "bind_failed".to_owned()
+                        },
+                        // Do not include the address — it is not secret, but the port number is
+                        // already carried by `SessionHandle.local_port` for the UI to display.
+                        msg: "port-forward: failed to bind local port".to_owned(),
+                        retryable: false,
+                    })?;
+
+            let bound_port = listener
+                .local_addr()
+                .map_err(|e| VfsError::Backend {
+                    code: "bind_failed".to_owned(),
+                    msg: e.to_string(),
+                    retryable: false,
+                })?
+                .port();
+
+            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<i32, VfsError>>();
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel_rx => break,
+                        accept = listener.accept() => {
+                            match accept {
+                                Ok((stream, _peer)) => {
+                                    // Echo server: copy bytes from the read half back to the
+                                    // write half. `tokio::io::split` takes ownership of `stream`
+                                    // so both halves can be used concurrently without conflict.
+                                    tokio::spawn(async move {
+                                        let (mut reader, mut writer) =
+                                            tokio::io::split(stream);
+                                        let _ =
+                                            tokio::io::copy(&mut reader, &mut writer).await;
+                                    });
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                // Cancel path: the accept loop exits; in-flight echo tasks drain naturally.
+                // If the done receiver was dropped, discard the error.
+                let _ = done_tx.send(Ok(0));
+            });
+
+            Ok(SessionHandle::new(
+                cancel_tx,
+                done_rx,
+                Some(bound_port),
+                None, // port-forward has no stdin/stdout — the relay is at the TCP level
+                None,
+                None, // no TTY resize for port-forward
+            ))
         }
 
         /// Echo-style exec mock: relays each stdin chunk back to stdout, then exits with code 0.
