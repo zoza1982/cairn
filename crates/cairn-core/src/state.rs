@@ -271,18 +271,34 @@ impl PaneState {
     ///
     /// The cursor and marks index into *this* view. Returns borrowed refs into the listing, so it
     /// allocates only the `Vec` of pointers (cheap); large-list virtualization is deferred (M1-9).
+    ///
+    /// The synthetic `..` entry (when present at position 0 in the listing) is **always** included
+    /// at position 0 regardless of any active filter — it must never be hidden by a name search,
+    /// matching MC behaviour.
     #[must_use]
     pub fn visible(&self) -> Vec<&Entry> {
         let entries = self.listing.entries();
-        match &self.filter {
-            None => entries.iter().collect(),
+        // Peel off the synthetic `..` sentinel (position 0 when not at the VFS root).
+        let (dot_dot, real) = match entries.first() {
+            Some(e) if e.is_dotdot_sentinel() => (Some(e), &entries[1..]),
+            _ => (None, entries),
+        };
+        let filtered: Vec<&Entry> = match &self.filter {
+            None => real.iter().collect(),
             Some(f) => {
                 let needle = f.to_lowercase();
-                entries
-                    .iter()
+                real.iter()
                     .filter(|e| e.name.to_lowercase().contains(&needle))
                     .collect()
             }
+        };
+        if let Some(dd) = dot_dot {
+            let mut result = Vec::with_capacity(filtered.len() + 1);
+            result.push(dd);
+            result.extend(filtered);
+            result
+        } else {
+            filtered
         }
     }
 
@@ -295,15 +311,21 @@ impl PaneState {
     }
 
     /// Whether the visible (filtered) listing is empty. Avoids the `visible()` allocation.
+    ///
+    /// When the synthetic `..` entry is present at position 0 the pane is never empty,
+    /// consistent with [`PaneState::visible`] always including `..` at the top.
     #[must_use]
     pub fn is_empty(&self) -> bool {
+        let entries = self.listing.entries();
+        // If `..` is present, there is always at least one visible entry.
+        if entries.first().is_some_and(|e| e.is_dotdot_sentinel()) {
+            return false;
+        }
         match &self.filter {
-            None => self.listing.entries().is_empty(),
+            None => entries.is_empty(),
             Some(f) => {
                 let needle = f.to_lowercase();
-                !self
-                    .listing
-                    .entries()
+                !entries
                     .iter()
                     .any(|e| e.name.to_lowercase().contains(&needle))
             }

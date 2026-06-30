@@ -130,7 +130,10 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         }
         Action::ToggleMark => {
             let p = state.active_mut();
-            if p.cursor < p.len() && !p.marked.remove(&p.cursor) {
+            // Never mark the synthetic `..` entry — it is a navigation affordance only and
+            // must not be included in copy/move/delete selections.
+            let on_dotdot = p.current().is_some_and(|e| e.is_dotdot_sentinel());
+            if !on_dotdot && p.cursor < p.len() && !p.marked.remove(&p.cursor) {
                 p.marked.insert(p.cursor);
             }
             Vec::new()
@@ -183,6 +186,11 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 state.status = Some("Nothing to rename".to_owned());
                 return Vec::new();
             };
+            // The synthetic `..` sentinel is not a real entry — silently ignore Rename on it,
+            // consistent with the no-op behaviour of ToggleMark, Copy, and Delete on `..`.
+            if entry.is_dotdot_sentinel() {
+                return Vec::new();
+            }
             let name = entry.name.to_string();
             let Ok(from) = state.active().cwd.join(&name) else {
                 state.status = Some("Cannot rename this entry".to_owned());
@@ -267,7 +275,11 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             // it transiently between frames), so a 100k-entry pane isn't copied on every keypress.
             if let Listing::Ready(entries) = &mut p.listing {
                 let v: &mut Vec<Entry> = Arc::make_mut(entries);
-                sort_entries(v, new_sort);
+                // Skip the synthetic `..` sentinel at position 0 (when present) so it always
+                // stays first regardless of sort mode. Sort only the real entries via a slice,
+                // avoiding two O(n) shifts from remove(0)/insert(0, ..).
+                let offset = usize::from(v.first().is_some_and(|e| e.is_dotdot_sentinel()));
+                sort_entries(&mut v[offset..], new_sort);
             }
             // Marks are positional; a re-order invalidates them.
             p.marked.clear();
@@ -962,7 +974,14 @@ fn op_targets(state: &AppState, side: Side) -> Vec<(VfsPath, String)> {
     indices
         .into_iter()
         .filter_map(|i| {
-            let name = entries[i].name.to_string();
+            let e = entries[i];
+            // Explicit guard so the exclusion of `..` is auditable here, not solely
+            // reliant on `VfsPath::join` continuing to reject traversal (a future
+            // symlink-following backend might relax that).
+            if e.is_dotdot_sentinel() {
+                return None;
+            }
+            let name = e.name.to_string();
             pane.cwd.join(&name).ok().map(|full| (full, name))
         })
         .collect()
@@ -1500,6 +1519,17 @@ fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
 
 fn enter_dir(state: &mut AppState) -> Vec<AppEffect> {
     let side = state.focus;
+    // The synthetic `..` sentinel is a navigation affordance: pressing Enter on it is
+    // identical to pressing Backspace/h/Left (leave_dir). We must NOT call `join("..")` —
+    // that is rejected by `VfsPath::join`. Route through `leave_dir`; the cursor lands on
+    // the `..` row of the new listing (index 0), which is the MC-consistent behaviour.
+    if state
+        .pane(side)
+        .current()
+        .is_some_and(|e| e.is_dotdot_sentinel())
+    {
+        return leave_dir(state);
+    }
     let target = {
         let p = state.pane(side);
         p.current().and_then(|e| {
@@ -1573,7 +1603,22 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             match result {
                 Ok(page) => {
                     let mut entries = page.entries;
+                    // Strip any literal `..` or `.` entries a misbehaving (or mock) backend
+                    // might return — they would collide with the synthetic sentinel we inject
+                    // below and confuse the guard logic throughout the reducer.
+                    entries.retain(|e| e.name.as_str() != ".." && e.name.as_str() != ".");
                     sort_entries(&mut entries, p.sort);
+                    // Inject a synthetic `..` entry at position 0 when not at the VFS root.
+                    // This is a pure UI affordance (MC convention): the entry name is `..` and
+                    // kind is `Dir`, but it never becomes a real `VfsPath`. `enter_dir` detects
+                    // it via `is_dotdot_sentinel()` and delegates to `leave_dir` rather than
+                    // calling `join("..")`.
+                    if !dir.is_root() {
+                        entries.insert(
+                            0,
+                            cairn_types::Entry::new("..", cairn_types::EntryKind::Dir),
+                        );
+                    }
                     p.listing = Listing::Ready(Arc::new(entries));
                     p.clamp_cursor();
                 }
@@ -4446,5 +4491,342 @@ mod session_tests {
         assert_eq!(evicted, 3, "should evict 3 lines");
         scroll = scroll.saturating_sub(evicted);
         assert_eq!(scroll, 2, "scroll should decrease by 3");
+    }
+}
+
+#[cfg(test)]
+mod navigation_dotdot_tests {
+    use super::*;
+    use cairn_types::{ConnectionId, Entry, EntryKind, VfsPath};
+    use cairn_vfs::ListPage;
+
+    fn page(entries: Vec<Entry>) -> ListPage {
+        ListPage {
+            entries,
+            cursor: None,
+            done: true,
+        }
+    }
+
+    fn state_at(cwd: VfsPath) -> AppState {
+        AppState::new(ConnectionId(1), ConnectionId(2), cwd)
+    }
+
+    fn state_root() -> AppState {
+        AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root())
+    }
+
+    fn deliver_to_left(s: &mut AppState, entries: Vec<Entry>) {
+        let dir = s.pane(Side::Left).cwd.clone();
+        let conn = s.pane(Side::Left).conn;
+        let _ = update(
+            s,
+            Msg::Event(AppEvent::Listed {
+                pane: Side::Left,
+                conn,
+                dir,
+                result: Ok(page(entries)),
+            }),
+        );
+    }
+
+    fn visible_names(s: &AppState) -> Vec<String> {
+        s.pane(Side::Left)
+            .visible()
+            .iter()
+            .map(|e| e.name.to_string())
+            .collect()
+    }
+
+    fn type_text(s: &mut AppState, text: &str) {
+        for c in text.chars() {
+            let _ = update(s, Msg::Text(TextEdit::Insert(c)));
+        }
+    }
+
+    // --- Change 1: default-root pane navigation ---
+
+    #[test]
+    fn leave_dir_navigates_up_from_deep_cwd_to_root_and_stops() {
+        // Panes rooted at `/` with cwd `/a/b`; Leave should walk /a/b → /a → / and no further.
+        let mut s = state_at(VfsPath::parse("/a/b").unwrap());
+        // Deliver a listing so the pane is in Ready state.
+        deliver_to_left(&mut s, vec![Entry::new("child", EntryKind::Dir)]);
+
+        // Leave: /a/b → /a
+        let fx = update(&mut s, Msg::Action(Action::Leave));
+        assert!(!fx.is_empty(), "Leave should emit a List effect");
+        assert_eq!(s.pane(Side::Left).cwd.as_str(), "/a");
+
+        // Deliver listing for /a.
+        deliver_to_left(&mut s, vec![Entry::new("child", EntryKind::Dir)]);
+
+        // Leave: /a → /
+        let fx = update(&mut s, Msg::Action(Action::Leave));
+        assert!(!fx.is_empty(), "Leave from /a should emit a List effect");
+        assert_eq!(s.pane(Side::Left).cwd.as_str(), "/");
+
+        // Deliver listing for root.
+        deliver_to_left(&mut s, vec![Entry::new("child", EntryKind::Dir)]);
+
+        // Leave at /: no-op (root has no parent).
+        let fx = update(&mut s, Msg::Action(Action::Leave));
+        assert!(fx.is_empty(), "Leave at root must be a no-op");
+        assert_eq!(s.pane(Side::Left).cwd.as_str(), "/", "cwd stays at /");
+    }
+
+    // --- Change 2: synthetic `..` entry tests ---
+
+    /// Deliver a listing to the left pane and return the visible entry names.
+    fn deliver_and_visible_left(s: &mut AppState, entries: Vec<Entry>) -> Vec<String> {
+        deliver_to_left(s, entries);
+        visible_names(s)
+    }
+
+    #[test]
+    fn dotdot_injected_first_when_not_at_root() {
+        let mut s = state_at(VfsPath::parse("/a/b").unwrap());
+        let visible = deliver_and_visible_left(
+            &mut s,
+            vec![
+                Entry::new("dir1", EntryKind::Dir),
+                Entry::new("file.txt", EntryKind::File),
+            ],
+        );
+        assert_eq!(visible[0], "..", "first visible entry must be `..`");
+        assert_eq!(visible.len(), 3, "total: .. + dir1 + file.txt");
+    }
+
+    #[test]
+    fn dotdot_not_injected_at_root() {
+        let mut s = state_root();
+        let visible = deliver_and_visible_left(&mut s, vec![Entry::new("dir1", EntryKind::Dir)]);
+        assert_eq!(visible[0], "dir1", "no `..` at root");
+        assert_eq!(visible.len(), 1);
+    }
+
+    #[test]
+    fn dotdot_survives_cycle_sort() {
+        // `..` must stay at position 0 after cycling through all sort modes.
+        let mut s = state_at(VfsPath::parse("/x").unwrap());
+        let _ = deliver_and_visible_left(
+            &mut s,
+            vec![
+                Entry::new("adir", EntryKind::Dir),
+                Entry::new("file.txt", EntryKind::File),
+            ],
+        );
+        for _ in 0..4 {
+            let _ = update(&mut s, Msg::Action(Action::CycleSort));
+            let first = s
+                .pane(Side::Left)
+                .listing
+                .entries()
+                .first()
+                .map(|e| e.name.to_string());
+            assert_eq!(
+                first.as_deref(),
+                Some(".."),
+                ".. must remain first after sort cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn dotdot_visible_regardless_of_filter() {
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(
+            &mut s,
+            vec![
+                Entry::new("alpha", EntryKind::File),
+                Entry::new("beta", EntryKind::File),
+            ],
+        );
+        // Apply a filter that matches neither `..` nor any real entry.
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        // Type a filter that matches no real file but `..` should still appear.
+        type_text(&mut s, "zzz");
+        let visible = s
+            .pane(Side::Left)
+            .visible()
+            .iter()
+            .map(|e| e.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible,
+            vec![".."],
+            "`..` visible even when filter matches nothing"
+        );
+    }
+
+    #[test]
+    fn enter_on_dotdot_navigates_up() {
+        let mut s = state_at(VfsPath::parse("/a/b").unwrap());
+        let _ = deliver_and_visible_left(&mut s, vec![Entry::new("sub", EntryKind::Dir)]);
+        // cursor is 0: on the `..` entry.
+        assert_eq!(s.pane(Side::Left).cursor, 0);
+        assert_eq!(
+            s.pane(Side::Left).current().map(|e| e.name.as_str()),
+            Some("..")
+        );
+        let fx = update(&mut s, Msg::Action(Action::Enter));
+        // Must navigate up to /a.
+        assert!(!fx.is_empty(), "Enter on `..` must emit a List effect");
+        assert_eq!(s.pane(Side::Left).cwd.as_str(), "/a");
+    }
+
+    #[test]
+    fn toggle_mark_on_dotdot_is_a_no_op() {
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(&mut s, vec![Entry::new("file", EntryKind::File)]);
+        // cursor 0 = `..`; ToggleMark must not add it to the mark set.
+        assert_eq!(s.pane(Side::Left).cursor, 0);
+        let _ = update(&mut s, Msg::Action(Action::ToggleMark));
+        assert!(
+            s.pane(Side::Left).marked.is_empty(),
+            "marking `..` must be a no-op"
+        );
+    }
+
+    #[test]
+    fn op_targets_excludes_dotdot() {
+        // `op_targets` is private; test it indirectly: Copy with cursor on `..` emits no Transfer.
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(&mut s, vec![Entry::new("sub", EntryKind::Dir)]);
+        // Cursor is on `..` (index 0).
+        assert_eq!(s.pane(Side::Left).cursor, 0);
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        // Copy with no valid target must produce no Transfer effect.
+        assert!(
+            fx.is_empty(),
+            "Copy with cursor on `..` must produce no Transfer effect"
+        );
+    }
+
+    #[test]
+    fn delete_with_cursor_on_dotdot_is_a_no_op() {
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(&mut s, vec![Entry::new("sub", EntryKind::Dir)]);
+        // cursor 0 = `..`; Delete (confirm-delete overlay) should not open for `..`.
+        let fx = update(&mut s, Msg::Action(Action::Delete));
+        assert!(
+            fx.is_empty() && s.overlay.is_none(),
+            "Delete with cursor on `..` must not open ConfirmDelete"
+        );
+    }
+
+    #[test]
+    fn rename_on_dotdot_is_a_no_op() {
+        // Rename bypasses op_targets and uses `current()` directly, so it needs its own guard.
+        // Pressing Rename with cursor on `..` must silently return with no overlay and no
+        // error status — consistent with ToggleMark/Copy/Delete on `..`.
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(&mut s, vec![Entry::new("file.txt", EntryKind::File)]);
+        // cursor 0 = `..`.
+        assert_eq!(s.pane(Side::Left).cursor, 0);
+        let _ = update(&mut s, Msg::Action(Action::Rename));
+        assert!(
+            s.overlay.is_none(),
+            "Rename on `..` must not open a Prompt overlay"
+        );
+        assert!(
+            s.status.is_none(),
+            "Rename on `..` must not set an error status"
+        );
+    }
+
+    #[test]
+    fn marks_offset_correctness() {
+        // With visible ["..","f1","f2"] in /a, marking visible index 2 (f2) and then issuing
+        // Copy must target /a/f2 — proves the `..`-at-index-0 offset doesn't shift the
+        // resolved path to the wrong file.
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(
+            &mut s,
+            vec![
+                Entry::new("f1", EntryKind::File),
+                Entry::new("f2", EntryKind::File),
+            ],
+        );
+        // visible: ["..", "f1", "f2"] — move cursor to index 2 (f2).
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        assert_eq!(
+            s.pane(Side::Left).current().map(|e| e.name.as_str()),
+            Some("f2")
+        );
+        // Mark f2.
+        let _ = update(&mut s, Msg::Action(Action::ToggleMark));
+        // Copy must target /a/f2.
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        let has_f2_target = fx.iter().any(|e| {
+            if let AppEffect::Transfer { items, .. } = e {
+                items.iter().any(|(src, _)| src.as_str() == "/a/f2")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_f2_target,
+            "Copy of marked f2 must target /a/f2, not /a/f1 (off-by-one from .. offset)"
+        );
+    }
+
+    #[test]
+    fn empty_non_root_dir_only_dotdot() {
+        // An empty listing in a non-root directory produces exactly one entry (`..`).
+        // The pane must report current()="..", len()==1, is_empty()==false, and neither
+        // CycleSort nor CursorDown must panic.
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(&mut s, vec![]);
+        {
+            let pane = s.pane(Side::Left);
+            assert_eq!(
+                pane.current().map(|e| e.name.as_str()),
+                Some(".."),
+                "only entry must be `..`"
+            );
+            assert_eq!(pane.len(), 1, "len must be 1 (just `..`)");
+            assert!(
+                !pane.is_empty(),
+                "is_empty must be false when `..` is present"
+            );
+        }
+        // Neither action must panic.
+        let _ = update(&mut s, Msg::Action(Action::CycleSort));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+    }
+
+    #[test]
+    fn filter_collapses_to_only_dotdot() {
+        // When a filter matches no real entries, visible() == [".."], cursor clamps to 0,
+        // current() is `..`, and op_targets is empty (Copy produces no Transfer effect).
+        let mut s = state_at(VfsPath::parse("/a").unwrap());
+        let _ = deliver_and_visible_left(
+            &mut s,
+            vec![
+                Entry::new("alpha", EntryKind::File),
+                Entry::new("beta", EntryKind::File),
+            ],
+        );
+        // Move cursor to a real entry so the clamp is meaningful.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        // Activate filter.
+        let _ = update(&mut s, Msg::Action(Action::Filter));
+        type_text(&mut s, "zzz"); // matches nothing
+        {
+            let pane = s.pane(Side::Left);
+            assert_eq!(pane.cursor, 0, "cursor must clamp to 0 after filter");
+            assert_eq!(
+                pane.current().map(|e| e.name.as_str()),
+                Some(".."),
+                "current must be `..` when filter matches nothing"
+            );
+        }
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        assert!(
+            fx.is_empty(),
+            "op_targets must be empty when only `..` is visible"
+        );
     }
 }
