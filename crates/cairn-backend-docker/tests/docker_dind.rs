@@ -16,6 +16,7 @@
 
 use bollard::models::ContainerCreateBody;
 use bollard::Docker;
+use bytes::Bytes;
 use cairn_backend_docker::{BollardDocker, DockerVfs};
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vfs::{action_ids, ActionCtx, ActionId, ActionOutcome, ListOpts, Vfs, VfsError};
@@ -27,8 +28,16 @@ const TEST_IMAGE: &str = "busybox:latest";
 const CONTAINER_NAME: &str = "cairn-it-docker-fs-test";
 /// Separate stable name for the log streaming test container.
 const LOG_CONTAINER_NAME: &str = "cairn-it-docker-logs-test";
+/// Stable name for the exec integration test container.
+const EXEC_CONTAINER_NAME: &str = "cairn-it-docker-exec-test";
+/// Stable name for the stdin-EOF exec test container.
+const EXEC_STDIN_CONTAINER_NAME: &str = "cairn-it-docker-exec-stdin-test";
+/// Stable name for the non-zero exit exec test container.
+const EXEC_EXIT_CONTAINER_NAME: &str = "cairn-it-docker-exec-exit-test";
 /// Marker printed by the log test container — chosen to be unique and easily grepped.
 const LOG_MARKER: &str = "CAIRN_LOG_STREAM_MARKER";
+/// Marker used by the exec integration test — distinct from the log marker.
+const EXEC_MARKER: &str = "CAIRN_EXEC_MARKER";
 
 fn p(s: &str) -> VfsPath {
     VfsPath::parse(s).unwrap()
@@ -319,4 +328,385 @@ async fn docker_container_log_streaming() {
     )
     .await
     .expect("force-remove log-test container");
+}
+
+/// Live exec round-trip: invoke `DockerVfs::invoke("exec")` with `echo CAIRN_EXEC_MARKER`,
+/// collect all stdout bytes, assert the marker is present, and assert exit code 0.
+///
+/// Uses `tty: false` and a short-lived command so the output stream closes naturally,
+/// letting `inspect_exec` return the real exit code without any manual cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docker_container_exec_round_trip() {
+    if std::env::var("CAIRN_IT_DOCKER").is_err() {
+        eprintln!("CAIRN_IT_DOCKER unset — skipping live Docker exec integration test");
+        return;
+    }
+
+    let raw =
+        Docker::connect_with_local_defaults().expect("connect to Docker daemon for scaffolding");
+
+    // Pull the image (no-op when the dind sidecar has already cached it).
+    {
+        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
+            .from_image(TEST_IMAGE)
+            .build();
+        let mut pull = raw.create_image(Some(pull_opts), None, None);
+        while let Some(item) = pull.next().await {
+            item.expect("image pull progress should not error");
+        }
+    }
+
+    // Remove any leftover container from a previous failed run.
+    let _ = raw
+        .remove_container(
+            EXEC_CONTAINER_NAME,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                    .force(true)
+                    .build(),
+            ),
+        )
+        .await;
+
+    // Create and start a sleeping container — exec requires the container to be running.
+    raw.create_container(
+        Some(
+            bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                .name(EXEC_CONTAINER_NAME)
+                .build(),
+        ),
+        ContainerCreateBody {
+            image: Some(TEST_IMAGE.to_owned()),
+            cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create exec-test container");
+
+    raw.start_container(
+        EXEC_CONTAINER_NAME,
+        None::<bollard::query_parameters::StartContainerOptions>,
+    )
+    .await
+    .expect("start exec-test container");
+
+    // Build the Vfs under test using the real BollardDocker adapter.
+    let ops = BollardDocker::connect_local().expect("BollardDocker::connect_local");
+    let vfs = DockerVfs::new(ConnectionId(99), ops);
+
+    // Invoke exec — echo the marker and exit immediately. non-TTY so the output stream
+    // terminates and inspect_exec can retrieve the exit code.
+    let exec_path = format!("/containers/{EXEC_CONTAINER_NAME}");
+    let outcome = vfs
+        .invoke(
+            &p(&exec_path),
+            ActionId::new(action_ids::EXEC),
+            ActionCtx::Exec {
+                argv: vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    format!("echo {EXEC_MARKER}"),
+                ],
+                tty: false,
+            },
+        )
+        .await
+        .expect("invoke exec must succeed on a running container");
+
+    let mut handle = match outcome {
+        ActionOutcome::Session(h) => h,
+        _ => panic!("expected ActionOutcome::Session from invoke exec"),
+    };
+
+    // Non-TTY exec: no resize, no local_port.
+    assert!(
+        handle.resize.is_none(),
+        "non-tty exec must have no resize channel"
+    );
+    assert!(
+        handle.local_port.is_none(),
+        "exec sessions never bind a port"
+    );
+
+    // Collect all stdout bytes until the stream closes (the echo process has exited).
+    let mut collected: Vec<Bytes> = Vec::new();
+    if let Some(stdout_rx) = handle.stdout.as_mut() {
+        while let Some(chunk) = stdout_rx.recv().await {
+            collected.push(chunk);
+        }
+    }
+
+    let combined: Vec<u8> = collected.iter().flat_map(|b| b.iter().copied()).collect();
+    let text = String::from_utf8_lossy(&combined);
+    assert!(
+        text.contains(EXEC_MARKER),
+        "exec output must contain the marker '{EXEC_MARKER}'; got: {text:?}"
+    );
+
+    // done must resolve with exit code 0 (echo always exits cleanly).
+    let exit = handle
+        .done
+        .await
+        .expect("done channel must resolve")
+        .expect("exit result must be Ok");
+    assert_eq!(exit, 0, "echo command must exit with code 0; got {exit}");
+
+    // Cleanup.
+    raw.remove_container(
+        EXEC_CONTAINER_NAME,
+        Some(
+            bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                .force(true)
+                .build(),
+        ),
+    )
+    .await
+    .expect("force-remove exec-test container");
+}
+
+/// stdin-EOF round-trip: proves the CRITICAL stdin-shutdown fix.
+///
+/// Runs `cat` (which reads stdin and echoes it to stdout, then exits when stdin closes).
+/// We send a known payload, drop `stdin_tx` (triggering the explicit `shutdown().await` in
+/// the relay task), collect stdout, and assert `done` resolves `Ok(0)` within a timeout.
+///
+/// This test would HANG FOREVER before the fix because dropping `stdin_tx` without
+/// `writer.shutdown().await` left the WriteHalf alive (ReadHalf kept the connection open),
+/// so `cat` never saw EOF and the output stream never closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docker_container_exec_stdin_eof_round_trip() {
+    if std::env::var("CAIRN_IT_DOCKER").is_err() {
+        eprintln!("CAIRN_IT_DOCKER unset — skipping stdin-EOF exec integration test");
+        return;
+    }
+
+    let raw =
+        Docker::connect_with_local_defaults().expect("connect to Docker daemon for scaffolding");
+
+    // Pull the image (no-op when the dind sidecar has already cached it).
+    {
+        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
+            .from_image(TEST_IMAGE)
+            .build();
+        let mut pull = raw.create_image(Some(pull_opts), None, None);
+        while let Some(item) = pull.next().await {
+            item.expect("image pull progress should not error");
+        }
+    }
+
+    // Clean up any leftover container from a previous failed run.
+    let _ = raw
+        .remove_container(
+            EXEC_STDIN_CONTAINER_NAME,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                    .force(true)
+                    .build(),
+            ),
+        )
+        .await;
+
+    // Create and start the sleeping container.
+    raw.create_container(
+        Some(
+            bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                .name(EXEC_STDIN_CONTAINER_NAME)
+                .build(),
+        ),
+        ContainerCreateBody {
+            image: Some(TEST_IMAGE.to_owned()),
+            cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create stdin-EOF test container");
+
+    raw.start_container(
+        EXEC_STDIN_CONTAINER_NAME,
+        None::<bollard::query_parameters::StartContainerOptions>,
+    )
+    .await
+    .expect("start stdin-EOF test container");
+
+    let ops = BollardDocker::connect_local().expect("BollardDocker::connect_local");
+    let vfs = DockerVfs::new(ConnectionId(100), ops);
+
+    let exec_path = format!("/containers/{EXEC_STDIN_CONTAINER_NAME}");
+    let outcome = vfs
+        .invoke(
+            &p(&exec_path),
+            ActionId::new(action_ids::EXEC),
+            ActionCtx::Exec {
+                // `cat` reads stdin, echoes to stdout, exits on EOF.
+                argv: vec!["cat".to_owned()],
+                tty: false,
+            },
+        )
+        .await
+        .expect("invoke exec (cat) must succeed");
+
+    let mut handle = match outcome {
+        ActionOutcome::Session(h) => h,
+        _ => panic!("expected ActionOutcome::Session"),
+    };
+
+    const STDIN_PAYLOAD: &[u8] = b"cairn-stdin-eof-test-payload\n";
+
+    // Send the payload and then drop stdin_tx to trigger shutdown.await in the relay.
+    let stdin_tx = handle.stdin.take().expect("stdin must be Some");
+    stdin_tx
+        .send(Bytes::from_static(STDIN_PAYLOAD))
+        .await
+        .expect("stdin send must succeed");
+    drop(stdin_tx); // Triggers explicit shutdown().await in the stdin relay task.
+
+    // Collect all stdout within a bounded timeout. Before the fix this would hang.
+    let stdout_rx = handle.stdout.as_mut().expect("stdout must be Some");
+    let stdout_collect = async {
+        let mut out = Vec::<u8>::new();
+        while let Some(chunk) = stdout_rx.recv().await {
+            out.extend_from_slice(&chunk);
+        }
+        out
+    };
+    let stdout_bytes = tokio::time::timeout(std::time::Duration::from_secs(10), stdout_collect)
+        .await
+        .expect("stdout stream must close within 10 s after stdin EOF — would hang before the shutdown() fix");
+
+    assert_eq!(
+        stdout_bytes, STDIN_PAYLOAD,
+        "cat must echo stdin back to stdout; got: {stdout_bytes:?}"
+    );
+
+    // done must resolve Ok(0): cat exits cleanly after stdin closes.
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(5), handle.done)
+        .await
+        .expect("done must resolve within 5 s")
+        .expect("done channel must not be dropped")
+        .expect("exit result must be Ok");
+    assert_eq!(exit, 0, "cat must exit with code 0; got {exit}");
+
+    // Cleanup.
+    raw.remove_container(
+        EXEC_STDIN_CONTAINER_NAME,
+        Some(
+            bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                .force(true)
+                .build(),
+        ),
+    )
+    .await
+    .expect("force-remove stdin-EOF test container");
+}
+
+/// Non-zero exit code round-trip: proves the inspect_exec polling correctly retrieves the code.
+///
+/// Runs `sh -c "exit 7"` and asserts `done` resolves with `Ok(7)`, not `Ok(0)` (which would
+/// indicate the fallback path was silently triggered rather than reading the real exit code).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docker_container_exec_non_zero_exit() {
+    if std::env::var("CAIRN_IT_DOCKER").is_err() {
+        eprintln!("CAIRN_IT_DOCKER unset — skipping non-zero exit exec integration test");
+        return;
+    }
+
+    let raw =
+        Docker::connect_with_local_defaults().expect("connect to Docker daemon for scaffolding");
+
+    // Pull the image (no-op when the dind sidecar has already cached it).
+    {
+        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
+            .from_image(TEST_IMAGE)
+            .build();
+        let mut pull = raw.create_image(Some(pull_opts), None, None);
+        while let Some(item) = pull.next().await {
+            item.expect("image pull progress should not error");
+        }
+    }
+
+    // Clean up any leftover container from a previous failed run.
+    let _ = raw
+        .remove_container(
+            EXEC_EXIT_CONTAINER_NAME,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                    .force(true)
+                    .build(),
+            ),
+        )
+        .await;
+
+    // Create and start the sleeping container.
+    raw.create_container(
+        Some(
+            bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                .name(EXEC_EXIT_CONTAINER_NAME)
+                .build(),
+        ),
+        ContainerCreateBody {
+            image: Some(TEST_IMAGE.to_owned()),
+            cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create non-zero-exit test container");
+
+    raw.start_container(
+        EXEC_EXIT_CONTAINER_NAME,
+        None::<bollard::query_parameters::StartContainerOptions>,
+    )
+    .await
+    .expect("start non-zero-exit test container");
+
+    let ops = BollardDocker::connect_local().expect("BollardDocker::connect_local");
+    let vfs = DockerVfs::new(ConnectionId(101), ops);
+
+    let exec_path = format!("/containers/{EXEC_EXIT_CONTAINER_NAME}");
+    let outcome = vfs
+        .invoke(
+            &p(&exec_path),
+            ActionId::new(action_ids::EXEC),
+            ActionCtx::Exec {
+                argv: vec!["sh".to_owned(), "-c".to_owned(), "exit 7".to_owned()],
+                tty: false,
+            },
+        )
+        .await
+        .expect("invoke exec must succeed");
+
+    let mut handle = match outcome {
+        ActionOutcome::Session(h) => h,
+        _ => panic!("expected ActionOutcome::Session"),
+    };
+
+    // Drain stdout (empty for `exit 7`).
+    if let Some(stdout_rx) = handle.stdout.as_mut() {
+        while stdout_rx.recv().await.is_some() {}
+    }
+
+    // done must resolve Ok(7). If it resolves Ok(0) the inspect_exec backoff path is broken.
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(10), handle.done)
+        .await
+        .expect("done must resolve within 10 s")
+        .expect("done channel must not be dropped")
+        .expect("exit result must be Ok");
+    assert_eq!(
+        exit, 7,
+        "exit code must be 7 (the value passed to `exit`); got {exit}"
+    );
+
+    // Cleanup.
+    raw.remove_container(
+        EXEC_EXIT_CONTAINER_NAME,
+        Some(
+            bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                .force(true)
+                .build(),
+        ),
+    )
+    .await
+    .expect("force-remove non-zero-exit test container");
 }

@@ -224,9 +224,8 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
 
     /// Advertise the per-container actions (`logs`, `exec`) anywhere within a container's subtree.
     /// This reflects path *shape*, not existence (it does no I/O, mirroring how the UI calls it on an
-    /// already-navigated node); existence is enforced by `stat`/`invoke`. The action surface is
-    /// discoverable now; live invocation (streaming over the Docker API) is the integration step, so
-    /// the overridden [`Vfs::invoke`] returns `VfsError::Backend { code: "not_implemented" }`.
+    /// already-navigated node); existence is enforced by `stat`/`invoke`. Both actions are live in
+    /// [`Vfs::invoke`]: `logs` returns `ActionOutcome::Stream`; `exec` returns `ActionOutcome::Session`.
     fn actions_at(&self, path: &VfsPath) -> Vec<ActionDescriptor> {
         let segs: Vec<&str> = path.segments().iter().map(SmolStr::as_str).collect();
         match segs.as_slice() {
@@ -256,10 +255,11 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
     ///   demultiplexes the Docker 8-byte stream header so callers receive plain payload bytes.
     ///   `follow` is taken from [`ActionCtx::Logs`] when present; the default is `false` (bounded
     ///   history, so a hermetic/dind test terminates). `tail` defaults to `"100"` for the same reason.
-    ///
-    /// **Deferred (follow-up M6-3/M6-6):**
-    /// - `exec` — interactive bidirectional `ActionOutcome::Session` (TTY, stdin/stdout); requires
-    ///   bollard's `exec` + WebSocket attach. Tracked as M6-3 follow-up.
+    /// - `exec` — opens an interactive exec session via the Docker Engine API (`create_exec` →
+    ///   `start_exec` → relay tasks → `inspect_exec`). Returns `ActionOutcome::Session` with a
+    ///   [`cairn_vfs::SessionHandle`] whose `stdin`/`stdout` channels carry bidirectional I/O;
+    ///   `resize` is populated when `tty: true`. Requires [`ActionCtx::Exec`]; any other ctx
+    ///   variant returns `VfsError::Backend { code: "invalid_ctx" }`.
     async fn invoke(
         &self,
         path: &VfsPath,
@@ -290,14 +290,31 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
                 let stream = self.ops.logs(container_name, follow, tail);
                 Ok(ActionOutcome::Stream(stream))
             }
-            // exec (interactive Session) is deferred: it requires bollard's `exec` endpoint,
-            // a WebSocket attach for bidirectional I/O, and stdout/stderr demux with TTY.
-            // Follow-up: M6-3 exec slice + M6-6 K8s streaming.
-            action_ids::EXEC => Err(VfsError::Backend {
-                code: "not_implemented".to_owned(),
-                msg: "exec (interactive Session) is deferred — follow-up M6-3".to_owned(),
-                retryable: false,
-            }),
+            action_ids::EXEC => {
+                // ActionCtx::Exec is required; any other variant is a caller bug, not a
+                // retryable engine error.
+                let (argv, tty) = match &ctx {
+                    ActionCtx::Exec { argv, tty } => (argv.clone(), *tty),
+                    _ => {
+                        return Err(VfsError::Backend {
+                            code: "invalid_ctx".to_owned(),
+                            msg: "exec action requires ActionCtx::Exec".to_owned(),
+                            retryable: false,
+                        })
+                    }
+                };
+                // Validate before the API call so the caller gets a clear error rather than an
+                // opaque daemon 400.
+                if argv.is_empty() {
+                    return Err(VfsError::Backend {
+                        code: "empty_argv".to_owned(),
+                        msg: "exec: argv must be non-empty".to_owned(),
+                        retryable: false,
+                    });
+                }
+                let handle = self.ops.exec(container_name, argv, tty).await?;
+                Ok(ActionOutcome::Session(handle))
+            }
             other => Err(VfsError::Backend {
                 code: "not_implemented".to_owned(),
                 msg: format!("action '{other}' is not available"),
@@ -520,19 +537,156 @@ mod tests {
         ));
     }
 
+    /// Passing the wrong `ActionCtx` variant must be a typed caller error, not a daemon error.
     #[tokio::test]
-    async fn invoke_exec_is_deferred_not_implemented() {
+    async fn invoke_exec_with_wrong_ctx_returns_invalid_ctx() {
         let vfs = backend();
-        // exec remains deferred (M6-3 follow-up); invoking it must still return the "not_implemented"
-        // backend error — distinct from VfsError::Unsupported — so callers can detect the deferral.
         assert!(matches!(
             vfs.invoke(
                 &p("/containers/web"),
                 ActionId::new(action_ids::EXEC),
-                ActionCtx::None
+                // ActionCtx::None instead of ActionCtx::Exec → invalid_ctx
+                ActionCtx::None,
             )
             .await,
-            Err(VfsError::Backend { code, .. }) if code == "not_implemented"
+            Err(VfsError::Backend { code, .. }) if code == "invalid_ctx"
+        ));
+    }
+
+    /// Non-TTY exec: stdin bytes must be echoed back to stdout; resize is absent; local_port is None.
+    #[tokio::test]
+    async fn invoke_exec_non_tty_echoes_stdin_to_stdout() {
+        use bytes::Bytes;
+
+        let vfs = backend();
+        let outcome = vfs
+            .invoke(
+                &p("/containers/web"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec!["sh".to_owned()],
+                    tty: false,
+                },
+            )
+            .await
+            .expect("exec on a running mock container must succeed");
+
+        let mut handle = match outcome {
+            ActionOutcome::Session(h) => h,
+            _ => panic!("expected ActionOutcome::Session"),
+        };
+
+        // Non-TTY exec must not provide a resize or local_port.
+        assert!(
+            handle.resize.is_none(),
+            "non-tty exec must have no resize channel"
+        );
+        assert!(
+            handle.local_port.is_none(),
+            "exec sessions never bind a port"
+        );
+
+        // Send a chunk via stdin and expect it echoed on stdout.
+        let stdin_tx = handle.stdin.take().expect("stdin must be Some for exec");
+        stdin_tx
+            .send(Bytes::from_static(b"hello"))
+            .await
+            .expect("stdin send");
+        drop(stdin_tx); // Close stdin → mock exits with code 0.
+
+        let stdout_rx = handle
+            .stdout
+            .as_mut()
+            .expect("stdout must be Some for exec");
+        let chunk = stdout_rx
+            .recv()
+            .await
+            .expect("stdout must yield the echoed chunk");
+        assert_eq!(chunk, Bytes::from_static(b"hello"));
+
+        // done must resolve with Ok(0) after stdin closes.
+        let exit = handle
+            .done
+            .await
+            .expect("done channel must resolve")
+            .expect("exit must be Ok");
+        assert_eq!(exit, 0);
+    }
+
+    /// TTY exec: a resize channel must be present; cancellation resolves done with Ok(-1).
+    #[tokio::test]
+    async fn invoke_exec_tty_has_resize_channel_and_cancel_works() {
+        let vfs = backend();
+        let outcome = vfs
+            .invoke(
+                &p("/containers/web"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec!["sh".to_owned()],
+                    tty: true,
+                },
+            )
+            .await
+            .expect("tty exec on mock container must succeed");
+
+        let handle = match outcome {
+            ActionOutcome::Session(h) => h,
+            _ => panic!("expected ActionOutcome::Session"),
+        };
+
+        // TTY exec must provide a resize channel.
+        let resize = handle.resize.expect("tty exec must have a resize channel");
+
+        // Send a resize event; mock accepts and discards it.
+        resize
+            .send((24, 80))
+            .await
+            .expect("resize send must succeed");
+
+        // Cancel the session and verify done resolves with Ok(-1).
+        handle.cancel.send(()).expect("cancel send must succeed");
+        let exit = handle
+            .done
+            .await
+            .expect("done channel must resolve")
+            .expect("exit must be Ok");
+        assert_eq!(exit, -1, "cancelled session must report exit code -1");
+    }
+
+    /// An empty argv must be rejected before any API call with a typed `empty_argv` error.
+    #[tokio::test]
+    async fn invoke_exec_empty_argv_returns_error() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.invoke(
+                &p("/containers/web"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec![], // deliberately empty
+                    tty: false,
+                },
+            )
+            .await,
+            Err(VfsError::Backend { code, .. }) if code == "empty_argv"
+        ));
+    }
+
+    /// Invoking exec on an unknown container must surface VfsError::NotFound from the mock.
+    #[tokio::test]
+    async fn invoke_exec_unknown_container_returns_not_found() {
+        let vfs = backend();
+        // "ghost" is not in MockDocker's container list.
+        assert!(matches!(
+            vfs.invoke(
+                &p("/containers/ghost"),
+                ActionId::new(action_ids::EXEC),
+                ActionCtx::Exec {
+                    argv: vec!["sh".to_owned()],
+                    tty: false,
+                },
+            )
+            .await,
+            Err(VfsError::NotFound(_))
         ));
     }
 
