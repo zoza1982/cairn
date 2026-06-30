@@ -12,9 +12,20 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# `plugin-network` enables the real brokered `host::http-fetch` implementation (RFC-0010 §3).
+# Without this feature both http-fetch and use-credential remain deny-stubs as before, making
+# the default `cargo test` hermetic and offline. Integration tests behind `CAIRN_IT_PLUGIN_NETWORK`
+# use this feature; `cairn` (the binary) enables it unconditionally.
+[features]
+plugin-network = ["dep:reqwest", "dep:ipnet", "tokio/net"]
+
 [dependencies]
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
+# The secret-free credential boundary. `cairn-plugin` depends on this (allowed by the
+# isolation contract) — never on `cairn-broker`, `cairn-vault`, or `cairn-secrets`
+# (enforced by the dep-closure CI test in `cairn-broker-api/tests/isolation.rs`).
+cairn-broker-api = { workspace = true }
 async-trait = "0.1"
 # `WriteSink::write_chunk` takes a `bytes::Bytes`; same crate/version cairn-vfs uses for that trait.
 bytes = "1"
@@ -34,7 +45,23 @@ wasmtime = { version = "46.0.1", default-features = false, features = [
 # default-features=false does not shrink the dep tree — wasmtime-wasi's cap-std/etc. are mandatory.)
 wasmtime-wasi = { version = "46.0.1", default-features = false }
 
+# ── plugin-network feature deps ───────────────────────────────────────────────────────────────
+# rustls only (no OpenSSL, no C toolchain), matching the TLS posture in cairn-ai.  Version 0.12
+# is already in the workspace (cairn-ai) — this activates the `stream` feature on that shared dep.
+# `dep:reqwest` prevents Cargo from auto-creating an implicit "reqwest" feature.
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+# CIDR matching for the SSRF private-IP guard (100.64.0.0/10, fc00::/7, fe80::/10, etc.).
+# Already in the workspace dep tree via cairn-backend-object's cloud SDKs.
+ipnet = { version = "2", optional = true }
+
 [dev-dependencies]
 # "time" is required for `tokio::time::timeout` in the ImmediatelyReady test.
-tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "time"] }
+# "net" for tokio::net::lookup_host in the http-fetch SSRF tests (feature-gated).
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "time", "net"] }
 futures = "0.3"
+# Hermetic HTTP mock server for the brokered http-fetch tests (no real network, no TLS).
+# Same pattern as cairn-ai/tests. Only active under the `plugin-network` feature.
+wiremock = "0.6"

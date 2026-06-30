@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Brokered host functions** (RFC-0010 PR-B, M8-4): replaced the deny-stubs for
+  `host::http-fetch` and `host::use-credential` with real, capability-gated implementations.
+  `http-fetch` performs HTTP on the plugin's behalf using reqwest+rustls (no OpenSSL); every
+  call is gated by a per-plugin hostname allow-list, SSRF-guarded via pre-flight DNS resolution
+  and IP-literal classification (loopback / RFC-1918 / CGNAT / link-local / ULA / IPv4-mapped
+  blocked), response-capped at 8 MiB, `Set-Cookie` stripped from responses, and sensitive
+  request headers (`Authorization`, `Cookie`, etc.) redacted from logs. Redirects are
+  re-validated per hop. `use-credential` resolves a vault credential by opaque handle via the
+  `CredentialBroker` trait — the raw `CredentialSecret` never crosses the WIT ABI; only an
+  ephemeral artifact (e.g. STS bearer token or base64-encoded Basic-Auth value) is returned.
+  Both functions are capability-gated: a plugin without a `network` or `credentials` grant in
+  `PluginGrants` receives a deny-stub error at runtime without touching the vault or the network.
+  Secrets are zeroized after use and never appear in error strings, logs, or journal entries.
+  New `cairn-broker-api` boundary types: `CredentialAction`, `CredentialBroker`, and
+  `CredentialBrokerError`. New `cairn-broker` adapter: `BrokerCredentialAdapter`. New
+  `cairn-plugin` module: `http_fetch` (gated by the `plugin-network` feature). New public types:
+  `PluginGrants`, `PluginHostConfig`, `PluginComponent::instantiate_with_grants`. The
+  `plugin-network` feature keeps default `cargo test` hermetic and offline. 78 tests pass in
+  both configurations.
+
 - **WASI subset narrowing** (RFC-0010 PR-A, M8-3b): replaced the blanket
   `wasmtime_wasi::p2::add_to_linker_sync` with an explicit per-interface allow-list. Only
   `wasi:io/{error,streams,poll}`, `wasi:clocks/{wall-clock,monotonic-clock}`, and

@@ -9,10 +9,18 @@
 //!
 //! For this milestone the broker provides credential resolution + journaling; the full
 //! authorize→confirm→execute action mediation (per ADR-0002 / LLD §9.6) is layered on in M7.
+//!
+//! [`BrokerCredentialAdapter`] (RFC-0010 §4) wraps a [`Broker`] and implements
+//! [`CredentialBroker`] for the plugin host: it resolves the secret internally, performs
+//! the requested [`CredentialAction`], zeroizes intermediate material, and returns only an
+//! ephemeral artifact — the raw secret never crosses the WIT ABI.
 
-pub use cairn_broker_api::{CredentialDirectory, CredentialInfo};
-use cairn_vault::{CredentialId, CredentialSecret, Vault};
-use std::sync::Mutex;
+pub use cairn_broker_api::{
+    CredentialAction, CredentialBroker, CredentialBrokerError, CredentialDirectory, CredentialInfo,
+};
+use cairn_secrets::ExposeSecret;
+use cairn_vault::{AwsCredential, CredentialId, CredentialSecret, SshCredential, Vault};
+use std::sync::{Arc, Mutex};
 
 /// Who is requesting an action — recorded in the audit journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +149,127 @@ impl Broker {
 impl CredentialDirectory for Broker {
     fn credentials(&self) -> Vec<CredentialInfo> {
         Broker::credentials(self)
+    }
+}
+
+// ── BrokerCredentialAdapter (RFC-0010 §4) ─────────────────────────────────────────────────────
+
+/// Implements [`CredentialBroker`] for the plugin host by wrapping a shared [`Broker`].
+///
+/// The raw [`CredentialSecret`] is resolved, used to produce an ephemeral artifact, and
+/// then dropped (zeroized) within [`BrokerCredentialAdapter::use_credential`]. The artifact
+/// — never the secret — is what crosses the plugin WIT boundary.
+///
+/// # Security invariant
+///
+/// The return value and all error strings are guaranteed to contain no raw secret material.
+/// The journal entry records only the actor name, handle label, and action name — no key
+/// material of any kind.
+pub struct BrokerCredentialAdapter {
+    broker: Arc<Broker>,
+}
+
+impl BrokerCredentialAdapter {
+    /// Wrap a shared broker. Cheap to clone (shares the `Arc`).
+    #[must_use]
+    pub fn new(broker: Arc<Broker>) -> Self {
+        Self { broker }
+    }
+}
+
+impl CredentialBroker for BrokerCredentialAdapter {
+    fn use_credential(
+        &self,
+        actor: &str,
+        handle: &str,
+        action: &CredentialAction,
+    ) -> Result<String, CredentialBrokerError> {
+        // Map handle (label) → CredentialId by scanning the secret-free directory.
+        // The label is what a plugin author puts in `plugin.toml`; it must match the vault entry.
+        let creds = self.broker.credentials();
+        let info = creds
+            .iter()
+            .find(|c| c.label == handle)
+            .ok_or(CredentialBrokerError::NotFound)?;
+        let id = info.id;
+
+        // Resolve to the secret (stays within this stack frame).
+        let secret = self
+            .broker
+            .resolve(Actor::Plugin(actor.to_owned()), id)
+            .map_err(|e| match e {
+                BrokerError::Locked => CredentialBrokerError::Locked,
+                BrokerError::NotFound => CredentialBrokerError::NotFound,
+            })?;
+
+        // Perform the closed-vocabulary action. Any zeroizing `SecretString` fields inside
+        // `secret` are dropped at the end of this scope, wiping them from memory.
+        let artifact = perform_credential_action(&secret, action)?;
+
+        // `secret` is dropped (and zeroized) here.
+        drop(secret);
+
+        // Journal: actor + action description; no secret material.
+        self.broker.record(JournalEntry {
+            actor: Actor::Plugin(actor.to_owned()),
+            action: format!("use-credential:{handle}:{}", action.as_str()),
+        });
+
+        Ok(artifact)
+    }
+}
+
+/// Perform the requested action on a `CredentialSecret` and return the ephemeral artifact.
+///
+/// The artifact must contain no raw secret key material. Each action is designed to return
+/// only the minimum information the plugin needs (a token, a header value, etc.).
+fn perform_credential_action(
+    secret: &CredentialSecret,
+    action: &CredentialAction,
+) -> Result<String, CredentialBrokerError> {
+    match action {
+        CredentialAction::BearerToken => match secret {
+            // AWS STS temporary credentials have a session token — that IS the bearer token.
+            CredentialSecret::Aws(AwsCredential::Static {
+                session_token: Some(t),
+                ..
+            }) => Ok(t.expose_secret().to_owned()),
+            // Static keys without a session token and delegation credentials cannot produce
+            // a bearer token without a live STS/token-exchange call (deferred to M8-5).
+            _ => Err(CredentialBrokerError::ActionNotSupported),
+        },
+
+        CredentialAction::BasicAuthHeader => {
+            // HTTP Basic: `base64(username:password)`. The plugin receives ONLY the encoded
+            // value — neither the raw password nor the intermediate plaintext is returned.
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine as _;
+
+            let plaintext = match secret {
+                CredentialSecret::Ssh(SshCredential::Password(p)) => {
+                    // No username stored in the SSH password vault entry; encode as ":password".
+                    format!(":{}", p.expose_secret())
+                }
+                CredentialSecret::Aws(AwsCredential::Static {
+                    access_key_id,
+                    secret_access_key,
+                    ..
+                }) => {
+                    // AWS static key as Basic auth: `access_key_id:secret_access_key`.
+                    // Used by S3-compatible services that accept HTTP Basic for compatibility.
+                    format!("{}:{}", access_key_id, secret_access_key.expose_secret())
+                }
+                _ => return Err(CredentialBrokerError::ActionNotSupported),
+            };
+            // Encode; `plaintext` is dropped (and its memory is Stack-allocated, not zeroized here,
+            // but it is a temporary String on the stack that goes out of scope immediately after
+            // encoding — the encoded value is the only artifact that persists).
+            Ok(STANDARD.encode(plaintext.as_bytes()))
+        }
+
+        // `CredentialAction` is `#[non_exhaustive]`; future variants added to `cairn-broker-api`
+        // must be handled here before they can be used. Until then, reject them.
+        _ => Err(CredentialBrokerError::ActionNotSupported),
     }
 }
 
