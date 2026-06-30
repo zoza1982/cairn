@@ -8,7 +8,11 @@
 //! The granted `host` interface (log/now-secs; brokered fns deny-stubbed) is linked here, and
 //! [`crate::backend::PluginVfsBackend`] exposes this as an async `Vfs` over a dedicated thread. The
 //! streaming `read-stream`/`write-sink` resources and mutation calls are wrapped too (PR2/PR3).
-//! Deferred (M8-4): an epoch deadline + the real brokered host functions. Verified hermetically
+//!
+//! WASI is linked via the narrowed allow-list from [`crate::wasi_narrowing`] (RFC-0010 §1): only
+//! `wasi:io/*`, `wasi:clocks/*`, and `wasi:random/*` are registered; sockets, filesystem, and CLI
+//! are absent.  The poll and monotonic-clock stubs close the epoch-vs-blocking evasion gap
+//! (RFC-0010 §2).  Deferred (M8-4): the real brokered host functions. Verified hermetically
 //! against a committed guest fixture (CI needs no WASM toolchain).
 
 use crate::{Limits, PluginError};
@@ -37,12 +41,13 @@ pub(crate) use wasmtime::component::ResourceAny;
 /// Store state for a component instance: the memory limiter plus an **ambient-authority-free** WASI
 /// context.
 ///
-/// A guest built against `std` references the `wasi:*` interfaces, so they must be linkable for
-/// instantiation. The context is **empty** — no preopened directories, no environment, null stdio,
-/// no network — so the plugin has no ambient filesystem/secret/network access (clocks and entropy
-/// remain functional; harmless without a network). It is not "no WASI": the interfaces are linked but
-/// grant nothing. Capability-gating which WASI a plugin may use, per its manifest grants — and
-/// narrowing the linked subset — is future work (M8-4/M8-5).
+/// A guest built against `std` references the `wasi:*` interfaces, so a subset must be linkable for
+/// instantiation.  The context is **empty** — no preopened directories, no environment, null stdio,
+/// no network — so the plugin has no ambient filesystem/secret/network access.  Only the RFC-0010
+/// §1.2 allow-list is registered: `wasi:io/*`, `wasi:clocks/*`, and `wasi:random/*`.  Sockets,
+/// filesystem, and CLI are absent from the linker; a component importing any of those fails
+/// instantiation (default-deny).  The poll and monotonic-clock stubs close the epoch-evasion gap
+/// (RFC-0010 §2).
 struct CompState {
     limits: StoreLimits,
     wasi: WasiCtx,
@@ -135,13 +140,13 @@ impl PluginComponent {
         // The dedicated-thread `Vfs` bridge makes synchronous guest calls, so the sync WASI linker
         // is correct (no async linker needed).
         //
-        // SECURITY: this links the *full* WASI 0.2 surface, which includes a blocking `wasi:io/poll`.
-        // The epoch deadline cannot interrupt a guest blocked inside that native call (epoch only
-        // traps in guest wasm — see `crate::epoch`), so a malicious guest could park this thread.
-        // Acceptable only because plugins are not yet user-loadable; narrowing this to the
-        // non-blocking subset a backend actually needs is gated before live untrusted use (M8-5).
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(|e| PluginError::Instantiate(e.to_string()))?;
+        // SECURITY (RFC-0010 §1 + §2): Only the RFC-0010 allow-list is registered here.
+        // Sockets, filesystem, and CLI are absent from the linker (default-deny).  The
+        // `wasi:io/poll` and `wasi:clocks/monotonic-clock` stubs return immediately, so a
+        // malicious guest cannot park this thread inside a native Tokio frame that epoch
+        // cannot interrupt.  The epoch deadline now reliably bounds wall-clock time even
+        // for a guest that tries the blocking-evasion attack described in `crate::epoch`.
+        crate::wasi_narrowing::add_narrowed_wasi_to_linker(&mut linker)?;
         // The granted `host` interface (log/now-secs real; brokered fns deny-stubbed — see `Host`).
         cairn::plugin::host::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,

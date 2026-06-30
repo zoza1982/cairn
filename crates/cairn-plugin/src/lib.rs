@@ -9,10 +9,15 @@
 //! loads a component exporting `cairn:plugin/backend`, and [`PluginVfsBackend`] exposes it as a full
 //! async [`Vfs`](cairn_vfs::Vfs) over a dedicated thread — metadata, listing, streaming reads and
 //! writes, and mutations. A spinning guest is bounded by both fuel and a wall-clock [`EpochTicker`]
-//! deadline. Still owed before live untrusted use: narrowing the linked WASI surface (a guest can
-//! still *block* in `wasi:io/poll`, which epoch can't interrupt) and the real brokered host functions
-//! (M8-4/M8-5). What is here proves a misbehaving plugin cannot hang the host with pure computation
-//! or exhaust memory, and that a guest reaches the host only through granted imports.
+//! deadline.
+//!
+//! The WASI surface is narrowed to a safe allow-list (RFC-0010 §1): only `wasi:io/{error,streams,
+//! poll}`, `wasi:clocks/{wall-clock,monotonic-clock}`, and `wasi:random/*` are linked. Sockets,
+//! filesystem, and CLI are absent — a component importing any of those fails instantiation.
+//! `wasi:io/poll` and `wasi:clocks/monotonic-clock` run as non-blocking stubs, closing the
+//! epoch-vs-blocking-WASI evasion gap (RFC-0010 §2). Still owed before live untrusted use: the
+//! real brokered host functions (M8-4/M8-5). What is here proves a misbehaving plugin cannot hang
+//! the host or access restricted surfaces.
 
 use thiserror::Error;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
@@ -22,6 +27,7 @@ mod bridge;
 mod component;
 mod epoch;
 mod handle;
+mod wasi_narrowing;
 pub use backend::PluginVfsBackend;
 pub use component::{engine_config, PluginComponent};
 pub use epoch::EpochTicker;

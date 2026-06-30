@@ -11,11 +11,56 @@
 //! `/dir/oversized` returns more bytes than the host requested. Built locally
 //! (`cargo component build`) and committed as `../fixtures/backend.wasm` so CI needs no WASM
 //! toolchain.
+//!
+//! # `no_std` build
+//!
+//! This crate uses `#![no_std]` so that the compiled component does **not** import `wasi:cli/*`
+//! interfaces.  Those interfaces are excluded from Cairn's narrowed WASI linker (RFC-0010 §1),
+//! meaning any component that imports them fails to instantiate — which would defeat the fixture
+//! tests.  Using `no_std` prevents the Rust runtime startup from pulling in environment, stdio,
+//! and exit WASI imports that a `std`-based wasm32-wasip2 crate would require.
+
+#![no_std]
+extern crate alloc;
+
+// `dlmalloc::GlobalDlmalloc` uses the wasm `memory.grow` instruction (no WASI imports) to
+// service allocations.  It is required when linking `no_std + alloc` for wasm32 targets where
+// the standard library would otherwise supply an allocator automatically.
+#[global_allocator]
+static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
+/// Panic handler: emit the wasm `unreachable` trap instruction.
+///
+/// Panics in a guest component should trap the component rather than loop
+/// forever or attempt to call a host `proc_exit`.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+// wit-bindgen 0.44 emits `impl std::error::Error for VfsError {}` in its generated code even
+// in no_std contexts.  In Rust 2021 edition, `std::` is resolved as an *extern crate* path,
+// not a local module path, so a bare `mod std { ... }` shim does not satisfy it.
+//
+// `extern crate self as std;` declares the current crate as an extern crate alias named `std`.
+// Combined with the `pub mod error` below, `std::error::Error` in generated submodules
+// resolves to `core::error::Error` (stable since Rust 1.81) without any change to the
+// auto-generated bindings file.
+extern crate self as std;
+
+/// Compatibility stub for the generated `impl std::error::Error` in `bindings.rs`.
+pub mod error {
+    pub use core::error::Error;
+}
 
 #[allow(warnings)]
 mod bindings;
 
-use std::cell::{Cell, RefCell};
+use alloc::string::String;
+use alloc::string::ToString as _;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 
 use bindings::cairn::plugin::types::{ByteRange, Caps, Entry, EntryKind, VfsError};
 use bindings::exports::cairn::plugin::backend::{
