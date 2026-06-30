@@ -17,7 +17,7 @@ workspace = true
 # the default `cargo test` hermetic and offline. Integration tests behind `CAIRN_IT_PLUGIN_NETWORK`
 # use this feature; `cairn` (the binary) enables it unconditionally.
 [features]
-plugin-network = ["dep:reqwest", "dep:ipnet", "tokio/net"]
+plugin-network = ["dep:reqwest", "dep:ipnet", "tokio/net", "tokio/time"]
 
 [dependencies]
 cairn-types = { workspace = true }

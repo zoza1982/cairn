@@ -56,8 +56,9 @@ pub use epoch::EpochTicker;
 pub struct PluginGrants {
     /// Hostnames this plugin may reach via `host::http-fetch`.
     ///
-    /// Exact hostname match (no scheme, no port, no wildcards in this version). Stored
-    /// lower-cased. Example: `["api.github.com", "releases.example.com"]`.
+    /// Exact hostname match (no scheme, no port, no wildcards in this version). Values are
+    /// compared case-insensitively at call time but are not normalized to lower-case at storage
+    /// time. Example: `["api.github.com", "releases.example.com"]`.
     pub network: Vec<String>,
     /// Credential handle labels this plugin may use via `host::use-credential`.
     ///
@@ -70,8 +71,9 @@ pub struct PluginGrants {
 /// Everything the plugin host needs to wire up brokered host functions for one plugin
 /// component instance (RFC-0010 §3/§4).
 ///
-/// Passed to [`PluginComponent::instantiate_with_grants`]. The `#[derive(Default)]`
-/// produces a zero-grant, no-broker config; use it for untrusted test fixtures.
+/// Passed to [`PluginComponent::instantiate_with_grants`]. `Default` produces a zero-grant,
+/// no-broker config; use it for untrusted test fixtures.
+#[derive(Default)]
 pub struct PluginHostConfig {
     /// Capability grants for this plugin instance.
     pub grants: PluginGrants,

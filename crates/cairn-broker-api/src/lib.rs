@@ -59,9 +59,16 @@ pub trait CredentialDirectory: Send + Sync {
 ///
 /// # Security
 ///
-/// Every action is designed to return only an *ephemeral artifact* derived from the secret, never
-/// the raw secret itself. The `CredentialBroker` implementor is responsible for upholding this
-/// invariant in each match arm.
+/// `BearerToken` returns a time-bounded, non-reversible artifact (an STS session token). The raw
+/// long-term credential is never exposed.
+///
+/// `BasicAuthHeader` is a **credential delegation** action: it returns `base64(user:secret)`
+/// which, while not the raw secret, is trivially reversible by the plugin (base64 decode). Granting
+/// this action effectively hands the credential to the plugin. Operator documentation must make
+/// this explicit; only grant `basic-auth-header` when the plugin legitimately needs HTTP Basic
+/// access and is sufficiently trusted.
+///
+/// The `CredentialBroker` implementor is responsible for upholding the invariant in each match arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CredentialAction {
@@ -72,7 +79,11 @@ pub enum CredentialAction {
     ///   deferred to M8-5 where the token cache is wired in).
     /// - SSH or unsupported types: returns [`CredentialBrokerError::ActionNotSupported`].
     BearerToken,
-    /// Return an HTTP Basic authentication value: `base64(username:password)`.
+    /// Return an HTTP Basic authentication header value: `base64(username:password)`.
+    ///
+    /// **Security note:** this is credential delegation — the plugin receives a value that is
+    /// trivially reversible to the raw secret (base64 decode). Only grant this to plugins that
+    /// need HTTP Basic auth and are operator-trusted.
     ///
     /// - `Aws::Static`: `base64("access_key_id:secret_access_key")`.
     /// - `Ssh::Password`: `base64(":password")` (no username stored in the vault variant).
@@ -117,9 +128,13 @@ pub enum CredentialBrokerError {
     /// The requested action is not supported for the credential type stored under this handle.
     #[error("action not supported for this credential type")]
     ActionNotSupported,
-    /// A broker-internal error (e.g. a token exchange failure). The message is secret-free.
+    /// A broker-internal error (e.g. a token exchange failure).
+    ///
+    /// Restricted to `&'static str` so that secret material cannot appear here at compile time —
+    /// a dynamic `String` would allow `Internal(format!("key was: {}", raw_key))` to slip through.
+    /// Use a code-discriminant variant rather than a dynamic message when richer diagnostics are needed.
     #[error("broker error: {0}")]
-    Internal(String),
+    Internal(&'static str),
 }
 
 /// The brokered credential capability for the plugin layer (RFC-0010 §4).

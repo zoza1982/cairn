@@ -37,7 +37,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     redirect, Client, Url,
 };
-use std::{net::IpAddr, str::FromStr, time::Duration};
+use std::{net::IpAddr, time::Duration};
 use tracing::{debug, warn};
 
 // ── Per-request limits ─────────────────────────────────────────────────────────────────────────
@@ -167,8 +167,15 @@ pub(crate) fn validate_url(req: &HttpRequest, grants: &[String]) -> Result<Url, 
         return Err("host not in network grant".to_owned());
     }
 
-    // IP-literal SSRF guard (pre-DNS, catches e.g. `http://127.0.0.1/...`).
-    if let Ok(ip) = IpAddr::from_str(host) {
+    // IP-literal SSRF guard (pre-DNS, catches e.g. `http://127.0.0.1/...` or `http://[::1]/...`).
+    // `url::Url::host_str()` returns IPv6 addresses in bracket notation (`[::1]`), which cannot
+    // be parsed by `IpAddr::parse` directly. Strip the brackets first to handle both forms.
+    let ip_str = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    if let Ok(ip) = ip_str.parse::<IpAddr>() {
         if is_ssrf_blocked_ip(ip) {
             return Err("SSRF: IP address in blocked range".to_owned());
         }
@@ -183,12 +190,32 @@ pub(crate) fn validate_url(req: &HttpRequest, grants: &[String]) -> Result<Url, 
 ///
 /// This is an async operation; the caller drives it with `Handle::block_on`. Returns `Ok(())`
 /// if all resolved IPs are public, or an error if any resolved IP is blocked.
-pub(crate) async fn check_ssrf_via_dns(host: &str, port: u16) -> Result<(), String> {
+///
+/// `connect_timeout_secs` bounds the DNS lookup; an unresponsive DNS server cannot park the
+/// plugin thread indefinitely.
+///
+/// # DNS rebinding caveat
+///
+/// There is an inherent TOCTOU window: reqwest performs its own DNS resolution at TCP connect
+/// time independently of this pre-flight. An attacker who controls the DNS record for a granted
+/// hostname can serve a public IP during this check, then flip to a private IP before reqwest
+/// connects (low-TTL DNS rebinding). Closing this gap requires a custom connector that locks
+/// the connection to the pre-validated `SocketAddr` set; that work is tracked in issue M8-SSRF.
+/// Until then, restrict network grants to hostnames under the operator's full control.
+pub(crate) async fn check_ssrf_via_dns(
+    host: &str,
+    port: u16,
+    connect_timeout_secs: u64,
+) -> Result<(), String> {
     // tokio's `lookup_host` performs a real DNS query (AAAA + A in parallel).
     let addr_str = format!("{host}:{port}");
-    let addrs = tokio::net::lookup_host(&addr_str)
-        .await
-        .map_err(|e| format!("DNS resolution failed: {e}"))?;
+    let addrs = tokio::time::timeout(
+        Duration::from_secs(connect_timeout_secs),
+        tokio::net::lookup_host(&addr_str),
+    )
+    .await
+    .map_err(|_| format!("DNS lookup timed out for {host}"))?
+    .map_err(|e| format!("DNS resolution failed: {e}"))?;
 
     let mut found_any = false;
     for addr in addrs {
@@ -221,39 +248,38 @@ const REDACTED_REQUEST_HEADERS: &[&str] = &[
     "proxy-authorization",
 ];
 
+/// Maximum number of response headers accepted from the server (inclusive). Prevents a
+/// compromised or adversarial granted server from forcing unbounded heap allocation via
+/// a flood of response headers whose count is not bounded by the body-size cap.
+const MAX_RESPONSE_HEADERS: usize = 200;
+
+/// Maximum byte length of a single response header value. Matches Chrome's cap.
+/// Headers exceeding this size are treated as malformed responses.
+const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
+
 /// Build a `reqwest::Client` configured for plugin use:
 /// - rustls TLS only (no OpenSSL)
 /// - per-call connect / request timeouts
-/// - custom redirect policy that re-checks each hop against the grant list
+/// - **no redirect following** (`Policy::none()`)
+///
+/// Redirects are intentionally disabled. A custom redirect-following policy that re-checks
+/// the grant list on each hop would still be vulnerable to SSRF via DNS rebinding on the
+/// redirect target (no async DNS pre-flight can run inside reqwest's synchronous redirect
+/// closure). Returning the 3xx response to the plugin is the safe choice: the plugin can
+/// inspect the `Location` header and issue a new `http-fetch` call, which goes through the
+/// full pipeline including DNS SSRF pre-flight.
 ///
 /// The client is built once per plugin instance and shared across calls (it holds a
 /// connection pool internally, which is safe to reuse from a single thread via `block_on`).
-pub(crate) fn build_client(limits: HttpLimits, grants: Vec<String>) -> Result<Client, String> {
-    // Clone grants into the redirect closure (which has a `'static` bound).
-    let redirect_grants = grants;
-    let redirect_policy = redirect::Policy::custom(move |attempt| {
-        // Re-check the redirected URL's hostname against the grant list on every hop.
-        let url = attempt.url();
-        let host = match url.host_str() {
-            Some(h) => h,
-            None => return attempt.error("redirect to URL with no host"),
-        };
-        if !hostname_allowed(host, &redirect_grants) {
-            return attempt.error("redirect target not in network grant");
-        }
-        // Default redirect handling for allowed hosts (up to 10 hops).
-        if attempt.previous().len() >= 10 {
-            return attempt.error("too many redirects");
-        }
-        attempt.follow()
-    });
-
+pub(crate) fn build_client(limits: HttpLimits) -> Result<Client, String> {
     Client::builder()
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(limits.connect_timeout_secs))
         .timeout(Duration::from_secs(limits.request_timeout_secs))
-        .redirect(redirect_policy)
-        // Never send credentials across origins automatically.
+        // Redirects are NOT followed; the plugin receives the 3xx and handles it explicitly.
+        // This prevents SSRF via redirect chaining (a server could redirect to a private IP).
+        .redirect(redirect::Policy::none())
+        // Disable connection-level debug output (reqwest/hyper verbose logging).
         .connection_verbose(false)
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))
@@ -275,7 +301,8 @@ pub(crate) async fn execute_fetch(
     let method = reqwest::Method::from_bytes(req.method.as_bytes())
         .map_err(|_| format!("invalid HTTP method: {}", req.method))?;
 
-    // Build request headers. Log names only; never log values for potentially-sensitive headers.
+    // Build request headers. Log the header name only; never log values — even for
+    // non-sensitive headers, values may contain credentials passed by the plugin guest.
     let mut headers = HeaderMap::new();
     for (name, value) in &req.headers {
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -284,9 +311,10 @@ pub(crate) async fn execute_fetch(
             HeaderValue::from_str(value).map_err(|_| format!("invalid header value for {name}"))?;
         let lower = name.to_ascii_lowercase();
         if REDACTED_REQUEST_HEADERS.contains(&lower.as_str()) {
-            debug!(target: "cairn_plugin::http_fetch", header = %name, "[redacted]");
+            debug!(target: "cairn_plugin::http_fetch", header = %name, value = "[redacted]");
         } else {
-            debug!(target: "cairn_plugin::http_fetch", header = %name, value = %value);
+            // Name only — no value, even for "non-sensitive" headers.
+            debug!(target: "cairn_plugin::http_fetch", header = %name);
         }
         headers.insert(header_name, header_value);
     }
@@ -304,25 +332,41 @@ pub(crate) async fn execute_fetch(
 
     let status = response.status().as_u16();
 
-    // Collect response headers, stripping `Set-Cookie`.
-    let resp_headers: Vec<(String, String)> = response
-        .headers()
-        .iter()
-        .filter(|(name, _)| !name.as_str().eq_ignore_ascii_case("set-cookie"))
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_owned(), v.to_owned()))
-        })
-        .collect();
+    // Collect response headers, stripping `Set-Cookie`, with count and size caps.
+    // An adversarial or compromised server could return thousands of large headers; we cap
+    // at `MAX_RESPONSE_HEADERS` entries and `MAX_HEADER_VALUE_BYTES` per value to bound
+    // host-process heap allocation independently of the body-size limit.
+    let mut resp_headers: Vec<(String, String)> = Vec::new();
+    let mut header_count = 0usize;
+    for (name, value) in response.headers() {
+        if name.as_str().eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        header_count += 1;
+        if header_count > MAX_RESPONSE_HEADERS {
+            return Err(format!(
+                "response exceeds the {MAX_RESPONSE_HEADERS}-header limit"
+            ));
+        }
+        if value.len() > MAX_HEADER_VALUE_BYTES {
+            return Err(format!(
+                "response header '{}' exceeds the {} byte value limit",
+                name.as_str(),
+                MAX_HEADER_VALUE_BYTES
+            ));
+        }
+        if let Ok(v) = value.to_str() {
+            resp_headers.push((name.as_str().to_owned(), v.to_owned()));
+        }
+    }
 
     // Stream the body with a size cap.
     use futures::StreamExt as _;
     let mut body_bytes: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("error reading response body: {e}"))?;
+        let chunk =
+            chunk.map_err(|e| format!("error reading response body: {}", redact_url_error(e)))?;
         if body_bytes.len() + chunk.len() > limits.max_response_bytes {
             return Err(format!(
                 "response body exceeds the {} byte limit",
@@ -378,9 +422,10 @@ pub(crate) async fn do_http_fetch(
     let url = validate_url(req, grants)?;
 
     let host = url.host_str().ok_or("URL has no host")?;
-    // Default to port 443 for HTTPS, 80 for HTTP (matches what browsers and reqwest do).
+    // `port_or_known_default` returns `None` only for unknown schemes; the scheme check above
+    // guarantees http/https, so `unwrap_or(80)` is unreachable dead-code safety net.
     let port = url.port_or_known_default().unwrap_or(80);
-    check_ssrf_via_dns(host, port).await?;
+    check_ssrf_via_dns(host, port, limits.connect_timeout_secs).await?;
 
     execute_fetch(req, url, client, limits).await
 }
@@ -566,6 +611,31 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_literal_loopback_is_rejected() {
+        // IPv6 loopback `::1` is represented in URLs as `[::1]`. The bracket form must be
+        // correctly parsed (stripping `[` and `]`) before the SSRF check runs.
+        let grants = vec!["[::1]".to_owned()]; // even if in grants — IP literal check runs
+        let req = make_req("http://[::1]/secret");
+        let err = validate_url(&req, &grants).unwrap_err();
+        assert!(
+            err.contains("SSRF") || err.contains("blocked"),
+            "IPv6 loopback must be SSRF-blocked, err = {err}"
+        );
+    }
+
+    #[test]
+    fn ipv6_ula_literal_is_rejected() {
+        // ULA prefix fc00::/7. Must be blocked even when grant list includes the address.
+        let grants = vec!["[fc00::1]".to_owned()];
+        let req = make_req("http://[fc00::1]/");
+        let err = validate_url(&req, &grants).unwrap_err();
+        assert!(
+            err.contains("SSRF") || err.contains("blocked"),
+            "IPv6 ULA must be SSRF-blocked, err = {err}"
+        );
+    }
+
+    #[test]
     fn non_http_scheme_is_rejected() {
         let grants = vec!["example.com".to_owned()];
         let req = make_req("ftp://example.com/file");
@@ -615,7 +685,7 @@ mod tests {
         let host = server.address().ip().to_string();
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits, grants.clone()).expect("client");
+        let client = build_client(limits).expect("client");
 
         let req = make_req(&format!("{base}/hello"));
         let resp = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
@@ -637,7 +707,7 @@ mod tests {
         let base = server.uri();
         let grants = vec!["api.allowed.example.com".to_owned()];
         let limits = HttpLimits::default();
-        let client = build_client(limits, grants.clone()).expect("client");
+        let client = build_client(limits).expect("client");
 
         let req = make_req(&format!("{base}/should-not-reach"));
         let err = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
@@ -679,7 +749,7 @@ mod tests {
             max_response_bytes: 1024,
             ..HttpLimits::default()
         };
-        let client = build_client(limits, grants.clone()).expect("client");
+        let client = build_client(limits).expect("client");
 
         let req = make_req(&format!("{base}/big"));
         let err = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
@@ -716,7 +786,7 @@ mod tests {
         let host = server.address().ip().to_string();
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits, grants.clone()).expect("client");
+        let client = build_client(limits).expect("client");
 
         let req = make_req(&format!("{base}/cookies"));
         let resp = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
@@ -760,7 +830,7 @@ mod tests {
         let host = server.address().ip().to_string();
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits, grants.clone()).expect("client");
+        let client = build_client(limits).expect("client");
 
         let req = HttpRequest {
             method: "POST".to_owned(),
@@ -775,9 +845,13 @@ mod tests {
         assert_eq!(resp.status, 201);
     }
 
-    /// Redirect to an unlisted external host is rejected by the redirect policy.
+    /// Redirects are not followed (Policy::none()); the 3xx response is returned to the plugin.
+    ///
+    /// The plugin is responsible for inspecting the `Location` header and issuing a new
+    /// `http-fetch` call, which will go through the full SSRF pre-flight pipeline. This prevents
+    /// redirect-chaining SSRF attacks where a server redirects to a private IP.
     #[tokio::test]
-    async fn redirect_to_disallowed_host_is_rejected() {
+    async fn redirect_is_returned_not_followed() {
         use wiremock::{
             matchers::{method, path},
             Mock, MockServer, ResponseTemplate,
@@ -795,21 +869,21 @@ mod tests {
 
         let base = server.uri();
         let host = server.address().ip().to_string();
-        // Only the wiremock host is granted; the redirect target is not.
         let grants = vec![host.clone()];
         let limits = HttpLimits::default();
-        let client = build_client(limits, grants.clone()).expect("client");
+        let client = build_client(limits).expect("client");
 
         let req = make_req(&format!("{base}/redir"));
-        let err = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
+        let resp = do_http_fetch_no_dns_ssrf(&req, &grants, &client, limits)
             .await
-            .unwrap_err();
+            .expect("302 returned as-is without following");
 
-        // reqwest's redirect policy fires; the exact error text depends on reqwest internals,
-        // but it will be one of these categories.
+        // The 302 status is returned to the plugin; the redirect target is NOT contacted.
+        assert_eq!(resp.status, 302, "must return 302 without following");
+        let has_location = resp.headers.iter().any(|(n, _)| n == "location");
         assert!(
-            err.contains("redirect") || err.contains("grant") || err.contains("request"),
-            "expected redirect-policy error, got: {err}"
+            has_location,
+            "Location header must be present in the 302 response"
         );
     }
 }

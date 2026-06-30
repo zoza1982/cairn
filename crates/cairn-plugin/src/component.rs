@@ -65,7 +65,8 @@ struct CompState {
     table: ResourceTable,
 
     // ── Capability grants (RFC-0010 §3/§4) ─────────────────────────────────────────────────
-    /// Lower-cased hostnames this plugin may reach via `host::http-fetch`. Empty → deny-stub.
+    /// Hostnames this plugin may reach via `host::http-fetch`. Compared case-insensitively
+    /// at call time; not normalized at storage time. Empty → deny-stub.
     network_grants: Vec<String>,
     /// Credential handle labels this plugin may use via `host::use-credential`. Empty → deny-stub.
     credential_grants: Vec<String>,
@@ -117,6 +118,8 @@ impl cairn::plugin::host::Host for CompState {
             let end = (0..=MAX_LOG)
                 .rev()
                 .find(|&i| msg.is_char_boundary(i))
+                // `unwrap_or(0)` is unreachable: the range `0..=MAX_LOG` always includes `0`,
+                // and `0` is always a UTF-8 char boundary, so `find` never returns `None`.
                 .unwrap_or(0);
             format!("{}…[truncated]", &msg[..end])
         } else {
@@ -311,7 +314,7 @@ impl PluginComponent {
             let h_limits = crate::http_fetch::HttpLimits::default();
             let handle = tokio::runtime::Handle::try_current().ok();
             let client = if !config.grants.network.is_empty() && handle.is_some() {
-                match crate::http_fetch::build_client(h_limits, config.grants.network.clone()) {
+                match crate::http_fetch::build_client(h_limits) {
                     Ok(c) => Some(Arc::new(c)),
                     Err(e) => {
                         // Log and degrade gracefully — plugin instantiates but http-fetch will
@@ -373,7 +376,15 @@ impl PluginComponent {
     /// The epoch deadline only bites while an [`EpochTicker`](crate::EpochTicker) advances the
     /// engine's epoch.
     pub(crate) fn arm(&mut self, limits: Limits) {
-        let _ = self.store.set_fuel(limits.fuel);
+        // `set_fuel` fails only when fuel metering is disabled on the engine. `engine_config`
+        // enables it unconditionally, so this should never fire. Log a warning rather than
+        // silently discarding the error — a misconfigured engine is a programming error.
+        if let Err(e) = self.store.set_fuel(limits.fuel) {
+            tracing::warn!(
+                target: "cairn_plugin",
+                "arm: set_fuel failed (engine misconfiguration?): {e}"
+            );
+        }
         // `.max(1)`: a 0-tick deadline would trap the very next op (deadline == current epoch).
         self.store.set_epoch_deadline(limits.max_call_ticks.max(1));
     }
