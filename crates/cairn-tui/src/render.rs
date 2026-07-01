@@ -165,6 +165,23 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
         Overlay::VaultUnlock { input, error, .. } => {
             render_vault_unlock(frame, input, error.as_deref(), state.vault_unlocking)
         }
+        Overlay::VaultCreate {
+            passphrase,
+            confirm,
+            focus,
+            remember,
+            error,
+            creating,
+            ..
+        } => render_vault_create(
+            frame,
+            passphrase,
+            confirm,
+            *focus,
+            *remember,
+            error.as_deref(),
+            *creating,
+        ),
         Overlay::LogViewer {
             title,
             lines,
@@ -267,6 +284,110 @@ fn render_vault_unlock(frame: &mut Frame, input: &MaskedInput, error: Option<&st
         .block(block)
         .alignment(Alignment::Center);
     frame.render_widget(body, area);
+}
+
+/// Draw the vault-create overlay: two masked passphrase fields, a "remember" toggle, a status/error
+/// line, and the action hints.
+///
+/// **Security invariants:** only the *count* of typed characters is exposed (as `•` bullets) —
+/// the actual bytes are never rendered. The `MaskedInput` API provides only `len()` for this.
+fn render_vault_create(
+    frame: &mut Frame,
+    passphrase: &MaskedInput,
+    confirm: &MaskedInput,
+    focus: u8,
+    remember: bool,
+    error: Option<&str>,
+    creating: bool,
+) {
+    // 11 rows: 2 borders + passphrase label + passphrase field + blank + confirm label +
+    // confirm field + blank + remember toggle + error/status + hint.
+    let area = centered(frame.area(), 54, 11);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Create vault ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Layout: 10 content rows inside the border.
+    let [pp_label, pp_field, blank1, cf_label, cf_field, blank2, remember_row, status_row, hint_row] =
+        Layout::vertical([
+            Constraint::Length(1), // "New passphrase:"
+            Constraint::Length(1), // bullets + cursor
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // "Confirm passphrase:"
+            Constraint::Length(1), // bullets + cursor
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // "[Ctrl-R] Remember: Yes/No"
+            Constraint::Length(1), // error or "Creating…"
+            Constraint::Length(1), // hint
+        ])
+        .areas(inner);
+
+    let pp_style = if focus == 0 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let cf_style = if focus == 1 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+
+    frame.render_widget(Paragraph::new("New passphrase:").style(pp_style), pp_label);
+    let pp_bullets = "\u{2022}".repeat(passphrase.len());
+    // Append the block cursor only to the focused field.
+    let pp_cursor = if focus == 0 { "\u{258f}" } else { "" };
+    frame.render_widget(
+        Paragraph::new(format!("{pp_bullets}{pp_cursor}")).style(pp_style),
+        pp_field,
+    );
+    frame.render_widget(Paragraph::new(""), blank1);
+    frame.render_widget(
+        Paragraph::new("Confirm passphrase:").style(cf_style),
+        cf_label,
+    );
+    let cf_bullets = "\u{2022}".repeat(confirm.len());
+    let cf_cursor = if focus == 1 { "\u{258f}" } else { "" };
+    frame.render_widget(
+        Paragraph::new(format!("{cf_bullets}{cf_cursor}")).style(cf_style),
+        cf_field,
+    );
+    frame.render_widget(Paragraph::new(""), blank2);
+
+    let remember_text = if remember { "Yes (keychain)" } else { "No" };
+    frame.render_widget(
+        Paragraph::new(format!("[Ctrl-R] Remember: {remember_text}"))
+            .style(Style::default().fg(Color::DarkGray)),
+        remember_row,
+    );
+
+    // Status/error row: "Creating…" while Argon2id runs; a red error if the last submit failed.
+    if creating {
+        frame.render_widget(
+            Paragraph::new("Creating…").style(Style::default().fg(Color::Yellow)),
+            status_row,
+        );
+    } else if let Some(err) = error {
+        frame.render_widget(
+            Paragraph::new(err.to_owned()).style(Style::default().fg(Color::Red)),
+            status_row,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("Passphrase must be ≥ 8 chars (12+ recommended)")
+                .style(Style::default().fg(Color::DarkGray)),
+            status_row,
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new("[Tab] Next field    [Enter] Create    [Esc] Cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        hint_row,
+    );
 }
 
 /// Top-level dispatcher for the connection form overlay (add/edit).

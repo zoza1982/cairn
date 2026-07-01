@@ -20,4 +20,4 @@ pub use state::{
     ShellActionMeta, Side, SortMode, TransferId, LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES,
     SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
-pub use update::{initial_effects, update};
+pub use update::{initial_effects, update, VAULT_PASSPHRASE_MIN_LEN};

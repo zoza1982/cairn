@@ -96,6 +96,12 @@ pub enum Action {
     /// Delete the selected connection profile. Only meaningful inside the connection switcher;
     /// ignored elsewhere. Requires confirmation via the connection switcher's selection.
     DeleteConnection,
+    /// Toggle the "remember passphrase on this device" checkbox inside [`crate::Overlay::VaultCreate`].
+    ///
+    /// Emitted by the input router when `Ctrl-R` is pressed while the `VaultCreate` overlay is
+    /// active (bypassing the normal text-routing path so the key is not inserted into the
+    /// passphrase field). Silently ignored everywhere else.
+    ToggleRemember,
 }
 
 /// A message into the reducer.
@@ -308,6 +314,20 @@ pub enum AppEvent {
     ConnectionOpFailed {
         /// Secret-free error message to display in the status line.
         message: String,
+    },
+    /// The [`AppEffect::CreateVault`] task completed.
+    ///
+    /// On success: the new vault is installed in the broker; the reducer closes the overlay, sets
+    /// `vault_unlocked` and `vault_file_exists`, flips every
+    /// [`NeedsVault`](crate::ChoiceStatus::NeedsVault) entry to
+    /// [`NeedsOpen`](crate::ChoiceStatus::NeedsOpen), and auto-opens the connection that triggered
+    /// the create (when `pending_conn` was set in the overlay).
+    ///
+    /// On failure: the overlay stays open with the inline error (the message is secret-free and
+    /// value-free — only a category is shown, never a path or passphrase fragment).
+    VaultCreated {
+        /// `Ok(())` on success; `Err(message)` with a secret-free, value-free error.
+        result: Result<(), String>,
     },
 }
 
@@ -524,5 +544,21 @@ pub enum AppEffect {
     DeleteConnection {
         /// The profile to remove.
         id: uuid::Uuid,
+    },
+    /// Create a new vault at the configured path (first-run setup). Argon2id key derivation is
+    /// CPU-bound; the effect runner executes this under `spawn_blocking` to keep the render path
+    /// responsive. The passphrase is consumed within the blocking task and zeroized on drop; it
+    /// is never logged, never printed via `Debug`, and never passed to `cairn-ai`/`cairn-plugin`.
+    ///
+    /// On success: the new vault is installed into the broker and
+    /// [`AppEvent::VaultCreated { Ok(()) }`](AppEvent::VaultCreated) is returned.
+    /// On failure (I/O error, already-exists, etc.): a redacted, value-free
+    /// [`AppEvent::VaultCreated { Err(…) }`](AppEvent::VaultCreated) keeps the overlay open.
+    CreateVault {
+        /// The new vault passphrase (zeroized on drop; Debug is redacted via [`SecretString`]).
+        passphrase: SecretString,
+        /// Whether to persist the passphrase in the OS keychain after successful creation.
+        /// Honoured only when the `keychain` feature is enabled; otherwise silently ignored.
+        remember: bool,
     },
 }

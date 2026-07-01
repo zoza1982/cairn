@@ -490,6 +490,37 @@ pub enum Overlay {
         /// Session id — state lives in [`AppState::sessions`].
         id: SessionId,
     },
+    /// Create a new vault (first-run setup).
+    ///
+    /// Presents two masked passphrase fields (`passphrase` + `confirm`), an OS-keychain
+    /// "remember" toggle, and an inline error. The raw passphrase bytes live only in the two
+    /// [`MaskedInput`] buffers — redacted in `Debug`, zeroized on drop — until
+    /// [`AppEffect::CreateVault`](crate::AppEffect::CreateVault) carries the taken secret to
+    /// the effect runner. The confirm field is zeroized immediately after the comparison.
+    ///
+    /// `capturing_text()` returns `true` while this overlay is open, routing keystrokes to
+    /// whichever field has `focus`. `creating` suppresses duplicate submissions while the
+    /// Argon2id `spawn_blocking` task is running.
+    ///
+    /// `pending_conn` carries the connection that triggered this overlay via a
+    /// [`NeedsVault`](ChoiceStatus::NeedsVault) selection, so it can be auto-opened after
+    /// the vault is created and unlocked. `None` when the user pressed `Ctrl-U` explicitly.
+    VaultCreate {
+        /// The new passphrase being typed (focus 0).
+        passphrase: MaskedInput,
+        /// The passphrase confirmation to match (focus 1). Zeroized after the comparison.
+        confirm: MaskedInput,
+        /// Which field has input focus: 0 = passphrase field, 1 = confirm field.
+        focus: u8,
+        /// Whether to store the passphrase in the OS keychain after successful vault creation.
+        remember: bool,
+        /// In-place validation error (mismatch, too-short, etc.). Cleared on each new `Insert`.
+        error: Option<String>,
+        /// Set while the Argon2id `spawn_blocking` task is running; suppresses double-submit.
+        creating: bool,
+        /// The connection that triggered this overlay (auto-opened after vault creation).
+        pending_conn: Option<ConnectionId>,
+    },
     /// Confirm deletion of a saved connection profile. The user sees the profile name and must
     /// press `[Enter]` to confirm or `[Esc]`/`[q]` to cancel. Destructive: removes the entry from
     /// the config file.
@@ -723,6 +754,12 @@ pub struct AppState {
     /// switcher (vault is locked, credentials unavailable). Drives the startup status hint that
     /// points the user at the unlock flow; cleared once the vault is unlocked.
     pub has_locked_connections: bool,
+    /// Whether the vault file already exists on disk. Set at startup by the runtime (a single
+    /// blocking `Path::exists()` call before the event loop starts) and flipped to `true` on a
+    /// successful [`AppEvent::VaultCreated`](crate::AppEvent::VaultCreated). The reducer uses
+    /// this to branch `Ctrl-U` and `NeedsVault` selections between the create and unlock flows
+    /// without ever doing I/O in the pure update function.
+    pub vault_file_exists: bool,
     /// Per-side slot tracking which connection is awaiting an async open (Phase P2).
     ///
     /// Indexed by [`Side::index()`] — `[Left, Right]`. Set when the user selects a
@@ -861,6 +898,7 @@ impl AppState {
             vault_unlocked: false,
             vault_unlocking: false,
             has_locked_connections: false,
+            vault_file_exists: false,
             pending_conn_open: [None; 2],
             next_log_viewer_id: 1,
             sessions: HashMap::new(),
@@ -906,9 +944,15 @@ impl AppState {
     #[must_use]
     pub fn capturing_text(&self) -> bool {
         match &self.overlay {
-            // Both the text prompt and the vault-unlock field capture keystrokes as `Msg::Text`.
+            // Text prompts, vault unlock/create fields, and exec panes capture keystrokes as
+            // `Msg::Text`. VaultCreate always captures: both passphrase and confirm are text
+            // fields, and `Ctrl-R` is the only bypass (routed to `Action::ToggleRemember` in
+            // `map_input` before `capturing_text()` is consulted).
             Some(
-                Overlay::Prompt { .. } | Overlay::VaultUnlock { .. } | Overlay::ExecPane { .. },
+                Overlay::Prompt { .. }
+                | Overlay::VaultUnlock { .. }
+                | Overlay::VaultCreate { .. }
+                | Overlay::ExecPane { .. },
             ) => true,
             // The connection form captures text only while the user is filling in fields.
             Some(Overlay::ConnectionForm {

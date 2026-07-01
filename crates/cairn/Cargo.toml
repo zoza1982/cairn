@@ -33,6 +33,10 @@ azure = ["dep:cairn-backend-object", "cairn-backend-object/azure"]
 # Docker/K8s connect without a vault credential (local socket / kubeconfig).
 docker = ["dep:cairn-backend-docker", "cairn-backend-docker/docker"]
 k8s = ["dep:cairn-backend-k8s", "cairn-backend-k8s/k8s"]
+# OS keychain: store the vault passphrase in the system credential manager so the user isn't
+# prompted on every launch. Off by default so the lean build avoids platform secret-store deps
+# (security-keyring on Linux, Security framework on macOS, Windows Credential Manager).
+keychain = ["cairn-vault/keychain"]
 # Convenience umbrellas.
 cloud = ["s3", "gcs", "azure"]
 containers = ["docker", "k8s"]
