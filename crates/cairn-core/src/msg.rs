@@ -1,6 +1,6 @@
 //! Messages, events, and effects — the three families of the TEA loop.
 
-use crate::state::{ConnectionChoice, LogViewerId, Side, TransferId};
+use crate::state::{LogViewerId, Side, TransferId};
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
 use cairn_types::{ConnectionId, SessionId, VfsPath};
@@ -195,12 +195,20 @@ pub enum AppEvent {
         /// Whether it ended in failure (non-zero exit, timeout, or refusal).
         error: bool,
     },
-    /// The vault-unlock effect finished. On success: the connections opened from the previously
-    /// deferred credential-bearing profiles (to add to the switcher) — possibly empty. On failure: a
-    /// secret-free, retryable message (wrong passphrase / missing vault) shown in the overlay.
+    /// The vault-unlock effect finished. On success the vault is now unlocked and the reducer flips
+    /// all [`NeedsVault`](crate::ChoiceStatus::NeedsVault) entries to
+    /// [`NeedsOpen`](crate::ChoiceStatus::NeedsOpen) in the switcher; the connection that triggered
+    /// the unlock (held in the `pending_conn` field of `Overlay::VaultUnlock`) is then auto-opened via
+    /// [`AppEffect::OpenConnection`]. On failure: a secret-free, retryable message is shown in the
+    /// overlay.
+    ///
+    /// **P2 behavioural change from P1:** previously this event carried `Ok(Vec<ConnectionChoice>)`
+    /// and the reducer extended the switcher with the newly-opened connections. In P2, connections
+    /// are already in the switcher as `NeedsVault` at enumeration time; the unlock simply makes
+    /// them openable, so the payload is now `Ok(())`.
     VaultUnlocked {
-        /// `Ok(opened)` with the newly opened connections, or `Err(message)` to keep the overlay open.
-        result: Result<Vec<ConnectionChoice>, String>,
+        /// `Ok(())` on success, or `Err(message)` to keep the overlay open with a retryable error.
+        result: Result<(), String>,
     },
     /// A decoded chunk of log text from a streaming log-viewer session.
     LogChunk {
@@ -233,6 +241,20 @@ pub enum AppEvent {
         exit_code: Option<i32>,
         /// A redacted (secret-free) error message; `None` on clean exit.
         error: Option<String>,
+    },
+    /// The async connection-open attempt (emitted by [`AppEffect::OpenConnection`]) has completed.
+    ///
+    /// On success the backend is now in the [`VfsRegistry`](cairn_vfs::VfsRegistry) and the
+    /// reducer flips the choice's status to [`Ready`](crate::ChoiceStatus::Ready) and navigates
+    /// the requesting pane into it. On failure the status is set to
+    /// [`Unreachable`](crate::ChoiceStatus::Unreachable) and a redacted error appears in the
+    /// status line.
+    ConnectionOpened {
+        /// Which connection was opened (or attempted).
+        conn: ConnectionId,
+        /// `Ok(())` on success. `Err(message)` on failure — the message is already redacted and
+        /// never carries host names, paths, or credential material.
+        result: Result<(), String>,
     },
     /// A port-forward session has bound its local TCP port and is ready to accept connections.
     ///
@@ -411,6 +433,21 @@ pub enum AppEffect {
         id: SessionId,
         /// The bytes to send (e.g. a line plus `\n`, or `\x04` for Ctrl-D).
         bytes: Vec<u8>,
+    },
+    /// Open a connection that is not yet mounted in the [`VfsRegistry`](cairn_vfs::VfsRegistry).
+    ///
+    /// Emitted by the reducer when the user selects a
+    /// [`NeedsOpen`](crate::ChoiceStatus::NeedsOpen) entry from the connection switcher, or
+    /// automatically after a successful vault unlock for the connection that triggered it. The
+    /// runtime looks up the connection descriptor by id in the descriptor side-map, calls the
+    /// opener, registers the result, and reports back via
+    /// [`AppEvent::ConnectionOpened`].
+    ///
+    /// The runtime guards against double-open: if the connection is already in the registry the
+    /// effect is a no-op that immediately sends `ConnectionOpened { Ok(()) }`.
+    OpenConnection {
+        /// The connection to open.
+        conn: ConnectionId,
     },
     /// Drop the stdin sender for an exec session, signalling EOF to the remote process without
     /// cancelling the session. The overlay stays open to show remaining output; `SessionEnded`

@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC-0011 Phase P2 — lazy, on-select connection opening** (RFC-0011 §2, ADR-0007): remote and
+  credential-bearing connection profiles are no longer opened at startup. They appear in the
+  connection switcher immediately as `NeedsOpen` (credential-free remote) or `NeedsVault`
+  (vault-locked credential), and are opened asynchronously on the first user selection via the new
+  `AppEffect::OpenConnection` / `AppEvent::ConnectionOpened` TEA round-trip. `LocalRoot` targets
+  (built-in roots + `scheme = "local"` profiles) continue to mount eagerly, preserving zero-latency
+  local navigation. Vault-unlock reconciliation: all `NeedsVault` entries flip to `NeedsOpen` on
+  unlock; only the connection that triggered the unlock overlay is auto-opened. Stable id reuse:
+  `ConnectionCoordinator::run` accepts a `prior_descriptors` map so re-enumeration (P3 config
+  reload) preserves live `ConnectionId`s, preventing pane repointing. `DeferredConnection` and
+  `VaultContext::deferred` are retired (always empty in P2). `run_vault_unlock_effect` now returns
+  `Result<(), String>` — no connections are opened at unlock time.
+
 - **RFC-0011 Phase P1 — connection provider/coordinator abstraction** (RFC-0011 §1–§2): replaces
   the imperative body of `register_connections` with a `ConnectionCoordinator` backed by
   `BuiltinLocalProvider` and `SavedProfileProvider`. Observable behavior is identical — same
