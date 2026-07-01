@@ -3,8 +3,8 @@
 use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{
-    AppState, Listing, LogViewerStatus, MaskedInput, Overlay, PaneState, PromptKind, SessionEnd,
-    SessionRecord, Side,
+    AppState, ChoiceProvenance, Listing, LogViewerStatus, MaskedInput, Overlay, PaneState,
+    PromptKind, SessionEnd, SessionRecord, Side,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -42,7 +42,17 @@ fn render_connections(
         .border_style(Style::default().fg(Color::Cyan));
     let items: Vec<ListItem> = connections
         .iter()
-        .map(|c| ListItem::new(c.label.clone()))
+        .map(|c| {
+            // P3: auto-discovered entries get an [auto] provenance badge and a dimmed style so
+            // users understand they come from the environment and cannot be edited in the config.
+            match &c.provenance {
+                ChoiceProvenance::Discovered { .. } => {
+                    let label = format!("[auto] {}", c.label);
+                    ListItem::new(label).style(Style::default().add_modifier(Modifier::DIM))
+                }
+                _ => ListItem::new(c.label.clone()),
+            }
+        })
         .collect();
     let list = List::new(items)
         .block(block)

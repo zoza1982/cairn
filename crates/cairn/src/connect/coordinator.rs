@@ -38,6 +38,10 @@ use cairn_vfs::VfsRegistry;
 use super::descriptor::{
     ConnectionDescriptor, ConnectionKey, DescriptorProvenance, OpenTarget, Reachability,
 };
+#[cfg(feature = "docker")]
+use super::provider::DockerProvider;
+#[cfg(feature = "k8s")]
+use super::provider::KubeconfigProvider;
 use super::provider::{
     BuiltinLocalProvider, ConnectionProvider, DiscoveryCtx, SavedProfileProvider,
 };
@@ -116,14 +120,50 @@ impl ConnectionCoordinator {
             prior_descriptors.keys().copied().collect();
 
         // ── Enumerate providers ───────────────────────────────────────────────────────────────
-        // P1 runs providers sequentially because they are fast, offline, and synchronous.
-        // P3 MUST switch to `FuturesUnordered` + per-provider timeout so that a hung Docker
-        // socket or a slow kubeconfig credential plugin cannot block startup enumeration
-        // (RFC-0011 §2: "concurrently and time-bounded").
-        let providers: &[&dyn ConnectionProvider] = &[&BuiltinLocalProvider, &SavedProfileProvider];
-        let mut raw: Vec<ConnectionDescriptor> = Vec::new();
-        for provider in providers {
-            raw.extend(provider.discover(ctx).await);
+        // P3: providers run concurrently via `join_all` so that a slow socket probe or a large
+        // kubeconfig does not delay the startup path for the other providers (RFC-0011 §2:
+        // "concurrently and time-bounded"). Per-socket timeouts are enforced inside each P3
+        // provider; P1 providers (builtin, saved) complete synchronously in microseconds.
+        // Build the provider list. `list` is `mut` so cfg-gated providers can be pushed; the
+        // `#[allow(unused_mut)]` suppresses the lint in lean builds where no pushes happen.
+        let provider_list: Vec<Box<dyn ConnectionProvider>> = {
+            #[allow(unused_mut)]
+            let mut list: Vec<Box<dyn ConnectionProvider>> = vec![
+                Box::new(BuiltinLocalProvider),
+                Box::new(SavedProfileProvider),
+            ];
+            #[cfg(feature = "docker")]
+            list.push(Box::new(DockerProvider));
+            #[cfg(feature = "k8s")]
+            list.push(Box::new(KubeconfigProvider));
+            list
+        };
+
+        // Run all providers concurrently and flatten the results into a single descriptor list.
+        let discover_results =
+            futures::future::join_all(provider_list.iter().map(|p| p.discover(ctx))).await;
+        let mut raw: Vec<ConnectionDescriptor> = discover_results.into_iter().flatten().collect();
+
+        // ── Apply hidden overlay ──────────────────────────────────────────────────────────────
+        // Drop any descriptor whose stable key appears in `config.discovery.hidden`. Applied
+        // before pinned so a hidden+pinned entry is simply absent (hidden wins).
+        if !ctx.config.discovery.hidden.is_empty() {
+            raw.retain(|d| !ctx.config.discovery.hidden.contains(&d.key.as_key_str()));
+        }
+
+        // ── Apply pinned overlay ──────────────────────────────────────────────────────────────
+        // Entries in `config.discovery.pinned` float to the front of the list, in stated order.
+        // A key listed in `pinned` but not present in the discovered set is silently ignored.
+        if !ctx.config.discovery.pinned.is_empty() {
+            let mut pinned_descs: Vec<ConnectionDescriptor> = Vec::new();
+            for pinned_key in &ctx.config.discovery.pinned {
+                if let Some(pos) = raw.iter().position(|d| d.key.as_key_str() == *pinned_key) {
+                    pinned_descs.push(raw.remove(pos));
+                }
+            }
+            let mut ordered = pinned_descs;
+            ordered.extend(raw);
+            raw = ordered;
         }
 
         // Providers must not emit duplicate keys — a duplicate would cause the key→id map to
@@ -208,6 +248,23 @@ impl ConnectionCoordinator {
                         label: desc.display_name.clone(),
                         provenance,
                         status: ChoiceStatus::NeedsVault,
+                        kind,
+                    });
+                }
+                // ── P3 discovered targets: always lazy-open on selection ─────────────────────
+                // Docker sockets and Kubernetes clusters never require vault credentials; they
+                // are presented as NeedsOpen regardless of vault state. The effect runner opens
+                // them on first selection. `NeedsVault` reachability would be a provider
+                // invariant violation for these targets, but is handled defensively here.
+                (_, OpenTarget::DockerSocket { .. })
+                | (_, OpenTarget::KubeconfigDefault)
+                | (_, OpenTarget::InCluster) => {
+                    let (provenance, kind) = core_projection(&desc.provenance);
+                    choices.push(ConnectionChoice {
+                        conn: id,
+                        label: desc.display_name.clone(),
+                        provenance,
+                        status: ChoiceStatus::NeedsOpen,
                         kind,
                     });
                 }
@@ -574,6 +631,117 @@ mod tests {
         assert!(
             matches!(kind, ConnectionKind::AutoDiscovered),
             "Discovered descriptor must have AutoDiscovered kind"
+        );
+    }
+
+    // ── P3: hidden overlay ───────────────────────────────────────────────────────────────────
+
+    /// Entries whose key string appears in `config.discovery.hidden` must be absent from choices.
+    #[tokio::test]
+    async fn hidden_overlay_removes_matching_keys() {
+        let (coordinator, registry) = make_coordinator();
+
+        // Find the key string for the filesystem root so we can hide it.
+        let mut config = Config::default();
+        let root_key = {
+            let (choices_pre, _, _) = coordinator
+                .run(&registry, &ctx(&config), &HashMap::new())
+                .await;
+            choices_pre
+                .iter()
+                .find(|c| c.label == "local: /")
+                .expect("root must be present in the pre-hide run")
+                .label // used below only as an existence check; key comes from descriptor
+                // trick: use the first coordinator run to confirm the key, then check absence
+                .clone()
+        };
+        // Confirm we found it.
+        assert_eq!(root_key, "local: /");
+
+        // Enumerate once (clean slate) and look up the actual key string from the descriptor map.
+        let (_, _, descriptors) = coordinator
+            .run(&registry, &ctx(&config), &HashMap::new())
+            .await;
+        let root_descriptor = descriptors
+            .values()
+            .find(|d| matches!(&d.key, ConnectionKey::Builtin(p) if p == &std::path::PathBuf::from("/")))
+            .expect("root descriptor must be present");
+        let root_key_str = root_descriptor.key.as_key_str();
+
+        // Hide the root.
+        config.discovery.hidden = vec![root_key_str.clone()];
+        let (choices_hidden, _, _) = coordinator
+            .run(&registry, &ctx(&config), &HashMap::new())
+            .await;
+
+        assert!(
+            !choices_hidden.iter().any(|c| c.label == "local: /"),
+            "hidden root must not appear in choices; hidden key: {root_key_str}"
+        );
+    }
+
+    /// A key listed in `pinned` must float to the front of the choice list.
+    #[tokio::test]
+    async fn pinned_overlay_floats_entry_to_front() {
+        let (coordinator, registry) = make_coordinator();
+
+        // Add a credential-free saved profile so it appears as NeedsOpen (no vault dependency).
+        let saved_id = Uuid::nil(); // stable, predictable UUID for test
+        let mut config = Config {
+            connections: vec![ConnectionProfile {
+                id: saved_id,
+                display_name: "my-server".to_owned(),
+                scheme: "sftp".to_owned(),
+                endpoint: std::collections::BTreeMap::new(),
+                secret_ref: None,
+            }],
+            ..Config::default()
+        };
+
+        // First run without pinning: saved profile appears after builtins.
+        let (choices_before, _, _) = coordinator
+            .run(&registry, &ctx(&config), &HashMap::new())
+            .await;
+        let saved_pos_before = choices_before
+            .iter()
+            .position(|c| c.label == "sftp: my-server")
+            .expect("saved profile must appear in pre-pin run");
+        assert!(
+            saved_pos_before > 0,
+            "without pinning, saved profile must follow the builtin roots"
+        );
+
+        // Now pin the saved profile by its key string.
+        let saved_key_str = format!("saved:{saved_id}");
+        config.discovery.pinned = vec![saved_key_str];
+
+        let (choices_pinned, _, _) = coordinator
+            .run(&registry, &ctx(&config), &HashMap::new())
+            .await;
+        let saved_pos_pinned = choices_pinned
+            .iter()
+            .position(|c| c.label == "sftp: my-server")
+            .expect("saved profile must still appear after pinning");
+        assert_eq!(
+            saved_pos_pinned, 0,
+            "pinned entry must be the very first choice"
+        );
+    }
+
+    /// A key listed in `pinned` that does not exist in the discovered set is silently ignored.
+    #[tokio::test]
+    async fn pinned_nonexistent_key_is_silently_ignored() {
+        let (coordinator, registry) = make_coordinator();
+        let mut config = Config::default();
+        config.discovery.pinned = vec!["kube:kubeconfig".to_owned()]; // k8s not built in lean
+
+        // Must not panic or error; just produce the normal builtin-only list.
+        let (choices, _, _) = coordinator
+            .run(&registry, &ctx(&config), &HashMap::new())
+            .await;
+        assert!(
+            !choices.is_empty(),
+            "builtin roots must still appear even if pinned key is absent"
         );
     }
 }

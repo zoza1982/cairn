@@ -187,27 +187,52 @@ impl ExecOutput {
 
 /// A [`KubeOps`] implementation backed by a live Kubernetes cluster via `kube-rs`.
 ///
-/// Uses the kubeconfig found at `$KUBECONFIG` or `~/.kube/config`. Builds a fresh
-/// `kube::Client` per operation call, scoped to the requested context. Credentials are handled
-/// entirely by `kube-rs` (exec plugins, OIDC refresh, service-account tokens, client certs); no
-/// credential material is ever embedded in error messages.
+/// Supports two connection modes:
 ///
-/// In-container filesystem access uses tar-over-exec; see the module-level documentation for the
-/// command strategy and error semantics.
-pub struct KubeRsOps;
+/// - **Kubeconfig mode** (`use_incluster = false`, the default): reads the merged kubeconfig from
+///   `$KUBECONFIG` or `~/.kube/config` and builds a per-call `kube::Client` scoped to the
+///   requested context. Credentials are handled entirely by `kube-rs` (exec plugins, OIDC
+///   refresh, client certs); no credential material is ever embedded in error messages.
+///
+/// - **In-cluster mode** (`use_incluster = true`, constructed via [`new_incluster`]): uses the
+///   pod's mounted service-account token and the `KUBERNETES_SERVICE_HOST` / `_PORT` env vars
+///   to build a `kube::Client` for the local cluster. Context is ignored (there is only one).
+///   Use this when Cairn is running *inside* a Kubernetes pod.
+///
+/// In-container filesystem access uses tar-over-exec; see the module-level documentation for
+/// the command strategy and error semantics.
+pub struct KubeRsOps {
+    use_incluster: bool,
+}
 
 impl KubeRsOps {
-    /// Create a new adapter. The kubeconfig is located at call-time via `$KUBECONFIG` or
-    /// `~/.kube/config`; no I/O happens at construction. (A future milestone may add an optional
-    /// explicit kubeconfig path or a per-context client cache.)
+    /// Create a kubeconfig-mode adapter. The kubeconfig is resolved at call-time via
+    /// `$KUBECONFIG` or `~/.kube/config`; no I/O happens at construction.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            use_incluster: false,
+        }
     }
 
-    /// Build a `kube::Client` scoped to the given context name.
+    /// Create an in-cluster adapter that uses the pod's service-account token.
+    ///
+    /// The adapter reads `KUBERNETES_SERVICE_HOST` and the mounted SA token at client-build time.
+    /// Construction itself is infallible; the error surfaces on the first API call.
+    #[must_use]
+    pub fn new_incluster() -> Self {
+        Self {
+            use_incluster: true,
+        }
+    }
+
+    /// Build a `kube::Client` for the given context name, respecting the connection mode.
     async fn client_for(&self, ctx: &str) -> Result<Client, VfsError> {
-        build_client_for(ctx.to_owned()).await
+        if self.use_incluster {
+            build_incluster_client().await
+        } else {
+            build_client_for(ctx.to_owned()).await
+        }
     }
 
     /// Execute `command` in `container` inside `pod`/`ns`/`ctx` and collect stdout, stderr, and
@@ -303,6 +328,21 @@ impl Default for KubeRsOps {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// In-cluster client builder (free function)
+// ---------------------------------------------------------------------------
+
+/// Build a `kube::Client` using the pod's mounted service-account token and environment.
+///
+/// Reads `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the SA token from the
+/// standard volume mount path. Returns [`VfsError::Connection`] when not running in a pod
+/// (env vars unset or token missing).
+async fn build_incluster_client() -> Result<Client, VfsError> {
+    ensure_crypto_provider();
+    let config = kube::Config::incluster().map_err(|e| VfsError::Connection(Box::new(e)))?;
+    Client::try_from(config).map_err(|e| VfsError::Connection(Box::new(e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +459,15 @@ fn map_phase(phase: Option<&str>) -> PodPhase {
 #[async_trait]
 impl KubeOps for KubeRsOps {
     async fn list_contexts(&self) -> Result<Vec<ContextInfo>, VfsError> {
-        // Parse the kubeconfig from $KUBECONFIG / ~/.kube/config. No cluster call needed.
+        // In-cluster mode: there is exactly one implicit context — the pod's own cluster.
+        if self.use_incluster {
+            return Ok(vec![ContextInfo {
+                name: "in-cluster".to_owned(),
+                server: String::new(), // server is resolved from env at client-build time
+            }]);
+        }
+
+        // Kubeconfig mode: parse the merged kubeconfig without making any network calls.
         // `Kubeconfig::read` is blocking file I/O, so run it off the async worker thread.
         let kubeconfig = tokio::task::spawn_blocking(Kubeconfig::read)
             .await

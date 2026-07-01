@@ -1145,11 +1145,13 @@ async fn run_vault_unlock_effect(
     Ok(())
 }
 
-/// Open a connection on demand (P2 lazy open) and insert it into the registry.
+/// Open a connection on demand (P2/P3 lazy open) and insert it into the registry.
 ///
 /// Called from the [`AppEffect::OpenConnection`] handler in [`dispatch`]. For `LocalRoot` targets
-/// the VFS is constructed directly; for `Profile` targets the broker-backed opener is used. Errors
-/// are returned as a secret-free string for the reducer to display in the status line.
+/// the VFS is constructed directly; for `Profile` targets the broker-backed opener is used; for
+/// the P3 discovered targets (`DockerSocket`, `KubeconfigDefault`, `InCluster`) the relevant
+/// backend constructors are used — feature-gated so the lean build falls back to a clear error.
+/// Errors are returned as a secret-free string for the reducer to display in the status line.
 async fn run_open_connection_effect(
     registry: &VfsRegistry,
     opener: &crate::connect::ConnectionOpener,
@@ -1187,7 +1189,74 @@ async fn run_open_connection_effect(
                 }
             }
         }
+        // ── P3 discovered targets ──────────────────────────────────────────────────────────
+        OpenTarget::DockerSocket { path } => open_docker_socket(registry, conn, path).await,
+        OpenTarget::KubeconfigDefault => open_kubeconfig(registry, conn).await,
+        OpenTarget::InCluster => open_incluster(registry, conn).await,
     }
+}
+
+/// Open a Docker VFS backed by the socket at `path` (or the platform default when `None`).
+///
+/// Feature-gated: the `docker` feature must be enabled. In lean builds this always returns an
+/// error — the coordinator never routes a `DockerSocket` target to this function in lean mode
+/// (the `DockerProvider` is absent), but the compiler still requires the arm to be present for
+/// match exhaustiveness.
+#[cfg(feature = "docker")]
+async fn open_docker_socket(
+    registry: &VfsRegistry,
+    conn: ConnectionId,
+    path: &Option<std::path::PathBuf>,
+) -> Result<(), String> {
+    let ops = match path.as_deref() {
+        Some(p) => cairn_backend_docker::BollardDocker::connect_with_socket(p),
+        None => cairn_backend_docker::BollardDocker::connect_local(),
+    }
+    .map_err(|e| format!("docker: {e}"))?;
+    let vfs = cairn_backend_docker::DockerVfs::new(conn, ops);
+    registry.insert(conn, Arc::new(vfs)).await;
+    Ok(())
+}
+
+#[cfg(not(feature = "docker"))]
+async fn open_docker_socket(
+    _registry: &VfsRegistry,
+    _conn: ConnectionId,
+    _path: &Option<std::path::PathBuf>,
+) -> Result<(), String> {
+    Err("docker backend not built into this binary".to_owned())
+}
+
+/// Open a Kubernetes VFS backed by the user's kubeconfig.
+///
+/// Feature-gated: the `k8s` feature must be enabled.
+#[cfg(feature = "k8s")]
+async fn open_kubeconfig(registry: &VfsRegistry, conn: ConnectionId) -> Result<(), String> {
+    let ops = cairn_backend_k8s::KubeRsOps::new();
+    let vfs = cairn_backend_k8s::KubeVfs::new(conn, ops);
+    registry.insert(conn, Arc::new(vfs)).await;
+    Ok(())
+}
+
+#[cfg(not(feature = "k8s"))]
+async fn open_kubeconfig(_registry: &VfsRegistry, _conn: ConnectionId) -> Result<(), String> {
+    Err("k8s backend not built into this binary".to_owned())
+}
+
+/// Open a Kubernetes VFS using the pod's in-cluster service-account credentials.
+///
+/// Feature-gated: the `k8s` feature must be enabled.
+#[cfg(feature = "k8s")]
+async fn open_incluster(registry: &VfsRegistry, conn: ConnectionId) -> Result<(), String> {
+    let ops = cairn_backend_k8s::KubeRsOps::new_incluster();
+    let vfs = cairn_backend_k8s::KubeVfs::new(conn, ops);
+    registry.insert(conn, Arc::new(vfs)).await;
+    Ok(())
+}
+
+#[cfg(not(feature = "k8s"))]
+async fn open_incluster(_registry: &VfsRegistry, _conn: ConnectionId) -> Result<(), String> {
+    Err("k8s backend not built into this binary".to_owned())
 }
 
 /// A compact "N file(s), M dir(s)" summary shared by the success and cancelled status messages.

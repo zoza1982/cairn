@@ -26,11 +26,51 @@ pub struct BollardDocker {
 impl BollardDocker {
     /// Connect using the platform's default Docker endpoint (socket / named pipe / env).
     ///
+    /// Bollard's `connect_with_local_defaults` checks `DOCKER_HOST`, the standard system socket
+    /// path, and (on Windows) the named pipe — in that order.
+    ///
     /// # Errors
-    /// [`VfsError::Connection`] if the engine cannot be reached.
+    /// [`VfsError::Connection`] if the client cannot be constructed (malformed `DOCKER_HOST`, etc.).
+    /// Note: this does **not** prove the daemon is reachable; call [`ping`](Self::ping) to verify.
     pub fn connect_local() -> Result<Self, VfsError> {
         Docker::connect_with_local_defaults()
             .map(|docker| Self { docker })
+            .map_err(|e| VfsError::Connection(Box::new(e)))
+    }
+
+    /// Connect to a Docker daemon at an explicit Unix socket path.
+    ///
+    /// Use this for rootless-Docker or Podman sockets discovered via `$XDG_RUNTIME_DIR`.
+    /// The timeout passed to bollard is 120 seconds (the same default bollard uses internally);
+    /// individual operation timeouts are the caller's responsibility.
+    ///
+    /// # Errors
+    /// [`VfsError::Connection`] if `path` is not valid UTF-8 (bollard requires a string address)
+    /// or if bollard cannot construct the client.
+    pub fn connect_with_socket(path: &std::path::Path) -> Result<Self, VfsError> {
+        let addr = path.to_str().ok_or_else(|| {
+            VfsError::Connection(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Docker socket path is not valid UTF-8",
+            )))
+        })?;
+        Docker::connect_with_unix(addr, 120, bollard::API_DEFAULT_VERSION)
+            .map(|docker| Self { docker })
+            .map_err(|e| VfsError::Connection(Box::new(e)))
+    }
+
+    /// Probe daemon reachability by sending `GET /_ping`.
+    ///
+    /// Returns `Ok(())` if the daemon is up and responds. Used by the `DockerProvider` during
+    /// auto-discovery with a short external `tokio::time::timeout` wrapper.
+    ///
+    /// # Errors
+    /// [`VfsError::Connection`] on any failure (socket not found, refused, protocol error, etc.).
+    pub async fn ping(&self) -> Result<(), VfsError> {
+        self.docker
+            .ping()
+            .await
+            .map(|_| ())
             .map_err(|e| VfsError::Connection(Box::new(e)))
     }
 

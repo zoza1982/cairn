@@ -54,6 +54,48 @@ pub struct PluginEntry {
 /// A reference to a credential stored in the vault. Safe to serialize; reveals nothing.
 pub type SecretRef = Uuid;
 
+/// Auto-discovery preferences (`[discovery]`).
+///
+/// Controls which environment sources the coordinator probes for connections automatically.
+/// All flags default to `true` (discovery is on by default); users can opt out per-source, and
+/// specific discovered entries can be hidden or pinned via their stable key strings.
+///
+/// This section is additive and backward-compatible: a config that predates P3 loads with all
+/// fields at their defaults (thanks to `#[serde(default)]`).
+///
+/// ## Key string format
+///
+/// Used in `hidden` and `pinned`:
+/// - Docker socket (default): `"docker:socket:default"`
+/// - Docker socket (explicit path): `"docker:socket:/run/user/1000/docker.sock"`
+/// - Kubeconfig cluster: `"kube:kubeconfig"`
+/// - In-cluster Kubernetes: `"kube:in-cluster"`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscoveryConfig {
+    /// Whether to auto-discover Docker daemon sockets (default `true`).
+    pub docker: bool,
+    /// Whether to auto-discover Kubernetes clusters from kubeconfig / in-cluster (default `true`).
+    pub kubernetes: bool,
+    /// Discovered entries to hide from the connection switcher, identified by their key strings.
+    /// A hidden entry is never shown even if discovered and reachable.
+    pub hidden: Vec<String>,
+    /// Discovered entries to float to the top of the connection list, in stated order.
+    /// A pinned key that is not discovered is silently ignored.
+    pub pinned: Vec<String>,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            docker: true,
+            kubernetes: true,
+            hidden: Vec::new(),
+            pinned: Vec::new(),
+        }
+    }
+}
+
 /// The whole configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -75,6 +117,10 @@ pub struct Config {
     /// Secrets-vault preferences.
     #[serde(default)]
     pub vault: VaultConfig,
+    /// Auto-discovery preferences (RFC-0011 P3). Controls which environment sources are probed
+    /// for connections at startup and on re-enumeration.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
     /// Installed plugin entries, keyed by `"<name>@<version>"` (RFC-0010 §5.4).
     ///
     /// Written by the plugin approval UI (PR-C2); read by `PluginLoader` at mount time.
@@ -92,6 +138,7 @@ impl Default for Config {
             shell_actions: Vec::new(),
             transfers: TransfersConfig::default(),
             vault: VaultConfig::default(),
+            discovery: DiscoveryConfig::default(),
             plugins: BTreeMap::new(),
         }
     }
@@ -856,5 +903,67 @@ mod tests {
             !text.to_lowercase().contains("password"),
             "must contain no secret values"
         );
+    }
+
+    // ── DiscoveryConfig ──────────────────────────────────────────────────────────────────────
+
+    /// A config file without a `[discovery]` section must load cleanly with all defaults.
+    #[test]
+    fn discovery_config_defaults_when_section_absent() {
+        let toml = r#"schema_version = 1"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.discovery.docker, "docker discovery defaults to true");
+        assert!(
+            cfg.discovery.kubernetes,
+            "kubernetes discovery defaults to true"
+        );
+        assert!(cfg.discovery.hidden.is_empty(), "hidden defaults to empty");
+        assert!(cfg.discovery.pinned.is_empty(), "pinned defaults to empty");
+    }
+
+    /// Round-trip: serialize a custom `DiscoveryConfig` to TOML and parse it back.
+    #[test]
+    fn discovery_config_roundtrips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.discovery.docker = false;
+        cfg.discovery.kubernetes = true;
+        cfg.discovery.hidden = vec!["docker:socket:/run/docker.sock".to_owned()];
+        cfg.discovery.pinned = vec!["kube:kubeconfig".to_owned()];
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+
+        assert!(
+            !parsed.discovery.docker,
+            "docker=false must survive round-trip"
+        );
+        assert!(
+            parsed.discovery.kubernetes,
+            "kubernetes=true must survive round-trip"
+        );
+        assert_eq!(
+            parsed.discovery.hidden,
+            vec!["docker:socket:/run/docker.sock"]
+        );
+        assert_eq!(parsed.discovery.pinned, vec!["kube:kubeconfig"]);
+    }
+
+    /// The `hidden` and `pinned` lists accept arbitrary key strings without parse errors.
+    #[test]
+    fn discovery_config_accepts_arbitrary_key_strings() {
+        let toml = r#"
+schema_version = 1
+
+[discovery]
+docker = true
+kubernetes = false
+hidden = ["builtin:/", "saved:00000000-0000-0000-0000-000000000000"]
+pinned = ["kube:in-cluster"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.discovery.docker);
+        assert!(!cfg.discovery.kubernetes);
+        assert_eq!(cfg.discovery.hidden.len(), 2);
+        assert_eq!(cfg.discovery.pinned.len(), 1);
     }
 }
