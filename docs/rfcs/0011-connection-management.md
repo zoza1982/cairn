@@ -69,7 +69,7 @@ the AI/plugin boundary.
 
 ### Manifest of the user-visible surface
 
-- New keybinding `Ctrl-N` = new connection (and `n`/`e`/`d` contextually inside the switcher).
+- New keybinding `Ctrl-N` = new connection (also available as `[Ctrl-N] New` hint inside the switcher; `e`/`d` contextually edit/delete inside the switcher).
 - New `[discovery]` section in `config.toml` (opt-out, hidden/pinned entries) — see below.
 - New overlays: the connection form, the vault-create prompt, the remove-connection confirm.
 
@@ -199,7 +199,7 @@ fn scheme_fields(scheme: &str) -> &'static [FieldSpec]
 `FieldValue` is `Plain(String)` or `Secret(MaskedInput)`; its `Clone` returns an empty
 `MaskedInput` for the secret variant and its `Debug` prints `Secret(<redacted>)`. `TextEdit` gains
 `NextField`/`PrevField` (bound to `Tab`/`BackTab` while capturing in the form; no-ops elsewhere).
-`Action` gains `NewConnection` (`Ctrl-N` global + `n` in the switcher), `EditConnection`,
+`Action` gains `NewConnection` (`Ctrl-N` global; also reachable via `[Ctrl-N] New` hint in the switcher), `EditConnection`,
 `DeleteConnection` (contextual in the switcher; no-ops on `AutoDiscovered` rows). The reducer's
 `capturing_text` and `advance_queue` block-list are extended for the `Fields` stage. Submission
 validates required fields purely, then extracts non-secret fields into `ConnectionProfile.endpoint`

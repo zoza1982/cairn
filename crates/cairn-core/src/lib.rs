@@ -6,16 +6,18 @@
 //! non-blocking. Asynchronous results return as [`AppEvent`]s (wrapped in [`Msg::Event`]). See
 //! `docs/LLD.md` §5.
 
+pub mod forms;
 mod msg;
 mod state;
 mod update;
 
+pub use forms::{scheme_fields, FieldSpec, ProfileData, KNOWN_SCHEMES};
 pub use msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 pub use state::{
-    ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionChoice, ConnectionKind,
-    DiscoverySource, Listing, LogViewerId, LogViewerStatus, MaskedInput, Overlay, PaneState,
-    PromptKind, QueuedTransfer, SessionEnd, SessionRecord, ShellActionMeta, Side, SortMode,
-    TransferId, LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES, SESSION_OUTPUT_MAX_BYTES,
-    SESSION_OUTPUT_MAX_LINES,
+    ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionChoice,
+    ConnectionFormStage, ConnectionKind, DiscoverySource, Listing, LogViewerId, LogViewerStatus,
+    MaskedInput, Overlay, PaneState, PromptKind, QueuedTransfer, SessionEnd, SessionRecord,
+    ShellActionMeta, Side, SortMode, TransferId, LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES,
+    SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
 pub use update::{initial_effects, update};

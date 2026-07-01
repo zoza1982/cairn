@@ -3,8 +3,9 @@
 use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{
-    AppState, ChoiceProvenance, Listing, LogViewerStatus, MaskedInput, Overlay, PaneState,
-    PromptKind, SessionEnd, SessionRecord, Side,
+    forms::{scheme_fields, KNOWN_SCHEMES},
+    AppState, ChoiceProvenance, ConnectionFormStage, ConnectionKind, Listing, LogViewerStatus,
+    MaskedInput, Overlay, PaneState, PromptKind, SessionEnd, SessionRecord, Side,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,16 +44,23 @@ fn render_connections(
     connections: &[cairn_core::ConnectionChoice],
     cursor: usize,
 ) {
+    // +3 = 2 borders + 1 hint line at the bottom.
     let h = u16::try_from(connections.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(2)
+        .saturating_add(3)
         .min(frame.area().height);
-    let area = centered(frame.area(), 50, h.max(3));
+    let area = centered(frame.area(), 56, h.max(4));
     frame.render_widget(Clear, area);
     // Overlays use fixed semantic accents (not the user's pane palette) so prompts stay distinct.
     let block = Block::bordered()
         .title(" Open connection ")
         .border_style(Style::default().fg(Color::Cyan));
+    // Split the inner area: list rows above, one hint line below.
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
     let items: Vec<ListItem> = connections
         .iter()
         // P3: auto-discovered entries get an [auto] provenance badge and a dimmed style so
@@ -70,14 +78,26 @@ fn render_connections(
         })
         .collect();
     let list = List::new(items)
-        .block(block)
         .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
         .highlight_symbol("> ");
     let mut st = ListState::default();
     if !connections.is_empty() {
         st.select(Some(cursor.min(connections.len() - 1)));
     }
-    frame.render_stateful_widget(list, area, &mut st);
+    frame.render_stateful_widget(list, list_area, &mut st);
+
+    // Contextual hint: profile entries show edit/delete, auto-discovered entries are read-only.
+    let selected_kind = connections
+        .get(cursor.min(connections.len().saturating_sub(1)))
+        .map(|c| &c.kind);
+    let hint = match selected_kind {
+        Some(ConnectionKind::Profile { .. }) => "[Ctrl-N] New  [e] Edit  [d] Delete  [Esc] Close",
+        _ => "[Ctrl-N] New  [Esc] Close  (auto-discovered — not editable)",
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(hint)).style(Style::default().fg(Color::Gray)),
+        hint_area,
+    );
 }
 
 /// Draw the active modal overlay (if any) centered over the screen. Takes `&AppState` so overlays
@@ -168,7 +188,51 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                 render_port_forward_status(frame, rec);
             }
         }
+        Overlay::ConfirmDeleteConnection { display_name, .. } => {
+            render_confirm_delete_connection(frame, display_name)
+        }
+        Overlay::ConnectionForm {
+            stage,
+            scheme,
+            values,
+            focus,
+            field_errors,
+            editing_id,
+            ..
+        } => render_connection_form(
+            frame,
+            stage,
+            scheme,
+            values,
+            *focus,
+            field_errors,
+            editing_id.is_some(),
+        ),
     }
+}
+
+/// Draw the confirm-delete-connection overlay: a red-bordered prompt asking the user to confirm
+/// before permanently removing a saved connection profile.
+fn render_confirm_delete_connection(frame: &mut Frame, display_name: &str) {
+    let msg = format!("Delete connection '{display_name}'? This cannot be undone.");
+    let h = 5u16;
+    let w = u16::try_from(msg.len() + 6)
+        .unwrap_or(64)
+        .min(frame.area().width);
+    let area = centered(frame.area(), w, h);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Confirm delete ")
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [msg_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(msg.as_str()), msg_area);
+    frame.render_widget(
+        Paragraph::new("[Enter] Delete  [Esc] Cancel").style(Style::default().fg(Color::DarkGray)),
+        hint_area,
+    );
 }
 
 /// Draw the vault-unlock overlay: a masked passphrase field (one `•` per typed character — the
@@ -203,6 +267,174 @@ fn render_vault_unlock(frame: &mut Frame, input: &MaskedInput, error: Option<&st
         .block(block)
         .alignment(Alignment::Center);
     frame.render_widget(body, area);
+}
+
+/// Top-level dispatcher for the connection form overlay (add/edit).
+///
+/// Delegates to [`render_scheme_picker`] in the `SchemePicker` stage and [`render_form_fields`]
+/// in the `Fields` stage.
+fn render_connection_form(
+    frame: &mut Frame,
+    stage: &ConnectionFormStage,
+    scheme: &str,
+    values: &std::collections::HashMap<String, String>,
+    focus: usize,
+    field_errors: &std::collections::HashMap<String, String>,
+    is_edit: bool,
+) {
+    match stage {
+        ConnectionFormStage::SchemePicker => render_scheme_picker(frame, focus),
+        ConnectionFormStage::Fields => {
+            render_form_fields(frame, scheme, values, focus, field_errors, is_edit)
+        }
+    }
+}
+
+/// Draw the scheme-picker stage: a scrollable list of known backend types.
+fn render_scheme_picker(frame: &mut Frame, focus: usize) {
+    let h = u16::try_from(KNOWN_SCHEMES.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(5) // 2 borders + 1 blank + 1 hint + 1 breathing room
+        .min(frame.area().height);
+    let area = centered(frame.area(), 50, h.max(5));
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" New connection — choose backend ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let items: Vec<ListItem> = KNOWN_SCHEMES
+        .iter()
+        .map(|(_, label)| ListItem::new(*label))
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
+        .highlight_symbol("> ");
+    let mut st = ListState::default();
+    if !KNOWN_SCHEMES.is_empty() {
+        st.select(Some(focus.min(KNOWN_SCHEMES.len() - 1)));
+    }
+    frame.render_stateful_widget(list, list_area, &mut st);
+    frame.render_widget(
+        Paragraph::new(Line::from("[Enter] Select  [Esc] Cancel"))
+            .style(Style::default().fg(Color::Gray)),
+        hint_area,
+    );
+}
+
+/// Draw the fields stage: a labelled form with one row per [`FieldSpec`] and an inline credential
+/// hint reminding the user that credentials are configured separately (Phase P5).
+fn render_form_fields(
+    frame: &mut Frame,
+    scheme: &str,
+    values: &std::collections::HashMap<String, String>,
+    focus: usize,
+    field_errors: &std::collections::HashMap<String, String>,
+    is_edit: bool,
+) {
+    let fields = scheme_fields(scheme);
+    // +5 = 2 borders + 1 cred hint + 1 blank + 1 action hint line
+    let h = u16::try_from(fields.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(5)
+        .min(frame.area().height);
+    let area = centered(frame.area(), 60, h.max(6));
+    frame.render_widget(Clear, area);
+
+    let title = if is_edit {
+        " Edit connection "
+    } else {
+        " New connection — fill in details "
+    };
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Layout: field rows, then cred-hint, then blank line, then action hint.
+    let n_fields = fields.len();
+    let mut constraints: Vec<Constraint> = (0..n_fields).map(|_| Constraint::Length(1)).collect();
+    constraints.push(Constraint::Length(1)); // credential hint
+    constraints.push(Constraint::Min(0)); // spacer
+    constraints.push(Constraint::Length(1)); // action hint
+    let areas = Layout::vertical(constraints).split(inner);
+
+    for (i, field) in fields.iter().enumerate() {
+        let is_focused = i == focus;
+        let value = values.get(field.key).map(String::as_str).unwrap_or("");
+        let error = field_errors.get(field.key).map(String::as_str);
+
+        let label_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let field_text = if value.is_empty() {
+            // Greyed-out placeholder.
+            format!("{}: {}", field.label, field.placeholder)
+        } else {
+            let cursor = if is_focused { "\u{258f}" } else { "" };
+            if field.secret {
+                let masked = "\u{2022}".repeat(value.chars().count());
+                format!("{}: {}{cursor}", field.label, masked)
+            } else {
+                format!("{}: {}{cursor}", field.label, value)
+            }
+        };
+        let field_style = if value.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else if is_focused {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default()
+        };
+
+        let mut spans = vec![
+            ratatui::text::Span::styled(if is_focused { "> " } else { "  " }, label_style),
+            ratatui::text::Span::styled(field_text, field_style),
+        ];
+        if let Some(err) = error {
+            spans.push(ratatui::text::Span::styled(
+                format!("  ⚠ {err}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        if areas.get(i).is_some() {
+            frame.render_widget(Paragraph::new(Line::from(spans)), areas[i]);
+        }
+    }
+
+    // Credential hint (always shown; P5 will replace this with credential fields).
+    if let Some(hint_area) = areas.get(n_fields) {
+        frame.render_widget(
+            Paragraph::new(Line::from(
+                "  Credentials are set up when the connection is first used (coming in next update).",
+            ))
+            .style(Style::default().fg(Color::DarkGray)),
+            *hint_area,
+        );
+    }
+
+    // Action hint: Esc goes back to the scheme picker for new connections; closes for edits.
+    let back_hint = if is_edit {
+        "  [Esc] Cancel"
+    } else {
+        "  [Esc] Back"
+    };
+    let action_hint = format!("[Tab/↑↓] Navigate fields  [Enter] Save{back_hint}");
+    if let Some(ahint_area) = areas.last() {
+        frame.render_widget(
+            Paragraph::new(Line::from(action_hint)).style(Style::default().fg(Color::Gray)),
+            *ahint_area,
+        );
+    }
 }
 
 /// Draw the transfer-queue view: the active transfer(s) plus the pending list, with the selection

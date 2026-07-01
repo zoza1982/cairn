@@ -205,6 +205,19 @@ async fn run_async() -> anyhow::Result<()> {
         let (choices, deferred, descriptors) =
             register_connections(&registry, &config, &opener).await;
         state.connections = choices;
+        // Populate the saved-profile mirror so the connection form (P4) can pre-fill fields.
+        for prof in &config.connections {
+            state.saved_profiles.insert(
+                prof.id,
+                cairn_core::forms::ProfileData {
+                    id: prof.id,
+                    scheme: prof.scheme.clone(),
+                    display_name: prof.display_name.clone(),
+                    endpoint: prof.endpoint.clone(),
+                    secret_ref: prof.secret_ref,
+                },
+            );
+        }
         (deferred, descriptors)
     };
     debug_assert!(
@@ -343,6 +356,122 @@ async fn register_connections(
         vault_locked: opener.vault_locked(),
     };
     coordinator.run(registry, &ctx, &HashMap::new()).await
+}
+
+/// Convert a [`cairn_core::forms::ProfileData`] into a [`cairn_config::ConnectionProfile`].
+///
+/// The mapping is one-to-one: both structs share the same field names and types (the core
+/// `ProfileData` was designed as a dep-free mirror of `ConnectionProfile`).
+fn profile_data_to_config(
+    profile: &cairn_core::forms::ProfileData,
+) -> cairn_config::ConnectionProfile {
+    cairn_config::ConnectionProfile {
+        id: profile.id,
+        scheme: profile.scheme.clone(),
+        display_name: profile.display_name.clone(),
+        endpoint: profile.endpoint.clone(),
+        secret_ref: profile.secret_ref,
+    }
+}
+
+/// Save (create or update) a connection profile to the cairn config file.
+///
+/// Loads the config, upserts the profile, and saves. Does NOT call `register_connections`
+/// (which would alias ConnectionIds and corrupt the descriptor_map). Always returns an
+/// `AppEvent` (success or `ConnectionOpFailed`).
+async fn run_save_connection_effect(
+    profile: cairn_core::forms::ProfileData,
+    is_edit: bool,
+) -> AppEvent {
+    let Some(config_path) = cairn_config::default_config_path() else {
+        return AppEvent::ConnectionOpFailed {
+            message: "Cannot determine config file path".to_owned(),
+        };
+    };
+
+    let mut config = match cairn_config::Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load config for save");
+            return AppEvent::ConnectionOpFailed {
+                message: format!("Failed to load config: {e}"),
+            };
+        }
+    };
+
+    let cfg_profile = profile_data_to_config(&profile);
+    let id = cfg_profile.id;
+    let display_name = cfg_profile.display_name.clone();
+    // Compute the switcher label using the same convention the provider uses:
+    // "local: {path}" for local profiles, display_name for all others.
+    let label = if profile.scheme == "local" {
+        let path = profile
+            .endpoint
+            .get("path")
+            .map(String::as_str)
+            .unwrap_or("");
+        format!("local: {path}")
+    } else {
+        profile.display_name.clone()
+    };
+    if is_edit {
+        if let Some(existing) = config.connections.iter_mut().find(|p| p.id == id) {
+            *existing = cfg_profile;
+        } else {
+            config.connections.push(cfg_profile);
+        }
+    } else {
+        config.connections.push(cfg_profile);
+    }
+
+    if let Err(e) = config.save(&config_path) {
+        tracing::warn!(error = %e, "failed to save config");
+        return AppEvent::ConnectionOpFailed {
+            message: format!("Failed to save config: {e}"),
+        };
+    }
+
+    AppEvent::ConnectionSaved {
+        id,
+        display_name,
+        label,
+        is_edit,
+        profile,
+    }
+}
+
+/// Delete a connection profile from the cairn config file.
+///
+/// Does NOT call `register_connections` (which would alias ConnectionIds). The reducer handles
+/// the in-memory switcher update via `ConnectionDeleted`. Always returns an `AppEvent` (success
+/// or `ConnectionOpFailed`).
+async fn run_delete_connection_effect(id: uuid::Uuid) -> AppEvent {
+    let Some(config_path) = cairn_config::default_config_path() else {
+        return AppEvent::ConnectionOpFailed {
+            message: "Cannot determine config file path".to_owned(),
+        };
+    };
+
+    let mut config = match cairn_config::Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load config for delete");
+            return AppEvent::ConnectionOpFailed {
+                message: format!("Failed to load config: {e}"),
+            };
+        }
+    };
+
+    config.connections.retain(|p| p.id != id);
+
+    if let Err(e) = config.save(&config_path) {
+        tracing::warn!(error = %e, "failed to save config after delete");
+        return AppEvent::ConnectionOpFailed {
+            message: format!("Failed to save config: {e}"),
+        };
+    }
+
+    AppEvent::ConnectionDeleted { id }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -982,6 +1111,20 @@ fn dispatch(
                     let _ = resize.try_send((rows, cols));
                 }
             }
+        }
+        AppEffect::SaveConnection { profile, is_edit } => {
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_save_connection_effect(profile, is_edit).await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::DeleteConnection { id } => {
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_delete_connection_effect(id).await;
+                let _ = event_tx.send(ev).await;
+            });
         }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
         other => tracing::warn!(effect = ?other, "unhandled effect"),

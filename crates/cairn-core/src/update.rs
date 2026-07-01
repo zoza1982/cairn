@@ -2,9 +2,9 @@
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 use crate::state::{
-    ActiveTransfer, AppState, ChoiceStatus, Listing, LogViewerStatus, MaskedInput, Overlay,
-    PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId,
-    SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
+    ActiveTransfer, AppState, ChoiceStatus, ConnectionFormStage, ConnectionKind, Listing,
+    LogViewerStatus, MaskedInput, Overlay, PromptKind, QueuedTransfer, SessionEnd, SessionRecord,
+    Side, SortMode, TransferId, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
 use cairn_types::{Entry, SessionId, VfsPath};
 use std::collections::VecDeque;
@@ -60,6 +60,9 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 | Action::OpenQueue
                 | Action::RunShellAction(_)
                 | Action::VaultUnlock
+                | Action::NewConnection
+                | Action::EditConnection
+                | Action::DeleteConnection
         )
     {
         state.status = Some("The assistant is preparing a plan…".to_owned());
@@ -81,6 +84,9 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 | Action::OpenQueue
                 | Action::RunShellAction(_)
                 | Action::VaultUnlock
+                | Action::NewConnection
+                | Action::EditConnection
+                | Action::DeleteConnection
         )
     {
         state.status = Some("A plan is executing — press Esc to cancel it first".to_owned());
@@ -325,12 +331,30 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             state.should_quit = true;
             Vec::new()
         }
+        Action::NewConnection => {
+            // Open the scheme picker. This is the global handler (no overlay open).
+            open_scheme_picker(state);
+            Vec::new()
+        }
+        // EditConnection/DeleteConnection are only meaningful inside the Connections overlay.
+        // Outside it they are silent no-ops so a misrouted key does not confuse the user.
+        Action::EditConnection | Action::DeleteConnection => Vec::new(),
     }
 }
 
 /// Handle a text-editing keystroke. Routed to the open text prompt, or — if none — to the active
 /// pane's live filter when it is being edited. A stray keystroke with neither active is a no-op.
 fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
+    // ConnectionForm in Fields stage captures text (the SchemePicker stage uses action keys only).
+    if matches!(
+        state.overlay,
+        Some(Overlay::ConnectionForm {
+            stage: ConnectionFormStage::Fields,
+            ..
+        })
+    ) {
+        return apply_connection_form_text(state, edit);
+    }
     if matches!(state.overlay, Some(Overlay::Prompt { .. })) {
         return apply_prompt_text(state, edit);
     }
@@ -389,8 +413,8 @@ fn apply_vault_unlock_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffec
             Vec::new()
         }
         TextEdit::Submit => submit_vault_unlock(state),
-        // `CloseStdin` is only meaningful inside `ExecPane`; ignore it everywhere else.
-        TextEdit::CloseStdin => Vec::new(),
+        // `CloseStdin`/`NextField`/`PrevField` are only meaningful inside `ExecPane`/`ConnectionForm`.
+        TextEdit::CloseStdin | TextEdit::NextField | TextEdit::PrevField => Vec::new(),
     }
 }
 
@@ -483,6 +507,8 @@ fn apply_exec_pane_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> 
             // to show remaining output; `SessionEnded` arrives when the process exits.
             vec![AppEffect::CloseStdin { id: session_id }]
         }
+        // `NextField`/`PrevField` are only meaningful inside `ConnectionForm`.
+        TextEdit::NextField | TextEdit::PrevField => Vec::new(),
     }
 }
 
@@ -509,8 +535,8 @@ fn apply_prompt_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
             Vec::new()
         }
         TextEdit::Submit => submit_prompt(state),
-        // `CloseStdin` is only meaningful inside `ExecPane`; ignore it everywhere else.
-        TextEdit::CloseStdin => Vec::new(),
+        // `CloseStdin`/`NextField`/`PrevField` are only meaningful inside `ExecPane`/`ConnectionForm`.
+        TextEdit::CloseStdin | TextEdit::NextField | TextEdit::PrevField => Vec::new(),
     }
 }
 
@@ -551,8 +577,8 @@ fn apply_filter_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
             p.marked.clear();
             p.cursor = 0;
         }
-        // `CloseStdin` is only meaningful inside `ExecPane`; ignore it everywhere else.
-        TextEdit::CloseStdin => {}
+        // `CloseStdin`/`NextField`/`PrevField` are only meaningful inside `ExecPane`/`ConnectionForm`.
+        TextEdit::CloseStdin | TextEdit::NextField | TextEdit::PrevField => {}
     }
     state.active_mut().clamp_cursor();
     Vec::new()
@@ -651,6 +677,300 @@ fn validate_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Open the scheme-picker stage of the connection form, replacing any current overlay.
+fn open_scheme_picker(state: &mut AppState) {
+    state.overlay = Some(Overlay::ConnectionForm {
+        stage: ConnectionFormStage::SchemePicker,
+        scheme: String::new(),
+        values: std::collections::HashMap::new(),
+        focus: 0,
+        field_errors: std::collections::HashMap::new(),
+        editing_id: None,
+        existing_secret_ref: None,
+    });
+}
+
+/// Drive the connection form overlay — both the `SchemePicker` and `Fields` stages.
+///
+/// Text input in the `Fields` stage is handled separately by [`apply_connection_form_text`] (routed
+/// via [`apply_text`]); this function receives only action keys (cursor, enter, cancel, leave).
+fn apply_connection_form_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    use crate::forms::KNOWN_SCHEMES;
+
+    // Extract the current stage so we can decide routing without holding the borrow.
+    let stage = match &state.overlay {
+        Some(Overlay::ConnectionForm { stage, .. }) => stage.clone(),
+        _ => return Vec::new(),
+    };
+
+    match stage {
+        ConnectionFormStage::SchemePicker => {
+            let n = KNOWN_SCHEMES.len();
+            match action {
+                Action::CursorUp => {
+                    if let Some(Overlay::ConnectionForm { focus, .. }) = &mut state.overlay {
+                        *focus = focus.saturating_sub(1);
+                    }
+                    Vec::new()
+                }
+                Action::CursorDown => {
+                    if let Some(Overlay::ConnectionForm { focus, .. }) = &mut state.overlay {
+                        if *focus + 1 < n {
+                            *focus += 1;
+                        }
+                    }
+                    Vec::new()
+                }
+                Action::Confirm | Action::Enter => {
+                    // Commit the chosen scheme and advance to Fields.
+                    let chosen = match &state.overlay {
+                        Some(Overlay::ConnectionForm { focus, .. }) => KNOWN_SCHEMES
+                            .get(*focus)
+                            .map(|(s, _)| s.to_string())
+                            .unwrap_or_default(),
+                        _ => return Vec::new(),
+                    };
+                    // Prune stale values from a previous scheme (preserves display_name which
+                    // every scheme shares). This prevents a host="example.com" typed in an SSH
+                    // form from silently appearing in a subsequently selected S3 form.
+                    let new_field_keys: std::collections::HashSet<&str> =
+                        crate::forms::scheme_fields(&chosen)
+                            .iter()
+                            .map(|f| f.key)
+                            .collect();
+                    if let Some(Overlay::ConnectionForm {
+                        stage,
+                        scheme,
+                        focus,
+                        values,
+                        field_errors,
+                        ..
+                    }) = &mut state.overlay
+                    {
+                        *scheme = chosen;
+                        *stage = ConnectionFormStage::Fields;
+                        *focus = 0;
+                        values.retain(|k, _| new_field_keys.contains(k.as_str()));
+                        field_errors.retain(|k, _| new_field_keys.contains(k.as_str()));
+                    }
+                    Vec::new()
+                }
+                Action::Cancel => {
+                    state.overlay = None;
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            }
+        }
+        ConnectionFormStage::Fields => {
+            // In the Fields stage, text capture (`capturing_text` returns `true`) routes
+            // Up/Down/Esc through `apply_connection_form_text` as `TextEdit` messages.
+            // The `Confirm | Enter` arm below is therefore unreachable while capturing_text()
+            // is true in Fields stage; kept for forward-compatibility if capturing_text() logic
+            // changes in the future.
+            match action {
+                Action::Confirm | Action::Enter => submit_connection_form(state),
+                Action::Cancel => {
+                    state.overlay = None;
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
+}
+
+/// Handle text-editing keystrokes while the connection form's `Fields` stage is active.
+fn apply_connection_form_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
+    use crate::forms::scheme_fields;
+
+    // Extract what we need with a shared borrow first (scheme, focus, n_fields).
+    let (scheme_clone, focus_val, n_fields) = match &state.overlay {
+        Some(Overlay::ConnectionForm {
+            stage: ConnectionFormStage::Fields,
+            scheme,
+            focus,
+            ..
+        }) => {
+            let fields = scheme_fields(scheme);
+            (scheme.clone(), *focus, fields.len())
+        }
+        _ => return Vec::new(),
+    };
+
+    match edit {
+        TextEdit::Insert(c) => {
+            if !c.is_control() {
+                // Get the field key for the current focus position.
+                let key = crate::forms::scheme_fields(&scheme_clone)
+                    .get(focus_val)
+                    .map(|f| f.key.to_owned());
+                if let (
+                    Some(key),
+                    Some(Overlay::ConnectionForm {
+                        values,
+                        field_errors,
+                        ..
+                    }),
+                ) = (key, &mut state.overlay)
+                {
+                    // Typing clears any existing error for this field.
+                    field_errors.remove(&key);
+                    values.entry(key).or_default().push(c);
+                }
+            }
+            Vec::new()
+        }
+        TextEdit::Backspace => {
+            let key = crate::forms::scheme_fields(&scheme_clone)
+                .get(focus_val)
+                .map(|f| f.key.to_owned());
+            if let (Some(key), Some(Overlay::ConnectionForm { values, .. })) =
+                (key, &mut state.overlay)
+            {
+                if let Some(v) = values.get_mut(&key) {
+                    v.pop();
+                }
+            }
+            Vec::new()
+        }
+        TextEdit::NextField => {
+            if let Some(Overlay::ConnectionForm { focus, .. }) = &mut state.overlay {
+                if *focus + 1 < n_fields {
+                    *focus += 1;
+                }
+            }
+            Vec::new()
+        }
+        TextEdit::PrevField => {
+            if let Some(Overlay::ConnectionForm { focus, .. }) = &mut state.overlay {
+                *focus = focus.saturating_sub(1);
+            }
+            Vec::new()
+        }
+        TextEdit::Submit => submit_connection_form(state),
+        TextEdit::Cancel => {
+            // For new connections in the Fields stage: Esc goes back to the scheme picker instead
+            // of closing the form entirely. For edits (editing_id is Some), Esc closes the form.
+            match &mut state.overlay {
+                Some(Overlay::ConnectionForm {
+                    stage,
+                    focus,
+                    editing_id: None,
+                    ..
+                }) if *stage == ConnectionFormStage::Fields => {
+                    *stage = ConnectionFormStage::SchemePicker;
+                    *focus = 0;
+                    return Vec::new();
+                }
+                _ => {}
+            }
+            state.overlay = None;
+            Vec::new()
+        }
+        // `CloseStdin` is only meaningful inside `ExecPane`; ignore it here.
+        TextEdit::CloseStdin => Vec::new(),
+    }
+}
+
+/// Validate and submit the connection form, emitting a [`AppEffect::SaveConnection`] on success.
+///
+/// Validates that all required fields are non-empty. On failure: sets per-field errors and a
+/// status message, leaving the form open. On success: closes the overlay, sets `connection_saving`,
+/// and emits the save effect.
+fn submit_connection_form(state: &mut AppState) -> Vec<AppEffect> {
+    use crate::forms::{scheme_fields, ProfileData};
+
+    if state.connection_saving {
+        return Vec::new();
+    }
+
+    // Extract everything we need in a shared-borrow pass.
+    let (scheme, values, editing_id, existing_secret_ref) = match &state.overlay {
+        Some(Overlay::ConnectionForm {
+            scheme,
+            values,
+            editing_id,
+            existing_secret_ref,
+            ..
+        }) => (
+            scheme.clone(),
+            values.clone(),
+            *editing_id,
+            *existing_secret_ref,
+        ),
+        _ => return Vec::new(),
+    };
+
+    let fields = scheme_fields(&scheme);
+
+    // Validate: collect errors for all required fields that are empty.
+    let mut errors: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for field in fields {
+        if field.required {
+            let is_empty = values.get(field.key).is_none_or(|v| v.trim().is_empty());
+            if is_empty {
+                errors.insert(field.key.to_owned(), format!("{} is required", field.label));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        // Compute the first-error index before consuming `errors` (avoids a clone).
+        let first_err_idx = fields.iter().position(|f| errors.contains_key(f.key));
+        // Put errors back into the overlay and surface a generic status hint.
+        if let Some(Overlay::ConnectionForm {
+            field_errors,
+            focus,
+            ..
+        }) = &mut state.overlay
+        {
+            *field_errors = errors; // move, not clone
+            if let Some(i) = first_err_idx {
+                *focus = i;
+            }
+        }
+        state.status = Some("Please fill in all required fields".to_owned());
+        return Vec::new();
+    }
+
+    let display_name = values.get("display_name").cloned().unwrap_or_default();
+    let display_name = display_name.trim().to_owned();
+
+    // Build the endpoint map (everything except display_name, which lives at the top level).
+    // HashMap for O(1) lookup during live field editing; ProfileData uses BTreeMap for
+    // deterministic serialisation order.
+    let mut endpoint = std::collections::BTreeMap::new();
+    for (k, v) in &values {
+        if k != "display_name" && !v.trim().is_empty() {
+            endpoint.insert(k.clone(), v.trim().to_owned());
+        }
+    }
+
+    let id = editing_id.unwrap_or_else(uuid::Uuid::new_v4);
+    let is_edit = editing_id.is_some();
+
+    let profile = ProfileData {
+        id,
+        scheme,
+        display_name: display_name.clone(),
+        endpoint,
+        secret_ref: existing_secret_ref,
+    };
+
+    // Do NOT close the overlay here. The form stays open in "Saving…" state so that a
+    // failed save (ConnectionOpFailed) can keep the user's values intact for retry.
+    // The overlay is closed only on ConnectionSaved (success) or Cancel (user abort).
+    state.connection_saving = true;
+    state.status = Some(if is_edit {
+        format!("Saving '{display_name}'…")
+    } else {
+        format!("Adding '{display_name}'…")
+    });
+
+    vec![AppEffect::SaveConnection { profile, is_edit }]
+}
+
 /// Handle an action while a modal overlay is open. Routes to the handler for the open overlay.
 fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     // Quit (q / Ctrl-C) always quits immediately, even from within an overlay — close it first so
@@ -664,12 +984,16 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::ConfirmDelete { .. }) => apply_confirm_delete_action(state, action),
         Some(Overlay::ConfirmOverwrite { .. }) => apply_confirm_overwrite_action(state, action),
         Some(Overlay::ConfirmShellAction { .. }) => apply_confirm_shell_action(state, action),
+        Some(Overlay::ConfirmDeleteConnection { .. }) => {
+            apply_confirm_delete_connection_action(state, action)
+        }
         Some(Overlay::AiPlan { .. }) => apply_ai_plan_action(state, action),
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
         Some(Overlay::TransferQueue { .. }) => apply_transfer_queue_action(state, action),
         Some(Overlay::LogViewer { .. }) => apply_log_viewer_action(state, action),
         Some(Overlay::ExecPane { .. }) => apply_exec_pane_action(state, action),
         Some(Overlay::PortForwardStatus { .. }) => apply_port_forward_status_action(state, action),
+        Some(Overlay::ConnectionForm { .. }) => apply_connection_form_action(state, action),
         // A text prompt / the vault-unlock field capture keystrokes as `Msg::Text`; non-quit actions
         // don't reach them.
         Some(Overlay::Prompt { .. } | Overlay::VaultUnlock { .. }) | None => Vec::new(),
@@ -811,6 +1135,35 @@ fn apply_confirm_shell_action(state: &mut AppState, action: Action) -> Vec<AppEf
     }
 }
 
+/// Drive the confirm-delete-connection dialog: `Confirm`/`Enter` fires `DeleteConnection`;
+/// `Cancel`/`Esc` returns to the connections overlay (or closes if there is none).
+fn apply_confirm_delete_connection_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    let Some(Overlay::ConfirmDeleteConnection {
+        id,
+        display_name: _,
+    }) = &state.overlay
+    else {
+        return Vec::new();
+    };
+    let id = *id;
+    match action {
+        Action::Confirm | Action::Enter => {
+            if state.connection_saving {
+                return Vec::new();
+            }
+            state.connection_saving = true;
+            state.status = Some("Deleting connection…".to_owned());
+            state.overlay = None;
+            vec![AppEffect::DeleteConnection { id }]
+        }
+        Action::Cancel => {
+            state.overlay = None;
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Drive the connection switcher: navigate the choice list and open the selected connection in the
 /// active pane.
 fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
@@ -877,6 +1230,74 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
         }
         Action::Cancel => {
             state.overlay = None;
+            Vec::new()
+        }
+        Action::NewConnection => {
+            // Open the scheme picker to start adding a new connection.
+            // `cursor` (the &mut into state.overlay) is not used after this point, so
+            // NLL ends the borrow before we replace state.overlay.
+            open_scheme_picker(state);
+            Vec::new()
+        }
+        Action::EditConnection => {
+            // Copy the cursor value so the mutable borrow on state.overlay ends before we read
+            // state.connections and then replace state.overlay.
+            let cursor_val = *cursor;
+            let Some(choice) = state.connections.get(cursor_val).cloned() else {
+                return Vec::new();
+            };
+            let profile_id = match &choice.kind {
+                ConnectionKind::Profile { id } => *id,
+                ConnectionKind::AutoDiscovered => {
+                    state.status = Some(
+                        "Built-in and auto-discovered connections are not editable".to_owned(),
+                    );
+                    return Vec::new();
+                }
+            };
+            let Some(profile_data) = state.saved_profiles.get(&profile_id).cloned() else {
+                state.status = Some("Connection data not found — try restarting Cairn".to_owned());
+                return Vec::new();
+            };
+            // Pre-populate the form with the existing profile data.
+            let mut values = std::collections::HashMap::new();
+            values.insert("display_name".to_owned(), profile_data.display_name.clone());
+            for (k, v) in &profile_data.endpoint {
+                values.insert(k.clone(), v.clone());
+            }
+            state.overlay = Some(Overlay::ConnectionForm {
+                stage: ConnectionFormStage::Fields,
+                scheme: profile_data.scheme.clone(),
+                values,
+                focus: 0,
+                field_errors: std::collections::HashMap::new(),
+                editing_id: Some(profile_id),
+                existing_secret_ref: profile_data.secret_ref,
+            });
+            Vec::new()
+        }
+        // `Action::Delete` is the key 'd' maps to; `Action::DeleteConnection` is the named action
+        // available via keybinding override. Both trigger the same delete logic here: open a
+        // confirmation dialog rather than immediately deleting (destructive, no undo).
+        Action::Delete | Action::DeleteConnection => {
+            let cursor_val = *cursor;
+            let Some(choice) = state.connections.get(cursor_val).cloned() else {
+                return Vec::new();
+            };
+            let profile_id = match &choice.kind {
+                ConnectionKind::Profile { id } => *id,
+                ConnectionKind::AutoDiscovered => {
+                    state.status = Some(
+                        "Built-in and auto-discovered connections cannot be deleted".to_owned(),
+                    );
+                    return Vec::new();
+                }
+            };
+            // Show a confirmation prompt instead of deleting immediately — this is destructive.
+            state.overlay = Some(Overlay::ConfirmDeleteConnection {
+                id: profile_id,
+                display_name: choice.label.clone(),
+            });
             Vec::new()
         }
         _ => Vec::new(),
@@ -1143,11 +1564,13 @@ fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
             Overlay::ConfirmDelete { .. }
                 | Overlay::ConfirmOverwrite { .. }
                 | Overlay::ConfirmShellAction { .. }
+                | Overlay::ConfirmDeleteConnection { .. }
                 | Overlay::AiPlan { .. }
                 | Overlay::Connections { .. }
                 | Overlay::TransferQueue { .. }
                 | Overlay::Prompt { .. }
                 | Overlay::VaultUnlock { .. }
+                | Overlay::ConnectionForm { .. }
         )
     );
     if blocks_queue {
@@ -1935,6 +2358,56 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             if let Some(rec) = state.sessions.get_mut(&id) {
                 rec.local_port = Some(local_port);
             }
+            Vec::new()
+        }
+        AppEvent::ConnectionSaved {
+            id,
+            display_name,
+            label,
+            is_edit,
+            profile,
+        } => {
+            state.connection_saving = false;
+            state.saved_profiles.insert(id, profile);
+            if is_edit {
+                // Update the label of the matching choice in-place (no re-enumeration needed).
+                // Use `label` (computed by the effect runner) rather than `display_name` so that
+                // local profiles get the "local: {path}" prefix the provider uses, not just the name.
+                if let Some(choice) = state
+                    .connections
+                    .iter_mut()
+                    .find(|c| matches!(&c.kind, ConnectionKind::Profile { id: cid } if *cid == id))
+                {
+                    choice.label = label.clone();
+                }
+                state.status = Some(format!(
+                    "Updated '{display_name}' — endpoint changes apply on next open/restart"
+                ));
+            } else {
+                // New connection: won't appear in the switcher until restart (descriptor_map is
+                // immutable for this session and re-enumeration would alias IDs — P5 will fix this).
+                state.status = Some(format!(
+                    "Connection '{display_name}' saved — restart Cairn to use it in the switcher"
+                ));
+            }
+            if matches!(state.overlay, Some(Overlay::ConnectionForm { .. })) {
+                state.overlay = None;
+            }
+            Vec::new()
+        }
+        AppEvent::ConnectionDeleted { id } => {
+            state.connection_saving = false;
+            state.saved_profiles.remove(&id);
+            // Remove the matching choice by UUID, keeping ConnectionIds of all other entries stable.
+            state
+                .connections
+                .retain(|c| !matches!(&c.kind, ConnectionKind::Profile { id: cid } if *cid == id));
+            state.status = Some("Connection deleted".to_owned());
+            Vec::new()
+        }
+        AppEvent::ConnectionOpFailed { message } => {
+            state.connection_saving = false;
+            state.status = Some(message);
             Vec::new()
         }
         AppEvent::ConnectionOpened { conn, result } => {
@@ -5421,6 +5894,601 @@ mod navigation_dotdot_tests {
         assert!(
             fx.is_empty(),
             "op_targets must be empty when only `..` is visible"
+        );
+    }
+}
+
+#[cfg(test)]
+mod p4_form_tests {
+    use super::*;
+    use crate::state::{ChoiceProvenance, ConnectionChoice, DiscoverySource};
+    use cairn_types::{ConnectionId, VfsPath};
+
+    fn base() -> AppState {
+        AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root())
+    }
+
+    fn open_form(state: &mut AppState) {
+        let effects = update(state, Msg::Action(Action::NewConnection));
+        assert!(
+            effects.is_empty(),
+            "NewConnection should not emit effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn new_connection_opens_scheme_picker() {
+        let mut s = base();
+        open_form(&mut s);
+        assert!(
+            matches!(
+                &s.overlay,
+                Some(Overlay::ConnectionForm {
+                    stage: ConnectionFormStage::SchemePicker,
+                    ..
+                })
+            ),
+            "overlay should be SchemePicker, got {:?}",
+            s.overlay
+        );
+    }
+
+    #[test]
+    fn scheme_picker_enter_advances_to_fields() {
+        let mut s = base();
+        open_form(&mut s);
+        let effects = update(&mut s, Msg::Action(Action::Enter));
+        assert!(
+            effects.is_empty(),
+            "Enter in picker should not emit effects"
+        );
+        assert!(
+            matches!(
+                &s.overlay,
+                Some(Overlay::ConnectionForm {
+                    stage: ConnectionFormStage::Fields,
+                    ..
+                })
+            ),
+            "overlay should advance to Fields, got {:?}",
+            s.overlay
+        );
+    }
+
+    #[test]
+    fn scheme_picker_cancel_closes_overlay() {
+        let mut s = base();
+        open_form(&mut s);
+        let effects = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(effects.is_empty());
+        assert!(s.overlay.is_none(), "overlay must close on Cancel");
+    }
+
+    #[test]
+    fn fields_text_insert_and_backspace() {
+        let mut s = base();
+        open_form(&mut s);
+        // Advance past scheme picker.
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+
+        // Type "test" into the display_name field (first field, index 0).
+        for c in "test".chars() {
+            let _ = update(&mut s, Msg::Text(TextEdit::Insert(c)));
+        }
+        let val = match &s.overlay {
+            Some(Overlay::ConnectionForm { values, .. }) => {
+                values.get("display_name").cloned().unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        assert_eq!(val, "test");
+
+        // Backspace removes the last character.
+        let _ = update(&mut s, Msg::Text(TextEdit::Backspace));
+        let val = match &s.overlay {
+            Some(Overlay::ConnectionForm { values, .. }) => {
+                values.get("display_name").cloned().unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        assert_eq!(val, "tes");
+    }
+
+    #[test]
+    fn tab_and_shift_tab_cycle_focus() {
+        let mut s = base();
+        open_form(&mut s);
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+
+        let focus_before = match &s.overlay {
+            Some(Overlay::ConnectionForm { focus, .. }) => *focus,
+            _ => 0,
+        };
+        assert_eq!(focus_before, 0);
+
+        // Tab moves to next field.
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        let focus_after = match &s.overlay {
+            Some(Overlay::ConnectionForm { focus, .. }) => *focus,
+            _ => 0,
+        };
+        assert_eq!(focus_after, 1);
+
+        // Shift-Tab moves back.
+        let _ = update(&mut s, Msg::Text(TextEdit::PrevField));
+        let focus_back = match &s.overlay {
+            Some(Overlay::ConnectionForm { focus, .. }) => *focus,
+            _ => 0,
+        };
+        assert_eq!(focus_back, 0);
+    }
+
+    #[test]
+    fn submit_with_missing_required_field_shows_error() {
+        let mut s = base();
+        open_form(&mut s);
+        let _ = update(&mut s, Msg::Action(Action::Enter)); // advance to Fields (scheme = first = ssh)
+
+        // Submit without filling any fields — should stay open with errors.
+        let effects = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(
+            effects.is_empty(),
+            "submit with errors should not emit effects"
+        );
+        assert!(
+            s.overlay.is_some(),
+            "overlay must stay open on validation failure"
+        );
+        let errors_empty = match &s.overlay {
+            Some(Overlay::ConnectionForm { field_errors, .. }) => field_errors.is_empty(),
+            _ => true,
+        };
+        assert!(
+            !errors_empty,
+            "field_errors must be populated on validation failure"
+        );
+    }
+
+    #[test]
+    fn submit_valid_ssh_form_emits_save_effect() {
+        let mut s = base();
+        open_form(&mut s);
+        let _ = update(&mut s, Msg::Action(Action::Enter)); // → Fields, scheme = ssh (first in list)
+
+        // Fill required fields: display_name, host, user.
+        let required = [
+            ("display_name", "My SSH"),
+            ("host", "ssh.example.com"),
+            ("user", "alice"),
+        ];
+        for (key, val) in required {
+            // Advance focus to this field.
+            let target_focus = crate::forms::scheme_fields("ssh")
+                .iter()
+                .position(|f| f.key == key)
+                .unwrap_or(0);
+            if let Some(Overlay::ConnectionForm { focus, .. }) = &mut s.overlay {
+                *focus = target_focus;
+            }
+            for c in val.chars() {
+                let _ = update(&mut s, Msg::Text(TextEdit::Insert(c)));
+            }
+        }
+
+        let effects = update(&mut s, Msg::Text(TextEdit::Submit));
+        // Fix 3: the form stays open in "Saving…" state until ConnectionSaved (or Cancel).
+        assert!(
+            matches!(s.overlay, Some(Overlay::ConnectionForm { .. })),
+            "form overlay must stay open while saving (Fix 3)"
+        );
+        assert!(s.connection_saving, "connection_saving must be set");
+        assert_eq!(effects.len(), 1, "expected one SaveConnection effect");
+        assert!(
+            matches!(
+                &effects[0],
+                AppEffect::SaveConnection { is_edit: false, .. }
+            ),
+            "expected SaveConnection(is_edit: false): {effects:?}"
+        );
+    }
+
+    #[test]
+    fn connection_saved_event_updates_state() {
+        let mut s = base();
+        let id = uuid::Uuid::new_v4();
+        let profile = crate::forms::ProfileData {
+            id,
+            scheme: "ssh".to_owned(),
+            display_name: "Test".to_owned(),
+            endpoint: std::collections::BTreeMap::new(),
+            secret_ref: None,
+        };
+        s.connection_saving = true;
+
+        let effects = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionSaved {
+                id,
+                display_name: "Test".to_owned(),
+                label: "Test".to_owned(),
+                is_edit: false,
+                profile: profile.clone(),
+            }),
+        );
+
+        assert!(!s.connection_saving, "connection_saving must clear");
+        assert!(
+            s.saved_profiles.contains_key(&id),
+            "saved_profiles must contain the new id"
+        );
+        assert!(
+            effects.is_empty()
+                || effects
+                    .iter()
+                    .all(|e| !matches!(e, AppEffect::SaveConnection { .. }))
+        );
+    }
+
+    #[test]
+    fn connection_op_failed_clears_saving_flag() {
+        let mut s = base();
+        s.connection_saving = true;
+        let effects = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionOpFailed {
+                message: "disk full".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(
+            !s.connection_saving,
+            "ConnectionOpFailed must clear connection_saving"
+        );
+        assert_eq!(s.status.as_deref(), Some("disk full"));
+    }
+
+    /// Build a state with one saved SSH profile and the Connections overlay open at cursor 0.
+    fn state_with_connections() -> AppState {
+        let mut s = AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root());
+        let prof_id = uuid::Uuid::new_v4();
+        let mut ep = std::collections::BTreeMap::new();
+        ep.insert("host".to_owned(), "example.com".to_owned());
+        ep.insert("user".to_owned(), "ubuntu".to_owned());
+        let profile = crate::forms::ProfileData {
+            id: prof_id,
+            scheme: "ssh".to_owned(),
+            display_name: "test-ssh".to_owned(),
+            endpoint: ep,
+            secret_ref: None,
+        };
+        s.saved_profiles.insert(prof_id, profile);
+        s.connections = vec![ConnectionChoice {
+            conn: ConnectionId(3),
+            label: "test-ssh".to_owned(),
+            provenance: ChoiceProvenance::Saved,
+            status: ChoiceStatus::NeedsOpen,
+            kind: ConnectionKind::Profile { id: prof_id },
+        }];
+        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        s
+    }
+
+    #[test]
+    fn scheme_change_prunes_stale_values() {
+        let mut s = AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root());
+        // Open scheme picker (new connection).
+        let _ = update(&mut s, Msg::Action(Action::NewConnection));
+        // Select SSH (focus=0) → advance to fields.
+        let _ = update(&mut s, Msg::Action(Action::Confirm));
+        // Move focus to the host field (index 1) and type a value.
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        for c in "example.com".chars() {
+            let _ = update(&mut s, Msg::Text(TextEdit::Insert(c)));
+        }
+        // Esc → back to SchemePicker (new connection so Esc goes back, not closes).
+        let _ = update(&mut s, Msg::Text(TextEdit::Cancel));
+        assert!(
+            matches!(
+                s.overlay,
+                Some(Overlay::ConnectionForm {
+                    stage: ConnectionFormStage::SchemePicker,
+                    ..
+                })
+            ),
+            "Esc in new-connection Fields should return to SchemePicker"
+        );
+        // Move to S3 (index 1) and confirm.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::Confirm));
+        // The stale "host" value must be gone; scheme must be s3.
+        match &s.overlay {
+            Some(Overlay::ConnectionForm { values, scheme, .. }) => {
+                assert_eq!(scheme, "s3", "scheme must be s3 after picker advance");
+                assert!(
+                    !values.contains_key("host"),
+                    "host value must be pruned on scheme change"
+                );
+            }
+            _ => panic!("expected ConnectionForm after scheme selection"),
+        }
+    }
+
+    #[test]
+    fn failed_save_keeps_form_open_with_values() {
+        let mut s = AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root());
+        // Open new SSH connection form.
+        let _ = update(&mut s, Msg::Action(Action::NewConnection));
+        let _ = update(&mut s, Msg::Action(Action::Confirm)); // pick SSH (focus=0)
+                                                              // Fill required fields: display_name, host, user (in order via NextField).
+        for c in "myserver".chars() {
+            let _ = update(&mut s, Msg::Text(TextEdit::Insert(c)));
+        }
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        for c in "prod.example.com".chars() {
+            let _ = update(&mut s, Msg::Text(TextEdit::Insert(c)));
+        }
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        for c in "ubuntu".chars() {
+            let _ = update(&mut s, Msg::Text(TextEdit::Insert(c)));
+        }
+        // Submit — emits SaveConnection effect, overlay stays open (Fix 3).
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(
+            s.connection_saving,
+            "connection_saving must be set after submit"
+        );
+        assert!(
+            matches!(s.overlay, Some(Overlay::ConnectionForm { .. })),
+            "form overlay must stay open while saving"
+        );
+        // Simulate a disk-full error.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionOpFailed {
+                message: "disk full".to_owned(),
+            }),
+        );
+        assert!(
+            !s.connection_saving,
+            "connection_saving must be cleared on failure"
+        );
+        assert!(
+            matches!(s.overlay, Some(Overlay::ConnectionForm { .. })),
+            "form overlay must survive a save failure so user can retry or cancel"
+        );
+        // User's values must still be there.
+        match &s.overlay {
+            Some(Overlay::ConnectionForm { values, .. }) => {
+                assert_eq!(
+                    values.get("display_name").map(String::as_str),
+                    Some("myserver")
+                );
+            }
+            _ => panic!("overlay lost on failed save"),
+        }
+    }
+
+    #[test]
+    fn delete_connection_opens_confirm_overlay() {
+        let mut s = state_with_connections();
+        let effects = update(&mut s, Msg::Action(Action::DeleteConnection));
+        assert!(
+            effects.is_empty(),
+            "must not immediately delete — show confirm first"
+        );
+        assert!(
+            matches!(s.overlay, Some(Overlay::ConfirmDeleteConnection { .. })),
+            "overlay must be ConfirmDeleteConnection after pressing delete"
+        );
+        // Confirm delete — must emit DeleteConnection effect.
+        let effects = update(&mut s, Msg::Action(Action::Confirm));
+        assert_eq!(effects.len(), 1, "expected one DeleteConnection effect");
+        assert!(matches!(effects[0], AppEffect::DeleteConnection { .. }));
+    }
+
+    #[test]
+    fn delete_confirm_cancel_restores_no_overlay() {
+        let mut s = state_with_connections();
+        let _ = update(&mut s, Msg::Action(Action::DeleteConnection));
+        let effects = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(effects.is_empty());
+        assert!(s.overlay.is_none(), "cancelling confirm must close overlay");
+    }
+
+    #[test]
+    fn edit_prefills_all_endpoint_fields() {
+        let mut s = state_with_connections();
+        let prof_id = match &s.connections[0].kind {
+            ConnectionKind::Profile { id } => *id,
+            _ => panic!("expected profile"),
+        };
+        let effects = update(&mut s, Msg::Action(Action::EditConnection));
+        assert!(effects.is_empty());
+        match &s.overlay {
+            Some(Overlay::ConnectionForm {
+                stage,
+                scheme,
+                values,
+                editing_id,
+                existing_secret_ref,
+                ..
+            }) => {
+                assert_eq!(*stage, ConnectionFormStage::Fields);
+                assert_eq!(scheme, "ssh");
+                assert_eq!(values.get("host").map(String::as_str), Some("example.com"));
+                assert_eq!(values.get("user").map(String::as_str), Some("ubuntu"));
+                assert_eq!(*editing_id, Some(prof_id));
+                assert!(
+                    existing_secret_ref.is_none(),
+                    "test profile has no secret_ref"
+                );
+            }
+            _ => panic!("expected ConnectionForm in Fields stage after EditConnection"),
+        }
+    }
+
+    #[test]
+    fn secret_ref_preserved_through_submit() {
+        let mut s = AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root());
+        let prof_id = uuid::Uuid::new_v4();
+        let vault_ref = uuid::Uuid::new_v4();
+        let mut ep = std::collections::BTreeMap::new();
+        ep.insert("host".to_owned(), "host".to_owned());
+        ep.insert("user".to_owned(), "u".to_owned());
+        let profile = crate::forms::ProfileData {
+            id: prof_id,
+            scheme: "ssh".to_owned(),
+            display_name: "secured".to_owned(),
+            endpoint: ep,
+            secret_ref: Some(vault_ref),
+        };
+        s.connections = vec![ConnectionChoice {
+            conn: ConnectionId(3),
+            label: "ssh: secured".to_owned(),
+            provenance: ChoiceProvenance::Saved,
+            status: ChoiceStatus::NeedsOpen,
+            kind: ConnectionKind::Profile { id: prof_id },
+        }];
+        s.saved_profiles.insert(prof_id, profile);
+        s.overlay = Some(Overlay::Connections { cursor: 0 });
+
+        // Open the edit form.
+        let _ = update(&mut s, Msg::Action(Action::EditConnection));
+        match &s.overlay {
+            Some(Overlay::ConnectionForm {
+                existing_secret_ref,
+                ..
+            }) => {
+                assert_eq!(
+                    *existing_secret_ref,
+                    Some(vault_ref),
+                    "secret_ref must be pre-loaded from the profile"
+                );
+            }
+            _ => panic!("expected ConnectionForm"),
+        }
+
+        // Submit the form (values are already pre-filled from the profile).
+        let effects = update(&mut s, Msg::Text(TextEdit::Submit));
+        // Should emit SaveConnection with the original secret_ref preserved.
+        assert_eq!(effects.len(), 1, "submit must emit SaveConnection effect");
+        match &effects[0] {
+            AppEffect::SaveConnection { profile, .. } => {
+                assert_eq!(
+                    profile.secret_ref,
+                    Some(vault_ref),
+                    "SaveConnection must preserve secret_ref"
+                );
+            }
+            other => panic!("expected SaveConnection effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auto_discovered_edit_is_rejected_with_hint() {
+        let mut s = AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root());
+        s.connections = vec![ConnectionChoice {
+            conn: ConnectionId(3),
+            label: "docker: /".to_owned(),
+            provenance: ChoiceProvenance::Discovered {
+                source: DiscoverySource::Docker,
+            },
+            status: ChoiceStatus::Ready,
+            kind: ConnectionKind::AutoDiscovered,
+        }];
+        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        let effects = update(&mut s, Msg::Action(Action::EditConnection));
+        assert!(effects.is_empty());
+        let status = s.status.as_deref().unwrap_or("").to_lowercase();
+        assert!(
+            status.contains("not editable") || status.contains("cannot"),
+            "edit of auto-discovered must show rejection hint: {:?}",
+            s.status
+        );
+        // Overlay should remain on Connections (not switch to ConnectionForm).
+        assert!(
+            matches!(s.overlay, Some(Overlay::Connections { .. })),
+            "overlay must stay as Connections after rejecting edit of auto-discovered"
+        );
+    }
+
+    #[test]
+    fn auto_discovered_delete_is_rejected_with_hint() {
+        let mut s = AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root());
+        s.connections = vec![ConnectionChoice {
+            conn: ConnectionId(3),
+            label: "docker: /".to_owned(),
+            provenance: ChoiceProvenance::Discovered {
+                source: DiscoverySource::Docker,
+            },
+            status: ChoiceStatus::Ready,
+            kind: ConnectionKind::AutoDiscovered,
+        }];
+        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        let effects = update(&mut s, Msg::Action(Action::DeleteConnection));
+        assert!(effects.is_empty());
+        assert!(
+            s.status
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("cannot"),
+            "delete of auto-discovered must show rejection hint: {:?}",
+            s.status
+        );
+    }
+
+    #[test]
+    fn edit_updates_switcher_label_with_scheme_prefix() {
+        let mut s = state_with_connections();
+        // Simulate the save completing with a prefixed label.
+        let prof_id = match &s.connections[0].kind {
+            ConnectionKind::Profile { id } => *id,
+            _ => panic!("expected profile"),
+        };
+        let saved_profile = s.saved_profiles[&prof_id].clone();
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionSaved {
+                id: prof_id,
+                display_name: "my-server".to_owned(),
+                label: "ssh: my-server".to_owned(),
+                is_edit: true,
+                profile: saved_profile,
+            }),
+        );
+        assert_eq!(
+            s.connections[0].label, "ssh: my-server",
+            "edited connection label must carry the scheme prefix"
+        );
+    }
+
+    #[test]
+    fn connection_deleted_event_removes_from_saved_profiles() {
+        let mut s = base();
+        let id = uuid::Uuid::new_v4();
+        let profile = crate::forms::ProfileData {
+            id,
+            scheme: "local".to_owned(),
+            display_name: "Old".to_owned(),
+            endpoint: std::collections::BTreeMap::new(),
+            secret_ref: None,
+        };
+        s.saved_profiles.insert(id, profile);
+        s.connection_saving = true;
+
+        let effects = update(&mut s, Msg::Event(AppEvent::ConnectionDeleted { id }));
+
+        assert!(!s.connection_saving, "connection_saving must clear");
+        assert!(
+            !s.saved_profiles.contains_key(&id),
+            "saved_profiles must not contain the deleted id"
+        );
+        assert!(
+            effects.is_empty()
+                || effects
+                    .iter()
+                    .all(|e| !matches!(e, AppEffect::DeleteConnection { .. }))
         );
     }
 }

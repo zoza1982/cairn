@@ -349,6 +349,18 @@ impl PaneState {
     }
 }
 
+/// The two stages of the connection form overlay.
+///
+/// `SchemePicker` shows a scrollable list of known backends; once the user selects one the form
+/// advances to `Fields` where they fill in the scheme-specific endpoint parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionFormStage {
+    /// Step 1: choose a backend scheme from the list.
+    SchemePicker,
+    /// Step 2: fill in the endpoint fields for the chosen scheme.
+    Fields,
+}
+
 /// A modal overlay awaiting user input.
 #[derive(Debug, Clone)]
 pub enum Overlay {
@@ -477,6 +489,42 @@ pub enum Overlay {
     PortForwardStatus {
         /// Session id — state lives in [`AppState::sessions`].
         id: SessionId,
+    },
+    /// Confirm deletion of a saved connection profile. The user sees the profile name and must
+    /// press `[Enter]` to confirm or `[Esc]`/`[q]` to cancel. Destructive: removes the entry from
+    /// the config file.
+    ConfirmDeleteConnection {
+        /// The stable UUID of the profile to delete.
+        id: uuid::Uuid,
+        /// Display name shown in the confirmation prompt.
+        display_name: String,
+    },
+    /// The add-/edit-connection form (Phase P4 of RFC-0011).
+    ///
+    /// A two-stage overlay: `SchemePicker` presents a scrollable list of backends; once the user
+    /// selects one the form advances to `Fields` for the scheme-specific endpoint parameters.
+    /// Credential capture is deferred to P5 — the form collects endpoint data only and shows a
+    /// one-line hint about upcoming credential support.
+    ///
+    /// `editing_id` is `None` for a new connection and `Some(id)` when editing an existing profile.
+    /// `existing_secret_ref` carries the `secret_ref` from the live profile so it is not silently
+    /// dropped when the user edits and re-saves a connection that already has credentials.
+    ConnectionForm {
+        /// Current stage.
+        stage: ConnectionFormStage,
+        /// The chosen scheme id (e.g. `"ssh"`), populated when advancing to `Fields`.
+        scheme: String,
+        /// Live field values keyed by [`crate::forms::FieldSpec::key`].
+        values: HashMap<String, String>,
+        /// Which field (by index into the scheme's field list) currently has focus.
+        focus: usize,
+        /// Per-field validation errors, shown inline. Cleared when the user edits the field.
+        field_errors: HashMap<String, String>,
+        /// `None` = new connection; `Some(id)` = editing an existing profile.
+        editing_id: Option<uuid::Uuid>,
+        /// The existing `secret_ref` from the profile being edited, preserved on save. `None`
+        /// for new connections (credentials are configured in P5).
+        existing_secret_ref: Option<uuid::Uuid>,
     },
 }
 
@@ -695,6 +743,13 @@ pub struct AppState {
     pub sessions: HashMap<SessionId, SessionRecord>,
     /// Monotonic id counter for session records (like `next_transfer_id`). Starts at 1; 0 is sentinel.
     pub next_session_id: SessionId,
+    /// Whether a `SaveConnection`/`DeleteConnection` effect is currently in flight (suppresses
+    /// duplicate submits from rapid key presses and drives a "Saving…" status hint).
+    pub connection_saving: bool,
+    /// All saved connection profiles, keyed by their stable UUID. Populated from config at startup
+    /// and kept in sync by `ConnectionSaved`/`ConnectionDeleted` events. The connection form reads
+    /// this to pre-populate fields when editing an existing profile.
+    pub saved_profiles: HashMap<uuid::Uuid, crate::forms::ProfileData>,
 }
 
 /// A stable identifier for an in-flight transfer, used to address progress/done events and the
@@ -810,6 +865,8 @@ impl AppState {
             next_log_viewer_id: 1,
             sessions: HashMap::new(),
             next_session_id: SessionId(1),
+            connection_saving: false,
+            saved_profiles: HashMap::new(),
         }
     }
 
@@ -853,6 +910,11 @@ impl AppState {
             Some(
                 Overlay::Prompt { .. } | Overlay::VaultUnlock { .. } | Overlay::ExecPane { .. },
             ) => true,
+            // The connection form captures text only while the user is filling in fields.
+            Some(Overlay::ConnectionForm {
+                stage: ConnectionFormStage::Fields,
+                ..
+            }) => true,
             Some(_) => false,
             None => self.active().filter_editing,
         }
