@@ -1997,6 +1997,9 @@ async fn run_port_forward_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Used only by the feature-gated deferral test below; gated to avoid an unused-import
+    // warning in the lean build.
+    #[cfg(feature = "s3")]
     use cairn_config::ConnectionProfile;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
