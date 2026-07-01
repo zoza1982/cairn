@@ -144,10 +144,17 @@ impl ConnectionCoordinator {
                 Box::new(BuiltinLocalProvider),
                 Box::new(SavedProfileProvider),
             ];
+            // Discovery providers are gated on BOTH the compiled feature AND the user's
+            // `[discovery]` opt-out toggle (default on). Skipping the push here is what makes
+            // `discovery.docker = false` / `discovery.kubernetes = false` actually take effect.
             #[cfg(feature = "docker")]
-            list.push(Box::new(DockerProvider));
+            if ctx.config.discovery.docker {
+                list.push(Box::new(DockerProvider));
+            }
             #[cfg(feature = "k8s")]
-            list.push(Box::new(KubeconfigProvider));
+            if ctx.config.discovery.kubernetes {
+                list.push(Box::new(KubeconfigProvider));
+            }
             list
         };
 
@@ -450,12 +457,24 @@ mod tests {
         }
     }
 
+    /// A `Config` with auto-discovery disabled. Coordinator unit tests exercise the merge / id /
+    /// overlay logic and must be hermetic — with discovery on and `--all-features`, the real Docker
+    /// / kubeconfig providers would run against whatever daemon/kubeconfig the host (or CI runner)
+    /// happens to have, making assertions like "builtin roots only" flaky. Real discovery is
+    /// covered by the provider modules' own tests and the env-guarded integration jobs.
+    fn test_config() -> Config {
+        let mut c = Config::default();
+        c.discovery.docker = false;
+        c.discovery.kubernetes = false;
+        c
+    }
+
     // ── No profiles ─────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn no_profiles_produces_builtin_roots_only() {
         let (coordinator, registry) = make_coordinator();
-        let config = Config::default();
+        let config = test_config();
         let (choices, deferred, descriptors) = coordinator
             .run(&registry, &ctx(&config), &HashMap::new())
             .await;
@@ -492,7 +511,7 @@ mod tests {
     #[tokio::test]
     async fn local_profiles_are_appended_after_builtins() {
         let (coordinator, registry) = make_coordinator();
-        let mut config = Config::default();
+        let mut config = test_config();
         let mut prof = ConnectionProfile::new("local", "work");
         prof.endpoint.insert("path".into(), "/work".into());
         let prof_id = prof.id;
@@ -529,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn credential_profile_with_vault_locked_is_needs_vault() {
         let (coordinator, registry) = make_coordinator();
-        let mut config = Config::default();
+        let mut config = test_config();
         let mut prof = ConnectionProfile::new("s3", "prod");
         prof.endpoint.insert("bucket".into(), "b".into());
         prof.secret_ref = Some(Uuid::new_v4());
@@ -568,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn credential_free_profile_is_needs_open() {
         let (coordinator, registry) = make_coordinator();
-        let mut config = Config::default();
+        let mut config = test_config();
         // Docker has no secret_ref → Ready classification by SavedProfileProvider.
         config
             .connections
@@ -605,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn id_assignment_matches_expected_order() {
         let (coordinator, registry) = make_coordinator();
-        let mut config = Config::default();
+        let mut config = test_config();
 
         let mut local_prof = ConnectionProfile::new("local", "work");
         local_prof.endpoint.insert("path".into(), "/work".into());
@@ -646,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn key_reuse_preserves_id_across_reenumeration() {
         let (coordinator, registry) = make_coordinator();
-        let config = Config::default();
+        let config = test_config();
 
         // First enumeration (no prior map).
         let (choices1, _, descriptors1) = coordinator
@@ -678,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_id_counter_skips_prior_claimed_ids() {
         let (coordinator, registry) = make_coordinator();
-        let mut config = Config::default();
+        let mut config = test_config();
 
         // Add a local profile so the second enumeration produces more entries.
         let mut prof = ConnectionProfile::new("local", "work");
@@ -741,7 +760,7 @@ mod tests {
         let (coordinator, registry) = make_coordinator();
 
         // Find the key string for the filesystem root so we can hide it.
-        let mut config = Config::default();
+        let mut config = test_config();
         let root_key = {
             let (choices_pre, _, _) = coordinator
                 .run(&registry, &ctx(&config), &HashMap::new())
@@ -831,7 +850,7 @@ mod tests {
     #[tokio::test]
     async fn pinned_nonexistent_key_is_silently_ignored() {
         let (coordinator, registry) = make_coordinator();
-        let mut config = Config::default();
+        let mut config = test_config();
         config.discovery.pinned = vec!["kube:kubeconfig".to_owned()]; // k8s not built in lean
 
         // Must not panic or error; just produce the normal builtin-only list.
