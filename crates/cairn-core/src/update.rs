@@ -10,6 +10,16 @@ use cairn_types::{Entry, SessionId, VfsPath};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+/// Minimum passphrase length for a new vault. Enforced in the pure reducer, before the effect
+/// runner even sees the secret; a 1-character vault would be trivially brute-forced even with
+/// Argon2id. 8 characters is the absolute floor; the UI hint says "at least 12 recommended".
+/// Minimum character count for a new vault master passphrase.
+///
+/// 12 characters is a conservative floor for a master passphrase that guards every stored
+/// credential. Argon2id provides additional strength through its KDF, but the passphrase
+/// itself must exceed a trivial length threshold.
+pub const VAULT_PASSPHRASE_MIN_LEN: usize = 12;
+
 /// Apply a message to the state, returning any effects to run. Deterministic and side-effect-free.
 #[must_use]
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<AppEffect> {
@@ -171,16 +181,32 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         Action::VaultUnlock => {
             if state.vault_unlocked {
                 state.status = Some("Vault already unlocked".to_owned());
-            } else {
+            } else if state.vault_file_exists {
+                // Vault file is present on disk — prompt for the passphrase to open it.
                 state.overlay = Some(Overlay::VaultUnlock {
                     input: MaskedInput::new(),
                     error: None,
                     // Explicitly triggered by the user (Ctrl-U), not a NeedsVault selection.
                     pending_conn: None,
                 });
+            } else {
+                // No vault file yet — guide the user through first-run creation.
+                state.overlay = Some(Overlay::VaultCreate {
+                    passphrase: MaskedInput::new(),
+                    confirm: MaskedInput::new(),
+                    focus: 0,
+                    remember: false,
+                    error: None,
+                    creating: false,
+                    pending_conn: None,
+                });
             }
             Vec::new()
         }
+        // `ToggleRemember` is emitted by `map_input` when Ctrl-R is pressed while the
+        // `VaultCreate` overlay is open. When the overlay is open `apply_overlay_action` handles
+        // it; this arm covers the (shouldn't-happen) path where no overlay is open.
+        Action::ToggleRemember => Vec::new(),
         Action::MakeDir => {
             state.overlay = Some(Overlay::Prompt {
                 kind: PromptKind::MakeDir,
@@ -361,6 +387,9 @@ fn apply_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
     if matches!(state.overlay, Some(Overlay::VaultUnlock { .. })) {
         return apply_vault_unlock_text(state, edit);
     }
+    if matches!(state.overlay, Some(Overlay::VaultCreate { .. })) {
+        return apply_vault_create_text(state, edit);
+    }
     if matches!(state.overlay, Some(Overlay::ExecPane { .. })) {
         return apply_exec_pane_text(state, edit);
     }
@@ -440,6 +469,182 @@ fn submit_vault_unlock(state: &mut AppState) -> Vec<AppEffect> {
     state.vault_unlocking = true;
     state.status = Some("Unlocking vault…".to_owned());
     vec![AppEffect::UnlockVault { passphrase }]
+}
+
+/// Edit the vault-create passphrase or confirm field.
+///
+/// Both fields are [`MaskedInput`] — no-echo, redacted in `Debug`, zeroized on drop. The focused
+/// field (0 = passphrase, 1 = confirm) receives character input; `Tab`/`Shift-Tab` cycle focus.
+/// The raw bytes NEVER leave the `MaskedInput` except via `take_secret()` inside
+/// `submit_vault_create`, and even then only into a `SecretString` that is immediately handed
+/// to [`AppEffect::CreateVault`].
+fn apply_vault_create_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffect> {
+    let Some(Overlay::VaultCreate {
+        passphrase,
+        confirm,
+        focus,
+        error,
+        ..
+    }) = &mut state.overlay
+    else {
+        return Vec::new();
+    };
+    match edit {
+        TextEdit::Insert(c) => {
+            // Reject control characters; passphrase and confirm accept anything else.
+            if !c.is_control() {
+                if *focus == 0 {
+                    passphrase.push(c);
+                } else {
+                    confirm.push(c);
+                }
+                // Any new input dismisses a stale mismatch/length error.
+                *error = None;
+            }
+            Vec::new()
+        }
+        TextEdit::Backspace => {
+            if *focus == 0 {
+                passphrase.backspace();
+            } else {
+                confirm.backspace();
+            }
+            Vec::new()
+        }
+        // Tab / Shift-Tab both wrap between the two fields (there are only two, so Next and Prev
+        // are symmetric: toggle). Using `NextField`/`PrevField` keeps the text-edit API
+        // symmetric with `ConnectionForm`.
+        TextEdit::NextField | TextEdit::PrevField => {
+            *focus = 1 - *focus;
+            Vec::new()
+        }
+        // Esc cancels the overlay (both fields zeroize on drop). Mirror VaultUnlock: clear any
+        // `pending_conn_open` slot so a future ConnectionOpened doesn't navigate the pane.
+        TextEdit::Cancel => {
+            if let Some(Overlay::VaultCreate {
+                pending_conn: Some(conn_id),
+                ..
+            }) = &state.overlay
+            {
+                let conn_id = *conn_id;
+                for slot in &mut state.pending_conn_open {
+                    if *slot == Some(conn_id) {
+                        *slot = None;
+                    }
+                }
+            }
+            state.overlay = None;
+            Vec::new()
+        }
+        TextEdit::Submit => submit_vault_create(state),
+        // `CloseStdin` is only meaningful in ExecPane.
+        TextEdit::CloseStdin => Vec::new(),
+    }
+}
+
+/// Validate and submit the two passphrase fields: emit [`AppEffect::CreateVault`] or set an
+/// in-place error without emitting an effect.
+///
+/// Security invariants:
+/// - Lengths are compared first (no bytes exposed, O(1)).
+/// - Only when lengths match are both secrets taken (wiping both fields) and compared via
+///   `expose_secret`. If content mismatches, both `SecretString` values drop immediately
+///   (zeroized before the function returns).
+/// - On success only the passphrase `SecretString` is carried in the effect; the confirm
+///   `SecretString` is always dropped before the effect is returned.
+/// - An empty or too-short passphrase is rejected before any `take_secret` call.
+///
+/// Explicit scoping blocks (`{ … }`) end each mutable borrow of `state.overlay` so that
+/// later phases can re-borrow it cleanly — the NLL borrow checker requires this when the
+/// same field is borrowed, mutated, and then borrowed again in sequence.
+fn submit_vault_create(state: &mut AppState) -> Vec<AppEffect> {
+    use cairn_secrets::ExposeSecret as _;
+
+    // Phase 1: guard against a duplicate submit while Argon2id is already running.
+    if matches!(
+        &state.overlay,
+        Some(Overlay::VaultCreate { creating: true, .. })
+    ) {
+        return Vec::new();
+    }
+
+    // Phase 2: validation (lengths only — no bytes exposed). Each early return ends the borrow.
+    {
+        let Some(Overlay::VaultCreate {
+            passphrase,
+            confirm,
+            error,
+            ..
+        }) = &mut state.overlay
+        else {
+            return Vec::new();
+        };
+        if passphrase.is_empty() {
+            *error = Some("Enter a passphrase".to_owned());
+            return Vec::new();
+        }
+        if passphrase.len() < VAULT_PASSPHRASE_MIN_LEN {
+            *error = Some(format!(
+                "Passphrase must be at least {VAULT_PASSPHRASE_MIN_LEN} characters"
+            ));
+            return Vec::new();
+        }
+        if confirm.is_empty() {
+            *error = Some("Confirm the passphrase".to_owned());
+            return Vec::new();
+        }
+        if passphrase.len() != confirm.len() {
+            // Clear confirm so the user types it fresh; leave passphrase intact for a quicker retry.
+            confirm.clear();
+            *error = Some("Passphrases do not match".to_owned());
+            return Vec::new();
+        }
+    } // ← mutable borrow ends; state.overlay is free again
+
+    // Phase 3: take both secrets (wipes both MaskedInput buffers) and compare content.
+    // The borrow ends when this block closes; `pp` and `cf` own their heap allocations.
+    let (pp, cf) = {
+        let Some(Overlay::VaultCreate {
+            passphrase,
+            confirm,
+            ..
+        }) = &mut state.overlay
+        else {
+            return Vec::new();
+        };
+        (passphrase.take_secret(), confirm.take_secret())
+    }; // ← borrow ends
+
+    if pp.expose_secret() != cf.expose_secret() {
+        // Both values are zeroized: `cf` explicitly here, `pp` at the early return below.
+        // Focus resets to the passphrase field so the user knows to re-enter both.
+        drop(cf);
+        if let Some(Overlay::VaultCreate { error, focus, .. }) = &mut state.overlay {
+            *error = Some("Passphrases do not match — re-enter both.".to_owned());
+            *focus = 0;
+        }
+        return Vec::new(); // `pp` zeroized here
+    }
+    // Confirm matched; zeroize it immediately — only `pp` proceeds.
+    drop(cf);
+
+    // Phase 4: set the in-flight flag and read `remember` in one re-borrow.
+    let remember = match &mut state.overlay {
+        Some(Overlay::VaultCreate {
+            remember, creating, ..
+        }) => {
+            let r = *remember;
+            *creating = true;
+            r
+        }
+        _ => return Vec::new(),
+    };
+
+    state.status = Some("Creating vault…".to_owned());
+    vec![AppEffect::CreateVault {
+        passphrase: pp,
+        remember,
+    }]
 }
 
 /// Route text-editing keystrokes to the exec pane's input field.
@@ -994,10 +1199,25 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::ExecPane { .. }) => apply_exec_pane_action(state, action),
         Some(Overlay::PortForwardStatus { .. }) => apply_port_forward_status_action(state, action),
         Some(Overlay::ConnectionForm { .. }) => apply_connection_form_action(state, action),
-        // A text prompt / the vault-unlock field capture keystrokes as `Msg::Text`; non-quit actions
-        // don't reach them.
+        // Text prompts and the vault-unlock field capture keystrokes as `Msg::Text`; non-quit
+        // actions don't reach them. VaultCreate is also primarily text-driven, but `ToggleRemember`
+        // needs an action path (Ctrl-R is intercepted in `map_input` before `capturing_text` is
+        // checked), so it has its own action handler.
+        Some(Overlay::VaultCreate { .. }) => apply_vault_create_action(state, action),
         Some(Overlay::Prompt { .. } | Overlay::VaultUnlock { .. }) | None => Vec::new(),
     }
+}
+
+/// Handle the one non-text action available while the VaultCreate overlay is open:
+/// `ToggleRemember` (Ctrl-R) flips the OS-keychain opt-in flag. All other actions are no-ops
+/// because the overlay captures keystrokes as text — they never reach this path.
+fn apply_vault_create_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    if action == Action::ToggleRemember {
+        if let Some(Overlay::VaultCreate { remember, .. }) = &mut state.overlay {
+            *remember = !*remember;
+        }
+    }
+    Vec::new()
 }
 
 /// Drive the transfer-queue overlay: navigate the pending list, drop the selected pending transfer
@@ -1210,13 +1430,27 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
                     vec![AppEffect::OpenConnection { conn: choice.conn }]
                 }
                 ChoiceStatus::NeedsVault => {
-                    // Record which conn + pane triggered the unlock so we can auto-open after.
+                    // Record which conn + pane triggered the overlay so we can auto-open after.
                     state.pending_conn_open[side.index()] = Some(choice.conn);
-                    state.overlay = Some(Overlay::VaultUnlock {
-                        input: MaskedInput::new(),
-                        error: None,
-                        pending_conn: Some(choice.conn),
-                    });
+                    if state.vault_file_exists {
+                        // Vault is on disk but locked — open the unlock overlay.
+                        state.overlay = Some(Overlay::VaultUnlock {
+                            input: MaskedInput::new(),
+                            error: None,
+                            pending_conn: Some(choice.conn),
+                        });
+                    } else {
+                        // No vault file yet — guide through first-run creation first.
+                        state.overlay = Some(Overlay::VaultCreate {
+                            passphrase: MaskedInput::new(),
+                            confirm: MaskedInput::new(),
+                            focus: 0,
+                            remember: false,
+                            error: None,
+                            creating: false,
+                            pending_conn: Some(choice.conn),
+                        });
+                    }
                     Vec::new()
                 }
                 ChoiceStatus::Unreachable => {
@@ -2308,6 +2542,89 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                         *error = Some(msg);
                     } else {
                         state.status = Some(format!("Vault unlock failed: {msg}"));
+                    }
+                    Vec::new()
+                }
+            }
+        }
+        AppEvent::VaultCreated {
+            result,
+            already_exists,
+        } => {
+            // The Argon2id task is no longer running; clear the in-flight flag regardless of outcome.
+            if let Some(Overlay::VaultCreate { creating, .. }) = &mut state.overlay {
+                *creating = false;
+            }
+            match result {
+                Ok(()) => {
+                    // The vault file now exists and the broker is unlocked.
+                    state.vault_file_exists = true;
+                    state.vault_unlocked = true;
+                    state.has_locked_connections = false;
+                    // Flip every NeedsVault entry to NeedsOpen (same logic as VaultUnlocked).
+                    let mut n_flipped: usize = 0;
+                    let mut flipped_ids: std::collections::HashSet<cairn_types::ConnectionId> =
+                        std::collections::HashSet::new();
+                    for choice in &mut state.connections {
+                        if choice.status == ChoiceStatus::NeedsVault {
+                            choice.status = ChoiceStatus::NeedsOpen;
+                            n_flipped += 1;
+                            flipped_ids.insert(choice.conn);
+                        }
+                    }
+                    // Extract the pending connection from the overlay before closing it.
+                    let pending_conn =
+                        if let Some(Overlay::VaultCreate { pending_conn, .. }) = &state.overlay {
+                            *pending_conn
+                        } else {
+                            None
+                        };
+                    if pending_conn.is_none() {
+                        // Overlay was replaced while Argon2id ran; clean stale pending slots.
+                        for slot in &mut state.pending_conn_open {
+                            if let Some(id) = *slot {
+                                if flipped_ids.contains(&id) {
+                                    *slot = None;
+                                }
+                            }
+                        }
+                    }
+                    // Close only our overlay; don't clobber one the user opened in the meantime.
+                    if matches!(state.overlay, Some(Overlay::VaultCreate { .. })) {
+                        state.overlay = None;
+                    }
+                    state.status = Some(if n_flipped == 0 {
+                        "Vault created and unlocked".to_owned()
+                    } else {
+                        format!("Vault created — {n_flipped} connection(s) now openable")
+                    });
+                    // Auto-open the connection that triggered vault creation (if any).
+                    if let Some(conn) = pending_conn {
+                        vec![AppEffect::OpenConnection { conn }]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(msg) => {
+                    // Keep the create overlay open with a retryable error. The error message is
+                    // secret-free and path-free (the effect runner ensures this).
+                    //
+                    // Special case: if the vault was created out-of-band (another process or
+                    // terminal) between startup and now, `already_exists == true`. We flip
+                    // `vault_file_exists` so subsequent Ctrl-U opens the Unlock overlay instead
+                    // of looping on "already exists".
+                    if already_exists {
+                        state.vault_file_exists = true;
+                    }
+                    let display = if already_exists {
+                        "A vault already exists — press Esc, then Ctrl-U to unlock it.".to_owned()
+                    } else {
+                        msg
+                    };
+                    if let Some(Overlay::VaultCreate { error, .. }) = &mut state.overlay {
+                        *error = Some(display);
+                    } else {
+                        state.status = Some(format!("Vault creation failed: {display}"));
                     }
                     Vec::new()
                 }
@@ -4385,6 +4702,7 @@ mod tests {
     #[test]
     fn vault_unlock_action_opens_and_cancel_closes_the_overlay() {
         let mut s = state();
+        s.vault_file_exists = true; // existing vault on disk → unlock flow
         let fx = update(&mut s, Msg::Action(Action::VaultUnlock));
         assert!(fx.is_empty());
         assert!(matches!(s.overlay, Some(Overlay::VaultUnlock { .. })));
@@ -4415,6 +4733,7 @@ mod tests {
         use cairn_secrets::ExposeSecret;
         const SECRET: &str = "correct horse battery staple";
         let mut s = state();
+        s.vault_file_exists = true; // existing vault → unlock flow
         let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
         type_text(&mut s, SECRET);
         // The typed passphrase must not be visible in a `{:?}` of the whole state (or the overlay).
@@ -4448,6 +4767,7 @@ mod tests {
     #[test]
     fn vault_unlock_empty_passphrase_keeps_the_overlay_with_an_error() {
         let mut s = state();
+        s.vault_file_exists = true; // existing vault → unlock flow
         let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
         let fx = update(&mut s, Msg::Text(TextEdit::Submit));
         assert!(fx.is_empty(), "an empty passphrase emits no effect");
@@ -4462,6 +4782,7 @@ mod tests {
     #[test]
     fn vault_unlock_failure_keeps_the_overlay_and_shows_the_error() {
         let mut s = state();
+        s.vault_file_exists = true; // existing vault → unlock flow
         let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
         type_text(&mut s, "wrong-pass");
         let _ = update(&mut s, Msg::Text(TextEdit::Submit));
@@ -4491,6 +4812,7 @@ mod tests {
         // A successful unlock flips them to NeedsOpen; the count stays the same.
         use crate::state::ConnectionChoice;
         let mut s = state();
+        s.vault_file_exists = true; // existing vault → unlock flow
         s.has_locked_connections = true;
         s.connections = vec![ConnectionChoice {
             conn: cairn_types::ConnectionId(7),
@@ -4526,6 +4848,7 @@ mod tests {
     #[test]
     fn vault_unlock_double_submit_does_not_spawn_a_second_effect() {
         let mut s = state();
+        s.vault_file_exists = true; // existing vault → unlock flow
         let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
         type_text(&mut s, "pw");
         let fx = update(&mut s, Msg::Text(TextEdit::Submit));
@@ -4540,6 +4863,7 @@ mod tests {
     #[test]
     fn late_unlock_success_does_not_clobber_a_different_overlay() {
         let mut s = state();
+        s.vault_file_exists = true; // existing vault → unlock flow
         s.connections = vec![crate::ConnectionChoice {
             conn: cairn_types::ConnectionId(3),
             label: "local: /".to_owned(),
@@ -4575,6 +4899,640 @@ mod tests {
         assert!(
             s.overlay.is_none(),
             "no overlay opens while a plan executes"
+        );
+    }
+
+    // ── P4.5: vault-create-from-UI ───────────────────────────────────────────────────
+
+    /// Helper: open the VaultCreate overlay (no vault file on disk).
+    fn open_vault_create(s: &mut AppState) {
+        s.vault_file_exists = false;
+        let _ = update(s, Msg::Action(Action::VaultUnlock));
+        assert!(
+            matches!(s.overlay, Some(Overlay::VaultCreate { .. })),
+            "expected VaultCreate overlay to be open"
+        );
+    }
+
+    #[test]
+    fn ctrl_u_opens_create_overlay_when_no_vault_file_exists() {
+        let mut s = state();
+        s.vault_file_exists = false;
+        let fx = update(&mut s, Msg::Action(Action::VaultUnlock));
+        assert!(fx.is_empty());
+        assert!(
+            matches!(
+                s.overlay,
+                Some(Overlay::VaultCreate {
+                    focus: 0,
+                    remember: false,
+                    ..
+                })
+            ),
+            "Ctrl-U with no vault file opens the create overlay"
+        );
+        assert!(s.capturing_text(), "create overlay captures keystrokes");
+    }
+
+    #[test]
+    fn ctrl_u_opens_unlock_overlay_when_vault_file_exists() {
+        let mut s = state();
+        s.vault_file_exists = true;
+        let fx = update(&mut s, Msg::Action(Action::VaultUnlock));
+        assert!(fx.is_empty());
+        assert!(
+            matches!(s.overlay, Some(Overlay::VaultUnlock { .. })),
+            "Ctrl-U with an existing vault file opens the unlock overlay"
+        );
+    }
+
+    #[test]
+    fn vault_create_cancel_closes_overlay() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        let fx = update(&mut s, Msg::Text(TextEdit::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none(), "Esc/Cancel closes the create overlay");
+    }
+
+    #[test]
+    fn vault_create_cancel_clears_pending_conn_open_slot() {
+        use crate::state::ConnectionChoice;
+        let mut s = state();
+        s.vault_file_exists = false;
+        s.connections = vec![ConnectionChoice {
+            conn: cairn_types::ConnectionId(7),
+            label: "ssh: host".to_owned(),
+            status: ChoiceStatus::NeedsVault,
+            ..Default::default()
+        }];
+        // Selecting the NeedsVault entry opens VaultCreate with a pending_conn.
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        let _ = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(
+            s.pending_conn_open.iter().any(|s| s.is_some()),
+            "pending_conn_open must be set after NeedsVault selection"
+        );
+        // Cancel must clear the pending slot so a stale ConnectionOpened can't navigate the pane.
+        let _ = update(&mut s, Msg::Text(TextEdit::Cancel));
+        assert!(
+            s.pending_conn_open.iter().all(|s| s.is_none()),
+            "cancel must clear the pending_conn_open slot"
+        );
+    }
+
+    #[test]
+    fn vault_create_tab_cycles_focus_between_fields() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // Initially focused on field 0 (passphrase).
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::VaultCreate { focus: 0, .. })
+        ));
+        // Tab moves to confirm.
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::VaultCreate { focus: 1, .. })
+        ));
+        // Shift-Tab moves back.
+        let _ = update(&mut s, Msg::Text(TextEdit::PrevField));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::VaultCreate { focus: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn vault_create_toggle_remember_flips_the_flag() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::VaultCreate {
+                remember: false,
+                ..
+            })
+        ));
+        // ToggleRemember (Ctrl-R bypass in map_input) flips the flag.
+        let _ = update(&mut s, Msg::Action(Action::ToggleRemember));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::VaultCreate { remember: true, .. })
+        ));
+        let _ = update(&mut s, Msg::Action(Action::ToggleRemember));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::VaultCreate {
+                remember: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn vault_create_empty_passphrase_rejected_before_compare() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // Submit with both fields empty.
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty(), "empty passphrase emits no effect");
+        assert!(
+            matches!(
+                &s.overlay,
+                Some(Overlay::VaultCreate { error: Some(_), .. })
+            ),
+            "empty passphrase sets an error"
+        );
+        // The error must not mention any secret value.
+        if let Some(Overlay::VaultCreate {
+            error: Some(err), ..
+        }) = &s.overlay
+        {
+            assert!(!err.is_empty());
+        }
+    }
+
+    #[test]
+    fn vault_create_too_short_passphrase_rejected_with_length_error() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // 11 chars = VAULT_PASSPHRASE_MIN_LEN - 1 → must be rejected.
+        type_text(&mut s, "short_passw"); // exactly 11 chars
+        assert_eq!(
+            "short_passw".chars().count(),
+            VAULT_PASSPHRASE_MIN_LEN - 1,
+            "precondition: string must be one char below the minimum"
+        );
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty(), "11-char passphrase emits no effect");
+        match &s.overlay {
+            Some(Overlay::VaultCreate {
+                error: Some(err), ..
+            }) => {
+                assert!(
+                    err.contains("least"),
+                    "error must mention the minimum length, got: {err}"
+                );
+            }
+            other => panic!("expected error in overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_create_exactly_min_len_passphrase_accepted() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // 12 chars = VAULT_PASSPHRASE_MIN_LEN → must be accepted (no length error).
+        let pp = "a".repeat(VAULT_PASSPHRASE_MIN_LEN);
+        type_text(&mut s, &pp);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, &pp);
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        // Length is valid; a CreateVault effect is emitted.
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, AppEffect::CreateVault { .. })),
+            "12-char passphrase must emit CreateVault effect, got: {fx:?}"
+        );
+    }
+
+    /// Fix 7: typing any character after a validation error clears the error.
+    #[test]
+    fn vault_create_insert_clears_stale_error() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // Trigger an error: submit with an empty passphrase.
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(
+            matches!(
+                &s.overlay,
+                Some(Overlay::VaultCreate { error: Some(_), .. })
+            ),
+            "precondition: submit on empty must set an error"
+        );
+        // Any new character must clear it.
+        let _ = update(&mut s, Msg::Text(TextEdit::Insert('a')));
+        match &s.overlay {
+            Some(Overlay::VaultCreate { error, .. }) => {
+                assert!(
+                    error.is_none(),
+                    "Insert must clear the stale error, got: {error:?}"
+                );
+            }
+            other => panic!("overlay must still be open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_create_empty_confirm_rejected_before_content_compare() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // Type a valid passphrase but leave confirm empty.
+        type_text(&mut s, "correct horse battery");
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty(), "empty confirm emits no effect");
+        match &s.overlay {
+            Some(Overlay::VaultCreate {
+                error: Some(err), ..
+            }) => {
+                assert!(
+                    err.to_lowercase().contains("confirm"),
+                    "error must mention confirm, got: {err}"
+                );
+            }
+            other => panic!("expected error in overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_create_length_mismatch_clears_confirm_and_leaves_passphrase_intact() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // Type passphrase, switch to confirm, type a shorter value.
+        type_text(&mut s, "correct horse battery staple");
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, "correct horse"); // shorter — length mismatch
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty(), "length mismatch emits no effect");
+        match &s.overlay {
+            Some(Overlay::VaultCreate {
+                passphrase,
+                confirm,
+                error,
+                ..
+            }) => {
+                // Passphrase field is intact for a quick retry.
+                assert!(
+                    !passphrase.is_empty(),
+                    "passphrase must be intact on a length mismatch"
+                );
+                // Confirm is wiped so the user re-types only the confirm field.
+                assert!(
+                    confirm.is_empty(),
+                    "confirm must be wiped on a length mismatch"
+                );
+                assert!(
+                    error.as_deref().is_some_and(|e| e.contains("match")),
+                    "error must say passphrases don't match"
+                );
+            }
+            other => panic!("expected VaultCreate overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_create_content_mismatch_wipes_both_fields_and_resets_focus() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // Same length (≥ 12) but different content — triggers the secret-comparison path.
+        type_text(&mut s, "aaaaaaaaaaaa"); // 12 chars (VAULT_PASSPHRASE_MIN_LEN)
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField)); // switch to confirm (focus = 1)
+        type_text(&mut s, "bbbbbbbbbbbb"); // 12 chars, different content
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(fx.is_empty(), "content mismatch emits no effect");
+        match &s.overlay {
+            Some(Overlay::VaultCreate {
+                passphrase,
+                confirm,
+                error,
+                focus,
+                ..
+            }) => {
+                // Both fields are wiped on content mismatch (the comparison consumed both secrets).
+                assert!(
+                    passphrase.is_empty(),
+                    "passphrase must be wiped on content mismatch"
+                );
+                assert!(
+                    confirm.is_empty(),
+                    "confirm must be wiped on content mismatch"
+                );
+                assert!(
+                    error.as_deref().is_some_and(|e| e.contains("match")),
+                    "error must say passphrases don't match"
+                );
+                // Fix 6: focus resets to 0 so the user knows to re-enter both from the start.
+                assert_eq!(
+                    *focus, 0,
+                    "focus must reset to passphrase field on content mismatch"
+                );
+            }
+            other => panic!("expected VaultCreate overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_create_matching_passphrase_emits_create_vault_effect_and_redacts_in_debug() {
+        use cairn_secrets::ExposeSecret;
+        const PP: &str = "correct horse battery staple";
+        let mut s = state();
+        open_vault_create(&mut s);
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, PP);
+        // Verify the passphrase is NOT visible in Debug before submit.
+        assert!(
+            !format!("{s:?}").contains("staple"),
+            "AppState Debug must not reveal the passphrase before submit"
+        );
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        // Exactly one CreateVault effect.
+        let (passphrase, remember) = match &fx[..] {
+            [AppEffect::CreateVault {
+                passphrase,
+                remember,
+            }] => (passphrase, *remember),
+            other => panic!("expected CreateVault effect, got {other:?}"),
+        };
+        // The effect carries the right secret.
+        assert_eq!(passphrase.expose_secret(), PP);
+        // The effect's own Debug must not reveal it (SecretString redacts).
+        assert!(
+            !format!("{:?}", fx[0]).contains("staple"),
+            "effect Debug must not reveal the passphrase"
+        );
+        assert!(!remember, "remember defaults to false");
+        // Both fields are wiped after take_secret.
+        match &s.overlay {
+            Some(Overlay::VaultCreate {
+                passphrase,
+                confirm,
+                creating,
+                ..
+            }) => {
+                assert!(passphrase.is_empty(), "passphrase field must be wiped");
+                assert!(confirm.is_empty(), "confirm field must be wiped");
+                assert!(*creating, "creating flag must be set while Argon2id runs");
+            }
+            other => panic!("overlay must stay open during create, got {other:?}"),
+        }
+        assert_eq!(s.status.as_deref(), Some("Creating vault…"));
+    }
+
+    #[test]
+    fn vault_create_remember_flag_carried_in_effect() {
+        const PP: &str = "hunter2hunter2";
+        let mut s = state();
+        open_vault_create(&mut s);
+        // Toggle remember on.
+        let _ = update(&mut s, Msg::Action(Action::ToggleRemember));
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, PP);
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        match &fx[..] {
+            [AppEffect::CreateVault { remember: true, .. }] => {}
+            other => panic!("expected CreateVault{{remember:true}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_create_double_submit_suppressed_by_creating_flag() {
+        const PP: &str = "longEnoughPassphrase";
+        let mut s = state();
+        open_vault_create(&mut s);
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, PP);
+        let fx1 = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert_eq!(fx1.len(), 1, "first submit emits the CreateVault effect");
+        // The creating flag is now set; a second submit must be suppressed.
+        let fx2 = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(
+            fx2.is_empty(),
+            "second submit must be suppressed while creating"
+        );
+    }
+
+    #[test]
+    fn vault_created_ok_flips_state_and_auto_opens_pending_conn() {
+        use crate::state::ConnectionChoice;
+        let mut s = state();
+        s.vault_file_exists = false;
+        s.has_locked_connections = true;
+        s.connections = vec![ConnectionChoice {
+            conn: cairn_types::ConnectionId(9),
+            label: "ssh: remote".to_owned(),
+            status: ChoiceStatus::NeedsVault,
+            ..Default::default()
+        }];
+        // Simulate the user selecting the NeedsVault entry, which opens VaultCreate.
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        let _ = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(matches!(s.overlay, Some(Overlay::VaultCreate { .. })));
+        // Submit matching passphrases to emit the effect, setting creating=true.
+        const PP: &str = "vaultpassword1";
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        // The "effect runner" reports success.
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::VaultCreated {
+                result: Ok(()),
+                already_exists: false,
+            }),
+        );
+        // Must emit OpenConnection for the pending conn.
+        assert!(
+            matches!(fx[..], [AppEffect::OpenConnection { conn }] if conn == cairn_types::ConnectionId(9)),
+            "VaultCreated success must auto-open the pending connection, got {fx:?}"
+        );
+        assert!(s.vault_file_exists, "vault_file_exists must flip to true");
+        assert!(s.vault_unlocked, "vault_unlocked must flip to true");
+        assert!(!s.has_locked_connections);
+        assert_eq!(s.connections[0].status, ChoiceStatus::NeedsOpen);
+        assert!(s.overlay.is_none(), "overlay closes on success");
+    }
+
+    #[test]
+    fn vault_created_err_keeps_overlay_open_with_error() {
+        const PP: &str = "correcthorsebattery";
+        let mut s = state();
+        open_vault_create(&mut s);
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        // Simulate failure (e.g. an I/O error — NOT an AlreadyExists).
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::VaultCreated {
+                result: Err("io error".to_owned()),
+                already_exists: false,
+            }),
+        );
+        assert!(fx.is_empty(), "failure emits no effect");
+        assert!(
+            !s.vault_file_exists,
+            "vault_file_exists must stay false on non-AlreadyExists failure"
+        );
+        assert!(
+            !s.vault_unlocked,
+            "vault_unlocked must stay false on failure"
+        );
+        match &s.overlay {
+            Some(Overlay::VaultCreate {
+                creating, error, ..
+            }) => {
+                assert!(!creating, "creating flag must be cleared on failure");
+                assert!(
+                    error.as_deref().is_some_and(|e| e.contains("io error")),
+                    "non-AlreadyExists error must be shown verbatim in the overlay, got {error:?}"
+                );
+            }
+            other => panic!("overlay must stay open for retry, got {other:?}"),
+        }
+    }
+
+    /// Fix 1: when `already_exists == true` the reducer sets `vault_file_exists = true` so the
+    /// user can press Esc → Ctrl-U to unlock instead of being stuck on "already exists".
+    #[test]
+    fn vault_created_already_exists_sets_vault_file_exists_and_allows_unlock() {
+        const PP: &str = "correcthorsebattery1";
+        let mut s = state();
+        s.vault_file_exists = false; // app started before vault file existed
+        open_vault_create(&mut s);
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        // The effect runner found VaultError::AlreadyExists (vault appeared out-of-band).
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::VaultCreated {
+                result: Err("vault already exists".to_owned()),
+                already_exists: true,
+            }),
+        );
+        assert!(fx.is_empty(), "already_exists failure emits no effect");
+        // vault_file_exists must now be true so Ctrl-U opens VaultUnlock.
+        assert!(
+            s.vault_file_exists,
+            "vault_file_exists must flip to true when already_exists"
+        );
+        assert!(
+            !s.vault_unlocked,
+            "vault must not be marked unlocked (we didn't actually unlock it)"
+        );
+        // Overlay must show the recovery hint, not the raw error.
+        match &s.overlay {
+            Some(Overlay::VaultCreate { error, .. }) => {
+                let msg = error.as_deref().expect("error must be set");
+                assert!(
+                    msg.to_lowercase().contains("unlock"),
+                    "error must tell the user to unlock, got: {msg}"
+                );
+            }
+            other => panic!("overlay must stay open, got {other:?}"),
+        }
+        // Pressing Esc then Ctrl-U must open VaultUnlock (vault_file_exists == true).
+        let _ = update(&mut s, Msg::Text(TextEdit::Cancel));
+        let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
+        assert!(
+            matches!(s.overlay, Some(Overlay::VaultUnlock { .. })),
+            "Ctrl-U must open VaultUnlock after already_exists recovery, got {:?}",
+            s.overlay
+        );
+    }
+
+    // Note (shared structural limitation): a late `VaultCreated { Ok(()) }` arriving after the
+    // user has closed the VaultCreate overlay and opened a different one will still set
+    // `vault_file_exists` and `vault_unlocked` (correct) but will NOT close the new overlay
+    // (also correct — we guard with `if matches!(state.overlay, Some(Overlay::VaultCreate { .. }))`).
+    // This is the same race the `VaultUnlock` path has. A request-id mechanism would fix both
+    // but is out of scope for P4.5. Covered by `vault_created_ok_does_not_clobber_unrelated_overlay`.
+    //
+    // Note (AI plan suppression): `Action::VaultUnlock` (which opens both VaultCreate and
+    // VaultUnlock) is already blocked while `state.ai_pending` or `state.ai_executing` is true
+    // (see the guards at the top of `update()`). No additional gate is needed.
+
+    #[test]
+    fn vault_created_ok_does_not_clobber_unrelated_overlay() {
+        use crate::state::ConnectionChoice;
+        const PP: &str = "somepassword1234";
+        let mut s = state();
+        s.vault_file_exists = false;
+        s.connections = vec![ConnectionChoice {
+            conn: cairn_types::ConnectionId(1),
+            label: "local: /".to_owned(),
+            ..Default::default()
+        }];
+        open_vault_create(&mut s);
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit)); // spawns create task
+                                                             // User closes create overlay and opens connections before the result arrives.
+        let _ = update(&mut s, Msg::Text(TextEdit::Cancel));
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        assert!(matches!(s.overlay, Some(Overlay::Connections { .. })));
+        // Late success must not clobber the unrelated overlay.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::VaultCreated {
+                result: Ok(()),
+                already_exists: false,
+            }),
+        );
+        assert!(
+            matches!(s.overlay, Some(Overlay::Connections { .. })),
+            "VaultCreated success must not close an unrelated overlay"
+        );
+        assert!(s.vault_file_exists);
+        assert!(s.vault_unlocked);
+    }
+
+    #[test]
+    fn needs_vault_selection_opens_create_overlay_when_no_vault_file() {
+        use crate::state::ConnectionChoice;
+        let mut s = state();
+        s.vault_file_exists = false;
+        s.connections = vec![ConnectionChoice {
+            conn: cairn_types::ConnectionId(5),
+            label: "s3: my-bucket".to_owned(),
+            status: ChoiceStatus::NeedsVault,
+            ..Default::default()
+        }];
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(fx.is_empty(), "NeedsVault must emit no effects (UI only)");
+        match &s.overlay {
+            Some(Overlay::VaultCreate { pending_conn, .. }) => {
+                assert_eq!(
+                    *pending_conn,
+                    Some(cairn_types::ConnectionId(5)),
+                    "pending_conn must record which connection triggered the create"
+                );
+            }
+            other => panic!("expected VaultCreate overlay, got {other:?}"),
+        }
+        // per-side slot must be set so ConnectionOpened knows where to navigate.
+        assert!(s
+            .pending_conn_open
+            .contains(&Some(cairn_types::ConnectionId(5))));
+    }
+
+    #[test]
+    fn needs_vault_selection_opens_unlock_overlay_when_vault_file_exists() {
+        use crate::state::ConnectionChoice;
+        let mut s = state();
+        s.vault_file_exists = true;
+        s.connections = vec![ConnectionChoice {
+            conn: cairn_types::ConnectionId(5),
+            label: "s3: my-bucket".to_owned(),
+            status: ChoiceStatus::NeedsVault,
+            ..Default::default()
+        }];
+        let _ = update(&mut s, Msg::Action(Action::OpenConnections));
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(fx.is_empty());
+        assert!(
+            matches!(s.overlay, Some(Overlay::VaultUnlock { .. })),
+            "NeedsVault selection with existing vault file must open the unlock overlay"
         );
     }
 
@@ -4774,11 +5732,13 @@ mod tests {
         );
     }
 
-    /// Selecting a NeedsVault connection opens the vault-unlock overlay with the conn recorded.
+    /// Selecting a NeedsVault connection opens the vault-unlock overlay with the conn recorded
+    /// (only when the vault file already exists; otherwise VaultCreate opens instead).
     #[test]
     fn needs_vault_selection_opens_vault_unlock_overlay_with_pending_conn() {
         use crate::state::ConnectionChoice;
         let mut s = state();
+        s.vault_file_exists = true; // existing vault → unlock flow
         s.connections = vec![ConnectionChoice {
             conn: cairn_types::ConnectionId(6),
             label: "s3: prod".to_owned(),

@@ -226,7 +226,12 @@ async fn run_async() -> anyhow::Result<()> {
     );
 
     state.vault_unlocked = broker.is_unlocked(); // false at startup; flips on unlock
-                                                 // Drive has_locked_connections from switcher entries rather than the (always-empty) deferred list.
+                                                 // Snapshot whether the vault file exists so the reducer can branch Ctrl-U and NeedsVault
+                                                 // selections between the create and unlock flows without ever doing I/O itself.
+                                                 // One blocking `Path::exists()` call before the event loop starts is acceptable; the
+                                                 // async loop never touches the filesystem for vault routing.
+    state.vault_file_exists = config.vault_path().is_some_and(|p| p.exists());
+    // Drive has_locked_connections from switcher entries rather than the (always-empty) deferred list.
     let n_needs_vault = state
         .connections
         .iter()
@@ -234,9 +239,12 @@ async fn run_async() -> anyhow::Result<()> {
         .count();
     state.has_locked_connections = n_needs_vault > 0;
     if state.has_locked_connections {
-        state.status = Some(format!(
-            "{n_needs_vault} connection(s) need the vault — press Ctrl-U to unlock"
-        ));
+        let hint = if state.vault_file_exists {
+            format!("{n_needs_vault} connection(s) need the vault — press Ctrl-U to unlock")
+        } else {
+            format!("{n_needs_vault} connection(s) need the vault — press Ctrl-U to create it")
+        };
+        state.status = Some(hint);
     }
 
     // Runtime-side context: the shared broker, the resolved vault file path, and the opener.
@@ -715,6 +723,15 @@ fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
                     return Some(Msg::Text(TextEdit::CloseStdin));
                 }
             }
+            // Inside the VaultCreate overlay, Ctrl-R toggles the keychain "remember" opt-in
+            // without inserting 'r' into the passphrase field. This is the only action bypass
+            // for a capturing overlay other than Ctrl-C (quit) and the ExecPane controls above.
+            if matches!(&state.overlay, Some(Overlay::VaultCreate { .. }))
+                && ctrl
+                && key.code == KeyCode::Char('r')
+            {
+                return Some(Msg::Action(Action::ToggleRemember));
+            }
             text_edit_for(key).map(Msg::Text)
         }
         Event::Key(key) => keymap.action_for(key).map(Msg::Action),
@@ -944,6 +961,24 @@ fn dispatch(
             tokio::spawn(async move {
                 let result = run_vault_unlock_effect(&broker, vault_path, passphrase).await;
                 let _ = event_tx.send(AppEvent::VaultUnlocked { result }).await;
+            });
+        }
+        AppEffect::CreateVault {
+            passphrase,
+            remember,
+        } => {
+            let broker = vault_ctx.broker.clone();
+            let vault_path = vault_ctx.vault_path.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let (result, already_exists) =
+                    run_create_vault_effect(&broker, vault_path, passphrase, remember).await;
+                let _ = event_tx
+                    .send(AppEvent::VaultCreated {
+                        result,
+                        already_exists,
+                    })
+                    .await;
             });
         }
         AppEffect::OpenConnection { conn } => {
@@ -1267,12 +1302,13 @@ async fn run_vault_unlock_effect(
     };
     // Open + decrypt off the async runtime: `Vault::open` runs Argon2id (CPU-bound) plus a file read,
     // and the existence check is itself a blocking `stat`, so *all* filesystem I/O is isolated here.
-    // The owned `SecretString` lives in the closure and is zeroized when it returns. Vault CREATION
-    // from the TUI is a follow-up — for now an absent file is a clear message, not a prompt.
+    // The owned `SecretString` lives in the closure and is zeroized when it returns.
     let vault = match tokio::task::spawn_blocking(move || {
         if !path.exists() {
+            // The reducer only emits UnlockVault when vault_file_exists == true, so reaching
+            // this branch means the file was removed after startup — report a clear error.
             return Err(
-                "no vault found (creating a vault from the UI is not yet available)".to_owned(),
+                "vault file not found — it may have been deleted since Cairn started".to_owned(),
             );
         }
         // `VaultError`'s Display is secret-free by construction (see its docs), so it is safe to show.
@@ -1286,6 +1322,79 @@ async fn run_vault_unlock_effect(
     };
     broker.unlock(vault);
     Ok(())
+}
+
+/// Create a new vault at `vault_path`, then immediately unlock the broker with it.
+///
+/// Called from the [`AppEffect::CreateVault`] handler in [`dispatch`]. Runs Argon2id key
+/// derivation inside `spawn_blocking` so the async runtime and render path stay responsive.
+///
+/// Returns `(result, already_exists)` where `already_exists` is `true` only when the failure
+/// was specifically `VaultError::AlreadyExists` (the vault appeared out-of-band after the app
+/// started). The reducer uses this to flip `vault_file_exists = true` so the user can unlock
+/// without restarting.
+///
+/// **Security invariants:**
+/// - The passphrase is never logged or included in any error message.
+/// - Errors returned to the reducer are secret-free and value-free (no path, no passphrase).
+/// - The vault file is created with `0600` permissions (enforced by `atomic_create` in cairn-vault).
+async fn run_create_vault_effect(
+    broker: &Arc<Broker>,
+    vault_path: Option<PathBuf>,
+    passphrase: cairn_secrets::SecretString,
+    remember: bool,
+) -> (Result<(), String>, bool) {
+    let Some(path) = vault_path else {
+        return (Err("no vault path configured".to_owned()), false);
+    };
+
+    // Clone the broker Arc for the move closure.
+    let broker = broker.clone();
+
+    // Argon2id is CPU-bound (~100 ms). Blocking in the async runtime would stall renders.
+    let result = tokio::task::spawn_blocking(move || -> (Result<(), String>, bool) {
+        // Vault::create uses `atomic_create` (persist_noclobber) so a cross-process race cannot
+        // silently overwrite an existing vault. VaultError::AlreadyExists is returned for both
+        // the pre-flight check and any race-window collision.
+        // The passphrase SecretString is consumed here and zeroized on drop.
+        let vault_result = cairn_vault::Vault::create(&path, &passphrase);
+        let already_exists = matches!(&vault_result, Err(cairn_vault::VaultError::AlreadyExists));
+        match vault_result {
+            Ok(vault) => {
+                // Immediately unlock the broker so NeedsVault connections can open.
+                broker.unlock(vault);
+
+                // Keychain store: best-effort. A keychain failure does NOT roll back the vault —
+                // the vault file is already persisted and unlocked. We log and continue.
+                if remember {
+                    #[cfg(feature = "keychain")]
+                    {
+                        // `UnlockProvider` and `KeychainUnlockProvider` are re-exported from the
+                        // crate root (not the private `unlock` module) when `keychain` is enabled.
+                        use cairn_vault::UnlockProvider as _;
+                        let provider = cairn_vault::KeychainUnlockProvider::default();
+                        if let Err(e) = provider.store(&passphrase) {
+                            tracing::warn!("keychain store after vault creation failed: {e}");
+                        }
+                    }
+                    #[cfg(not(feature = "keychain"))]
+                    {
+                        // Keychain feature not built; the `remember` flag is silently ignored.
+                        tracing::debug!("keychain feature not built; skipping passphrase store");
+                    }
+                }
+                (Ok(()), false)
+            }
+            Err(e) => (Err(e.to_string()), already_exists),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(pair) => pair,
+        // spawn_blocking only panics if the closure panics; treat as an internal error.
+        Err(_) => (Err("vault creation task failed".to_owned()), false),
+    }
 }
 
 /// Open a connection on demand (P2/P3 lazy open) and insert it into the registry.
@@ -2927,11 +3036,145 @@ mod tests {
         )
         .await
         .unwrap_err();
+        // The message must be user-friendly and mention the vault (no passphrase, no path).
         assert!(
-            err.contains("no vault"),
-            "expected a friendly message, got: {err}"
+            err.contains("vault"),
+            "expected a user-friendly vault message, got: {err}"
         );
         assert!(!broker.is_unlocked());
+    }
+
+    // ---- P4.5: vault-create effect ---------------------------------------------------------------
+    //
+    // These tests call `run_create_vault_effect` directly. The function calls `Vault::create`
+    // which uses `KdfParams::recommended()` (Argon2id, ~100 ms). Marked `#[tokio::test]` so they
+    // run in the standard async test harness — acceptable latency for CI.
+    // No real keychain is touched: `remember = false` skips the store path entirely.
+
+    #[tokio::test]
+    async fn create_vault_effect_creates_and_unlocks_broker() {
+        use cairn_secrets::SecretString;
+        let dir = tempfile_dir();
+        let path = dir.path().join("new.cvlt");
+        assert!(!path.exists(), "precondition: vault file must not exist");
+        let broker = Arc::new(Broker::locked());
+        let (result, already_exists) = run_create_vault_effect(
+            &broker,
+            Some(path.clone()),
+            SecretString::from("correct horse battery staple".to_owned()),
+            false, // no keychain
+        )
+        .await;
+        assert!(result.is_ok(), "create should succeed, got: {result:?}");
+        assert!(!already_exists, "already_exists must be false on success");
+        assert!(broker.is_unlocked(), "broker must be unlocked after create");
+        assert!(path.exists(), "vault file must be on disk after create");
+        // Verify 0600 permissions on Unix (the OS-level security requirement).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "vault file must be 0600, got {mode:o}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_vault_effect_no_path_configured_returns_clear_error() {
+        use cairn_secrets::SecretString;
+        let broker = Arc::new(Broker::locked());
+        let (result, already_exists) = run_create_vault_effect(
+            &broker,
+            None,
+            SecretString::from("passphrase".to_owned()),
+            false,
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(err.contains("no vault path"), "got: {err}");
+        assert!(!already_exists);
+        assert!(!broker.is_unlocked());
+    }
+
+    #[tokio::test]
+    async fn create_vault_effect_already_existing_file_returns_error_and_leaves_broker_locked() {
+        use cairn_secrets::SecretString;
+        use cairn_vault::{KdfParams, Vault};
+        let dir = tempfile_dir();
+        let path = dir.path().join("existing.cvlt");
+        // Create a vault file first (fast params to keep the test quick).
+        Vault::create_with_params(
+            &path,
+            &SecretString::from("first".to_owned()),
+            KdfParams::fast_for_tests(),
+        )
+        .unwrap();
+        let broker = Arc::new(Broker::locked());
+        // Attempting to create again must fail cleanly.
+        let (result, already_exists) = run_create_vault_effect(
+            &broker,
+            Some(path.clone()),
+            SecretString::from("second".to_owned()),
+            false,
+        )
+        .await;
+        let err = result.unwrap_err();
+        // The error must not contain the passphrase or the vault file path (Fix 4).
+        assert!(
+            !err.contains("second"),
+            "error must not reveal the passphrase, got: {err}"
+        );
+        assert!(
+            !err.contains(path.to_str().unwrap_or("")),
+            "error must not reveal the vault path, got: {err}"
+        );
+        // The error should mention "already" or "exists".
+        assert!(
+            err.to_lowercase().contains("already") || err.to_lowercase().contains("exist"),
+            "expected a 'file already exists' error, got: {err}"
+        );
+        assert!(
+            already_exists,
+            "already_exists must be true for AlreadyExists failure"
+        );
+        assert!(!broker.is_unlocked(), "broker must stay locked on failure");
+    }
+
+    /// Fix 2 (runtime side): `run_create_vault_effect` must not silently overwrite an existing
+    /// vault — the existing file must be byte-for-byte identical after the failed attempt.
+    ///
+    /// This exercises the `atomic_create` (persist_noclobber) path in `cairn-vault`.
+    #[tokio::test]
+    async fn create_vault_effect_does_not_clobber_existing_vault_file() {
+        use cairn_secrets::SecretString;
+        use cairn_vault::{KdfParams, Vault};
+        let dir = tempfile_dir();
+        let path = dir.path().join("existing.cvlt");
+        // Create an original vault (fast params) and read its bytes.
+        Vault::create_with_params(
+            &path,
+            &SecretString::from("original-passphrase".to_owned()),
+            KdfParams::fast_for_tests(),
+        )
+        .unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        // A second `create` attempt (simulating the race window) must fail.
+        let broker = Arc::new(Broker::locked());
+        let (result, already_exists) = run_create_vault_effect(
+            &broker,
+            Some(path.clone()),
+            SecretString::from("attacker-passphrase".to_owned()),
+            false,
+        )
+        .await;
+        assert!(result.is_err(), "second create must fail");
+        assert!(already_exists, "must be flagged as AlreadyExists");
+        // The vault file must be unchanged.
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            original_bytes, bytes_after,
+            "vault file must not be modified by a failed create"
+        );
+        assert!(!broker.is_unlocked(), "broker must stay locked");
     }
 
     // P2: A locked vault means credential-bearing profiles appear as NeedsVault in the switcher

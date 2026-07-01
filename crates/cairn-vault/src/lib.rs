@@ -192,7 +192,9 @@ impl Vault {
             kek,
             creds: Vec::new(),
         };
-        vault.save()?;
+        // Use the no-clobber write so a cross-process race between the `path.exists()` check
+        // above and the actual write cannot silently overwrite a populated vault.
+        vault.save_new()?;
         Ok(vault)
     }
 
@@ -278,19 +280,35 @@ impl Vault {
         self.creds.is_empty()
     }
 
-    /// Encrypt and atomically write the vault to disk.
+    /// Encrypt and atomically write the vault to disk (clobbering update path).
     ///
     /// # Errors
     /// Serialization, crypto, or I/O errors.
     pub fn save(&self) -> Result<(), VaultError> {
+        let bytes = self.seal()?;
+        atomic_write(&self.path, &bytes)
+    }
+
+    /// Like [`save`] but uses `persist_noclobber` so a cross-process race in the ~100 ms
+    /// Argon2id window cannot silently overwrite an existing vault. Only called from
+    /// [`create_with_params`].
+    fn save_new(&self) -> Result<(), VaultError> {
+        let bytes = self.seal()?;
+        atomic_create(&self.path, &bytes)
+    }
+
+    /// Serialize and encrypt the vault, returning the sealed ciphertext bytes.
+    ///
+    /// Called by both [`save`] (clobbering) and [`save_new`] (no-clobber initial write).
+    fn seal(&self) -> Result<Vec<u8>, VaultError> {
         // Mirror the typed creds into the zeroizing wire form just for serialization; `store` is
         // dropped at the end of this method, wiping the transient secret strings.
         let store = Store {
             creds: self.creds.iter().map(CredentialWire::from).collect(),
         };
-        // The final buffer is `Zeroizing`. NB residual: `to_allocvec` grows an internal `Vec`, so any
-        // intermediate buffers freed during reallocation are not wiped — a small, defense-in-depth
-        // gap (the bytes are freed heap behind the encryption boundary, never logged or persisted).
+        // NB residual: `to_allocvec` grows an internal `Vec`, so any intermediate buffers freed
+        // during reallocation are not wiped — a small, defense-in-depth gap (the bytes are freed
+        // heap behind the encryption boundary, never logged or persisted).
         let plaintext =
             Zeroizing::new(postcard::to_allocvec(&store).map_err(|_| VaultError::Format)?);
         let nonce: [u8; NONCE_LEN] = rand_array();
@@ -307,10 +325,9 @@ impl Vault {
                 },
             )
             .map_err(|_| VaultError::Decrypt)?;
-
         let mut bytes = header;
         bytes.extend_from_slice(&ciphertext);
-        atomic_write(&self.path, &bytes)
+        Ok(bytes)
     }
 }
 
@@ -394,6 +411,29 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| VaultError::Io(e.error))?;
+    Ok(())
+}
+
+/// Atomic no-clobber write — used only by [`Vault::save_new`] on the create path.
+///
+/// Uses `persist_noclobber` (on Unix: `link(2)`, atomic; on Windows: `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING`, best-effort) to close the race window between the pre-flight
+/// `path.exists()` check in [`Vault::create_with_params`] and the final rename. If the
+/// destination already exists the error is mapped to [`VaultError::AlreadyExists`] so callers
+/// receive the same sentinel as the pre-flight check, not a raw I/O error.
+fn atomic_create(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist_noclobber(path).map_err(|e| {
+        if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+            VaultError::AlreadyExists
+        } else {
+            VaultError::Io(e.error)
+        }
+    })?;
     Ok(())
 }
 
@@ -522,6 +562,33 @@ mod tests {
             Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()),
             Err(VaultError::AlreadyExists)
         ));
+    }
+
+    /// Regression test for the create-path clobber window (Fix 2): `atomic_create` must return
+    /// `VaultError::AlreadyExists` and leave the existing file byte-for-byte intact.
+    ///
+    /// This test accesses the private `atomic_create` function directly (possible from within the
+    /// same module) to simulate the narrow race between the pre-flight `path.exists()` check and
+    /// the actual write in [`Vault::create_with_params`].
+    #[test]
+    fn atomic_create_does_not_clobber_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        // Write a sentinel file to act as the "existing vault".
+        let sentinel = b"existing-vault-sentinel";
+        std::fs::write(&path, sentinel).unwrap();
+        // atomic_create must refuse to overwrite it.
+        let result = atomic_create(&path, b"would-clobber");
+        assert!(
+            matches!(result, Err(VaultError::AlreadyExists)),
+            "atomic_create must fail with AlreadyExists when target exists, got {result:?}"
+        );
+        // The existing file must be byte-for-byte unchanged.
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after, sentinel,
+            "atomic_create must not modify the existing file on failure"
+        );
     }
 
     #[test]

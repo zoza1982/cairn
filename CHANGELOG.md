@@ -37,6 +37,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC-0011 Phase P4.5 — vault-create-from-UI** (branch `feat/conn-p45-vault-create`): closes
+  the security gate that allows a first-run user to create the encrypted vault from inside Cairn,
+  unblocking the credential-provisioning phase (P5). Key details: `Overlay::VaultCreate` with
+  two `MaskedInput` passphrase fields (new + confirm), Tab-cycling focus, `[Ctrl-R] Remember`
+  keychain toggle, and a submit path that validates minimum length (8 chars), compares the two
+  fields without ever exposing the bytes (length check first; `take_secret()` + `expose_secret()`
+  only when lengths match, both values zeroized on mismatch), then emits
+  `AppEffect::CreateVault { passphrase: SecretString, remember: bool }`. The Argon2id KDF
+  (`KdfParams::recommended()`: 19 MiB / 2 passes) runs in `tokio::task::spawn_blocking` so the
+  render path is never blocked. The vault file is written atomically via `tempfile::NamedTempFile`
+  at mode 0600. On `VaultCreated { Ok(()) }` the broker is unlocked immediately (and the
+  passphrase optionally stored in the OS keychain), all `NeedsVault` connections are flipped to
+  `NeedsOpen`, and `AppState::vault_file_exists` is set to `true` so subsequent `Ctrl-U` / vault
+  selections open the unlock overlay rather than create. `AppState`/`AppEffect` `Debug` never
+  reveals the passphrase. Error strings crossing to logs are value-free (no path, no passphrase).
+  New hermetic tests: field editing, Tab/Esc, mismatch rejection, min-length enforcement,
+  double-submit guard, remember flag, pending-conn routing, `VaultCreated` TEA round-trip, Unix
+  0600 file permission, and a `Debug` redaction assertion.
+
 - **RFC-0011 Phase P4 — in-app connection form (add / edit / remove)**: users can now create,
   edit, and delete connection profiles from within the TUI without manually editing the cairn
   config file. `Ctrl-N` opens the scheme picker; `e` edits the selected profile in the switcher;
