@@ -971,9 +971,14 @@ fn dispatch(
             let vault_path = vault_ctx.vault_path.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let result =
+                let (result, already_exists) =
                     run_create_vault_effect(&broker, vault_path, passphrase, remember).await;
-                let _ = event_tx.send(AppEvent::VaultCreated { result }).await;
+                let _ = event_tx
+                    .send(AppEvent::VaultCreated {
+                        result,
+                        already_exists,
+                    })
+                    .await;
             });
         }
         AppEffect::OpenConnection { conn } => {
@@ -1324,63 +1329,71 @@ async fn run_vault_unlock_effect(
 /// Called from the [`AppEffect::CreateVault`] handler in [`dispatch`]. Runs Argon2id key
 /// derivation inside `spawn_blocking` so the async runtime and render path stay responsive.
 ///
-/// On success, the broker is unlocked (identical to `run_vault_unlock_effect`'s outcome) and the
-/// caller should store the passphrase in the OS keychain when `remember == true`.
+/// Returns `(result, already_exists)` where `already_exists` is `true` only when the failure
+/// was specifically `VaultError::AlreadyExists` (the vault appeared out-of-band after the app
+/// started). The reducer uses this to flip `vault_file_exists = true` so the user can unlock
+/// without restarting.
 ///
 /// **Security invariants:**
 /// - The passphrase is never logged or included in any error message.
 /// - Errors returned to the reducer are secret-free and value-free (no path, no passphrase).
-/// - The vault file is created with `0600` permissions (enforced by `atomic_write` in cairn-vault).
+/// - The vault file is created with `0600` permissions (enforced by `atomic_create` in cairn-vault).
 async fn run_create_vault_effect(
     broker: &Arc<Broker>,
     vault_path: Option<PathBuf>,
     passphrase: cairn_secrets::SecretString,
     remember: bool,
-) -> Result<(), String> {
+) -> (Result<(), String>, bool) {
     let Some(path) = vault_path else {
-        return Err("no vault path configured".to_owned());
+        return (Err("no vault path configured".to_owned()), false);
     };
 
     // Clone the broker Arc for the move closure.
     let broker = broker.clone();
 
     // Argon2id is CPU-bound (~100 ms). Blocking in the async runtime would stall renders.
-    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        // Vault::create returns VaultError::AlreadyExists if the file is already there — the
-        // user created it externally between startup and now. Surface a clear message.
+    let result = tokio::task::spawn_blocking(move || -> (Result<(), String>, bool) {
+        // Vault::create uses `atomic_create` (persist_noclobber) so a cross-process race cannot
+        // silently overwrite an existing vault. VaultError::AlreadyExists is returned for both
+        // the pre-flight check and any race-window collision.
         // The passphrase SecretString is consumed here and zeroized on drop.
-        let vault = cairn_vault::Vault::create(&path, &passphrase).map_err(|e| e.to_string())?;
-        // Immediately unlock the broker so NeedsVault connections can open.
-        broker.unlock(vault);
+        let vault_result = cairn_vault::Vault::create(&path, &passphrase);
+        let already_exists = matches!(&vault_result, Err(cairn_vault::VaultError::AlreadyExists));
+        match vault_result {
+            Ok(vault) => {
+                // Immediately unlock the broker so NeedsVault connections can open.
+                broker.unlock(vault);
 
-        // Keychain store: best-effort. A keychain failure does NOT roll back the vault — the
-        // vault file is already persisted and unlocked. We log the error and continue.
-        if remember {
-            #[cfg(feature = "keychain")]
-            {
-                // `UnlockProvider` and `KeychainUnlockProvider` are re-exported from the crate
-                // root (not the private `unlock` module) when the `keychain` feature is on.
-                use cairn_vault::UnlockProvider as _;
-                let provider = cairn_vault::KeychainUnlockProvider::default();
-                if let Err(e) = provider.store(&passphrase) {
-                    tracing::warn!("keychain store after vault creation failed: {e}");
+                // Keychain store: best-effort. A keychain failure does NOT roll back the vault —
+                // the vault file is already persisted and unlocked. We log and continue.
+                if remember {
+                    #[cfg(feature = "keychain")]
+                    {
+                        // `UnlockProvider` and `KeychainUnlockProvider` are re-exported from the
+                        // crate root (not the private `unlock` module) when `keychain` is enabled.
+                        use cairn_vault::UnlockProvider as _;
+                        let provider = cairn_vault::KeychainUnlockProvider::default();
+                        if let Err(e) = provider.store(&passphrase) {
+                            tracing::warn!("keychain store after vault creation failed: {e}");
+                        }
+                    }
+                    #[cfg(not(feature = "keychain"))]
+                    {
+                        // Keychain feature not built; the `remember` flag is silently ignored.
+                        tracing::debug!("keychain feature not built; skipping passphrase store");
+                    }
                 }
+                (Ok(()), false)
             }
-            #[cfg(not(feature = "keychain"))]
-            {
-                // Keychain feature not built; the `remember` flag is silently ignored.
-                tracing::debug!("keychain feature not built; skipping passphrase store");
-            }
+            Err(e) => (Err(e.to_string()), already_exists),
         }
-        Ok(())
     })
     .await;
 
     match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(msg)) => Err(msg),
+        Ok(pair) => pair,
         // spawn_blocking only panics if the closure panics; treat as an internal error.
-        Err(_) => Err("vault creation task failed".to_owned()),
+        Err(_) => (Err("vault creation task failed".to_owned()), false),
     }
 }
 
@@ -3045,7 +3058,7 @@ mod tests {
         let path = dir.path().join("new.cvlt");
         assert!(!path.exists(), "precondition: vault file must not exist");
         let broker = Arc::new(Broker::locked());
-        let result = run_create_vault_effect(
+        let (result, already_exists) = run_create_vault_effect(
             &broker,
             Some(path.clone()),
             SecretString::from("correct horse battery staple".to_owned()),
@@ -3053,6 +3066,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "create should succeed, got: {result:?}");
+        assert!(!already_exists, "already_exists must be false on success");
         assert!(broker.is_unlocked(), "broker must be unlocked after create");
         assert!(path.exists(), "vault file must be on disk after create");
         // Verify 0600 permissions on Unix (the OS-level security requirement).
@@ -3068,15 +3082,16 @@ mod tests {
     async fn create_vault_effect_no_path_configured_returns_clear_error() {
         use cairn_secrets::SecretString;
         let broker = Arc::new(Broker::locked());
-        let err = run_create_vault_effect(
+        let (result, already_exists) = run_create_vault_effect(
             &broker,
             None,
             SecretString::from("passphrase".to_owned()),
             false,
         )
-        .await
-        .unwrap_err();
+        .await;
+        let err = result.unwrap_err();
         assert!(err.contains("no vault path"), "got: {err}");
+        assert!(!already_exists);
         assert!(!broker.is_unlocked());
     }
 
@@ -3095,25 +3110,71 @@ mod tests {
         .unwrap();
         let broker = Arc::new(Broker::locked());
         // Attempting to create again must fail cleanly.
-        let err = run_create_vault_effect(
+        let (result, already_exists) = run_create_vault_effect(
             &broker,
-            Some(path),
+            Some(path.clone()),
             SecretString::from("second".to_owned()),
             false,
         )
-        .await
-        .unwrap_err();
-        // The error must not contain the passphrase.
+        .await;
+        let err = result.unwrap_err();
+        // The error must not contain the passphrase or the vault file path (Fix 4).
         assert!(
             !err.contains("second"),
             "error must not reveal the passphrase, got: {err}"
+        );
+        assert!(
+            !err.contains(path.to_str().unwrap_or("")),
+            "error must not reveal the vault path, got: {err}"
         );
         // The error should mention "already" or "exists".
         assert!(
             err.to_lowercase().contains("already") || err.to_lowercase().contains("exist"),
             "expected a 'file already exists' error, got: {err}"
         );
+        assert!(
+            already_exists,
+            "already_exists must be true for AlreadyExists failure"
+        );
         assert!(!broker.is_unlocked(), "broker must stay locked on failure");
+    }
+
+    /// Fix 2 (runtime side): `run_create_vault_effect` must not silently overwrite an existing
+    /// vault — the existing file must be byte-for-byte identical after the failed attempt.
+    ///
+    /// This exercises the `atomic_create` (persist_noclobber) path in `cairn-vault`.
+    #[tokio::test]
+    async fn create_vault_effect_does_not_clobber_existing_vault_file() {
+        use cairn_secrets::SecretString;
+        use cairn_vault::{KdfParams, Vault};
+        let dir = tempfile_dir();
+        let path = dir.path().join("existing.cvlt");
+        // Create an original vault (fast params) and read its bytes.
+        Vault::create_with_params(
+            &path,
+            &SecretString::from("original-passphrase".to_owned()),
+            KdfParams::fast_for_tests(),
+        )
+        .unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        // A second `create` attempt (simulating the race window) must fail.
+        let broker = Arc::new(Broker::locked());
+        let (result, already_exists) = run_create_vault_effect(
+            &broker,
+            Some(path.clone()),
+            SecretString::from("attacker-passphrase".to_owned()),
+            false,
+        )
+        .await;
+        assert!(result.is_err(), "second create must fail");
+        assert!(already_exists, "must be flagged as AlreadyExists");
+        // The vault file must be unchanged.
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            original_bytes, bytes_after,
+            "vault file must not be modified by a failed create"
+        );
+        assert!(!broker.is_unlocked(), "broker must stay locked");
     }
 
     // P2: A locked vault means credential-bearing profiles appear as NeedsVault in the switcher

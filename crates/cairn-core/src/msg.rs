@@ -325,9 +325,17 @@ pub enum AppEvent {
     ///
     /// On failure: the overlay stays open with the inline error (the message is secret-free and
     /// value-free — only a category is shown, never a path or passphrase fragment).
+    ///
+    /// `already_exists` is `true` when the failure was specifically `VaultError::AlreadyExists`
+    /// — the vault was created out-of-band (another instance or terminal) after this session
+    /// started. The reducer uses this flag to set `vault_file_exists = true` so subsequent
+    /// `Ctrl-U` presses open the unlock overlay instead of looping on "already exists".
     VaultCreated {
         /// `Ok(())` on success; `Err(message)` with a secret-free, value-free error.
         result: Result<(), String>,
+        /// `true` when the error is specifically `VaultError::AlreadyExists`; `false` otherwise
+        /// and when `result` is `Ok`. Only meaningful when `result` is `Err`.
+        already_exists: bool,
     },
 }
 

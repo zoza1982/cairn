@@ -300,8 +300,8 @@ fn render_vault_create(
     error: Option<&str>,
     creating: bool,
 ) {
-    // 11 rows: 2 borders + passphrase label + passphrase field + blank + confirm label +
-    // confirm field + blank + remember toggle + error/status + hint.
+    // 11 rows: 2 borders + 9 content rows (passphrase label + passphrase field + blank +
+    // confirm label + confirm field + blank + remember toggle + error/status + hint).
     let area = centered(frame.area(), 54, 11);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
@@ -310,7 +310,7 @@ fn render_vault_create(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Layout: 10 content rows inside the border.
+    // Layout: 9 content rows inside the border.
     let [pp_label, pp_field, blank1, cf_label, cf_field, blank2, remember_row, status_row, hint_row] =
         Layout::vertical([
             Constraint::Length(1), // "New passphrase:"
@@ -377,7 +377,7 @@ fn render_vault_create(
         );
     } else {
         frame.render_widget(
-            Paragraph::new("Passphrase must be ≥ 8 chars (12+ recommended)")
+            Paragraph::new("Passphrase must be ≥ 12 chars")
                 .style(Style::default().fg(Color::DarkGray)),
             status_row,
         );

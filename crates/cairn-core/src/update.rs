@@ -13,7 +13,12 @@ use std::sync::Arc;
 /// Minimum passphrase length for a new vault. Enforced in the pure reducer, before the effect
 /// runner even sees the secret; a 1-character vault would be trivially brute-forced even with
 /// Argon2id. 8 characters is the absolute floor; the UI hint says "at least 12 recommended".
-pub const VAULT_PASSPHRASE_MIN_LEN: usize = 8;
+/// Minimum character count for a new vault master passphrase.
+///
+/// 12 characters is a conservative floor for a master passphrase that guards every stored
+/// credential. Argon2id provides additional strength through its KDF, but the passphrase
+/// itself must exceed a trivial length threshold.
+pub const VAULT_PASSPHRASE_MIN_LEN: usize = 12;
 
 /// Apply a message to the state, returning any effects to run. Deterministic and side-effect-free.
 #[must_use]
@@ -506,14 +511,11 @@ fn apply_vault_create_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffec
             }
             Vec::new()
         }
-        // Tab / Shift-Tab cycle between the two fields. Using `NextField`/`PrevField` keeps the
-        // text-edit API symmetric with `ConnectionForm`.
-        TextEdit::NextField => {
-            *focus = 1;
-            Vec::new()
-        }
-        TextEdit::PrevField => {
-            *focus = 0;
+        // Tab / Shift-Tab both wrap between the two fields (there are only two, so Next and Prev
+        // are symmetric: toggle). Using `NextField`/`PrevField` keeps the text-edit API
+        // symmetric with `ConnectionForm`.
+        TextEdit::NextField | TextEdit::PrevField => {
+            *focus = 1 - *focus;
             Vec::new()
         }
         // Esc cancels the overlay (both fields zeroize on drop). Mirror VaultUnlock: clear any
@@ -614,10 +616,12 @@ fn submit_vault_create(state: &mut AppState) -> Vec<AppEffect> {
     }; // ← borrow ends
 
     if pp.expose_secret() != cf.expose_secret() {
-        // `cf` and `pp` are both dropped (zeroized) before we return.
+        // Both values are zeroized: `cf` explicitly here, `pp` at the early return below.
+        // Focus resets to the passphrase field so the user knows to re-enter both.
         drop(cf);
-        if let Some(Overlay::VaultCreate { error, .. }) = &mut state.overlay {
-            *error = Some("Passphrases do not match".to_owned());
+        if let Some(Overlay::VaultCreate { error, focus, .. }) = &mut state.overlay {
+            *error = Some("Passphrases do not match — re-enter both.".to_owned());
+            *focus = 0;
         }
         return Vec::new(); // `pp` zeroized here
     }
@@ -2543,7 +2547,10 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 }
             }
         }
-        AppEvent::VaultCreated { result } => {
+        AppEvent::VaultCreated {
+            result,
+            already_exists,
+        } => {
             // The Argon2id task is no longer running; clear the in-flight flag regardless of outcome.
             if let Some(Overlay::VaultCreate { creating, .. }) = &mut state.overlay {
                 *creating = false;
@@ -2601,10 +2608,23 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 Err(msg) => {
                     // Keep the create overlay open with a retryable error. The error message is
                     // secret-free and path-free (the effect runner ensures this).
-                    if let Some(Overlay::VaultCreate { error, .. }) = &mut state.overlay {
-                        *error = Some(msg);
+                    //
+                    // Special case: if the vault was created out-of-band (another process or
+                    // terminal) between startup and now, `already_exists == true`. We flip
+                    // `vault_file_exists` so subsequent Ctrl-U opens the Unlock overlay instead
+                    // of looping on "already exists".
+                    if already_exists {
+                        state.vault_file_exists = true;
+                    }
+                    let display = if already_exists {
+                        "A vault already exists — press Esc, then Ctrl-U to unlock it.".to_owned()
                     } else {
-                        state.status = Some(format!("Vault creation failed: {msg}"));
+                        msg
+                    };
+                    if let Some(Overlay::VaultCreate { error, .. }) = &mut state.overlay {
+                        *error = Some(display);
+                    } else {
+                        state.status = Some(format!("Vault creation failed: {display}"));
                     }
                     Vec::new()
                 }
@@ -5038,9 +5058,15 @@ mod tests {
     fn vault_create_too_short_passphrase_rejected_with_length_error() {
         let mut s = state();
         open_vault_create(&mut s);
-        type_text(&mut s, "short"); // 5 chars < VAULT_PASSPHRASE_MIN_LEN
+        // 11 chars = VAULT_PASSPHRASE_MIN_LEN - 1 → must be rejected.
+        type_text(&mut s, "short_passw"); // exactly 11 chars
+        assert_eq!(
+            "short_passw".chars().count(),
+            VAULT_PASSPHRASE_MIN_LEN - 1,
+            "precondition: string must be one char below the minimum"
+        );
         let fx = update(&mut s, Msg::Text(TextEdit::Submit));
-        assert!(fx.is_empty(), "too-short passphrase emits no effect");
+        assert!(fx.is_empty(), "11-char passphrase emits no effect");
         match &s.overlay {
             Some(Overlay::VaultCreate {
                 error: Some(err), ..
@@ -5051,6 +5077,51 @@ mod tests {
                 );
             }
             other => panic!("expected error in overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_create_exactly_min_len_passphrase_accepted() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // 12 chars = VAULT_PASSPHRASE_MIN_LEN → must be accepted (no length error).
+        let pp = "a".repeat(VAULT_PASSPHRASE_MIN_LEN);
+        type_text(&mut s, &pp);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, &pp);
+        let fx = update(&mut s, Msg::Text(TextEdit::Submit));
+        // Length is valid; a CreateVault effect is emitted.
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, AppEffect::CreateVault { .. })),
+            "12-char passphrase must emit CreateVault effect, got: {fx:?}"
+        );
+    }
+
+    /// Fix 7: typing any character after a validation error clears the error.
+    #[test]
+    fn vault_create_insert_clears_stale_error() {
+        let mut s = state();
+        open_vault_create(&mut s);
+        // Trigger an error: submit with an empty passphrase.
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert!(
+            matches!(
+                &s.overlay,
+                Some(Overlay::VaultCreate { error: Some(_), .. })
+            ),
+            "precondition: submit on empty must set an error"
+        );
+        // Any new character must clear it.
+        let _ = update(&mut s, Msg::Text(TextEdit::Insert('a')));
+        match &s.overlay {
+            Some(Overlay::VaultCreate { error, .. }) => {
+                assert!(
+                    error.is_none(),
+                    "Insert must clear the stale error, got: {error:?}"
+                );
+            }
+            other => panic!("overlay must still be open, got {other:?}"),
         }
     }
 
@@ -5112,13 +5183,13 @@ mod tests {
     }
 
     #[test]
-    fn vault_create_content_mismatch_wipes_both_fields() {
+    fn vault_create_content_mismatch_wipes_both_fields_and_resets_focus() {
         let mut s = state();
         open_vault_create(&mut s);
-        // Same length but different content.
-        type_text(&mut s, "aaaaaaaa"); // 8 chars
-        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
-        type_text(&mut s, "bbbbbbbb"); // 8 chars, different content
+        // Same length (≥ 12) but different content — triggers the secret-comparison path.
+        type_text(&mut s, "aaaaaaaaaaaa"); // 12 chars (VAULT_PASSPHRASE_MIN_LEN)
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField)); // switch to confirm (focus = 1)
+        type_text(&mut s, "bbbbbbbbbbbb"); // 12 chars, different content
         let fx = update(&mut s, Msg::Text(TextEdit::Submit));
         assert!(fx.is_empty(), "content mismatch emits no effect");
         match &s.overlay {
@@ -5126,6 +5197,7 @@ mod tests {
                 passphrase,
                 confirm,
                 error,
+                focus,
                 ..
             }) => {
                 // Both fields are wiped on content mismatch (the comparison consumed both secrets).
@@ -5140,6 +5212,11 @@ mod tests {
                 assert!(
                     error.as_deref().is_some_and(|e| e.contains("match")),
                     "error must say passphrases don't match"
+                );
+                // Fix 6: focus resets to 0 so the user knows to re-enter both from the start.
+                assert_eq!(
+                    *focus, 0,
+                    "focus must reset to passphrase field on content mismatch"
                 );
             }
             other => panic!("expected VaultCreate overlay, got {other:?}"),
@@ -5254,7 +5331,10 @@ mod tests {
         // The "effect runner" reports success.
         let fx = update(
             &mut s,
-            Msg::Event(AppEvent::VaultCreated { result: Ok(()) }),
+            Msg::Event(AppEvent::VaultCreated {
+                result: Ok(()),
+                already_exists: false,
+            }),
         );
         // Must emit OpenConnection for the pending conn.
         assert!(
@@ -5277,17 +5357,18 @@ mod tests {
         let _ = update(&mut s, Msg::Text(TextEdit::NextField));
         type_text(&mut s, PP);
         let _ = update(&mut s, Msg::Text(TextEdit::Submit));
-        // Simulate failure (e.g. vault file already exists).
+        // Simulate failure (e.g. an I/O error — NOT an AlreadyExists).
         let fx = update(
             &mut s,
             Msg::Event(AppEvent::VaultCreated {
-                result: Err("vault already exists".to_owned()),
+                result: Err("io error".to_owned()),
+                already_exists: false,
             }),
         );
         assert!(fx.is_empty(), "failure emits no effect");
         assert!(
             !s.vault_file_exists,
-            "vault_file_exists must stay false on failure"
+            "vault_file_exists must stay false on non-AlreadyExists failure"
         );
         assert!(
             !s.vault_unlocked,
@@ -5299,15 +5380,75 @@ mod tests {
             }) => {
                 assert!(!creating, "creating flag must be cleared on failure");
                 assert!(
-                    error
-                        .as_deref()
-                        .is_some_and(|e| e.contains("already exists")),
-                    "error must be shown in the overlay"
+                    error.as_deref().is_some_and(|e| e.contains("io error")),
+                    "non-AlreadyExists error must be shown verbatim in the overlay, got {error:?}"
                 );
             }
             other => panic!("overlay must stay open for retry, got {other:?}"),
         }
     }
+
+    /// Fix 1: when `already_exists == true` the reducer sets `vault_file_exists = true` so the
+    /// user can press Esc → Ctrl-U to unlock instead of being stuck on "already exists".
+    #[test]
+    fn vault_created_already_exists_sets_vault_file_exists_and_allows_unlock() {
+        const PP: &str = "correcthorsebattery1";
+        let mut s = state();
+        s.vault_file_exists = false; // app started before vault file existed
+        open_vault_create(&mut s);
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::NextField));
+        type_text(&mut s, PP);
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit));
+        // The effect runner found VaultError::AlreadyExists (vault appeared out-of-band).
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::VaultCreated {
+                result: Err("vault already exists".to_owned()),
+                already_exists: true,
+            }),
+        );
+        assert!(fx.is_empty(), "already_exists failure emits no effect");
+        // vault_file_exists must now be true so Ctrl-U opens VaultUnlock.
+        assert!(
+            s.vault_file_exists,
+            "vault_file_exists must flip to true when already_exists"
+        );
+        assert!(
+            !s.vault_unlocked,
+            "vault must not be marked unlocked (we didn't actually unlock it)"
+        );
+        // Overlay must show the recovery hint, not the raw error.
+        match &s.overlay {
+            Some(Overlay::VaultCreate { error, .. }) => {
+                let msg = error.as_deref().expect("error must be set");
+                assert!(
+                    msg.to_lowercase().contains("unlock"),
+                    "error must tell the user to unlock, got: {msg}"
+                );
+            }
+            other => panic!("overlay must stay open, got {other:?}"),
+        }
+        // Pressing Esc then Ctrl-U must open VaultUnlock (vault_file_exists == true).
+        let _ = update(&mut s, Msg::Text(TextEdit::Cancel));
+        let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
+        assert!(
+            matches!(s.overlay, Some(Overlay::VaultUnlock { .. })),
+            "Ctrl-U must open VaultUnlock after already_exists recovery, got {:?}",
+            s.overlay
+        );
+    }
+
+    // Note (shared structural limitation): a late `VaultCreated { Ok(()) }` arriving after the
+    // user has closed the VaultCreate overlay and opened a different one will still set
+    // `vault_file_exists` and `vault_unlocked` (correct) but will NOT close the new overlay
+    // (also correct — we guard with `if matches!(state.overlay, Some(Overlay::VaultCreate { .. }))`).
+    // This is the same race the `VaultUnlock` path has. A request-id mechanism would fix both
+    // but is out of scope for P4.5. Covered by `vault_created_ok_does_not_clobber_unrelated_overlay`.
+    //
+    // Note (AI plan suppression): `Action::VaultUnlock` (which opens both VaultCreate and
+    // VaultUnlock) is already blocked while `state.ai_pending` or `state.ai_executing` is true
+    // (see the guards at the top of `update()`). No additional gate is needed.
 
     #[test]
     fn vault_created_ok_does_not_clobber_unrelated_overlay() {
@@ -5332,7 +5473,10 @@ mod tests {
         // Late success must not clobber the unrelated overlay.
         let _ = update(
             &mut s,
-            Msg::Event(AppEvent::VaultCreated { result: Ok(()) }),
+            Msg::Event(AppEvent::VaultCreated {
+                result: Ok(()),
+                already_exists: false,
+            }),
         );
         assert!(
             matches!(s.overlay, Some(Overlay::Connections { .. })),

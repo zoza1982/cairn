@@ -517,6 +517,10 @@ pub enum Overlay {
         /// In-place validation error (mismatch, too-short, etc.). Cleared on each new `Insert`.
         error: Option<String>,
         /// Set while the Argon2id `spawn_blocking` task is running; suppresses double-submit.
+        ///
+        /// Unlike `AppState::vault_unlocking` (not yet tracked), this lives inside the overlay
+        /// because it is only meaningful while VaultCreate is open — there is no global
+        /// "vault-creation in progress" state that the rest of the reducer needs to observe.
         creating: bool,
         /// The connection that triggered this overlay (auto-opened after vault creation).
         pending_conn: Option<ConnectionId>,
