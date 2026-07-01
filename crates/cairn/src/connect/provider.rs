@@ -22,6 +22,13 @@ use super::descriptor::{
     ConnectionDescriptor, ConnectionKey, DescriptorProvenance, OpenTarget, Reachability,
 };
 
+/// Placeholder [`ConnectionId`] assigned to every freshly-discovered descriptor.
+///
+/// The coordinator always overwrites this before inserting the descriptor into the registry or
+/// the side-map. Seeing this id in a live registry would indicate a coordinator bug. Named so
+/// that construction sites are self-documenting rather than using the opaque literal `0`.
+const UNASSIGNED: ConnectionId = ConnectionId(0);
+
 /// Context passed to every [`ConnectionProvider::discover`] call.
 pub(crate) struct DiscoveryCtx<'a> {
     /// The current user configuration (connection profiles, future discovery opt-outs).
@@ -58,7 +65,7 @@ pub(crate) trait ConnectionProvider: Send + Sync {
 
     /// Enumerate connections from this source and return their descriptors.
     ///
-    /// The returned descriptors have placeholder [`ConnectionId`]s (`ConnectionId(0)`); the
+    /// The returned descriptors have placeholder [`ConnectionId`]s ([`UNASSIGNED`]); the
     /// coordinator assigns real ids after merging all providers' output.
     async fn discover(&self, ctx: &DiscoveryCtx<'_>) -> Vec<ConnectionDescriptor>;
 }
@@ -88,7 +95,7 @@ impl ConnectionProvider for BuiltinLocalProvider {
         // `PathBuf::from("/")`, so we match that for behavioral equivalence in P1.
         let root = PathBuf::from("/");
         out.push(ConnectionDescriptor {
-            id: ConnectionId(0), // placeholder; coordinator assigns real ids
+            id: UNASSIGNED, // placeholder; coordinator assigns real ids
             key: ConnectionKey::Builtin(root.clone()),
             provenance: DescriptorProvenance::Builtin,
             scheme: "local".to_owned(),
@@ -103,7 +110,7 @@ impl ConnectionProvider for BuiltinLocalProvider {
             let home_path = PathBuf::from(&home);
             let label = format!("local: {}", home_path.to_string_lossy());
             out.push(ConnectionDescriptor {
-                id: ConnectionId(0),
+                id: UNASSIGNED,
                 key: ConnectionKey::Builtin(home_path.clone()),
                 provenance: DescriptorProvenance::Builtin,
                 scheme: "local".to_owned(),
@@ -154,7 +161,7 @@ impl ConnectionProvider for SavedProfileProvider {
                 Some(path) if !path.is_empty() => {
                     let fs_path = PathBuf::from(path);
                     out.push(ConnectionDescriptor {
-                        id: ConnectionId(0),
+                        id: UNASSIGNED,
                         key: ConnectionKey::Saved(prof.id),
                         provenance: DescriptorProvenance::Saved {
                             profile_id: prof.id,
@@ -195,7 +202,7 @@ impl ConnectionProvider for SavedProfileProvider {
                 Reachability::Ready
             };
             out.push(ConnectionDescriptor {
-                id: ConnectionId(0),
+                id: UNASSIGNED,
                 key: ConnectionKey::Saved(prof.id),
                 provenance: DescriptorProvenance::Saved {
                     profile_id: prof.id,
@@ -350,6 +357,38 @@ mod tests {
                 profile_id: local_id
             }
         );
-        matches!(&descs[0].key, ConnectionKey::Saved(id) if *id == local_id);
+        assert!(
+            matches!(&descs[0].key, ConnectionKey::Saved(id) if *id == local_id),
+            "key must be Saved with the profile's UUID"
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_provider_local_profile_empty_path_is_skipped() {
+        // Deliberate behavior fix over the original `register_connections`: an empty-string
+        // `endpoint.path` is now treated identically to a missing key — the entry is skipped
+        // with a warning rather than mounting a broken `LocalVfs` rooted at an empty path and
+        // consuming a `ConnectionId`. This ensures that a later credential-bearing profile in
+        // the same config is NOT id-shifted by the empty-path entry.
+        let mut config = Config::default();
+        // A local profile with an explicitly empty path.
+        let mut empty_path = ConnectionProfile::new("local", "broken-empty");
+        empty_path.endpoint.insert("path".into(), "".into());
+        config.connections.push(empty_path);
+        // A credential-bearing profile that follows — its position in the output must not shift.
+        let mut remote = ConnectionProfile::new("ssh", "bastion");
+        remote.secret_ref = Some(Uuid::new_v4());
+        config.connections.push(remote);
+
+        let descs = SavedProfileProvider.discover(&ctx(&config, true)).await;
+
+        // The empty-path local entry must not appear.
+        assert!(
+            descs.iter().all(|d| d.scheme != "local"),
+            "local profile with empty endpoint.path must produce no descriptor"
+        );
+        // The following ssh profile still emits exactly one descriptor at index 0.
+        assert_eq!(descs.len(), 1, "only the ssh profile should appear");
+        assert_eq!(descs[0].scheme, "ssh");
     }
 }

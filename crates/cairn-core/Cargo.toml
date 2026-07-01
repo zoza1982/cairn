@@ -22,6 +22,7 @@ zeroize = "1"
 # `Uuid` is used by `ConnectionKind::Profile { id }` to hold the stable profile UUID,
 # keeping `cairn-core` free of `cairn-config` types while still naming the profile precisely.
 # Same version as `cairn-config`; Cargo resolves a single copy in the workspace.
+# FIXME(arch): if `ConnectionKind` migrates to `cairn-types`, this dep moves with it.
 uuid = { version = "1", default-features = false }
 # FIXME(arch): the reducer holds an AI `Plan` in `Overlay::AiPlan`, so it depends on cairn-ai.
 # Consider promoting the pure plan data types to cairn-types so the core stays dependency-light.

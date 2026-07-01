@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kind: ConnectionKind`) allow the reducer and renderer to display richer connection metadata
   in future phases. New `ConnectionDescriptor` side-map stored in `event_loop` (unused in P1,
   established for P2 lazy open on selection). Broker-isolation test remains green.
+  **Micro-fix (deliberate, not pure refactor):** a `scheme = "local"` profile with
+  `endpoint.path = ""` (explicitly empty string) is now skipped with a warning, matching the
+  existing treatment of a missing key. The original code silently mounted a broken `LocalVfs`
+  at an empty path and consumed a `ConnectionId`, shifting ids of any following profiles.
 
 - **Plugin loader and manifest parser** (RFC-0010 PR-C1, M8-5): new `cairn-plugin::manifest`
   module with `PluginManifest` (parsed from `plugin.toml` via `serde`+`toml`, all structs

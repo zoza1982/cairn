@@ -317,11 +317,11 @@ async fn register_connections(
     HashMap<ConnectionId, ConnectionDescriptor>,
 ) {
     let coordinator = ConnectionCoordinator::new(opener.clone(), RIGHT.0 + 1);
-    // The broker starts locked at startup; SavedProfileProvider uses this to tag credential-bearing
-    // profiles as NeedsVault so the coordinator defers them rather than opening immediately.
+    // Derive vault_locked from the live broker state so this call site and future P2
+    // re-enumeration calls automatically reflect the current lock status.
     let ctx = DiscoveryCtx {
         config,
-        vault_locked: true,
+        vault_locked: opener.vault_locked(),
     };
     coordinator.run(registry, &ctx).await
 }
@@ -339,8 +339,8 @@ async fn event_loop(
     vault_ctx: &VaultContext,
     descriptor_map: HashMap<ConnectionId, ConnectionDescriptor>,
 ) -> anyhow::Result<()> {
-    // Descriptor side-map established for P2 (lazy open on selection); unused in P1.
-    let _connection_descriptors = descriptor_map;
+    // P2 will bind this map to resolve a ConnectionId to its descriptor on selection.
+    let _p2_descriptor_map = descriptor_map;
     // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
     // matching effect can signal them. Each is cleared when its Done event arrives.
     // Per-transfer control, keyed by `TransferId`: the cancel token + pause sender form a *control

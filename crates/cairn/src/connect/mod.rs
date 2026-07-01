@@ -122,6 +122,17 @@ impl ConnectionOpener {
         Self { broker }
     }
 
+    /// Whether the broker's vault is currently locked.
+    ///
+    /// Pass this as [`DiscoveryCtx::vault_locked`](provider::DiscoveryCtx::vault_locked) when
+    /// calling the coordinator so that [`SavedProfileProvider`](provider::SavedProfileProvider)
+    /// classifies credential-bearing profiles correctly. Using the live broker state (rather than
+    /// a hardcoded literal) means a P2 re-enumeration after vault unlock will automatically
+    /// classify those profiles as [`Reachability::Ready`](descriptor::Reachability::Ready).
+    pub(crate) fn vault_locked(&self) -> bool {
+        !self.broker.is_unlocked()
+    }
+
     /// Open the backend described by `profile`, assigning it [`ConnectionId`] `conn`.
     ///
     /// `actor` is recorded in the broker's audit journal for the credential resolution. Dispatches

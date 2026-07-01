@@ -10,12 +10,12 @@
 //! 3. `HashMap<ConnectionId, ConnectionDescriptor>` — the runtime side-map, established here for
 //!    P2 use (unused by reducer logic in P1).
 //!
-//! ## Id-assignment contract
+//! ## Id-assignment contract (P1 → P2 migration note)
 //!
-//! The coordinator assigns ids sequentially in provider-output order. Since
-//! [`BuiltinLocalProvider`] emits `/` then `$HOME`, and [`SavedProfileProvider`] emits local
-//! profiles first then credential-bearing profiles, the final id assignment is identical to the
-//! original function:
+//! **P1 behavior:** ids are assigned by sequential counter (`base_id + i`) in provider-output
+//! order. Since [`BuiltinLocalProvider`] emits `/` then `$HOME`, and [`SavedProfileProvider`]
+//! emits local profiles first then credential-bearing profiles, the assignment matches the
+//! original `register_connections`:
 //!
 //! ```text
 //! id = base+0  →  builtin "/"
@@ -23,6 +23,16 @@
 //! id = base+N  →  first local config profile  (N = num builtin roots)
 //! id = base+M  →  first credential-bearing config profile
 //! ```
+//!
+//! **P2 MUST change this to key-based stable-id reuse.** On config reload or re-enumeration,
+//! P2 should look up the existing [`ConnectionId`] for each `ConnectionKey` already live in
+//! a pane and reuse it — minting a fresh id only for genuinely new keys. Without this, a config
+//! reload will silently repoint open panes to new ids, breaking any in-flight operation.
+//!
+//! **Descriptor-map contract:** `descriptors.insert(id, desc)` runs for every descriptor,
+//! including those whose open failed with a non-deferrable error (e.g. `BackendNotBuilt` in the
+//! lean build). The map therefore contains ids with no corresponding choice or registry entry.
+//! P2 must account for this when deciding whether an id is "live".
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -87,6 +97,11 @@ impl ConnectionCoordinator {
         // Collect descriptors from all providers in registration order.
         // The ordering contract: builtin roots first (BuiltinLocalProvider), then local saved
         // profiles, then credential-bearing saved profiles (SavedProfileProvider).
+        //
+        // P1 runs providers sequentially because they are fast, offline, and synchronous.
+        // P3 MUST switch to `FuturesUnordered` + per-provider timeout so that a hung Docker
+        // socket or a slow kubeconfig credential plugin cannot block startup enumeration
+        // (RFC-0011 §2: "concurrently and time-bounded").
         let providers: &[&dyn ConnectionProvider] = &[&BuiltinLocalProvider, &SavedProfileProvider];
         let mut raw: Vec<ConnectionDescriptor> = Vec::new();
         for provider in providers {
@@ -119,8 +134,8 @@ impl ConnectionCoordinator {
                         }
                         OpenTarget::Profile(profile) => {
                             // Remote/credential-free profile (docker, k8s, or unlocked ssh/s3/…).
-                            // Attempt to open; non-vault failures are logged and the id is consumed
-                            // (a gap in the id space is harmless — ids are opaque u64 handles).
+                            // Attempt to open; defer on `BrokerError::Locked` (the vault state
+                            // might be mis-set in future call sites), drop on any other error.
                             match self.opener.open(Actor::User, id, &profile).await {
                                 Ok(vfs) => {
                                     registry.insert(id, vfs).await;
@@ -134,15 +149,25 @@ impl ConnectionCoordinator {
                                     });
                                 }
                                 Err(e) => {
+                                    // A Ready-classified profile that still gets Locked is a sign
+                                    // that vault_locked was mis-set by the call site (e.g. a P2
+                                    // re-enumeration that passes false while the broker is locked).
+                                    // Defer rather than silently dropping so the unlock flow can
+                                    // retry it — same contract as the NeedsVault arm.
+                                    let deferrable =
+                                        matches!(e, OpenError::Broker(BrokerError::Locked));
                                     tracing::warn!(
                                         scheme = %desc.scheme,
                                         name = %desc.display_name,
                                         error = %e,
-                                        deferred = false,
+                                        deferred = deferrable,
                                         "connection profile not opened at startup"
                                     );
-                                    // Not deferrable: the profile had no secret_ref or docker/k8s
-                                    // isn't built. No choice entry is added; the id slot is consumed.
+                                    if deferrable {
+                                        deferred.push(DeferredConnection { id, profile });
+                                    }
+                                    // Non-deferrable (BackendNotBuilt, MissingField, …): id slot
+                                    // consumed but no choice or deferred entry is added.
                                 }
                             }
                         }
@@ -154,11 +179,17 @@ impl ConnectionCoordinator {
                     // The id is reserved so the profile keeps a positionally stable slot.
                     let profile = match &desc.target {
                         OpenTarget::Profile(p) => p.clone(),
-                        OpenTarget::LocalRoot(_) => {
-                            // Local roots are always Ready; reaching NeedsVault here is a bug.
-                            unreachable!(
-                                "local root descriptor cannot have NeedsVault reachability"
+                        OpenTarget::LocalRoot(path) => {
+                            // P1 providers never emit a LocalRoot with NeedsVault, but a future
+                            // P3 provider could violate the invariant. Log and skip — a broken
+                            // descriptor does not justify crashing the whole startup sequence.
+                            tracing::error!(
+                                path = ?path,
+                                name = %desc.display_name,
+                                "local root descriptor has NeedsVault reachability; skipping"
                             );
+                            descriptors.insert(id, desc);
+                            continue;
                         }
                     };
                     match self.opener.open(Actor::User, id, &profile).await {
@@ -207,9 +238,7 @@ impl ConnectionCoordinator {
 /// - `Builtin` → `(ChoiceProvenance::Builtin, ConnectionKind::AutoDiscovered)`
 /// - `Saved { id }` → `(ChoiceProvenance::Saved, ConnectionKind::Profile { id })`
 /// - `Discovered { src }` → `(ChoiceProvenance::Discovered { source: src }, ConnectionKind::AutoDiscovered)`
-pub(crate) fn core_projection(
-    provenance: &DescriptorProvenance,
-) -> (ChoiceProvenance, ConnectionKind) {
+fn core_projection(provenance: &DescriptorProvenance) -> (ChoiceProvenance, ConnectionKind) {
     match provenance {
         DescriptorProvenance::Builtin => {
             (ChoiceProvenance::Builtin, ConnectionKind::AutoDiscovered)
@@ -410,6 +439,100 @@ mod tests {
         assert!(
             descriptors.contains_key(&expected_cred_id),
             "credential profile id must be reserved at position base + builtins + 1"
+        );
+    }
+
+    // ── Ready/Profile deferral on Locked (fix 4) ─────────────────────────────────────────────
+
+    /// Even when `vault_locked` is incorrectly set to `false` (or a profile is mis-classified as
+    /// `Ready`), the coordinator must defer on `BrokerError::Locked` from the `Ready/Profile`
+    /// arm. Without this, a stale `vault_locked: false` at a P2 call site would silently drop
+    /// profiles instead of deferring them. Gated on `s3` — see the P1 deferral test above.
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn ready_profile_that_gets_locked_error_is_deferred() {
+        let (coordinator, registry) = make_coordinator(); // broker is Broker::locked()
+        let mut config = Config::default();
+        let mut prof = ConnectionProfile::new("s3", "prod");
+        prof.endpoint.insert("bucket".into(), "b".into());
+        prof.secret_ref = Some(Uuid::new_v4());
+        config.connections.push(prof);
+
+        // vault_locked: false → SavedProfileProvider classifies the profile as Ready (not
+        // NeedsVault), but the broker is actually locked → opener returns BrokerError::Locked.
+        let ctx_unlocked = DiscoveryCtx {
+            config: &config,
+            vault_locked: false,
+        };
+        let (choices, deferred, _descriptors) = coordinator.run(&registry, &ctx_unlocked).await;
+
+        assert!(
+            choices.iter().all(|c| !c.label.starts_with("s3:")),
+            "locked profile must not appear in choices"
+        );
+        assert_eq!(
+            deferred.len(),
+            1,
+            "BrokerError::Locked from Ready/Profile arm must defer, not drop"
+        );
+        assert_eq!(deferred[0].profile.display_name, "prod");
+    }
+
+    // ── Lean-build descriptor count contract (P2 baseline) ───────────────────────────────────
+
+    /// In the lean build (no backend features), a `docker` profile fails with `BackendNotBuilt`
+    /// — a non-deferrable error. The id slot is still consumed and the descriptor is always
+    /// inserted into the side-map. P2 re-enumeration code that checks the map for live ids must
+    /// account for this: a descriptor in the map does NOT imply a live registry or choice entry.
+    #[cfg(not(feature = "docker"))]
+    #[tokio::test]
+    async fn failed_open_reserves_id_in_descriptor_map_but_not_in_choices() {
+        let (coordinator, registry) = make_coordinator();
+        let mut config = Config::default();
+        config
+            .connections
+            .push(ConnectionProfile::new("docker", "local-docker"));
+
+        let (choices, deferred, descriptors) = coordinator.run(&registry, &ctx(&config)).await;
+
+        assert!(deferred.is_empty(), "BackendNotBuilt is not deferrable");
+        // choices = builtin roots only; docker is absent.
+        assert!(
+            choices.iter().all(|c| !c.label.starts_with("docker:")),
+            "docker profile must not appear in choices (lean build: BackendNotBuilt)"
+        );
+        // But the descriptor IS in the map — the id slot was consumed.
+        assert_eq!(
+            descriptors.len(),
+            choices.len() + 1,
+            "failed docker descriptor must still be in the side-map"
+        );
+    }
+
+    // ── core_projection Discovered mapping (P3 baseline) ─────────────────────────────────────
+
+    /// Locks the `Discovered` arm of `core_projection` so P3 docker/kubeconfig providers can
+    /// rely on it. The arm is dead in P1 (no provider constructs `Discovered` yet).
+    #[test]
+    fn core_projection_discovered_maps_to_auto_discovered() {
+        use super::super::descriptor::DescriptorProvenance;
+        use cairn_core::DiscoverySource;
+
+        let (prov, kind) = core_projection(&DescriptorProvenance::Discovered {
+            source: DiscoverySource::Docker,
+        });
+        assert!(
+            matches!(
+                prov,
+                ChoiceProvenance::Discovered {
+                    source: DiscoverySource::Docker
+                }
+            ),
+            "Discovered must map to ChoiceProvenance::Discovered with the same source"
+        );
+        assert!(
+            matches!(kind, ConnectionKind::AutoDiscovered),
+            "Discovered descriptor must have AutoDiscovered kind"
         );
     }
 }

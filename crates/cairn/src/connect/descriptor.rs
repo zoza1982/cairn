@@ -65,8 +65,10 @@ pub(crate) enum Reachability {
 /// Held binary-side in the coordinator's side-map (`HashMap<ConnectionId, ConnectionDescriptor>`
 /// in [`event_loop`](crate::app)). The pure-core
 /// [`ConnectionChoice`](cairn_core::ConnectionChoice) is derived from this by
-/// [`coordinator::core_projection`](super::coordinator::core_projection). The descriptor is the
-/// single source of truth for the P2 open effect and future re-enumeration diffing.
+/// `coordinator::core_projection` (module-private; called inside
+/// [`ConnectionCoordinator::run`](super::coordinator::ConnectionCoordinator::run)). The
+/// descriptor is the single source of truth for the P2 open effect and future re-enumeration
+/// diffing.
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionDescriptor {
     /// The stable [`ConnectionId`] assigned by the coordinator for this enumeration round.
