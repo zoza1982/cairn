@@ -24,13 +24,58 @@ use uuid::Uuid;
 /// avoiding a pane repoint on re-enumeration. The string forms are:
 /// - Built-in: `"builtin:<absolute-path>"` (e.g. `"builtin:/"`)
 /// - Saved: `"saved:<uuid>"` (the profile's stable UUID)
-/// - Docker / Kubeconfig: future, see RFC-0011 §3–§4.
+/// - Docker socket: `"docker:socket:<path>"` (e.g. `"docker:socket:default"` for the platform
+///   default, or `"docker:socket:/run/user/1000/docker.sock"` for an explicit rootless socket)
+/// - Kubeconfig: `"kube:kubeconfig"` (the merged kubeconfig from `$KUBECONFIG` / `~/.kube/config`)
+/// - In-cluster: `"kube:in-cluster"` (the pod's service-account credentials)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ConnectionKey {
     /// A built-in local root, identified by its filesystem path.
     Builtin(PathBuf),
     /// A user-saved profile, identified by its stable UUID.
     Saved(Uuid),
+    /// An auto-discovered Docker daemon socket.
+    ///
+    /// `socket_path` is `"default"` when the platform-default socket was probed via
+    /// `BollardDocker::connect_local`, or the raw path string for explicit rootless /
+    /// Podman sockets.
+    ///
+    /// Constructed by `DockerProvider` — only available with the `docker` feature. The variant
+    /// must exist in all build configurations for match exhaustiveness in `as_key_str`.
+    #[cfg_attr(not(feature = "docker"), allow(dead_code))]
+    Docker {
+        /// The socket path key: `"default"` for the platform default, or the explicit path.
+        socket_path: String,
+    },
+    /// The Kubernetes cluster reachable via the merged kubeconfig
+    /// (`$KUBECONFIG` / `~/.kube/config`).
+    ///
+    /// Constructed by `KubeconfigProvider` — only available with the `k8s` feature.
+    #[cfg_attr(not(feature = "k8s"), allow(dead_code))]
+    Kubeconfig,
+    /// The Kubernetes cluster reached via the pod's in-cluster service-account credentials.
+    ///
+    /// Constructed by `KubeconfigProvider` — only available with the `k8s` feature.
+    #[cfg_attr(not(feature = "k8s"), allow(dead_code))]
+    InCluster,
+}
+
+impl ConnectionKey {
+    /// Stable string representation used for hidden/pinned config matching.
+    ///
+    /// Forms:
+    /// - `"builtin:<path>"`, `"saved:<uuid>"`
+    /// - `"docker:socket:<socket_path>"` (e.g. `"docker:socket:default"`)
+    /// - `"kube:kubeconfig"`, `"kube:in-cluster"`
+    pub(crate) fn as_key_str(&self) -> String {
+        match self {
+            Self::Builtin(p) => format!("builtin:{}", p.display()),
+            Self::Saved(u) => format!("saved:{u}"),
+            Self::Docker { socket_path } => format!("docker:socket:{socket_path}"),
+            Self::Kubeconfig => "kube:kubeconfig".to_owned(),
+            Self::InCluster => "kube:in-cluster".to_owned(),
+        }
+    }
 }
 
 /// What the coordinator will open when a connection is selected or eagerly mounted at startup.
@@ -45,6 +90,32 @@ pub(crate) enum OpenTarget {
     /// profile. The profile carries no secret material; the broker resolves the credential at
     /// open time.
     Profile(ConnectionProfile),
+    /// Open a Docker backend at the given Unix socket path.
+    ///
+    /// `path = None` means use the platform-default socket (equivalent to
+    /// `BollardDocker::connect_local`). `path = Some(p)` connects to the explicit socket at `p`
+    /// (rootless Docker or Podman socket discovered by `DockerProvider`).
+    ///
+    /// Constructed by `DockerProvider` — only available with the `docker` feature. The variant
+    /// must exist in all build configurations for match exhaustiveness in `run_open_connection_effect`.
+    #[cfg_attr(not(feature = "docker"), allow(dead_code))]
+    DockerSocket {
+        /// The explicit socket path, or `None` for the platform default.
+        path: Option<PathBuf>,
+    },
+    /// Open a Kubernetes backend using the kubeconfig file resolved at open time
+    /// (`$KUBECONFIG` / `~/.kube/config`).
+    ///
+    /// Constructed by `KubeconfigProvider` — only available with the `k8s` feature.
+    #[cfg_attr(not(feature = "k8s"), allow(dead_code))]
+    KubeconfigDefault,
+    /// Open a Kubernetes backend using the pod's in-cluster service-account credentials.
+    ///
+    /// Requires `KUBERNETES_SERVICE_HOST` to be set and a readable SA token at the standard path.
+    ///
+    /// Constructed by `KubeconfigProvider` — only available with the `k8s` feature.
+    #[cfg_attr(not(feature = "k8s"), allow(dead_code))]
+    InCluster,
 }
 
 /// Reachability as assessed at enumeration time (without actually opening the connection).
@@ -105,8 +176,11 @@ pub(crate) enum DescriptorProvenance {
         profile_id: Uuid,
     },
     /// Auto-discovered from the environment (Docker socket, kubeconfig, …).
-    // P2+: constructed by the Docker / Kubeconfig providers when those are added.
-    #[allow(dead_code)]
+    ///
+    /// Constructed by `DockerProvider` and `KubeconfigProvider` (P3, feature-gated). In lean
+    /// builds where neither feature is enabled, this variant is never constructed; the
+    /// `cfg_attr` below suppresses the dead-code lint in that case only.
+    #[cfg_attr(all(not(feature = "docker"), not(feature = "k8s")), allow(dead_code))]
     Discovered {
         /// The discovery mechanism that surfaced this connection.
         source: DiscoverySource,

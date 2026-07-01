@@ -22,6 +22,9 @@ use super::descriptor::{
     ConnectionDescriptor, ConnectionKey, DescriptorProvenance, OpenTarget, Reachability,
 };
 
+#[cfg(any(feature = "docker", feature = "k8s"))]
+use cairn_core::DiscoverySource;
+
 /// Placeholder [`ConnectionId`] assigned to every freshly-discovered descriptor.
 ///
 /// The coordinator always overwrites this before inserting the descriptor into the registry or
@@ -57,9 +60,12 @@ pub(crate) struct DiscoveryCtx<'a> {
 pub(crate) trait ConnectionProvider: Send + Sync {
     /// A short, stable, human-readable name for this provider.
     ///
-    /// Used as a log tag and (in future phases) as the `ConnectionKey` source prefix.
+    /// Used as a log tag on provider timeout warnings, and (in future phases) as the
+    /// `ConnectionKey` source prefix for re-enumeration diffing.
     /// Examples: `"builtin"`, `"saved"`, `"docker"`, `"kubeconfig"`.
-    // P2: the coordinator will call this to tag each descriptor's origin for re-enumeration diffing.
+    ///
+    /// P4: if `source_id` is still unused beyond timeout logging by the time P5 ships, consider
+    /// removing it from the trait to keep the surface minimal.
     #[allow(dead_code)]
     fn source_id(&self) -> &'static str;
 
@@ -219,6 +225,119 @@ impl ConnectionProvider for SavedProfileProvider {
 }
 
 // ---------------------------------------------------------------------------
+// DockerProvider (P3, feature-gated)
+// ---------------------------------------------------------------------------
+
+/// Auto-discovers reachable Docker/Podman sockets (RFC-0011 P3).
+///
+/// Probes the platform-default socket, a rootless `$XDG_RUNTIME_DIR/docker.sock`, and a Podman
+/// socket at `$XDG_RUNTIME_DIR/podman/podman.sock` — concurrently, with a 500 ms per-socket
+/// deadline. One [`ConnectionDescriptor`] is emitted per reachable socket.
+///
+/// Discovery is **enumerate-only**: no credential lookups, network calls, or exec-plugin runs.
+/// Requires the `docker` Cargo feature; in lean builds this struct is absent.
+#[cfg(feature = "docker")]
+pub(crate) struct DockerProvider;
+
+#[cfg(feature = "docker")]
+#[async_trait]
+impl ConnectionProvider for DockerProvider {
+    fn source_id(&self) -> &'static str {
+        "docker"
+    }
+
+    async fn discover(&self, ctx: &DiscoveryCtx<'_>) -> Vec<ConnectionDescriptor> {
+        if !ctx.config.discovery.docker {
+            return Vec::new();
+        }
+
+        let sockets = cairn_backend_docker::discovery::probe_sockets().await;
+
+        sockets
+            .into_iter()
+            .map(|s| ConnectionDescriptor {
+                id: UNASSIGNED,
+                key: ConnectionKey::Docker {
+                    socket_path: s.key.clone(),
+                },
+                provenance: DescriptorProvenance::Discovered {
+                    source: DiscoverySource::Docker,
+                },
+                scheme: "docker".to_owned(),
+                display_name: format!("docker: {}", s.display_name),
+                target: OpenTarget::DockerSocket { path: s.path },
+                reachability: Reachability::Ready,
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KubeconfigProvider (P3, feature-gated)
+// ---------------------------------------------------------------------------
+
+/// Auto-discovers Kubernetes clusters from kubeconfig and in-cluster credentials (RFC-0011 P3).
+///
+/// Reads `$KUBECONFIG` / `~/.kube/config` via `spawn_blocking` (no network, no exec-credential
+/// plugins). Emits one descriptor for the merged kubeconfig when present, and a second for the
+/// pod's in-cluster credentials when `KUBERNETES_SERVICE_HOST` is set and the SA token exists.
+///
+/// Requires the `k8s` Cargo feature; in lean builds this struct is absent.
+#[cfg(feature = "k8s")]
+pub(crate) struct KubeconfigProvider;
+
+#[cfg(feature = "k8s")]
+#[async_trait]
+impl ConnectionProvider for KubeconfigProvider {
+    fn source_id(&self) -> &'static str {
+        "kubeconfig"
+    }
+
+    async fn discover(&self, ctx: &DiscoveryCtx<'_>) -> Vec<ConnectionDescriptor> {
+        if !ctx.config.discovery.kubernetes {
+            return Vec::new();
+        }
+
+        let status = cairn_backend_k8s::discovery::probe_kubeconfig().await;
+        let mut out = Vec::new();
+
+        if status.has_kubeconfig {
+            out.push(ConnectionDescriptor {
+                id: UNASSIGNED,
+                key: ConnectionKey::Kubeconfig,
+                provenance: DescriptorProvenance::Discovered {
+                    source: DiscoverySource::Kubeconfig,
+                },
+                scheme: "k8s".to_owned(),
+                display_name: "k8s: (kubeconfig)".to_owned(),
+                target: OpenTarget::KubeconfigDefault,
+                reachability: Reachability::Ready,
+            });
+        }
+
+        if status.has_incluster {
+            out.push(ConnectionDescriptor {
+                id: UNASSIGNED,
+                key: ConnectionKey::InCluster,
+                // P4 note: both kubeconfig and in-cluster entries currently use
+                // `DiscoverySource::Kubeconfig`. If P4 adds a sectioned switcher that shows
+                // separate sections for kubeconfig vs. in-cluster, a new `DiscoverySource::InCluster`
+                // variant may be needed. Confirm with kube-staff-engineer before adding it.
+                provenance: DescriptorProvenance::Discovered {
+                    source: DiscoverySource::Kubeconfig,
+                },
+                scheme: "k8s".to_owned(),
+                display_name: "k8s: (in-cluster)".to_owned(),
+                target: OpenTarget::InCluster,
+                reachability: Reachability::Ready,
+            });
+        }
+
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -244,7 +363,10 @@ mod tests {
 
         let has_root = descs.iter().any(|d| match &d.target {
             OpenTarget::LocalRoot(p) => p == std::path::Path::new("/"),
-            OpenTarget::Profile(_) => false,
+            OpenTarget::Profile(_)
+            | OpenTarget::DockerSocket { .. }
+            | OpenTarget::KubeconfigDefault
+            | OpenTarget::InCluster => false,
         });
         assert!(has_root, "/ must always be in builtin descriptors");
     }

@@ -37,6 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC-0011 Phase P3 — Docker + Kubernetes auto-discovery** (RFC-0011 §3–§4, §7): Cairn now
+  auto-discovers Docker sockets and Kubernetes clusters from the environment at startup without
+  blocking the UI or making any network connections during discovery. Discovered entries appear in
+  the connection switcher with an `[auto]` provenance badge (dimmed, non-editable). Three Docker
+  socket candidates are probed concurrently with a 500 ms timeout each: the platform default
+  (via `connect_local()`), the rootless Docker socket (`$XDG_RUNTIME_DIR/docker.sock`), and the
+  Podman socket (`$XDG_RUNTIME_DIR/podman/podman.sock`). For Kubernetes, the merged kubeconfig
+  (`$KUBECONFIG` / `~/.kube/config`) is parsed in a `spawn_blocking` task; a second in-cluster
+  entry is emitted if `KUBERNETES_SERVICE_HOST` is set and the SA token file exists. Discovered
+  connections open lazily on selection (`NeedsOpen`), exactly like P2 saved profiles. New
+  `DiscoveryConfig` section in `cairn.toml` (additive, `#[serde(default)]`, no schema bump):
+  `docker = true`, `kubernetes = true`, `hidden = []`, `pinned = []`. The `hidden` list suppresses
+  individual entries by key string; `pinned` floats entries to the top of the switcher. Provider
+  loop is now concurrent (`join_all`) across all providers. All providers are feature-gated
+  (`docker` / `k8s` features); the lean build (no features) compiles and passes clippy cleanly.
+
 - **RFC-0011 Phase P2 — lazy, on-select connection opening** (RFC-0011 §2, ADR-0007): remote and
   credential-bearing connection profiles are no longer opened at startup. They appear in the
   connection switcher immediately as `NeedsOpen` (credential-free remote) or `NeedsVault`

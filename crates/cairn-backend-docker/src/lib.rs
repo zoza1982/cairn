@@ -6,6 +6,8 @@
 //! real engine access is the `BollardDocker` adapter, compiled only under the `docker` feature
 //! (off by default — it pulls bollard's hyper stack). See `docs/LLD.md` §3.6, RFC-0004, ADR-0006.
 
+#[cfg(feature = "docker")]
+pub mod discovery;
 mod ops;
 #[cfg(feature = "docker")]
 mod real;

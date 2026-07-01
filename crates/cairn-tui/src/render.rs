@@ -3,8 +3,8 @@
 use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{
-    AppState, Listing, LogViewerStatus, MaskedInput, Overlay, PaneState, PromptKind, SessionEnd,
-    SessionRecord, Side,
+    AppState, ChoiceProvenance, Listing, LogViewerStatus, MaskedInput, Overlay, PaneState,
+    PromptKind, SessionEnd, SessionRecord, Side,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,6 +22,19 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     render_pane(frame, right, state, Side::Right, theme);
     render_status(frame, status, state, theme);
     render_overlay(frame, state);
+}
+
+/// Compute the display label for a connection choice in the switcher.
+///
+/// Auto-discovered entries (provenance `Discovered { .. }`) are prefixed with `[auto]` so
+/// users can tell environment-sourced entries apart from manually-configured ones.
+///
+/// P4: remove `[auto]` prefix once the sectioned SAVED / DISCOVERED / LOCAL switcher layout lands.
+fn connection_display_label(c: &cairn_core::ConnectionChoice) -> String {
+    match &c.provenance {
+        ChoiceProvenance::Discovered { .. } => format!("[auto] {}", c.label),
+        _ => c.label.clone(),
+    }
 }
 
 /// Draw the connection switcher: a centered list of the configured connections.
@@ -42,7 +55,19 @@ fn render_connections(
         .border_style(Style::default().fg(Color::Cyan));
     let items: Vec<ListItem> = connections
         .iter()
-        .map(|c| ListItem::new(c.label.clone()))
+        // P3: auto-discovered entries get an [auto] provenance badge and a dimmed style so
+        // users understand they come from the environment and cannot be edited in the config.
+        // P4: remove [auto] prefix when the sectioned SAVED/DISCOVERED/LOCAL switcher lands.
+        .map(|c| {
+            let label = connection_display_label(c);
+            let item = ListItem::new(label);
+            match &c.provenance {
+                ChoiceProvenance::Discovered { .. } => {
+                    item.style(Style::default().add_modifier(Modifier::DIM))
+                }
+                _ => item,
+            }
+        })
         .collect();
     let list = List::new(items)
         .block(block)
@@ -1368,5 +1393,65 @@ mod tests {
             text.contains("Bind") || text.contains("bind"),
             "binding indicator: {text}"
         );
+    }
+
+    // ── P3: [auto] badge via connection_display_label ────────────────────────────────────────
+
+    fn make_choice(label: &str, provenance: ChoiceProvenance) -> cairn_core::ConnectionChoice {
+        cairn_core::ConnectionChoice {
+            conn: ConnectionId(42),
+            label: label.to_owned(),
+            provenance,
+            status: cairn_core::ChoiceStatus::NeedsOpen,
+            kind: cairn_core::ConnectionKind::AutoDiscovered,
+        }
+    }
+
+    /// Builtin entries must NOT receive the `[auto]` prefix.
+    #[test]
+    fn builtin_connection_label_unchanged() {
+        let c = make_choice("local: /", ChoiceProvenance::Builtin);
+        assert_eq!(connection_display_label(&c), "local: /");
+    }
+
+    /// Saved entries must NOT receive the `[auto]` prefix.
+    #[test]
+    fn saved_connection_label_unchanged() {
+        let c = make_choice("sftp: my-server", ChoiceProvenance::Saved);
+        assert_eq!(connection_display_label(&c), "sftp: my-server");
+    }
+
+    /// Auto-discovered entries MUST receive the `[auto]` prefix — both Docker and Kubeconfig
+    /// sources use the same `Discovered` variant so one test per source is sufficient.
+    #[test]
+    fn discovered_docker_label_prefixed_with_auto() {
+        let c = make_choice(
+            "docker (default)",
+            ChoiceProvenance::Discovered {
+                source: cairn_core::DiscoverySource::Docker,
+            },
+        );
+        let label = connection_display_label(&c);
+        assert!(
+            label.starts_with("[auto]"),
+            "discovered label must start with [auto]: {label}"
+        );
+        assert!(
+            label.contains("docker (default)"),
+            "original label must be preserved after the prefix: {label}"
+        );
+        assert_eq!(label, "[auto] docker (default)");
+    }
+
+    #[test]
+    fn discovered_kubeconfig_label_prefixed_with_auto() {
+        let c = make_choice(
+            "k8s: (kubeconfig)",
+            ChoiceProvenance::Discovered {
+                source: cairn_core::DiscoverySource::Kubeconfig,
+            },
+        );
+        let label = connection_display_label(&c);
+        assert_eq!(label, "[auto] k8s: (kubeconfig)");
     }
 }

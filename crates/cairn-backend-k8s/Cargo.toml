@@ -25,6 +25,10 @@ cairn-vfs = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 smol_str = "0.3"
+# Structured logging for discovery warnings (kubeconfig parse errors, timeouts). Consistent with
+# other Cairn crates (cairn, cairn-plugin) that already use tracing. Zero-cost when no subscriber
+# is installed (the default in library code).
+tracing = "0.1"
 # `bytes` is an unconditional dep: `KubeOps::logs` and `ActionOutcome::Stream` carry `Bytes`
 # payloads, so the trait and mock need it even without the live `kube-rs` adapter.
 bytes = "1"

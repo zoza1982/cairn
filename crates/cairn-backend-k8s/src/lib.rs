@@ -22,6 +22,8 @@
 //!
 //! **Deferred (follow-up PR):** The TUI exec pane (RFC-0009 §4) is PR-4.
 
+#[cfg(feature = "k8s")]
+pub mod discovery;
 mod ops;
 #[cfg(feature = "k8s")]
 mod real;
