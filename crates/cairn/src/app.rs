@@ -10,12 +10,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::connect::coordinator::{ConnectionCoordinator, DeferredConnection};
+use crate::connect::descriptor::ConnectionDescriptor;
+use crate::connect::provider::DiscoveryCtx;
 use cairn_backend_local::LocalVfs;
-use cairn_broker::{Actor, Broker, BrokerError};
-use cairn_config::{Config, ConnectionProfile};
+use cairn_broker::{Actor, Broker};
+use cairn_config::Config;
 use cairn_core::{
-    initial_effects, update, Action, AppEffect, AppEvent, AppState, ConnectionChoice, LogViewerId,
-    Msg, Overlay, ShellActionMeta, TransferId,
+    initial_effects, update, Action, AppEffect, AppEvent, AppState, ChoiceProvenance, ChoiceStatus,
+    ConnectionChoice, ConnectionKind, LogViewerId, Msg, Overlay, ShellActionMeta, TransferId,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
@@ -40,14 +43,6 @@ const TRANSFER_PROGRESS_STEP: u64 = 256 * 1024;
 struct Ui {
     keymap: Keymap,
     theme: Theme,
-}
-
-/// A credential-bearing connection profile that could not be opened at startup because the vault was
-/// locked. Its [`ConnectionId`] is reserved up front so the connection keeps a stable slot; the
-/// vault-unlock flow retries exactly these once the broker is unlocked.
-struct DeferredConnection {
-    id: ConnectionId,
-    profile: ConnectionProfile,
 }
 
 /// Runtime-side state for the vault-unlock flow (M3-7): the shared credential [`Broker`] (kept alive
@@ -205,7 +200,7 @@ async fn run_async() -> anyhow::Result<()> {
     // s3/gcs/azure) are opened via the broker-backed opener. A profile that can't open *because the
     // vault is locked* is returned as a `deferred` connection (retried after unlock); other failures
     // (missing field, backend not built) are skipped with a warning.
-    let (choices, deferred) = register_connections(&registry, &config, &opener).await;
+    let (choices, deferred, descriptors) = register_connections(&registry, &config, &opener).await;
     state.connections = choices;
     state.vault_unlocked = broker.is_unlocked(); // false at startup; flips on unlock
     state.has_locked_connections = !deferred.is_empty();
@@ -272,6 +267,7 @@ async fn run_async() -> anyhow::Result<()> {
         &mut input_rx,
         &shell_action_defs,
         &vault_ctx,
+        descriptors,
     )
     .await;
 
@@ -300,97 +296,34 @@ fn load_config() -> Config {
     cfg
 }
 
-/// Register the connections offered by the switcher and return their UI choices plus the connections
-/// deferred while the vault is locked. Built-in local roots (`/` and `$HOME` when set) and each
-/// `scheme = "local"` config profile mount immediately; each credential-bearing profile
-/// (`ssh`/`s3`/`gcs`/`azure`) is opened through the broker-backed
-/// [`ConnectionOpener`](crate::connect::ConnectionOpener) and registered on success.
+/// Register the connections offered by the switcher and return their UI choices, the connections
+/// deferred while the vault is locked, and the runtime descriptor side-map.
 ///
-/// A credential-bearing profile that fails **specifically because the vault is locked** is returned
-/// in the second vec (a [`DeferredConnection`]) so the vault-unlock flow can retry it once unlocked;
-/// any other failure (missing field, or a backend not compiled into this binary) is skipped with a
-/// warning so a single bad profile never blocks startup.
+/// Delegates to [`ConnectionCoordinator`] (RFC-0011 P1). Built-in local roots (`/` and `$HOME`
+/// when set) and each `scheme = "local"` config profile mount immediately; credential-bearing
+/// profiles (`ssh`/`s3`/`gcs`/`azure`) are opened through the broker-backed opener. A profile
+/// that fails **specifically because the vault is locked** is returned in the deferred vec so the
+/// vault-unlock flow can retry it; any other failure is skipped with a warning.
+///
+/// The descriptor map is established here for P2 use (lazy open on selection); the values are
+/// unused by reducer logic in P1.
 async fn register_connections(
     registry: &VfsRegistry,
     config: &Config,
     opener: &crate::connect::ConnectionOpener,
-) -> (Vec<ConnectionChoice>, Vec<DeferredConnection>) {
-    // Build the (path, label) local targets: built-in roots first, then `scheme = "local"` profiles.
-    let mut targets: Vec<(PathBuf, String)> = vec![(PathBuf::from("/"), "local: /".to_owned())];
-    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        targets.push((
-            PathBuf::from(&home),
-            format!("local: {}", home.to_string_lossy()),
-        ));
-    }
-    for prof in &config.connections {
-        if prof.scheme == "local" {
-            match prof.endpoint.get("path") {
-                Some(path) => {
-                    targets.push((PathBuf::from(path), format!("local: {}", prof.display_name)));
-                }
-                // Surface the misconfiguration rather than dropping it silently — every other
-                // un-registerable profile already gets a warning.
-                None => tracing::warn!(
-                    name = %prof.display_name,
-                    "skipping local connection profile: missing endpoint.path"
-                ),
-            }
-        }
-    }
-
-    // Switcher connection ids follow the startup panes (LEFT/RIGHT) so they never collide.
-    let base = RIGHT.0 + 1;
-    let mut choices = Vec::with_capacity(targets.len());
-    for (i, (path, label)) in targets.into_iter().enumerate() {
-        let id = ConnectionId(base + i as u64);
-        registry.insert(id, Arc::new(LocalVfs::new(id, path))).await;
-        choices.push(ConnectionChoice { conn: id, label });
-    }
-
-    // Credential-bearing (remote) profiles, continuing the id sequence. These are user-initiated, so
-    // the broker resolution is journaled as `Actor::User`.
-    let mut deferred = Vec::new();
-    let mut next_id = base + choices.len() as u64;
-    for prof in &config.connections {
-        if prof.scheme == "local" {
-            continue;
-        }
-        // The id is reserved even when the open fails, so a profile keeps a positionally stable
-        // slot across runs of the same config (a failed open just leaves a harmless gap — ids are
-        // opaque u64 handles, not a contiguous space).
-        let id = ConnectionId(next_id);
-        next_id += 1;
-        match opener.open(Actor::User, id, prof).await {
-            Ok(vfs) => {
-                registry.insert(id, vfs).await;
-                choices.push(ConnectionChoice {
-                    conn: id,
-                    label: format!("{}: {}", prof.scheme, prof.display_name),
-                });
-            }
-            Err(e) => {
-                // A locked vault is recoverable: keep the (id, profile) so the unlock flow can retry
-                // it. Any other error won't change on unlock, so it's just logged and dropped.
-                let deferrable =
-                    matches!(e, crate::connect::OpenError::Broker(BrokerError::Locked));
-                tracing::warn!(
-                    scheme = %prof.scheme,
-                    name = %prof.display_name,
-                    error = %e,
-                    deferred = deferrable,
-                    "connection profile not opened at startup"
-                );
-                if deferrable {
-                    deferred.push(DeferredConnection {
-                        id,
-                        profile: prof.clone(),
-                    });
-                }
-            }
-        }
-    }
-    (choices, deferred)
+) -> (
+    Vec<ConnectionChoice>,
+    Vec<DeferredConnection>,
+    HashMap<ConnectionId, ConnectionDescriptor>,
+) {
+    let coordinator = ConnectionCoordinator::new(opener.clone(), RIGHT.0 + 1);
+    // Derive vault_locked from the live broker state so this call site and future P2
+    // re-enumeration calls automatically reflect the current lock status.
+    let ctx = DiscoveryCtx {
+        config,
+        vault_locked: opener.vault_locked(),
+    };
+    coordinator.run(registry, &ctx).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -404,7 +337,10 @@ async fn event_loop(
     input_rx: &mut mpsc::Receiver<Event>,
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
     vault_ctx: &VaultContext,
+    descriptor_map: HashMap<ConnectionId, ConnectionDescriptor>,
 ) -> anyhow::Result<()> {
+    // P2 will bind this map to resolve a ConnectionId to its descriptor on selection.
+    let _p2_descriptor_map = descriptor_map;
     // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
     // matching effect can signal them. Each is cleared when its Done event arrives.
     // Per-transfer control, keyed by `TransferId`: the cancel token + pause sender form a *control
@@ -1092,6 +1028,9 @@ async fn run_vault_unlock_effect(
                 opened.push(ConnectionChoice {
                     conn: d.id,
                     label: format!("{}: {}", d.profile.scheme, d.profile.display_name),
+                    provenance: ChoiceProvenance::Saved,
+                    status: ChoiceStatus::Ready,
+                    kind: ConnectionKind::Profile { id: d.profile.id },
                 });
             }
             Err(e) => {
@@ -2058,6 +1997,10 @@ async fn run_port_forward_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Used only by the feature-gated deferral test below; gated to avoid an unused-import
+    // warning in the lean build.
+    #[cfg(feature = "s3")]
+    use cairn_config::ConnectionProfile;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[tokio::test]
@@ -2686,7 +2629,8 @@ mod tests {
         let broker = Arc::new(Broker::locked());
         let opener = crate::connect::ConnectionOpener::new(broker.clone());
         let registry = VfsRegistry::new();
-        let (_choices, deferred) = register_connections(&registry, &cfg, &opener).await;
+        let (_choices, deferred, _descriptors) =
+            register_connections(&registry, &cfg, &opener).await;
         assert_eq!(
             deferred.len(),
             1,

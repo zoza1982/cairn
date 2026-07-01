@@ -1159,10 +1159,12 @@ mod tests {
             cairn_core::ConnectionChoice {
                 conn: ConnectionId(3),
                 label: "local: /".into(),
+                ..Default::default()
             },
             cairn_core::ConnectionChoice {
                 conn: ConnectionId(4),
                 label: "local: ~/work".into(),
+                ..Default::default()
             },
         ];
         s.overlay = Some(cairn_core::Overlay::Connections { cursor: 0 });

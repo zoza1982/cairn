@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC-0011 Phase P1 — connection provider/coordinator abstraction** (RFC-0011 §1–§2): replaces
+  the imperative body of `register_connections` with a `ConnectionCoordinator` backed by
+  `BuiltinLocalProvider` and `SavedProfileProvider`. Observable behavior is identical — same
+  switcher entries, same id assignment order, same eager-mount / vault-lock-defer split. New
+  additive fields on `ConnectionChoice` (`provenance: ChoiceProvenance`, `status: ChoiceStatus`,
+  `kind: ConnectionKind`) allow the reducer and renderer to display richer connection metadata
+  in future phases. New `ConnectionDescriptor` side-map stored in `event_loop` (unused in P1,
+  established for P2 lazy open on selection). Broker-isolation test remains green.
+  **Micro-fix (deliberate, not pure refactor):** a `scheme = "local"` profile with
+  `endpoint.path = ""` (explicitly empty string) is now skipped with a warning, matching the
+  existing treatment of a missing key. The original code silently mounted a broken `LocalVfs`
+  at an empty path and consumed a `ConnectionId`, shifting ids of any following profiles.
+
 - **Plugin loader and manifest parser** (RFC-0010 PR-C1, M8-5): new `cairn-plugin::manifest`
   module with `PluginManifest` (parsed from `plugin.toml` via `serde`+`toml`, all structs
   `deny_unknown_fields`) covering the `[plugin]`, `[capabilities]`, `[network]`, and `[limits]`

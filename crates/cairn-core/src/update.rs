@@ -3276,6 +3276,7 @@ mod tests {
         s.connections = vec![crate::state::ConnectionChoice {
             conn: ConnectionId(9),
             label: "other".into(),
+            ..Default::default()
         }];
         let old_conn = s.active().conn;
         let _ = update(&mut s, Msg::Action(Action::OpenConnections));
@@ -3599,10 +3600,12 @@ mod tests {
             ConnectionChoice {
                 conn: ConnectionId(1),
                 label: "local: /a".into(),
+                ..Default::default()
             },
             ConnectionChoice {
                 conn: ConnectionId(7),
                 label: "local: /b".into(),
+                ..Default::default()
             },
         ];
         // Open the switcher.
@@ -3644,10 +3647,12 @@ mod tests {
             ConnectionChoice {
                 conn: ConnectionId(3),
                 label: "a".into(),
+                ..Default::default()
             },
             ConnectionChoice {
                 conn: ConnectionId(4),
                 label: "b".into(),
+                ..Default::default()
             },
         ];
         let _ = update(&mut s, Msg::Action(Action::OpenConnections));
@@ -3676,6 +3681,7 @@ mod tests {
         s.connections = vec![ConnectionChoice {
             conn: ConnectionId(1),
             label: "local".into(),
+            ..Default::default()
         }];
         let _ = update(&mut s, Msg::Action(Action::OpenConnections));
         let fx = update(&mut s, Msg::Action(Action::Cancel));
@@ -3868,6 +3874,7 @@ mod tests {
         let opened = vec![crate::ConnectionChoice {
             conn: cairn_types::ConnectionId(7),
             label: "ssh: bastion".to_owned(),
+            ..Default::default()
         }];
         let fx = update(
             &mut s,
@@ -3906,6 +3913,7 @@ mod tests {
         s.connections = vec![crate::ConnectionChoice {
             conn: cairn_types::ConnectionId(3),
             label: "local: /".to_owned(),
+            ..Default::default()
         }];
         let _ = update(&mut s, Msg::Action(Action::VaultUnlock));
         type_text(&mut s, "pw");
