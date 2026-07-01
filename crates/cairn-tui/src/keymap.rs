@@ -161,6 +161,9 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "page_up" => Action::PageUp,
         "page_down" => Action::PageDown,
         "quit" => Action::Quit,
+        "new_connection" => Action::NewConnection,
+        "edit_connection" => Action::EditConnection,
+        "delete_connection" => Action::DeleteConnection,
         _ => return None,
     })
 }
@@ -247,6 +250,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
             KeyCode::Char('t') => Some(Action::OpenQueue),
             // Ctrl-U opens the vault-unlock overlay.
             KeyCode::Char('u') => Some(Action::VaultUnlock),
+            // Ctrl-N opens the add-connection form (new connection).
+            KeyCode::Char('n') => Some(Action::NewConnection),
             _ => None,
         };
     }
@@ -265,6 +270,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::F(8) | KeyCode::Delete | KeyCode::Char('d') => Some(Action::Delete),
         KeyCode::Char('y') => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
+        // 'e' opens the edit-connection form for the selected profile in the switcher.
+        KeyCode::Char('e') => Some(Action::EditConnection),
         KeyCode::Char('r') => Some(Action::Refresh),
         // Shift-K/J move the selected pending transfer up/down in the queue view (no-op elsewhere).
         KeyCode::Char('K') => Some(Action::QueueMoveUp),
@@ -307,6 +314,14 @@ pub fn text_edit_for(key: KeyEvent) -> Option<TextEdit> {
         KeyCode::Enter => Some(TextEdit::Submit),
         KeyCode::Esc => Some(TextEdit::Cancel),
         KeyCode::Backspace => Some(TextEdit::Backspace),
+        // Tab / Shift-Tab cycle focus between fields in the connection form. Both are delivered as
+        // TextEdit so the form's text handler intercepts them without disturbing the action keymap.
+        KeyCode::Tab => Some(TextEdit::NextField),
+        KeyCode::BackTab => Some(TextEdit::PrevField),
+        // Up / Down also navigate fields in the connection form, and are otherwise no-ops in text
+        // capture mode (no action should fire while a prompt is active).
+        KeyCode::Up => Some(TextEdit::PrevField),
+        KeyCode::Down => Some(TextEdit::NextField),
         KeyCode::Char(c)
             if !key
                 .modifiers
@@ -558,6 +573,9 @@ mod tests {
             "page_up",
             "page_down",
             "quit",
+            "new_connection",
+            "edit_connection",
+            "delete_connection",
         ];
         for name in names {
             assert!(
@@ -565,7 +583,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 32);
+        assert_eq!(names.len(), 35);
     }
 
     #[test]

@@ -84,6 +84,15 @@ pub enum Action {
     PageDown,
     /// Quit the application.
     Quit,
+    /// Open the add-connection form (scheme picker → fields). Available globally via `Ctrl-N`, and
+    /// also from within the connection switcher overlay.
+    NewConnection,
+    /// Open the edit-connection form for the selected profile. Only meaningful inside the
+    /// connection switcher; ignored (no-op) elsewhere.
+    EditConnection,
+    /// Delete the selected connection profile. Only meaningful inside the connection switcher;
+    /// ignored elsewhere. Requires confirmation via the connection switcher's selection.
+    DeleteConnection,
 }
 
 /// A message into the reducer.
@@ -115,6 +124,10 @@ pub enum TextEdit {
     /// Close stdin on an active exec session pane (`Ctrl-D` inside `Overlay::ExecPane`).
     /// Handled by the text-routing path; a no-op outside an active session pane.
     CloseStdin,
+    /// Move focus to the next field in the connection form (`Tab`). No-op outside the form.
+    NextField,
+    /// Move focus to the previous field in the connection form (`Shift-Tab`). No-op outside the form.
+    PrevField,
 }
 
 /// Results flowing back from the async world.
@@ -264,6 +277,31 @@ pub enum AppEvent {
         id: SessionId,
         /// The local port that was bound (may differ from the requested port if `0` was used).
         local_port: u16,
+    },
+    /// A connection profile was successfully saved (created or updated). The reducer updates
+    /// `saved_profiles`, patches the in-place switcher choice label (on edit) or notes that the
+    /// new profile will appear after restart (on create), and shows a status message.
+    ConnectionSaved {
+        /// The UUID of the saved profile.
+        id: uuid::Uuid,
+        /// The `display_name` for the status message.
+        display_name: String,
+        /// `true` when updating an existing profile; `false` when creating a new one.
+        is_edit: bool,
+        /// The saved profile data (so `saved_profiles` stays in sync).
+        profile: crate::forms::ProfileData,
+    },
+    /// A connection profile was successfully deleted. The reducer removes it from `saved_profiles`
+    /// and from the in-memory switcher list (without re-enumerating), then shows a status message.
+    ConnectionDeleted {
+        /// The UUID of the deleted profile.
+        id: uuid::Uuid,
+    },
+    /// A connection save or delete operation failed. Clears the `connection_saving` flag so the
+    /// user can retry (or the form closes). The message is already human-readable and secret-free.
+    ConnectionOpFailed {
+        /// Secret-free error message to display in the status line.
+        message: String,
     },
 }
 
@@ -465,5 +503,20 @@ pub enum AppEffect {
         rows: u16,
         /// New terminal columns.
         cols: u16,
+    },
+    /// Save a connection profile (new or edited). The runtime writes the profile to `cairn.toml`
+    /// and calls `register_connections` to rebuild the switcher list, then reports back via
+    /// [`AppEvent::ConnectionSaved`].
+    SaveConnection {
+        /// The profile data to persist.
+        profile: crate::forms::ProfileData,
+        /// `true` when updating an existing profile; `false` for a new one. Used for the status message.
+        is_edit: bool,
+    },
+    /// Delete a connection profile by its stable UUID. The runtime removes it from `cairn.toml`
+    /// and rebuilds the switcher list, then reports back via [`AppEvent::ConnectionDeleted`].
+    DeleteConnection {
+        /// The profile to remove.
+        id: uuid::Uuid,
     },
 }

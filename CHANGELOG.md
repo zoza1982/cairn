@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC-0011 Phase P4 — in-app connection form (add / edit / remove)**: users can now create,
+  edit, and delete connection profiles from within the TUI without manually editing the cairn
+  config file. `Ctrl-N` opens the scheme picker; `e` edits the selected profile in the switcher;
+  `d` deletes it (Profile entries only — auto-discovered entries are read-only). The form collects
+  per-scheme endpoint fields (SSH host/user/port, S3 bucket/region, GCS/Azure equivalents, local
+  path) and persists the profile to the user config file. Credential capture is deferred to P5;
+  the form shows a one-line hint explaining this. A single hint line in the switcher footer shows
+  available actions for the selected entry type. `Tab`/`Shift-Tab` and `↑`/`↓` navigate fields;
+  `Enter` saves; `Esc` goes back to the scheme picker (new connections) or cancels (edits). Note:
+  newly created connections require a restart to appear in the switcher. Deleted and edited
+  connections are reflected immediately. New `AppEffect::SaveConnection`/`DeleteConnection` and
+  `AppEvent::ConnectionSaved`/`ConnectionDeleted`/`ConnectionOpFailed` complete the TEA round-trip.
+
 - **RFC-0011 Phase P3 — Docker + Kubernetes auto-discovery** (RFC-0011 §3–§4, §7): Cairn now
   auto-discovers Docker sockets and Kubernetes clusters from the environment at startup without
   blocking the UI or making any network connections during discovery. Discovered entries appear in
