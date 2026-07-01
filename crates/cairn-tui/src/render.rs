@@ -188,6 +188,9 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                 render_port_forward_status(frame, rec);
             }
         }
+        Overlay::ConfirmDeleteConnection { display_name, .. } => {
+            render_confirm_delete_connection(frame, display_name)
+        }
         Overlay::ConnectionForm {
             stage,
             scheme,
@@ -206,6 +209,30 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             editing_id.is_some(),
         ),
     }
+}
+
+/// Draw the confirm-delete-connection overlay: a red-bordered prompt asking the user to confirm
+/// before permanently removing a saved connection profile.
+fn render_confirm_delete_connection(frame: &mut Frame, display_name: &str) {
+    let msg = format!("Delete connection '{display_name}'? This cannot be undone.");
+    let h = 5u16;
+    let w = u16::try_from(msg.len() + 6)
+        .unwrap_or(64)
+        .min(frame.area().width);
+    let area = centered(frame.area(), w, h);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Confirm delete ")
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [msg_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(msg.as_str()), msg_area);
+    frame.render_widget(
+        Paragraph::new("[Enter] Delete  [Esc] Cancel").style(Style::default().fg(Color::DarkGray)),
+        hint_area,
+    );
 }
 
 /// Draw the vault-unlock overlay: a masked passphrase field (one `•` per typed character — the

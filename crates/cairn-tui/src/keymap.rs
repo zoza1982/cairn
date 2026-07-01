@@ -271,6 +271,7 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         // 'e' opens the edit-connection form for the selected profile in the switcher.
+        // P5: remove global 'e' binding when edit-in-place file editing lands (the two would conflict).
         KeyCode::Char('e') => Some(Action::EditConnection),
         KeyCode::Char('r') => Some(Action::Refresh),
         // Shift-K/J move the selected pending transfer up/down in the queue view (no-op elsewhere).

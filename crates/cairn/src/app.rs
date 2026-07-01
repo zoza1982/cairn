@@ -402,6 +402,18 @@ async fn run_save_connection_effect(
     let cfg_profile = profile_data_to_config(&profile);
     let id = cfg_profile.id;
     let display_name = cfg_profile.display_name.clone();
+    // Compute the switcher label using the same convention the provider uses:
+    // "local: {path}" for local profiles, display_name for all others.
+    let label = if profile.scheme == "local" {
+        let path = profile
+            .endpoint
+            .get("path")
+            .map(String::as_str)
+            .unwrap_or("");
+        format!("local: {path}")
+    } else {
+        profile.display_name.clone()
+    };
     if is_edit {
         if let Some(existing) = config.connections.iter_mut().find(|p| p.id == id) {
             *existing = cfg_profile;
@@ -422,6 +434,7 @@ async fn run_save_connection_effect(
     AppEvent::ConnectionSaved {
         id,
         display_name,
+        label,
         is_edit,
         profile,
     }

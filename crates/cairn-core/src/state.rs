@@ -490,6 +490,15 @@ pub enum Overlay {
         /// Session id — state lives in [`AppState::sessions`].
         id: SessionId,
     },
+    /// Confirm deletion of a saved connection profile. The user sees the profile name and must
+    /// press `[Enter]` to confirm or `[Esc]`/`[q]` to cancel. Destructive: removes the entry from
+    /// the config file.
+    ConfirmDeleteConnection {
+        /// The stable UUID of the profile to delete.
+        id: uuid::Uuid,
+        /// Display name shown in the confirmation prompt.
+        display_name: String,
+    },
     /// The add-/edit-connection form (Phase P4 of RFC-0011).
     ///
     /// A two-stage overlay: `SchemePicker` presents a scrollable list of backends; once the user

@@ -25,8 +25,16 @@ pub struct FieldSpec {
     pub placeholder: &'static str,
     /// Whether the form refuses to submit when this field is empty.
     pub required: bool,
-    /// Whether the field holds a secret value (rendered masked). Not used in P4 — credential
-    /// capture is deferred to P5 — but present here so P5 can enable it without an API break.
+    /// Whether the field holds a secret value that should be masked on screen and stored
+    /// in the vault rather than the config file.
+    ///
+    /// **P4 scope:** this field is forward-declared for P5 (credential provisioning). In P4, no
+    /// field has `secret: true`, no value is masked in the form renderer, and no value is stored
+    /// in the vault — all fields are stored as plain strings in `ProfileData::endpoint`. A `// P5:`
+    /// note below marks where masked storage (a `FieldValue`/`MaskedInput` layer) will be wired in,
+    /// and that change will require a `security-review`.
+    // P5: add masked storage for `secret: true` fields; introduce `FieldValue { plain: String }` vs
+    // `FieldValue { secret: MaskedInput }` and update the renderer to show bullet masks.
     pub secret: bool,
 }
 
@@ -84,6 +92,20 @@ static SSH_FIELDS: &[FieldSpec] = &[
         required: false,
         secret: false,
     },
+    FieldSpec {
+        key: "known_hosts",
+        label: "Known-hosts file",
+        placeholder: "~/.ssh/known_hosts",
+        required: false,
+        secret: false,
+    },
+    FieldSpec {
+        key: "host_key",
+        label: "Host key check",
+        placeholder: "strict|accept-new|off",
+        required: false,
+        secret: false,
+    },
 ];
 
 static S3_FIELDS: &[FieldSpec] = &[
@@ -109,9 +131,23 @@ static S3_FIELDS: &[FieldSpec] = &[
         secret: false,
     },
     FieldSpec {
-        key: "endpoint_url",
+        key: "endpoint",
         label: "Endpoint URL",
-        placeholder: "https://s3.amazonaws.com",
+        placeholder: "http://localhost:9000",
+        required: false,
+        secret: false,
+    },
+    FieldSpec {
+        key: "force_path_style",
+        label: "Force path style",
+        placeholder: "true (for MinIO/Ceph etc)",
+        required: false,
+        secret: false,
+    },
+    FieldSpec {
+        key: "root",
+        label: "Root prefix",
+        placeholder: "prefix/",
         required: false,
         secret: false,
     },
@@ -132,6 +168,20 @@ static GCS_FIELDS: &[FieldSpec] = &[
         required: true,
         secret: false,
     },
+    FieldSpec {
+        key: "endpoint",
+        label: "Endpoint URL",
+        placeholder: "http://localhost:4443",
+        required: false,
+        secret: false,
+    },
+    FieldSpec {
+        key: "root",
+        label: "Root prefix",
+        placeholder: "prefix/",
+        required: false,
+        secret: false,
+    },
 ];
 
 static AZURE_FIELDS: &[FieldSpec] = &[
@@ -144,7 +194,7 @@ static AZURE_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         key: "account",
-        label: "Account",
+        label: "Storage account",
         placeholder: "mystorageaccount",
         required: true,
         secret: false,
@@ -154,6 +204,20 @@ static AZURE_FIELDS: &[FieldSpec] = &[
         label: "Container",
         placeholder: "mycontainer",
         required: true,
+        secret: false,
+    },
+    FieldSpec {
+        key: "endpoint",
+        label: "Endpoint URL",
+        placeholder: "http://localhost:10000",
+        required: false,
+        secret: false,
+    },
+    FieldSpec {
+        key: "root",
+        label: "Root prefix",
+        placeholder: "prefix/",
+        required: false,
         secret: false,
     },
 ];
@@ -190,7 +254,7 @@ static GENERIC_FIELDS: &[FieldSpec] = &[FieldSpec {
 #[must_use]
 pub fn scheme_fields(scheme: &str) -> &'static [FieldSpec] {
     match scheme {
-        "ssh" => SSH_FIELDS,
+        "ssh" | "sftp" => SSH_FIELDS,
         "s3" => S3_FIELDS,
         "gcs" => GCS_FIELDS,
         "azure" => AZURE_FIELDS,
@@ -275,6 +339,80 @@ mod tests {
         for (id, label) in KNOWN_SCHEMES {
             assert!(!id.is_empty());
             assert!(!label.is_empty());
+        }
+    }
+
+    /// Every non-display_name key in `scheme_fields` must match a key that `connect/mod.rs`
+    /// actually reads. This list is the ground truth extracted from `ssh_params`/`s3_params`/
+    /// `gcs_params`/`azure_params`/`root_prefix`/`provider.rs` (2026-07-01). Update it if those
+    /// functions change.
+    #[test]
+    fn scheme_fields_keys_match_connect_reader_keys() {
+        // SSH / SFTP
+        let ssh_known: &[&str] = &["host", "user", "port", "known_hosts", "host_key"];
+        for (scheme, _) in &[("ssh", ""), ("sftp", "")] {
+            for f in scheme_fields(scheme)
+                .iter()
+                .filter(|f| f.key != "display_name")
+            {
+                assert!(
+                    ssh_known.contains(&f.key),
+                    "SSH field '{key}' is not read by connect.rs ssh_params — check for key mismatch",
+                    key = f.key
+                );
+            }
+        }
+
+        // S3
+        let s3_known: &[&str] = &["bucket", "region", "endpoint", "force_path_style", "root"];
+        for f in scheme_fields("s3")
+            .iter()
+            .filter(|f| f.key != "display_name")
+        {
+            assert!(
+                s3_known.contains(&f.key),
+                "S3 field '{key}' is not read by connect.rs s3_params — check for key mismatch",
+                key = f.key
+            );
+        }
+
+        // GCS
+        let gcs_known: &[&str] = &["bucket", "endpoint", "root"];
+        for f in scheme_fields("gcs")
+            .iter()
+            .filter(|f| f.key != "display_name")
+        {
+            assert!(
+                gcs_known.contains(&f.key),
+                "GCS field '{key}' is not read by connect.rs gcs_params — check for key mismatch",
+                key = f.key
+            );
+        }
+
+        // Azure
+        let azure_known: &[&str] = &["account", "container", "endpoint", "root"];
+        for f in scheme_fields("azure")
+            .iter()
+            .filter(|f| f.key != "display_name")
+        {
+            assert!(
+                azure_known.contains(&f.key),
+                "Azure field '{key}' is not read by connect.rs azure_params — check for key mismatch",
+                key = f.key
+            );
+        }
+
+        // Local
+        let local_known: &[&str] = &["path"];
+        for f in scheme_fields("local")
+            .iter()
+            .filter(|f| f.key != "display_name")
+        {
+            assert!(
+                local_known.contains(&f.key),
+                "Local field '{key}' is not read by the local provider — check for key mismatch",
+                key = f.key
+            );
         }
     }
 

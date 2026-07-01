@@ -84,8 +84,11 @@ pub enum Action {
     PageDown,
     /// Quit the application.
     Quit,
-    /// Open the add-connection form (scheme picker → fields). Available globally via `Ctrl-N`, and
-    /// also from within the connection switcher overlay.
+    /// Open the add-connection form (scheme picker → fields).
+    ///
+    /// Bound globally to `Ctrl-N`. Inside the connection switcher it is also accessible via
+    /// the `[Ctrl-N] New` hint line. Plain `n` inside the switcher maps to `Action::Cancel`
+    /// (dismisses the switcher), consistent with the default `n`-closes-overlay convention.
     NewConnection,
     /// Open the edit-connection form for the selected profile. Only meaningful inside the
     /// connection switcher; ignored (no-op) elsewhere.
@@ -286,6 +289,9 @@ pub enum AppEvent {
         id: uuid::Uuid,
         /// The `display_name` for the status message.
         display_name: String,
+        /// The ready-to-use switcher label, computed by the effect runner using the same
+        /// convention the provider uses: `"local: {path}"` for local, `display_name` for others.
+        label: String,
         /// `true` when updating an existing profile; `false` when creating a new one.
         is_edit: bool,
         /// The saved profile data (so `saved_profiles` stays in sync).
