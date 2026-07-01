@@ -19,10 +19,11 @@ pub struct DiscoveredSocket {
     /// Stable key string used for `hidden`/`pinned` config matching and for
     /// [`ConnectionKey::Docker::socket_path`].
     ///
-    /// - `"default"` — the platform-default socket (probed via
-    ///   [`BollardDocker::connect_local`])
-    /// - Otherwise the raw absolute socket path string (e.g.
-    ///   `"/run/user/1000/docker.sock"`)
+    /// - `"default"` — the platform-default socket (probed via [`BollardDocker::connect_local`]).
+    ///   P4 note: `"default"` tracks whatever `connect_local()` resolves at probe time (which
+    ///   honours `DOCKER_HOST`); if `DOCKER_HOST` is set to a different path at each run,
+    ///   the key will still be `"default"` and stable-id reuse will work correctly.
+    /// - Otherwise the raw absolute socket path string (e.g. `"/run/user/1000/docker.sock"`)
     pub key: String,
     /// Human-readable display name shown in the connection switcher.
     pub display_name: String,

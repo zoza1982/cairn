@@ -12,13 +12,23 @@
 //! - **In-cluster**: `KUBERNETES_SERVICE_HOST` must be set and non-empty, AND the standard
 //!   service-account token file must exist. No file contents are read; existence is sufficient.
 //!
-//! All errors are silently swallowed — a missing or unreadable kubeconfig simply sets
-//! `has_kubeconfig = false` rather than propagating an error.
+//! Parse errors are logged as warnings (at level `warn`; the kube error Display exposes only path
+//! and YAML-syntax information — no credentials or secret material). A missing or unreadable
+//! kubeconfig simply sets `has_kubeconfig = false`.
 
 use kube::config::Kubeconfig;
+use std::time::Duration;
 
 /// Standard path for the pod's service-account token when running inside Kubernetes.
 const IN_CLUSTER_TOKEN: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+
+/// Timeout for the `spawn_blocking` kubeconfig read task.
+///
+/// Protects against a `~/.kube/config` file on a stalled network filesystem. The blocking OS
+/// thread cannot be cancelled (it leaks until the FS eventually responds), but the async caller
+/// unblocks after this deadline so the TUI can draw. 2 s is generous for a local filesystem and
+/// still short enough to not noticeably delay startup on a slow networked home directory.
+const KUBECONFIG_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Result of a kubeconfig/in-cluster discovery probe.
 ///
@@ -35,15 +45,40 @@ pub struct KubeconfigStatus {
 
 /// Probe for Kubernetes connectivity sources without making any network calls.
 ///
-/// Blocking FS/YAML I/O is offloaded to `spawn_blocking`. If the kubeconfig read fails or the
-/// spawned task panics, `has_kubeconfig` is set to `false`. The in-cluster check is a fast,
-/// non-blocking env-var lookup plus a non-blocking `std::path::Path::exists()` delegated to a
-/// second `spawn_blocking` call.
+/// Blocking FS/YAML I/O is offloaded to `spawn_blocking` and time-bounded by
+/// [`KUBECONFIG_READ_TIMEOUT`]. If the kubeconfig read fails, times out, or the spawned task
+/// panics, `has_kubeconfig` is set to `false`. Parse errors are logged at `warn` level — the
+/// kube error Display exposes only path/syntax information, never credential material.
 pub async fn probe_kubeconfig() -> KubeconfigStatus {
-    // Kubeconfig: reading and parsing the YAML file is blocking CPU + I/O.
-    let kubeconfig_ok = tokio::task::spawn_blocking(|| Kubeconfig::read().is_ok())
-        .await
-        .unwrap_or(false);
+    // Kubeconfig: reading and parsing the YAML file is blocking CPU + I/O, potentially on a
+    // network filesystem. Wrap in a timeout so a stalled FS can't block the TUI from drawing.
+    // The blocking thread itself cannot be cancelled — it leaks until the FS responds — but
+    // the async task returns immediately after the deadline.
+    let kubeconfig_ok = match tokio::time::timeout(
+        KUBECONFIG_READ_TIMEOUT,
+        tokio::task::spawn_blocking(Kubeconfig::read),
+    )
+    .await
+    {
+        Ok(Ok(Ok(_cfg))) => true,
+        Ok(Ok(Err(e))) => {
+            // kube's error Display shows path + YAML parse info only — no secrets.
+            tracing::warn!(error = %e, "kubeconfig unreadable; skipping k8s discovery");
+            false
+        }
+        Ok(Err(_join_err)) => {
+            // spawn_blocking task panicked — very unlikely, but recoverable.
+            false
+        }
+        Err(_timeout) => {
+            // The FS stalled; the blocking thread leaks but the UI unblocks.
+            tracing::warn!(
+                timeout_secs = KUBECONFIG_READ_TIMEOUT.as_secs(),
+                "kubeconfig read timed out; skipping k8s discovery"
+            );
+            false
+        }
+    };
 
     // In-cluster env var: non-blocking env lookup.
     let incluster_env = std::env::var("KUBERNETES_SERVICE_HOST")
@@ -73,21 +108,24 @@ mod tests {
     ///
     /// In CI / a developer machine without `~/.kube/config`, `has_kubeconfig` will be `false`;
     /// that is a valid result. The test only asserts the function returns (no panic, no deadlock).
-    #[tokio::test]
+    // `current_thread` ensures the env-var mutation below doesn't race with parallel test tasks.
+    #[tokio::test(flavor = "current_thread")]
     async fn probe_kubeconfig_is_hermetic_and_non_panicking() {
         // May return false on both fields in an environment without k8s — that's correct.
         let _ = probe_kubeconfig().await;
     }
 
     /// When `KUBERNETES_SERVICE_HOST` is not set, `has_incluster` must be `false`.
-    #[tokio::test]
+    ///
+    /// Uses `current_thread` flavor to avoid races: process-global env mutation is not
+    /// safe across concurrently-running tokio test tasks in the default multi-thread runtime.
+    #[tokio::test(flavor = "current_thread")]
     async fn has_incluster_false_when_env_not_set() {
-        // Remove the env var for the duration of this test. Note: env mutation is process-global;
-        // this is acceptable in a single-threaded tokio test.
         let was_set = std::env::var_os("KUBERNETES_SERVICE_HOST");
+        // SAFETY (env): this test runs single-threaded so no concurrent env readers exist.
         std::env::remove_var("KUBERNETES_SERVICE_HOST");
         let status = probe_kubeconfig().await;
-        // Restore.
+        // Restore the variable so other test modules are unaffected.
         if let Some(val) = was_set {
             std::env::set_var("KUBERNETES_SERVICE_HOST", val);
         }

@@ -910,7 +910,7 @@ mod tests {
     /// A config file without a `[discovery]` section must load cleanly with all defaults.
     #[test]
     fn discovery_config_defaults_when_section_absent() {
-        let toml = r#"schema_version = 1"#;
+        let toml = r#"version = 1"#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.discovery.docker, "docker discovery defaults to true");
         assert!(
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn discovery_config_accepts_arbitrary_key_strings() {
         let toml = r#"
-schema_version = 1
+version = 1
 
 [discovery]
 docker = true

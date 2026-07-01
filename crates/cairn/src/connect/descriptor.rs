@@ -37,7 +37,7 @@ pub(crate) enum ConnectionKey {
     /// An auto-discovered Docker daemon socket.
     ///
     /// `socket_path` is `"default"` when the platform-default socket was probed via
-    /// [`BollardDocker::connect_local`], or the raw path string for explicit rootless /
+    /// `BollardDocker::connect_local`, or the raw path string for explicit rootless /
     /// Podman sockets.
     ///
     /// Constructed by `DockerProvider` — only available with the `docker` feature. The variant
@@ -93,8 +93,8 @@ pub(crate) enum OpenTarget {
     /// Open a Docker backend at the given Unix socket path.
     ///
     /// `path = None` means use the platform-default socket (equivalent to
-    /// [`BollardDocker::connect_local`]). `path = Some(p)` connects to the explicit socket at `p`
-    /// (rootless Docker or Podman socket discovered by [`DockerProvider`]).
+    /// `BollardDocker::connect_local`). `path = Some(p)` connects to the explicit socket at `p`
+    /// (rootless Docker or Podman socket discovered by `DockerProvider`).
     ///
     /// Constructed by `DockerProvider` — only available with the `docker` feature. The variant
     /// must exist in all build configurations for match exhaustiveness in `run_open_connection_effect`.
@@ -176,8 +176,11 @@ pub(crate) enum DescriptorProvenance {
         profile_id: Uuid,
     },
     /// Auto-discovered from the environment (Docker socket, kubeconfig, …).
-    // P2+: constructed by the Docker / Kubeconfig providers when those are added.
-    #[allow(dead_code)]
+    ///
+    /// Constructed by `DockerProvider` and `KubeconfigProvider` (P3, feature-gated). In lean
+    /// builds where neither feature is enabled, this variant is never constructed; the
+    /// `cfg_attr` below suppresses the dead-code lint in that case only.
+    #[cfg_attr(all(not(feature = "docker"), not(feature = "k8s")), allow(dead_code))]
     Discovered {
         /// The discovery mechanism that surfaced this connection.
         source: DiscoverySource,

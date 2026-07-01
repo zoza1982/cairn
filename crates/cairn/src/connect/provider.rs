@@ -60,9 +60,12 @@ pub(crate) struct DiscoveryCtx<'a> {
 pub(crate) trait ConnectionProvider: Send + Sync {
     /// A short, stable, human-readable name for this provider.
     ///
-    /// Used as a log tag and (in future phases) as the `ConnectionKey` source prefix.
+    /// Used as a log tag on provider timeout warnings, and (in future phases) as the
+    /// `ConnectionKey` source prefix for re-enumeration diffing.
     /// Examples: `"builtin"`, `"saved"`, `"docker"`, `"kubeconfig"`.
-    // P2: the coordinator will call this to tag each descriptor's origin for re-enumeration diffing.
+    ///
+    /// P4: if `source_id` is still unused beyond timeout logging by the time P5 ships, consider
+    /// removing it from the trait to keep the surface minimal.
     #[allow(dead_code)]
     fn source_id(&self) -> &'static str;
 
@@ -316,6 +319,10 @@ impl ConnectionProvider for KubeconfigProvider {
             out.push(ConnectionDescriptor {
                 id: UNASSIGNED,
                 key: ConnectionKey::InCluster,
+                // P4 note: both kubeconfig and in-cluster entries currently use
+                // `DiscoverySource::Kubeconfig`. If P4 adds a sectioned switcher that shows
+                // separate sections for kubeconfig vs. in-cluster, a new `DiscoverySource::InCluster`
+                // variant may be needed. Confirm with kube-staff-engineer before adding it.
                 provenance: DescriptorProvenance::Discovered {
                     source: DiscoverySource::Kubeconfig,
                 },

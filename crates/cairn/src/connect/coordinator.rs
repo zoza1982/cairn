@@ -28,8 +28,9 @@
 //!
 //! At startup (the first call), pass an empty `HashMap::new()` as `prior_descriptors`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cairn_core::{ChoiceProvenance, ChoiceStatus, ConnectionChoice, ConnectionKind};
 use cairn_types::ConnectionId;
@@ -121,9 +122,20 @@ impl ConnectionCoordinator {
 
         // ── Enumerate providers ───────────────────────────────────────────────────────────────
         // P3: providers run concurrently via `join_all` so that a slow socket probe or a large
-        // kubeconfig does not delay the startup path for the other providers (RFC-0011 §2:
-        // "concurrently and time-bounded"). Per-socket timeouts are enforced inside each P3
-        // provider; P1 providers (builtin, saved) complete synchronously in microseconds.
+        // kubeconfig does not delay other providers. Each provider is individually time-bounded
+        // (RFC-0011 §2: "concurrently and time-bounded"):
+        // - P1 providers (builtin, saved) complete in microseconds; the timeout is never reached.
+        // - P3 providers (Docker, K8s) may block on I/O but are bounded here AND internally.
+        //   Per-socket 500 ms timeouts are enforced inside `DockerProvider`. The `KubeconfigProvider`
+        //   adds a 2 s `spawn_blocking` timeout. The per-provider guard here adds a final safety
+        //   net so a buggy provider can't hold up the whole startup.
+        //
+        // Per-provider timeout: a slow/hung provider degrades to "no entries" for THAT provider
+        // only, so Docker failing fast doesn't discard the builtin roots or the kubeconfig entry.
+        // A single outer `join_all` timeout would be wrong: it could discard ALL results when one
+        // provider is slow, leaving the switcher empty.
+        const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
+
         // Build the provider list. `list` is `mut` so cfg-gated providers can be pushed; the
         // `#[allow(unused_mut)]` suppresses the lint in lean builds where no pushes happen.
         let provider_list: Vec<Box<dyn ConnectionProvider>> = {
@@ -139,20 +151,47 @@ impl ConnectionCoordinator {
             list
         };
 
-        // Run all providers concurrently and flatten the results into a single descriptor list.
-        let discover_results =
-            futures::future::join_all(provider_list.iter().map(|p| p.discover(ctx))).await;
+        // Run all providers concurrently, each behind its own timeout.
+        let discover_results = futures::future::join_all(provider_list.iter().map(|p| async {
+            match tokio::time::timeout(PROVIDER_TIMEOUT, p.discover(ctx)).await {
+                Ok(descs) => descs,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        provider = p.source_id(),
+                        timeout_secs = PROVIDER_TIMEOUT.as_secs(),
+                        "provider timed out; skipping its entries"
+                    );
+                    Vec::new()
+                }
+            }
+        }))
+        .await;
         let mut raw: Vec<ConnectionDescriptor> = discover_results.into_iter().flatten().collect();
 
+        // ── Saved-wins dedup ─────────────────────────────────────────────────────────────────
+        // RFC §2: if the user has manually configured a saved profile for the same backend type,
+        // suppress the auto-discovered entry so the switcher doesn't show duplicates.
+        // We compare at the backend-type level (Docker scheme vs Docker socket, kubernetes scheme
+        // vs kubeconfig/in-cluster) which covers the common case correctly.
+        //
+        // Deferred: exact same-socket or same-cluster comparison is impractical without querying
+        // the running daemon/cluster. P4 may add explicit endpoint keys (e.g. "socket" = path)
+        // to `ConnectionProfile` to enable finer-grained dedup.
+        raw = dedup_discovered_vs_saved(raw);
+
         // ── Apply hidden overlay ──────────────────────────────────────────────────────────────
-        // Drop any descriptor whose stable key appears in `config.discovery.hidden`. Applied
-        // before pinned so a hidden+pinned entry is simply absent (hidden wins).
+        // Drop any descriptor whose stable key string appears in `config.discovery.hidden`.
+        // The overlay applies to ALL descriptor types (builtin, saved, discovered) — the key
+        // strings are the same `as_key_str()` format used everywhere (e.g. `"builtin:/"`,
+        // `"saved:<uuid>"`, `"docker:socket:default"`, `"kube:kubeconfig"`).
+        // Applied before pinned so a hidden+pinned entry is simply absent (hidden wins).
         if !ctx.config.discovery.hidden.is_empty() {
             raw.retain(|d| !ctx.config.discovery.hidden.contains(&d.key.as_key_str()));
         }
 
         // ── Apply pinned overlay ──────────────────────────────────────────────────────────────
         // Entries in `config.discovery.pinned` float to the front of the list, in stated order.
+        // Like hidden, pinned can reference any descriptor type (builtin, saved, discovered).
         // A key listed in `pinned` but not present in the discovered set is silently ignored.
         if !ctx.config.discovery.pinned.is_empty() {
             let mut pinned_descs: Vec<ConnectionDescriptor> = Vec::new();
@@ -320,6 +359,66 @@ fn mint_fresh_id(
     claimed.insert(id);
     *next_fresh += 1;
     id
+}
+
+// ---------------------------------------------------------------------------
+// Saved-wins dedup
+// ---------------------------------------------------------------------------
+
+/// Suppress auto-discovered entries that duplicate a user-saved profile for the same backend.
+///
+/// RFC-0011 §2 requires the coordinator to present at most one entry per logical backend so a
+/// user with both a manually-saved Docker profile and an auto-discovered Docker socket doesn't
+/// see two Docker entries. We compare at the *backend-type level*:
+///
+/// - Any saved `"docker"` profile suppresses all discovered `DockerSocket` entries.
+/// - Any saved `"kubernetes"` or `"k8s"` profile suppresses all discovered
+///   `KubeconfigDefault` and `InCluster` entries.
+///
+/// Saved and builtin entries are never suppressed by this function.
+///
+/// ## Deferred cases
+///
+/// Exact same-socket or same-cluster comparison (e.g. a saved docker profile pointing to the
+/// same rootless socket as a discovered entry) is impractical without querying the running
+/// daemon/cluster at discovery time. These are left for P4 when the `ConnectionProfile` schema
+/// gains explicit endpoint keys (e.g. `"socket" = "/run/user/1000/docker.sock"`) that can be
+/// compared directly against the discovered socket path.
+fn dedup_discovered_vs_saved(raw: Vec<ConnectionDescriptor>) -> Vec<ConnectionDescriptor> {
+    // Collect the schemes of all saved profiles as owned strings so we can test membership
+    // without holding a borrow that would prevent moving `raw` into the filter below.
+    let saved_schemes: HashSet<String> = raw
+        .iter()
+        .filter_map(|d| {
+            if let OpenTarget::Profile(p) = &d.target {
+                Some(p.scheme.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if saved_schemes.is_empty() {
+        return raw;
+    }
+
+    raw.into_iter()
+        .filter(|d| {
+            // Builtin and Saved entries are always retained.
+            if !matches!(&d.provenance, DescriptorProvenance::Discovered { .. }) {
+                return true;
+            }
+            match &d.target {
+                OpenTarget::DockerSocket { .. } => !saved_schemes.contains("docker"),
+                OpenTarget::KubeconfigDefault | OpenTarget::InCluster => {
+                    !saved_schemes.contains("kubernetes") && !saved_schemes.contains("k8s")
+                }
+                // LocalRoot and Profile targets should never appear on a Discovered descriptor,
+                // but if they do, keep them (don't suppress unexpectedly).
+                _ => true,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +841,158 @@ mod tests {
         assert!(
             !choices.is_empty(),
             "builtin roots must still appear even if pinned key is absent"
+        );
+    }
+
+    // ── P3: saved-wins dedup ─────────────────────────────────────────────────────────────────
+
+    /// A saved "docker" profile suppresses a Discovered Docker socket for the same type.
+    ///
+    /// Tests `dedup_discovered_vs_saved` directly with injected descriptors so the test is
+    /// hermetic (no Docker daemon required) and deterministic in CI.
+    #[test]
+    fn saved_docker_profile_suppresses_discovered_docker_socket() {
+        use super::super::descriptor::Reachability;
+        use cairn_core::DiscoverySource;
+        use std::collections::BTreeMap;
+
+        // A discovered Docker socket entry (as DockerProvider would produce).
+        let discovered = ConnectionDescriptor {
+            id: ConnectionId(0),
+            key: ConnectionKey::Docker {
+                socket_path: "default".to_owned(),
+            },
+            provenance: DescriptorProvenance::Discovered {
+                source: DiscoverySource::Docker,
+            },
+            scheme: "docker".to_owned(),
+            display_name: "docker (default)".to_owned(),
+            target: OpenTarget::DockerSocket { path: None },
+            reachability: Reachability::Ready,
+        };
+
+        // A manually-saved Docker profile (as SavedProfileProvider would produce).
+        let saved = ConnectionDescriptor {
+            id: ConnectionId(0),
+            key: ConnectionKey::Saved(Uuid::nil()),
+            provenance: DescriptorProvenance::Saved {
+                profile_id: Uuid::nil(),
+            },
+            scheme: "docker".to_owned(),
+            display_name: "docker: my-docker".to_owned(),
+            target: OpenTarget::Profile(ConnectionProfile {
+                id: Uuid::nil(),
+                scheme: "docker".to_owned(),
+                display_name: "my-docker".to_owned(),
+                endpoint: BTreeMap::new(),
+                secret_ref: None,
+            }),
+            reachability: Reachability::Ready,
+        };
+
+        let raw = vec![discovered, saved];
+        let deduped = dedup_discovered_vs_saved(raw);
+
+        assert_eq!(
+            deduped.len(),
+            1,
+            "discovered docker entry must be suppressed"
+        );
+        assert!(
+            matches!(deduped[0].provenance, DescriptorProvenance::Saved { .. }),
+            "the saved entry must be retained"
+        );
+    }
+
+    /// A saved "kubernetes" profile suppresses discovered kubeconfig and in-cluster entries.
+    #[test]
+    fn saved_k8s_profile_suppresses_discovered_kubeconfig_and_incluster() {
+        use super::super::descriptor::Reachability;
+        use cairn_core::DiscoverySource;
+        use std::collections::BTreeMap;
+
+        let discovered_kubeconfig = ConnectionDescriptor {
+            id: ConnectionId(0),
+            key: ConnectionKey::Kubeconfig,
+            provenance: DescriptorProvenance::Discovered {
+                source: DiscoverySource::Kubeconfig,
+            },
+            scheme: "kubernetes".to_owned(),
+            display_name: "k8s: (kubeconfig)".to_owned(),
+            target: OpenTarget::KubeconfigDefault,
+            reachability: Reachability::Ready,
+        };
+
+        let discovered_incluster = ConnectionDescriptor {
+            id: ConnectionId(0),
+            key: ConnectionKey::InCluster,
+            provenance: DescriptorProvenance::Discovered {
+                source: DiscoverySource::Kubeconfig,
+            },
+            scheme: "kubernetes".to_owned(),
+            display_name: "k8s: (in-cluster)".to_owned(),
+            target: OpenTarget::InCluster,
+            reachability: Reachability::Ready,
+        };
+
+        let saved_k8s = ConnectionDescriptor {
+            id: ConnectionId(0),
+            key: ConnectionKey::Saved(Uuid::nil()),
+            provenance: DescriptorProvenance::Saved {
+                profile_id: Uuid::nil(),
+            },
+            scheme: "kubernetes".to_owned(),
+            display_name: "kubernetes: my-cluster".to_owned(),
+            target: OpenTarget::Profile(ConnectionProfile {
+                id: Uuid::nil(),
+                scheme: "kubernetes".to_owned(),
+                display_name: "my-cluster".to_owned(),
+                endpoint: BTreeMap::new(),
+                secret_ref: None,
+            }),
+            reachability: Reachability::Ready,
+        };
+
+        let raw = vec![discovered_kubeconfig, discovered_incluster, saved_k8s];
+        let deduped = dedup_discovered_vs_saved(raw);
+
+        assert_eq!(
+            deduped.len(),
+            1,
+            "both discovered k8s entries must be suppressed"
+        );
+        assert!(
+            matches!(deduped[0].provenance, DescriptorProvenance::Saved { .. }),
+            "only the saved entry must remain"
+        );
+    }
+
+    /// Without any saved profiles, no discovered entries are dropped.
+    #[test]
+    fn dedup_is_noop_without_saved_profiles() {
+        use super::super::descriptor::Reachability;
+        use cairn_core::DiscoverySource;
+
+        let discovered = ConnectionDescriptor {
+            id: ConnectionId(0),
+            key: ConnectionKey::Docker {
+                socket_path: "default".to_owned(),
+            },
+            provenance: DescriptorProvenance::Discovered {
+                source: DiscoverySource::Docker,
+            },
+            scheme: "docker".to_owned(),
+            display_name: "docker (default)".to_owned(),
+            target: OpenTarget::DockerSocket { path: None },
+            reachability: Reachability::Ready,
+        };
+
+        let raw = vec![discovered];
+        let deduped = dedup_discovered_vs_saved(raw);
+        assert_eq!(
+            deduped.len(),
+            1,
+            "without saved profiles, nothing is suppressed"
         );
     }
 }
