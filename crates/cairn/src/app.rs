@@ -4,21 +4,21 @@
 //! backends. The render path is synchronous; all I/O runs as tokio tasks whose results return as
 //! [`AppEvent`]s over a bounded channel — see `docs/LLD.md` §4–§6.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connect::coordinator::{ConnectionCoordinator, DeferredConnection};
-use crate::connect::descriptor::ConnectionDescriptor;
+use crate::connect::coordinator::ConnectionCoordinator;
+use crate::connect::descriptor::{ConnectionDescriptor, OpenTarget};
 use crate::connect::provider::DiscoveryCtx;
 use cairn_backend_local::LocalVfs;
 use cairn_broker::{Actor, Broker};
 use cairn_config::Config;
 use cairn_core::{
-    initial_effects, update, Action, AppEffect, AppEvent, AppState, ChoiceProvenance, ChoiceStatus,
-    ConnectionChoice, ConnectionKind, LogViewerId, Msg, Overlay, ShellActionMeta, TransferId,
+    initial_effects, update, Action, AppEffect, AppEvent, AppState, ChoiceStatus, ConnectionChoice,
+    LogViewerId, Msg, Overlay, ShellActionMeta, TransferId,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
@@ -45,14 +45,16 @@ struct Ui {
     theme: Theme,
 }
 
-/// Runtime-side state for the vault-unlock flow (M3-7): the shared credential [`Broker`] (kept alive
-/// so the unlock overlay can install a decrypted vault into it), the resolved vault file path, and
-/// the connections deferred at startup while the vault was locked. Lives in the effect layer, never
-/// in [`AppState`] — it holds no secret, but it holds the live broker handle.
+/// Runtime-side state for the vault-unlock and lazy-open flows. Lives in the effect layer, never
+/// in [`AppState`] — it holds no secrets, but it holds the live broker handle and the opener.
+///
+/// - `broker`: shared credential broker; `run_vault_unlock_effect` installs the decrypted vault.
+/// - `vault_path`: resolved vault file path (from config).
+/// - `opener`: cloneable opener used by `run_open_connection_effect` to open Profile targets.
 struct VaultContext {
     broker: Arc<Broker>,
     vault_path: Option<PathBuf>,
-    deferred: Arc<[DeferredConnection]>,
+    opener: crate::connect::ConnectionOpener,
 }
 
 /// Split an absolute OS path into its root prefix (the `LocalVfs` base) and the remaining
@@ -190,33 +192,46 @@ async fn run_async() -> anyhow::Result<()> {
     // The capability broker mediates credential resolution for credential-bearing (remote)
     // connections. It starts *locked*, so credential-bearing profiles can't be opened yet — the
     // opener resolves cleanly to a locked-vault error rather than connecting. The `Arc<Broker>` is
-    // kept alive in the runtime-side `VaultContext` (below) so the vault-unlock overlay (M3-7) can
-    // `.unlock(vault)` it and re-open the connections deferred here.
+    // kept alive in the runtime-side `VaultContext` (below) so the vault-unlock overlay (M3-7)
+    // can `.unlock(vault)` it; after unlock the reducer flips NeedsVault entries to NeedsOpen and
+    // the trigger connection opens automatically via the P2 lazy-open path.
     let broker = Arc::new(Broker::locked());
     let opener = crate::connect::ConnectionOpener::new(broker.clone());
 
-    // Register the switchable connections (Ctrl-O) and record their labels: built-in local roots
-    // plus the config profiles. Local profiles mount immediately; credential-bearing profiles (ssh/
-    // s3/gcs/azure) are opened via the broker-backed opener. A profile that can't open *because the
-    // vault is locked* is returned as a `deferred` connection (retried after unlock); other failures
-    // (missing field, backend not built) are skipped with a warning.
-    let (choices, deferred, descriptors) = register_connections(&registry, &config, &opener).await;
-    state.connections = choices;
+    // Register the switchable connections (Ctrl-O). In P2, local roots (builtin and saved) are
+    // mounted eagerly; non-local profiles are enumerated as NeedsOpen or NeedsVault and opened
+    // lazily when the user selects them. The deferred vec is always empty in P2.
+    let (_deferred, descriptors) = {
+        let (choices, deferred, descriptors) =
+            register_connections(&registry, &config, &opener).await;
+        state.connections = choices;
+        (deferred, descriptors)
+    };
+    debug_assert!(
+        _deferred.is_empty(),
+        "P2 coordinator must not defer any connections"
+    );
+
     state.vault_unlocked = broker.is_unlocked(); // false at startup; flips on unlock
-    state.has_locked_connections = !deferred.is_empty();
+                                                 // Drive has_locked_connections from switcher entries rather than the (always-empty) deferred list.
+    let n_needs_vault = state
+        .connections
+        .iter()
+        .filter(|c| c.status == ChoiceStatus::NeedsVault)
+        .count();
+    state.has_locked_connections = n_needs_vault > 0;
     if state.has_locked_connections {
         state.status = Some(format!(
-            "{} connection(s) need the vault — press Ctrl-U to unlock",
-            deferred.len()
+            "{n_needs_vault} connection(s) need the vault — press Ctrl-U to unlock"
         ));
     }
 
-    // Runtime-side vault context: the shared broker, the resolved vault file path, and the profiles
-    // deferred above. The unlock effect reads these to open the vault and retry those connections.
+    // Runtime-side context: the shared broker, the resolved vault file path, and the opener.
+    // The vault-unlock effect reads broker + vault_path; the OpenConnection effect uses the opener.
     let vault_ctx = VaultContext {
         broker,
         vault_path: config.vault_path(),
-        deferred: deferred.into(),
+        opener: opener.clone(),
     };
 
     // Resolve the color theme from the preset + per-role config overrides.
@@ -242,6 +257,11 @@ async fn run_async() -> anyhow::Result<()> {
     let mut startup_controls = HashMap::new();
     let mut startup_log_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
     let mut startup_session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
+    // Initial effects are List effects only (asserted above); empty descriptor map and an
+    // empty in-flight set are safe here because OpenConnection is never emitted before the
+    // event loop starts.
+    let empty_descriptors: HashMap<ConnectionId, ConnectionDescriptor> = HashMap::new();
+    let mut startup_in_flight: HashSet<ConnectionId> = HashSet::new();
     for effect in initial {
         dispatch(
             effect,
@@ -253,6 +273,8 @@ async fn run_async() -> anyhow::Result<()> {
             &mut startup_session_controls,
             &shell_action_defs,
             &vault_ctx,
+            &empty_descriptors,
+            &mut startup_in_flight,
         );
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
@@ -296,34 +318,31 @@ fn load_config() -> Config {
     cfg
 }
 
-/// Register the connections offered by the switcher and return their UI choices, the connections
-/// deferred while the vault is locked, and the runtime descriptor side-map.
+/// Register the connections offered by the switcher and return their UI choices, the (always-empty
+/// in P2) deferred list, and the runtime descriptor side-map.
 ///
-/// Delegates to [`ConnectionCoordinator`] (RFC-0011 P1). Built-in local roots (`/` and `$HOME`
-/// when set) and each `scheme = "local"` config profile mount immediately; credential-bearing
-/// profiles (`ssh`/`s3`/`gcs`/`azure`) are opened through the broker-backed opener. A profile
-/// that fails **specifically because the vault is locked** is returned in the deferred vec so the
-/// vault-unlock flow can retry it; any other failure is skipped with a warning.
-///
-/// The descriptor map is established here for P2 use (lazy open on selection); the values are
-/// unused by reducer logic in P1.
+/// Delegates to [`ConnectionCoordinator`] (RFC-0011 P2). Built-in local roots (`/` and `$HOME`
+/// when set) and `scheme = "local"` config profiles are eagerly mounted as `Ready`; all `Profile`
+/// targets (remote or credential-bearing) are placed in the switcher as `NeedsOpen` or
+/// `NeedsVault` without opening. Pass `&HashMap::new()` as `prior_descriptors` on startup; pass
+/// the previous descriptor map on re-enumeration so ids are reused for keys already live in a pane.
 async fn register_connections(
     registry: &VfsRegistry,
     config: &Config,
     opener: &crate::connect::ConnectionOpener,
 ) -> (
     Vec<ConnectionChoice>,
-    Vec<DeferredConnection>,
+    Vec<crate::connect::coordinator::DeferredConnection>,
     HashMap<ConnectionId, ConnectionDescriptor>,
 ) {
     let coordinator = ConnectionCoordinator::new(opener.clone(), RIGHT.0 + 1);
-    // Derive vault_locked from the live broker state so this call site and future P2
+    // Derive vault_locked from the live broker state so this call site and future
     // re-enumeration calls automatically reflect the current lock status.
     let ctx = DiscoveryCtx {
         config,
         vault_locked: opener.vault_locked(),
     };
-    coordinator.run(registry, &ctx).await
+    coordinator.run(registry, &ctx, &HashMap::new()).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,8 +358,9 @@ async fn event_loop(
     vault_ctx: &VaultContext,
     descriptor_map: HashMap<ConnectionId, ConnectionDescriptor>,
 ) -> anyhow::Result<()> {
-    // P2 will bind this map to resolve a ConnectionId to its descriptor on selection.
-    let _p2_descriptor_map = descriptor_map;
+    // `descriptor_map` is looked up by the OpenConnection effect runner to find what to open.
+    // P3: needs Arc<RwLock<_>> or a re-enumeration message to swap this map without restarting
+    // the loop (RFC-0011 §3: live config reload while panes are browsing connections).
     // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
     // matching effect can signal them. Each is cleared when its Done event arrives.
     // Per-transfer control, keyed by `TransferId`: the cancel token + pause sender form a *control
@@ -350,6 +370,11 @@ async fn event_loop(
     let mut ai_cancel: Option<CancellationToken> = None;
     let mut log_viewer_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
     let mut session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
+    // Tracks which ConnectionIds currently have an open task in flight. A duplicate
+    // OpenConnection effect for the same id (e.g. the user selects a NeedsOpen entry twice
+    // before the first open completes) is dropped here so only one backend connection is
+    // established. The id is removed when the matching ConnectionOpened event arrives.
+    let mut open_connection_in_flight: HashSet<ConnectionId> = HashSet::new();
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -379,6 +404,11 @@ async fn event_loop(
         if let Msg::Event(AppEvent::SessionEnded { id, .. }) = &msg {
             session_controls.remove(id);
         }
+        // Remove the in-flight marker when the open result arrives so duplicate effects
+        // for the same id are unblocked (the first open is done; a retry is now allowed).
+        if let Msg::Event(AppEvent::ConnectionOpened { conn, .. }) = &msg {
+            open_connection_in_flight.remove(conn);
+        }
         let effects = update(state, msg);
         if state.should_quit {
             break;
@@ -395,6 +425,8 @@ async fn event_loop(
                 &mut session_controls,
                 shell_action_defs,
                 vault_ctx,
+                &descriptor_map,
+                &mut open_connection_in_flight,
             );
         }
     }
@@ -471,6 +503,50 @@ impl Drop for SessionDoneGuard {
     }
 }
 
+/// Drop-guard for a spawned `OpenConnection` task — mirrors [`TransferDoneGuard`].
+///
+/// If the task panics or is dropped before completing, the guard fires
+/// `ConnectionOpened { Err }` via `try_send` so the reducer can clear its `NeedsOpen` status
+/// and the in-flight tracker removes the entry. Disarm before the explicit final send.
+struct ConnectionOpenGuard {
+    conn: ConnectionId,
+    event_tx: mpsc::Sender<AppEvent>,
+    armed: bool,
+}
+
+impl ConnectionOpenGuard {
+    fn new(conn: ConnectionId, event_tx: mpsc::Sender<AppEvent>) -> Self {
+        Self {
+            conn,
+            event_tx,
+            armed: true,
+        }
+    }
+
+    /// Disarm before emitting the real outcome so the guard does not fire on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionOpenGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort (`try_send`, no `.await` allowed in Drop). If the bounded event channel
+            // is momentarily full the synthetic error is silently dropped. The consequence is
+            // worse than `TransferDoneGuard`'s slot leak: the `ConnectionId` stays in
+            // `open_connection_in_flight` indefinitely (it is only removed on `ConnectionOpened`),
+            // making the connection permanently un-openable for the lifetime of the process. In
+            // practice the channel (256 deep) is ~never near full when a single open task panics,
+            // so the race is negligible — but the asymmetry with transfer is worth documenting.
+            let _ = self.event_tx.try_send(AppEvent::ConnectionOpened {
+                conn: self.conn,
+                result: Err("connection open task interrupted".to_owned()),
+            });
+        }
+    }
+}
+
 /// Runtime-side handles for an active exec or port-forward session, keyed by [`SessionId`].
 ///
 /// Held by the effect runner for the session's lifetime. [`AppEffect::CloseSession`] cancels the
@@ -521,7 +597,9 @@ fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
 
 /// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s. `transfer_controls`
 /// maps each [`TransferId`] to its cancel token + pause sender, so [`AppEffect::CancelTransfer`] and
-/// [`AppEffect::SetTransferPaused`] can target the right transfer task.
+/// [`AppEffect::SetTransferPaused`] can target the right transfer task. `descriptor_map` is looked
+/// up by [`AppEffect::OpenConnection`] to find the [`ConnectionDescriptor`] for a selected id.
+/// `open_connection_in_flight` prevents duplicate concurrent backend connections for the same id.
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
     effect: AppEffect,
@@ -533,6 +611,8 @@ fn dispatch(
     session_controls: &mut HashMap<SessionId, SessionControls>,
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
     vault_ctx: &VaultContext,
+    descriptor_map: &HashMap<ConnectionId, ConnectionDescriptor>,
+    open_connection_in_flight: &mut HashSet<ConnectionId>,
 ) {
     match effect {
         AppEffect::List {
@@ -731,14 +811,61 @@ fn dispatch(
         AppEffect::UnlockVault { passphrase } => {
             let broker = vault_ctx.broker.clone();
             let vault_path = vault_ctx.vault_path.clone();
-            let deferred = vault_ctx.deferred.clone();
-            let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let result =
-                    run_vault_unlock_effect(&broker, vault_path, &deferred, &registry, passphrase)
-                        .await;
+                let result = run_vault_unlock_effect(&broker, vault_path, passphrase).await;
                 let _ = event_tx.send(AppEvent::VaultUnlocked { result }).await;
+            });
+        }
+        AppEffect::OpenConnection { conn } => {
+            // In-flight guard: if another open task is already running for this id, drop the
+            // duplicate effect. The first task will emit ConnectionOpened and unblock future
+            // selections. This prevents two concurrent backend handshakes for the same connection
+            // (e.g. when the user selects a NeedsOpen entry twice before the first open finishes).
+            if open_connection_in_flight.contains(&conn) {
+                return;
+            }
+            open_connection_in_flight.insert(conn);
+
+            // Lazy open: look up the descriptor, guard against already-mounted, open in background.
+            let Some(desc) = descriptor_map.get(&conn).cloned() else {
+                // Descriptor missing — coordinator bug or race on re-enumeration; report error.
+                tracing::error!(conn = %conn.0, "OpenConnection: no descriptor found for id");
+                let event_tx = event_tx.clone();
+                // No ConnectionOpenGuard needed: the spawn only calls `.send()` and cannot panic.
+                tokio::spawn(async move {
+                    let _ = event_tx
+                        .send(AppEvent::ConnectionOpened {
+                            conn,
+                            result: Err("connection descriptor not found".to_owned()),
+                        })
+                        .await;
+                });
+                return;
+            };
+            let registry = registry.clone();
+            let opener = vault_ctx.opener.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut guard = ConnectionOpenGuard::new(conn, event_tx.clone());
+                // Already-mounted guard: if the registry already has a live VFS for this id
+                // (e.g. eager-mount at startup or a prior open that beat us here), report
+                // success immediately without re-opening (idempotent).
+                if registry.get(conn).await.is_some() {
+                    guard.disarm();
+                    let _ = event_tx
+                        .send(AppEvent::ConnectionOpened {
+                            conn,
+                            result: Ok(()),
+                        })
+                        .await;
+                    return;
+                }
+                let result = run_open_connection_effect(&registry, &opener, conn, &desc).await;
+                guard.disarm();
+                let _ = event_tx
+                    .send(AppEvent::ConnectionOpened { conn, result })
+                    .await;
             });
         }
         AppEffect::OpenLogViewer {
@@ -978,22 +1105,20 @@ async fn propose_plan(prompt: &str) -> Result<cairn_ai::Plan, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Unlock the secrets vault with `passphrase`, install it into the shared broker, and retry the
-/// connections deferred at startup while the vault was locked (M3-7).
+/// Unlock the secrets vault with `passphrase` and install it into the shared broker (P2).
 ///
-/// Returns `Ok(opened)` with the now-reachable connections (possibly empty) to add to the switcher,
-/// or `Err(message)` with a secret-free, retryable reason (missing vault / wrong passphrase). The
-/// passphrase is consumed here and zeroized on drop; it is never logged.
+/// Returns `Ok(())` on success or `Err(message)` with a secret-free, retryable reason (missing
+/// vault / wrong passphrase). The passphrase is consumed here and zeroized on drop; it is never
+/// logged. Connecting deferred profiles is no longer done here — in P2, NeedsVault connections are
+/// opened lazily via [`AppEffect::OpenConnection`] after the vault is unlocked.
 ///
 /// `Vault::open` runs Argon2id key derivation (CPU-bound) plus a file read, so it is offloaded to a
 /// blocking thread to keep the async runtime — and the render path — responsive.
 async fn run_vault_unlock_effect(
     broker: &Arc<Broker>,
     vault_path: Option<PathBuf>,
-    deferred: &[DeferredConnection],
-    registry: &VfsRegistry,
     passphrase: cairn_secrets::SecretString,
-) -> Result<Vec<ConnectionChoice>, String> {
+) -> Result<(), String> {
     let Some(path) = vault_path else {
         return Err("no vault path configured".to_owned());
     };
@@ -1017,34 +1142,52 @@ async fn run_vault_unlock_effect(
         Err(_) => return Err("unlock task failed".to_owned()),
     };
     broker.unlock(vault);
+    Ok(())
+}
 
-    // Retry the deferred profiles now that the broker is unlocked; the opener shares this broker.
-    let opener = crate::connect::ConnectionOpener::new(broker.clone());
-    let mut opened = Vec::new();
-    for d in deferred {
-        match opener.open(Actor::User, d.id, &d.profile).await {
-            Ok(vfs) => {
-                registry.insert(d.id, vfs).await;
-                opened.push(ConnectionChoice {
-                    conn: d.id,
-                    label: format!("{}: {}", d.profile.scheme, d.profile.display_name),
-                    provenance: ChoiceProvenance::Saved,
-                    status: ChoiceStatus::Ready,
-                    kind: ConnectionKind::Profile { id: d.profile.id },
-                });
-            }
-            Err(e) => {
-                // The vault is unlocked but this one still won't open (e.g. bad field); log and skip.
-                tracing::warn!(
-                    scheme = %d.profile.scheme,
-                    name = %d.profile.display_name,
-                    error = %e,
-                    "deferred connection still failed after unlock"
-                );
+/// Open a connection on demand (P2 lazy open) and insert it into the registry.
+///
+/// Called from the [`AppEffect::OpenConnection`] handler in [`dispatch`]. For `LocalRoot` targets
+/// the VFS is constructed directly; for `Profile` targets the broker-backed opener is used. Errors
+/// are returned as a secret-free string for the reducer to display in the status line.
+async fn run_open_connection_effect(
+    registry: &VfsRegistry,
+    opener: &crate::connect::ConnectionOpener,
+    conn: ConnectionId,
+    desc: &ConnectionDescriptor,
+) -> Result<(), String> {
+    match &desc.target {
+        OpenTarget::LocalRoot(path) => {
+            // Defensive: the coordinator eagerly mounts all LocalRoot targets at startup, so
+            // this arm is only reached if the registry entry was evicted or the initial mount
+            // failed. Re-mount without error; the already-mounted guard in the caller handles
+            // the common case where the entry is still live.
+            let vfs = cairn_backend_local::LocalVfs::new(conn, path.clone());
+            registry.insert(conn, Arc::new(vfs)).await;
+            Ok(())
+        }
+        OpenTarget::Profile(profile) => {
+            match opener.open(Actor::User, conn, profile).await {
+                Ok(vfs) => {
+                    registry.insert(conn, vfs).await;
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        conn = %conn.0,
+                        scheme = %profile.scheme,
+                        name = %profile.display_name,
+                        error = %e,
+                        "lazy open failed"
+                    );
+                    // `OpenError`'s Display is already redacted: the Vfs variant delegates to
+                    // `VfsError::redacted()`, and the Broker/BackendNotBuilt variants carry only
+                    // safe category strings. Surface as-is; never include raw hostname or creds.
+                    Err(format!("{}: {e}", profile.scheme))
+                }
             }
         }
     }
-    Ok(opened)
 }
 
 /// A compact "N file(s), M dir(s)" summary shared by the success and cancelled status messages.
@@ -2512,17 +2655,14 @@ mod tests {
         )
         .unwrap();
         let broker = Arc::new(Broker::locked());
-        let registry = VfsRegistry::new();
+        // P2: run_vault_unlock_effect only unlocks the broker; connections open lazily.
         let res = run_vault_unlock_effect(
             &broker,
             Some(path),
-            &[],
-            &registry,
             SecretString::from("open-sesame".to_owned()),
         )
         .await;
         assert!(res.is_ok(), "unlock should succeed");
-        assert_eq!(res.unwrap().len(), 0, "no deferred connections to open");
         assert!(broker.is_unlocked(), "the broker must now be unlocked");
     }
 
@@ -2539,16 +2679,10 @@ mod tests {
         )
         .unwrap();
         let broker = Arc::new(Broker::locked());
-        let registry = VfsRegistry::new();
-        let err = run_vault_unlock_effect(
-            &broker,
-            Some(path),
-            &[],
-            &registry,
-            SecretString::from("wrong".to_owned()),
-        )
-        .await
-        .unwrap_err();
+        let err =
+            run_vault_unlock_effect(&broker, Some(path), SecretString::from("wrong".to_owned()))
+                .await
+                .unwrap_err();
         assert!(
             err.to_lowercase().contains("passphrase") || err.to_lowercase().contains("decryption"),
             "expected a wrong-passphrase message, got: {err}"
@@ -2563,16 +2697,9 @@ mod tests {
     async fn vault_unlock_effect_no_path_configured_returns_a_clear_error() {
         use cairn_secrets::SecretString;
         let broker = Arc::new(Broker::locked());
-        let registry = VfsRegistry::new();
-        let err = run_vault_unlock_effect(
-            &broker,
-            None,
-            &[],
-            &registry,
-            SecretString::from("x".to_owned()),
-        )
-        .await
-        .unwrap_err();
+        let err = run_vault_unlock_effect(&broker, None, SecretString::from("x".to_owned()))
+            .await
+            .unwrap_err();
         assert!(err.contains("no vault path"), "got: {err}");
         assert!(!broker.is_unlocked());
     }
@@ -2581,12 +2708,9 @@ mod tests {
     async fn vault_unlock_effect_missing_file_is_a_clear_message() {
         use cairn_secrets::SecretString;
         let broker = Arc::new(Broker::locked());
-        let registry = VfsRegistry::new();
         let err = run_vault_unlock_effect(
             &broker,
             Some(PathBuf::from("/no/such/dir/vault.cvlt")),
-            &[],
-            &registry,
             SecretString::from("x".to_owned()),
         )
         .await
@@ -2598,12 +2722,14 @@ mod tests {
         assert!(!broker.is_unlocked());
     }
 
-    // A locked vault defers a credential-bearing profile; unlocking retries it. Hermetic: the S3
-    // profile references a wrong-family (SSH) credential, which every connector rejects with `Auth`
-    // *before any network*, so the retry exercises the full path without a live server.
+    // P2: A locked vault means credential-bearing profiles appear as NeedsVault in the switcher
+    // rather than being deferred. Unlocking the broker (via run_vault_unlock_effect) does NOT
+    // open them; opening happens lazily via run_open_connection_effect on selection. This test
+    // verifies the P2 coordinator behaviour and that vault unlock leaves the broker unlocked.
     #[cfg(feature = "s3")]
     #[tokio::test]
-    async fn locked_vault_defers_credentialed_profiles_then_unlock_retries_them() {
+    async fn locked_vault_makes_credentialed_profiles_needs_vault_and_unlock_unblocks_broker() {
+        use cairn_core::ChoiceStatus;
         use cairn_secrets::SecretString;
         use cairn_vault::{CredentialSecret, KdfParams, SshCredential, Vault};
         let dir = tempfile_dir();
@@ -2629,31 +2755,32 @@ mod tests {
         let broker = Arc::new(Broker::locked());
         let opener = crate::connect::ConnectionOpener::new(broker.clone());
         let registry = VfsRegistry::new();
-        let (_choices, deferred, _descriptors) =
+        let (choices, deferred, _descriptors) =
             register_connections(&registry, &cfg, &opener).await;
+
+        // P2: coordinator never defers; credential-bearing profile is NeedsVault in switcher.
+        assert!(
+            deferred.is_empty(),
+            "P2 coordinator must not produce any deferred connections"
+        );
+        let s3 = choices.iter().find(|c| c.label.starts_with("s3:"));
+        assert!(s3.is_some(), "s3 profile must appear in choices");
         assert_eq!(
-            deferred.len(),
-            1,
-            "a locked credentialed profile must be deferred"
+            s3.unwrap().status,
+            ChoiceStatus::NeedsVault,
+            "vault-locked s3 profile must be NeedsVault, not absent"
         );
 
-        let opened = run_vault_unlock_effect(
-            &broker,
-            Some(path),
-            &deferred,
-            &registry,
-            SecretString::from("pw".to_owned()),
-        )
-        .await
-        .unwrap();
+        // Vault unlock just unlocks the broker; no connections are opened here.
+        run_vault_unlock_effect(&broker, Some(path), SecretString::from("pw".to_owned()))
+            .await
+            .unwrap();
         assert!(
             broker.is_unlocked(),
-            "the broker is unlocked even if a retry fails"
+            "the broker must be unlocked after a successful vault open"
         );
-        assert!(
-            opened.is_empty(),
-            "the wrong-family credential is rejected pre-network, so nothing connects"
-        );
+        // The s3 choice remains NeedsVault in the switcher until the reducer flips it to
+        // NeedsOpen on receiving AppEvent::VaultUnlocked; actual open happens on selection.
     }
 
     #[cfg(unix)]

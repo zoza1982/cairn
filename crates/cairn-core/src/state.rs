@@ -402,11 +402,18 @@ pub enum Overlay {
     /// [`MaskedInput`] (no-echo, never logged, wiped on drop); submitting it emits
     /// [`AppEffect::UnlockVault`](crate::AppEffect::UnlockVault). A failed attempt (wrong passphrase /
     /// missing vault) keeps the overlay open with [`error`](Overlay::VaultUnlock::error) set.
+    ///
+    /// `pending_conn` (added in Phase P2) records which connection triggered this overlay: when the
+    /// user selects a [`NeedsVault`](crate::ChoiceStatus::NeedsVault) entry, that connection's id is
+    /// stored here so the runtime can auto-open it immediately after a successful unlock. `None`
+    /// when the user explicitly pressed `Ctrl-U` rather than selecting a locked connection.
     VaultUnlock {
         /// The passphrase entered so far — masked on screen, redacted in `Debug`, zeroized on drop.
         input: MaskedInput,
         /// A retryable error from the last attempt, shown in the overlay; `None` before the first try.
         error: Option<String>,
+        /// The connection that triggered this unlock, if any (Phase P2+).
+        pending_conn: Option<ConnectionId>,
     },
     /// Confirm running a user-defined shell action before it executes (security gate — shell actions
     /// run a local program). Holds what's needed to dispatch on confirm.
@@ -664,10 +671,19 @@ pub struct AppState {
     /// cleared when the result arrives; it suppresses a duplicate submit and drives the "Unlocking…"
     /// indicator. No secret material.
     pub vault_unlocking: bool,
-    /// Whether one or more credential-bearing connections were deferred at startup because the vault
-    /// was locked. Drives the startup status hint that points the user at the unlock flow; cleared
-    /// once the vault is unlocked.
+    /// Whether one or more connections appear as [`NeedsVault`](ChoiceStatus::NeedsVault) in the
+    /// switcher (vault is locked, credentials unavailable). Drives the startup status hint that
+    /// points the user at the unlock flow; cleared once the vault is unlocked.
     pub has_locked_connections: bool,
+    /// Per-side slot tracking which connection is awaiting an async open (Phase P2).
+    ///
+    /// Indexed by [`Side::index()`] — `[Left, Right]`. Set when the user selects a
+    /// [`NeedsOpen`](ChoiceStatus::NeedsOpen), [`NeedsVault`](ChoiceStatus::NeedsVault), or
+    /// [`Unreachable`](ChoiceStatus::Unreachable) entry; cleared when
+    /// [`AppEvent::ConnectionOpened`](crate::AppEvent::ConnectionOpened) arrives for that conn.
+    /// Using per-side slots allows simultaneous in-flight opens on both panes without the
+    /// single-slot aliasing bug where a slow Left open could navigate Right after the user moved on.
+    pub pending_conn_open: [Option<ConnectionId>; 2],
     /// Monotonic id counter for log-viewer sessions (like `next_transfer_id`). Starts at 1.
     pub next_log_viewer_id: LogViewerId,
     /// Active exec and port-forward sessions, keyed by stable [`SessionId`].
@@ -790,6 +806,7 @@ impl AppState {
             vault_unlocked: false,
             vault_unlocking: false,
             has_locked_connections: false,
+            pending_conn_open: [None; 2],
             next_log_viewer_id: 1,
             sessions: HashMap::new(),
             next_session_id: SessionId(1),
@@ -875,6 +892,7 @@ mod tests {
         let overlay = Overlay::VaultUnlock {
             input: m,
             error: None,
+            pending_conn: None,
         };
         assert!(!format!("{overlay:?}").contains("hunter2"));
     }

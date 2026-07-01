@@ -117,7 +117,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
         Overlay::TransferQueue { cursor } => render_transfer_queue(frame, state, *cursor),
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
         Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),
-        Overlay::VaultUnlock { input, error } => {
+        Overlay::VaultUnlock { input, error, .. } => {
             render_vault_unlock(frame, input, error.as_deref(), state.vault_unlocking)
         }
         Overlay::LogViewer {
@@ -1136,6 +1136,7 @@ mod tests {
         s.overlay = Some(cairn_core::Overlay::VaultUnlock {
             input,
             error: Some("decryption failed (wrong passphrase or corrupt vault)".to_owned()),
+            pending_conn: None,
         });
         let text = render_text(&s, 80, 24);
         assert!(text.contains("Unlock vault"), "dialog title: {text}");

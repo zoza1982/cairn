@@ -778,4 +778,114 @@ mod tests {
         let err = open_err(&opener, ConnectionId(5), &profile("s3", &[("bucket", "b")])).await;
         assert!(matches!(err, OpenError::MissingCredential(_)), "{err}");
     }
+
+    /// Every `OpenError` variant, when formatted via `"{scheme}: {e}"` as
+    /// `run_open_connection_effect` does, must not expose a raw host address or credential value
+    /// in the string pushed to the UI status line.
+    ///
+    /// For `Vfs` variants the critical mechanism is [`VfsError::redacted`] — it strips
+    /// path/host/source detail and emits only the error category.  For `Broker` variants the
+    /// `Display` strings are static category labels ("vault is locked", "credential not found")
+    /// with no dynamic data.  For the remaining variants the embedded fields are metadata (scheme
+    /// name, profile display-name, endpoint key name), not endpoint values or secrets; the
+    /// assertions here document that no stray endpoint data is interpolated.
+    #[test]
+    fn open_error_display_does_not_leak_host_or_credential() {
+        // Sentinel values embedded in error internals; neither must appear in the surfaced string.
+        const HOST: &str = "bastion.corp.example";
+        const CRED: &str = "sEcrEt-p@ssw0rd-42";
+        const SCHEME: &str = "ssh";
+
+        macro_rules! check {
+            ($label:expr, $e:expr) => {{
+                let surfaced = format!("{SCHEME}: {}", $e);
+                assert!(
+                    !surfaced.contains(HOST),
+                    "{}: surfaced string exposed HOST in: {:?}",
+                    $label,
+                    surfaced
+                );
+                assert!(
+                    !surfaced.contains(CRED),
+                    "{}: surfaced string exposed CRED in: {:?}",
+                    $label,
+                    surfaced
+                );
+            }};
+        }
+
+        // ── Vfs: the critical cases — VfsError::redacted() must strip all inner detail ─────────
+
+        // NotFound path encodes the sentinel host — must redact to "not found".
+        check!(
+            "Vfs::NotFound",
+            OpenError::Vfs(VfsError::NotFound(
+                cairn_types::VfsPath::parse(&format!("/{HOST}/data")).expect("test path"),
+            ))
+        );
+
+        // Forbidden path encodes the sentinel credential — must redact to "permission denied".
+        check!(
+            "Vfs::Forbidden",
+            OpenError::Vfs(VfsError::Forbidden(
+                cairn_types::VfsPath::parse(&format!("/{CRED}")).expect("test path"),
+            ))
+        );
+
+        // Connection source error embeds the hostname — must redact to "connection failed".
+        check!(
+            "Vfs::Connection",
+            OpenError::Vfs(VfsError::Connection(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                HOST,
+            ))))
+        );
+
+        // Backend msg embeds a credential-like string — only the stable code must surface.
+        check!(
+            "Vfs::Backend",
+            OpenError::Vfs(VfsError::Backend {
+                code: "AccessDenied".to_owned(),
+                msg: format!("access denied for key '{CRED}' on host {HOST}"),
+                retryable: false,
+            })
+        );
+
+        // ── Broker: static category strings only — no dynamic host or credential data ──────────
+        check!("Broker::Locked", OpenError::Broker(BrokerError::Locked));
+        check!("Broker::NotFound", OpenError::Broker(BrokerError::NotFound));
+
+        // ── Metadata variants: scheme name / display-name / endpoint key name — not values ──────
+        // BackendNotBuilt and UnsupportedScheme carry only the scheme identifier (not a host).
+        check!(
+            "BackendNotBuilt",
+            OpenError::BackendNotBuilt("ftp".to_owned())
+        );
+        check!(
+            "UnsupportedScheme",
+            OpenError::UnsupportedScheme("unknown".to_owned())
+        );
+        // MissingField/InvalidField carry the profile display-name and endpoint key name ("host",
+        // "port") — neither is the actual host value or a credential.
+        check!(
+            "MissingField",
+            OpenError::MissingField {
+                profile: "dev-bastion".to_owned(),
+                field: "host".to_owned(),
+            }
+        );
+        check!(
+            "InvalidField",
+            OpenError::InvalidField {
+                profile: "prod-s3".to_owned(),
+                field: "port".to_owned(),
+                reason: "not a number".to_owned(),
+            }
+        );
+        // MissingCredential carries the display-name, not the credential value itself.
+        check!(
+            "MissingCredential",
+            OpenError::MissingCredential("dev-bastion".to_owned())
+        );
+    }
 }

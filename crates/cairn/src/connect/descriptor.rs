@@ -74,12 +74,13 @@ pub(crate) struct ConnectionDescriptor {
     /// The stable [`ConnectionId`] assigned by the coordinator for this enumeration round.
     pub(crate) id: ConnectionId,
     /// A content-derived key that identifies this connection across re-enumeration rounds.
-    // P2: used by the coordinator's diff-and-preserve logic on config reload.
-    #[allow(dead_code)]
+    // Used by the coordinator's diff-and-preserve logic on re-enumeration.
     pub(crate) key: ConnectionKey,
     /// How this connection entered the list.
     pub(crate) provenance: DescriptorProvenance,
     /// The URI scheme string (e.g. `"local"`, `"ssh"`, `"s3"`).
+    // Read by the coordinator's log calls and future P3/P4 re-enumeration diffing.
+    #[allow(dead_code)]
     pub(crate) scheme: String,
     /// Human-readable display name shown in the switcher.
     pub(crate) display_name: String,
