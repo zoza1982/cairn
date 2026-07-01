@@ -126,6 +126,22 @@ impl ConnectionCoordinator {
             raw.extend(provider.discover(ctx).await);
         }
 
+        // Providers must not emit duplicate keys — a duplicate would cause the key→id map to
+        // silently alias two descriptors onto the same ConnectionId. Assert in debug builds;
+        // in release the duplicate would be overwritten by `descriptors.insert` below, which
+        // is recoverable but confusing, and should never happen with well-behaved providers.
+        #[cfg(debug_assertions)]
+        {
+            let mut seen_keys = std::collections::HashSet::new();
+            for desc in &raw {
+                debug_assert!(
+                    seen_keys.insert(&desc.key),
+                    "duplicate ConnectionKey across providers: {:?}",
+                    desc.key
+                );
+            }
+        }
+
         let mut choices: Vec<ConnectionChoice> = Vec::new();
         // P2 never populates this; retained for API stability.
         let deferred: Vec<DeferredConnection> = Vec::new();
@@ -232,6 +248,10 @@ fn core_projection(provenance: &DescriptorProvenance) -> (ChoiceProvenance, Conn
 /// Mint the next available [`ConnectionId`] that is not already in `claimed`, advancing
 /// `next_fresh` past the result. Inserts the minted id into `claimed` before returning so
 /// successive calls never produce the same id.
+///
+/// **Termination:** `claimed` is bounded by the number of live connections (a small constant in
+/// practice), and `u64::MAX` (~1.8 × 10¹⁹) far exceeds any realistic claim count, so the
+/// `while` loop always terminates before wrapping.
 fn mint_fresh_id(
     next_fresh: &mut u64,
     claimed: &mut std::collections::HashSet<ConnectionId>,

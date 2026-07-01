@@ -671,18 +671,19 @@ pub struct AppState {
     /// cleared when the result arrives; it suppresses a duplicate submit and drives the "Unlocking…"
     /// indicator. No secret material.
     pub vault_unlocking: bool,
-    /// Whether one or more credential-bearing connections were deferred at startup because the vault
-    /// was locked. Drives the startup status hint that points the user at the unlock flow; cleared
-    /// once the vault is unlocked.
+    /// Whether one or more connections appear as [`NeedsVault`](ChoiceStatus::NeedsVault) in the
+    /// switcher (vault is locked, credentials unavailable). Drives the startup status hint that
+    /// points the user at the unlock flow; cleared once the vault is unlocked.
     pub has_locked_connections: bool,
-    /// The connection + pane awaiting an async open (Phase P2).
+    /// Per-side slot tracking which connection is awaiting an async open (Phase P2).
     ///
-    /// Set when the user selects a [`NeedsOpen`](ChoiceStatus::NeedsOpen) or
-    /// [`NeedsVault`](ChoiceStatus::NeedsVault) entry; cleared when
-    /// [`AppEvent::ConnectionOpened`](crate::AppEvent::ConnectionOpened) arrives. Holds the pane
-    /// side so the reducer knows where to navigate after a successful open. `None` when no
-    /// open is in flight.
-    pub pending_conn_open: Option<(ConnectionId, Side)>,
+    /// Indexed by [`Side::index()`] — `[Left, Right]`. Set when the user selects a
+    /// [`NeedsOpen`](ChoiceStatus::NeedsOpen), [`NeedsVault`](ChoiceStatus::NeedsVault), or
+    /// [`Unreachable`](ChoiceStatus::Unreachable) entry; cleared when
+    /// [`AppEvent::ConnectionOpened`](crate::AppEvent::ConnectionOpened) arrives for that conn.
+    /// Using per-side slots allows simultaneous in-flight opens on both panes without the
+    /// single-slot aliasing bug where a slow Left open could navigate Right after the user moved on.
+    pub pending_conn_open: [Option<ConnectionId>; 2],
     /// Monotonic id counter for log-viewer sessions (like `next_transfer_id`). Starts at 1.
     pub next_log_viewer_id: LogViewerId,
     /// Active exec and port-forward sessions, keyed by stable [`SessionId`].
@@ -805,7 +806,7 @@ impl AppState {
             vault_unlocked: false,
             vault_unlocking: false,
             has_locked_connections: false,
-            pending_conn_open: None,
+            pending_conn_open: [None; 2],
             next_log_viewer_id: 1,
             sessions: HashMap::new(),
             next_session_id: SessionId(1),

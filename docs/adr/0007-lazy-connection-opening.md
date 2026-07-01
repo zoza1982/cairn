@@ -83,8 +83,14 @@ We adopt lazy, on-select connection opening for all `Profile` targets (P2):
 
 - The `Overlay::VaultUnlock` struct gains `pending_conn: Option<ConnectionId>` for the
   auto-open-on-unlock path; existing code uses `..` patterns to remain forward-compatible.
-- The `AppState` gains `pending_conn_open: Option<(ConnectionId, Side)>` to track which connection
-  + pane is awaiting an async open; this is reducer state (no secrets, no I/O).
+- The `AppState` gains `pending_conn_open: [Option<ConnectionId>; 2]` (indexed by
+  `Side::index()`, Left→0 / Right→1) to track which connection is awaiting an async open per
+  pane. Using per-side slots eliminates the single-slot aliasing bug present in the initial
+  `Option<(ConnectionId, Side)>` design: with one slot, selecting `NeedsOpen A` on Left then
+  `B` on Right before A completes would overwrite the slot; when A's `ConnectionOpened{Ok}`
+  arrived the slot id (`B`) would not match `A`, so Left would silently fail to navigate.
+  Per-side slots are independent and both opens proceed correctly. This is reducer state (no
+  secrets, no I/O).
 
 ## Alternatives considered
 

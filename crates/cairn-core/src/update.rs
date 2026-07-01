@@ -370,17 +370,20 @@ fn apply_vault_unlock_text(state: &mut AppState, edit: TextEdit) -> Vec<AppEffec
         // Closing the overlay drops the `MaskedInput`, which zeroizes the buffer.
         TextEdit::Cancel => {
             // If this overlay was triggered by a NeedsVault connection selection,
-            // `pending_conn_open` was set at that point but no OpenConnection was ever emitted.
-            // Clear it now — leaving it set would let a future ConnectionOpened from a retry
-            // incorrectly navigate the pane to the connection the user cancelled on.
-            if matches!(
-                &state.overlay,
-                Some(Overlay::VaultUnlock {
-                    pending_conn: Some(_),
-                    ..
-                })
-            ) {
-                state.pending_conn_open = None;
+            // `pending_conn_open[side]` was set at that point but no OpenConnection was emitted.
+            // Clear the matching per-side slot now — leaving it set would cause a future
+            // ConnectionOpened (from a retry) to navigate the pane to the cancelled connection.
+            if let Some(Overlay::VaultUnlock {
+                pending_conn: Some(conn_id),
+                ..
+            }) = &state.overlay
+            {
+                let conn_id = *conn_id;
+                for slot in &mut state.pending_conn_open {
+                    if *slot == Some(conn_id) {
+                        *slot = None;
+                    }
+                }
             }
             state.overlay = None;
             Vec::new()
@@ -830,28 +833,32 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
             let Some(Overlay::Connections { cursor }) = state.overlay.take() else {
                 return Vec::new();
             };
-            let choice = state.connections[cursor].clone();
+            // Cheap insurance: `cursor` is bounded by `n` (clamped on CursorDown), but
+            // P4 will allow mid-switcher removal. Get instead of indexing so any TOCTOU
+            // between the cursor bound-check and the take() is handled cleanly.
+            let Some(choice) = state.connections.get(cursor).cloned() else {
+                return Vec::new();
+            };
             let side = state.focus;
             match choice.status {
                 ChoiceStatus::Ready => {
                     // A direct-navigate to a Ready connection supersedes any in-flight lazy open
-                    // for this same pane. Clear the slot so a delayed ConnectionOpened for the
-                    // prior in-flight connection cannot later repoint this pane.
-                    if matches!(state.pending_conn_open, Some((_, s)) if s == side) {
-                        state.pending_conn_open = None;
-                    }
+                    // for this same pane. Clear the per-side slot so a delayed ConnectionOpened
+                    // for the prior in-flight connection cannot later repoint this pane.
+                    state.pending_conn_open[side.index()] = None;
                     state.status = Some(format!("Opened {}", choice.label));
                     navigate_to_conn(state, side, choice.conn)
                 }
                 ChoiceStatus::NeedsOpen => {
-                    // Record pending intent so ConnectionOpened can navigate after the open.
+                    // Record pending intent in the per-side slot so ConnectionOpened knows
+                    // where to navigate after the open completes.
                     state.status = Some(format!("Opening {}…", choice.label));
-                    state.pending_conn_open = Some((choice.conn, side));
+                    state.pending_conn_open[side.index()] = Some(choice.conn);
                     vec![AppEffect::OpenConnection { conn: choice.conn }]
                 }
                 ChoiceStatus::NeedsVault => {
                     // Record which conn + pane triggered the unlock so we can auto-open after.
-                    state.pending_conn_open = Some((choice.conn, side));
+                    state.pending_conn_open[side.index()] = Some(choice.conn);
                     state.overlay = Some(Overlay::VaultUnlock {
                         input: MaskedInput::new(),
                         error: None,
@@ -863,7 +870,7 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
                     // Retry: treat exactly like NeedsOpen — the descriptor is still in the
                     // side-map. The transient failure (e.g. network blip) may have resolved.
                     state.status = Some(format!("Retrying {}…", choice.label));
-                    state.pending_conn_open = Some((choice.conn, side));
+                    state.pending_conn_open[side.index()] = Some(choice.conn);
                     vec![AppEffect::OpenConnection { conn: choice.conn }]
                 }
             }
@@ -1813,22 +1820,42 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                     // P2: flip every NeedsVault entry to NeedsOpen — they are now openable.
                     // (Previously P1 added new ConnectionChoices from the deferred list;
                     //  in P2 they are already in the switcher since enumeration time.)
+                    // Collect the flipped ids so we can clean stale pending slots below.
                     // Count only the newly-flipped entries so the message is accurate even when
                     // credential-free NeedsOpen entries already exist in the switcher.
                     let mut n_flipped: usize = 0;
+                    let mut flipped_ids: std::collections::HashSet<cairn_types::ConnectionId> =
+                        std::collections::HashSet::new();
                     for choice in &mut state.connections {
                         if choice.status == ChoiceStatus::NeedsVault {
                             choice.status = ChoiceStatus::NeedsOpen;
                             n_flipped += 1;
+                            flipped_ids.insert(choice.conn);
                         }
                     }
-                    // Extract the pending connection BEFORE closing the overlay.
+                    // Extract the pending connection from the overlay BEFORE closing it.
+                    // This is the authoritative source for the auto-open target (the connection
+                    // whose selection opened the VaultUnlock overlay). If the overlay was replaced
+                    // (e.g. user cancelled and opened something else while the async unlock ran),
+                    // `pending_conn` is None and we skip auto-open entirely. In that case we also
+                    // clear any per-side pending slots whose connection just flipped — they belong
+                    // to the cancelled NeedsVault selection and would otherwise navigate the pane
+                    // to a connection the user no longer explicitly requested.
                     let pending_conn =
                         if let Some(Overlay::VaultUnlock { pending_conn, .. }) = &state.overlay {
                             *pending_conn
                         } else {
                             None
                         };
+                    if pending_conn.is_none() {
+                        for slot in &mut state.pending_conn_open {
+                            if let Some(id) = *slot {
+                                if flipped_ids.contains(&id) {
+                                    *slot = None;
+                                }
+                            }
+                        }
+                    }
                     // Only close *our* overlay: the unlock runs in a detached task, so by the time it
                     // finishes the user may have closed the unlock box and opened a different one
                     // (e.g. the connection switcher) — which we must not clobber.
@@ -1840,9 +1867,9 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                     } else {
                         format!("Vault unlocked — {n_flipped} connection(s) now openable")
                     });
-                    // Auto-open the connection that triggered the unlock (if any); the
-                    // pending_conn_open tracking ensures that ConnectionOpened will navigate
-                    // the right pane once the open completes.
+                    // Auto-open the connection that triggered the unlock (if any); the per-side
+                    // `pending_conn_open` slot ensures that ConnectionOpened navigates the right
+                    // pane once the open completes.
                     if let Some(conn) = pending_conn {
                         vec![AppEffect::OpenConnection { conn }]
                     } else {
@@ -1911,7 +1938,8 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             Vec::new()
         }
         AppEvent::ConnectionOpened { conn, result } => {
-            // Flip the choice's reachability status based on the open outcome.
+            // Flip the choice's reachability status based on the open outcome (always
+            // unconditional — the badge must reflect reality even for superseded opens).
             if let Some(choice) = state.connections.iter_mut().find(|c| c.conn == conn) {
                 match &result {
                     Ok(()) => choice.status = ChoiceStatus::Ready,
@@ -1920,36 +1948,40 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             }
             match result {
                 Ok(()) => {
-                    // Navigate the requesting pane into the now-open connection, if this was the
-                    // pending open. Restore `pending_conn_open` if it was for a different conn
-                    // (two concurrent opens would be unusual but must not corrupt state).
-                    if let Some((pending_id, side)) = state.pending_conn_open.take() {
-                        if pending_id == conn {
-                            let label = state
-                                .connections
-                                .iter()
-                                .find(|c| c.conn == conn)
-                                .map(|c| c.label.clone())
-                                .unwrap_or_default();
-                            state.status = Some(format!("Opened {label}"));
-                            return navigate_to_conn(state, side, conn);
-                        }
-                        // A different conn was pending — restore the slot.
-                        state.pending_conn_open = Some((pending_id, side));
+                    // Find the per-side slot that was waiting for this conn, navigate that side,
+                    // and clear only that slot. The other side's slot (if any) is untouched,
+                    // allowing simultaneous in-flight opens on both panes.
+                    if let Some(idx) = state
+                        .pending_conn_open
+                        .iter()
+                        .position(|s| *s == Some(conn))
+                    {
+                        let side = if idx == 0 { Side::Left } else { Side::Right };
+                        state.pending_conn_open[idx] = None;
+                        let label = state
+                            .connections
+                            .iter()
+                            .find(|c| c.conn == conn)
+                            .map(|c| c.label.clone())
+                            .unwrap_or_default();
+                        state.status = Some(format!("Opened {label}"));
+                        return navigate_to_conn(state, side, conn);
                     }
                     Vec::new()
                 }
                 Err(msg) => {
-                    // Only update the status line when this is the still-active pending open.
-                    // A superseded background open (the user navigated elsewhere before the result
-                    // arrived) must not overwrite the status the user is currently looking at.
-                    match state.pending_conn_open {
-                        Some((pending_id, _)) if pending_id == conn => {
-                            state.pending_conn_open = None;
-                            state.status = Some(format!("Failed to open connection: {msg}"));
+                    // Only update the status line when this conn matches an active pending slot.
+                    // A superseded background open must not overwrite the status the user sees.
+                    let is_active = state.pending_conn_open.iter_mut().any(|slot| {
+                        if *slot == Some(conn) {
+                            *slot = None;
+                            true
+                        } else {
+                            false
                         }
-                        // Different pending active, or pending already cleared — suppress noise.
-                        _ => {}
+                    });
+                    if is_active {
+                        state.status = Some(format!("Failed to open connection: {msg}"));
                     }
                     Vec::new()
                 }
@@ -4264,8 +4296,8 @@ mod tests {
         );
         assert!(s.overlay.is_none(), "overlay is closed after selection");
         assert_eq!(
-            s.pending_conn_open,
-            Some((cairn_types::ConnectionId(5), Side::Left))
+            s.pending_conn_open[Side::Left.index()],
+            Some(cairn_types::ConnectionId(5))
         );
     }
 
@@ -4294,8 +4326,8 @@ mod tests {
             other => panic!("expected VaultUnlock overlay, got {other:?}"),
         }
         assert_eq!(
-            s.pending_conn_open,
-            Some((cairn_types::ConnectionId(6), Side::Left))
+            s.pending_conn_open[Side::Left.index()],
+            Some(cairn_types::ConnectionId(6))
         );
     }
 
@@ -4326,9 +4358,9 @@ mod tests {
             "status must mention retry"
         );
         assert_eq!(
-            s.pending_conn_open,
-            Some((cairn_types::ConnectionId(7), Side::Left)),
-            "pending_conn_open is set for the retry"
+            s.pending_conn_open[Side::Left.index()],
+            Some(cairn_types::ConnectionId(7)),
+            "pending_conn_open[Left] is set for the retry"
         );
     }
 
@@ -4344,7 +4376,7 @@ mod tests {
             ..Default::default()
         }];
         // Simulate having selected the connection (pending set by the reducer on NeedsOpen select).
-        s.pending_conn_open = Some((cairn_types::ConnectionId(5), Side::Left));
+        s.pending_conn_open[Side::Left.index()] = Some(cairn_types::ConnectionId(5));
         let fx = update(
             &mut s,
             Msg::Event(AppEvent::ConnectionOpened {
@@ -4353,7 +4385,10 @@ mod tests {
             }),
         );
         assert_eq!(s.connections[0].status, ChoiceStatus::Ready);
-        assert!(s.pending_conn_open.is_none(), "pending is cleared");
+        assert!(
+            s.pending_conn_open.iter().all(|s| s.is_none()),
+            "pending is cleared"
+        );
         assert_eq!(s.active().conn, cairn_types::ConnectionId(5));
         assert!(
             matches!(s.active().listing, Listing::Loading),
@@ -4376,7 +4411,7 @@ mod tests {
             status: ChoiceStatus::NeedsOpen,
             ..Default::default()
         }];
-        s.pending_conn_open = Some((cairn_types::ConnectionId(5), Side::Left));
+        s.pending_conn_open[Side::Left.index()] = Some(cairn_types::ConnectionId(5));
         let fx = update(
             &mut s,
             Msg::Event(AppEvent::ConnectionOpened {
@@ -4386,7 +4421,10 @@ mod tests {
         );
         assert!(fx.is_empty());
         assert_eq!(s.connections[0].status, ChoiceStatus::Unreachable);
-        assert!(s.pending_conn_open.is_none(), "pending is cleared on error");
+        assert!(
+            s.pending_conn_open.iter().all(|s| s.is_none()),
+            "pending is cleared on error"
+        );
         assert!(
             s.status
                 .as_deref()
@@ -4408,7 +4446,7 @@ mod tests {
             ..Default::default()
         }];
         // Simulate: user selected the s3 conn, was redirected to VaultUnlock overlay.
-        s.pending_conn_open = Some((cairn_types::ConnectionId(8), Side::Left));
+        s.pending_conn_open[Side::Left.index()] = Some(cairn_types::ConnectionId(8));
         s.overlay = Some(Overlay::VaultUnlock {
             input: MaskedInput::new(),
             error: None,
@@ -4449,16 +4487,16 @@ mod tests {
                 ..Default::default()
             },
         ];
-        // Simulate: user previously selected NeedsOpen conn 5 — pending was set.
-        s.pending_conn_open = Some((cairn_types::ConnectionId(5), Side::Left));
+        // Simulate: user previously selected NeedsOpen conn 5 — pending was set for Left.
+        s.pending_conn_open[Side::Left.index()] = Some(cairn_types::ConnectionId(5));
         // User now selects Ready conn 6 on the same Left pane.
         let _ = update(&mut s, Msg::Action(Action::OpenConnections));
         let _ = update(&mut s, Msg::Action(Action::CursorDown)); // cursor → index 1 (conn 6)
         let nav_fx = update(&mut s, Msg::Action(Action::Confirm));
-        // The stale pending slot for conn 5 on Left must be cleared.
+        // The per-side slot for Left (conn 5) must be cleared.
         assert!(
-            s.pending_conn_open.is_none(),
-            "Ready navigation on same side must clear stale pending_conn_open"
+            s.pending_conn_open[Side::Left.index()].is_none(),
+            "Ready navigation on same side must clear the stale Left pending_conn_open slot"
         );
         // A List for conn 6 must have been emitted (navigate happened).
         assert!(
@@ -4505,7 +4543,7 @@ mod tests {
         let fx = update(&mut s, Msg::Action(Action::Confirm));
         assert!(fx.is_empty(), "NeedsVault emits no effect");
         assert!(
-            s.pending_conn_open.is_some(),
+            s.pending_conn_open.iter().any(|s| s.is_some()),
             "pending_conn_open must be set after NeedsVault selection"
         );
         // User presses Esc to cancel the vault-unlock overlay.
@@ -4513,7 +4551,7 @@ mod tests {
         assert!(fx.is_empty());
         assert!(s.overlay.is_none(), "overlay must be closed");
         assert!(
-            s.pending_conn_open.is_none(),
+            s.pending_conn_open.iter().all(|s| s.is_none()),
             "pending_conn_open must be cleared when vault-unlock is cancelled"
         );
     }
@@ -4530,8 +4568,8 @@ mod tests {
             status: ChoiceStatus::NeedsOpen,
             ..Default::default()
         }];
-        // pending_conn_open cleared — the user navigated elsewhere (e.g. via Finding 1 fix).
-        s.pending_conn_open = None;
+        // pending_conn_open cleared — the user navigated elsewhere (e.g. via the per-side fix).
+        s.pending_conn_open = [None; 2];
         s.status = Some("Opened / (local)".to_owned());
         // A delayed error from the background open of conn 5 arrives.
         let fx = update(
@@ -4572,9 +4610,9 @@ mod tests {
                 ..Default::default()
             },
         ];
-        // pending_conn_open is for conn 6, Left.
-        s.pending_conn_open = Some((cairn_types::ConnectionId(6), Side::Left));
-        // ConnectionOpened arrives for conn 5 (a different in-flight open).
+        // pending_conn_open: Left=conn6, Right=empty.
+        s.pending_conn_open[Side::Left.index()] = Some(cairn_types::ConnectionId(6));
+        // ConnectionOpened arrives for conn 5 (a different in-flight open with no pending slot).
         let fx = update(
             &mut s,
             Msg::Event(AppEvent::ConnectionOpened {
@@ -4582,19 +4620,90 @@ mod tests {
                 result: Ok(()),
             }),
         );
-        // No navigate effects for conn 5.
+        // No navigate effects for conn 5 (no pending slot matched).
         assert!(
             fx.is_empty(),
             "different-conn Ok must emit no navigate effects, got {fx:?}"
         );
         // Conn 5 is now Ready in the switcher.
         assert_eq!(s.connections[0].status, ChoiceStatus::Ready);
-        // The pending slot for conn 6 must be preserved.
+        // The pending slot for conn 6 on Left must be preserved.
         assert_eq!(
-            s.pending_conn_open,
-            Some((cairn_types::ConnectionId(6), Side::Left)),
+            s.pending_conn_open[Side::Left.index()],
+            Some(cairn_types::ConnectionId(6)),
             "pending slot for conn 6 must survive an unrelated ConnectionOpened"
         );
+        assert_eq!(
+            s.pending_conn_open[Side::Right.index()],
+            None,
+            "Right slot was never set"
+        );
+    }
+
+    /// Validates the per-side pending slots: simultaneous in-flight opens on both panes each
+    /// navigate the correct side and clear only their own slot.
+    #[test]
+    fn per_side_pending_both_open_navigate_correct_sides() {
+        use crate::state::{ConnectionChoice, Listing};
+        let mut s = state();
+        s.connections = vec![
+            ConnectionChoice {
+                conn: cairn_types::ConnectionId(10),
+                label: "ssh: left-server".to_owned(),
+                status: ChoiceStatus::NeedsOpen,
+                ..Default::default()
+            },
+            ConnectionChoice {
+                conn: cairn_types::ConnectionId(11),
+                label: "ssh: right-server".to_owned(),
+                status: ChoiceStatus::NeedsOpen,
+                ..Default::default()
+            },
+        ];
+        // Two concurrent in-flight opens — one per pane.
+        s.pending_conn_open[Side::Left.index()] = Some(cairn_types::ConnectionId(10));
+        s.pending_conn_open[Side::Right.index()] = Some(cairn_types::ConnectionId(11));
+
+        // Left open completes first.
+        let fx_a = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionOpened {
+                conn: cairn_types::ConnectionId(10),
+                result: Ok(()),
+            }),
+        );
+        assert!(
+            matches!(&fx_a[..], [AppEffect::List { conn, pane: Side::Left, .. }] if *conn == cairn_types::ConnectionId(10)),
+            "Left open must navigate Left pane, got {fx_a:?}"
+        );
+        // Left slot is cleared; Right slot survives.
+        assert_eq!(s.pending_conn_open[Side::Left.index()], None);
+        assert_eq!(
+            s.pending_conn_open[Side::Right.index()],
+            Some(cairn_types::ConnectionId(11)),
+            "Right slot must not be disturbed by Left's ConnectionOpened"
+        );
+
+        // Right open completes next.
+        let fx_b = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionOpened {
+                conn: cairn_types::ConnectionId(11),
+                result: Ok(()),
+            }),
+        );
+        assert!(
+            matches!(&fx_b[..], [AppEffect::List { conn, pane: Side::Right, .. }] if *conn == cairn_types::ConnectionId(11)),
+            "Right open must navigate Right pane, got {fx_b:?}"
+        );
+        // Both slots are now cleared.
+        assert!(
+            s.pending_conn_open.iter().all(|s| s.is_none()),
+            "both slots must be cleared after both opens complete"
+        );
+        // Pane listing states: both should be Loading (navigate_to_conn resets to Loading).
+        assert!(matches!(s.pane(Side::Left).listing, Listing::Loading));
+        assert!(matches!(s.pane(Side::Right).listing, Listing::Loading));
     }
 }
 

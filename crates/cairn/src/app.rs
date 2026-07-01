@@ -192,8 +192,9 @@ async fn run_async() -> anyhow::Result<()> {
     // The capability broker mediates credential resolution for credential-bearing (remote)
     // connections. It starts *locked*, so credential-bearing profiles can't be opened yet — the
     // opener resolves cleanly to a locked-vault error rather than connecting. The `Arc<Broker>` is
-    // kept alive in the runtime-side `VaultContext` (below) so the vault-unlock overlay (M3-7) can
-    // `.unlock(vault)` it and re-open the connections deferred here.
+    // kept alive in the runtime-side `VaultContext` (below) so the vault-unlock overlay (M3-7)
+    // can `.unlock(vault)` it; after unlock the reducer flips NeedsVault entries to NeedsOpen and
+    // the trigger connection opens automatically via the P2 lazy-open path.
     let broker = Arc::new(Broker::locked());
     let opener = crate::connect::ConnectionOpener::new(broker.clone());
 
@@ -358,6 +359,8 @@ async fn event_loop(
     descriptor_map: HashMap<ConnectionId, ConnectionDescriptor>,
 ) -> anyhow::Result<()> {
     // `descriptor_map` is looked up by the OpenConnection effect runner to find what to open.
+    // P3: needs Arc<RwLock<_>> or a re-enumeration message to swap this map without restarting
+    // the loop (RFC-0011 §3: live config reload while panes are browsing connections).
     // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
     // matching effect can signal them. Each is cleared when its Done event arrives.
     // Per-transfer control, keyed by `TransferId`: the cancel token + pause sender form a *control
@@ -529,6 +532,13 @@ impl ConnectionOpenGuard {
 impl Drop for ConnectionOpenGuard {
     fn drop(&mut self) {
         if self.armed {
+            // Best-effort (`try_send`, no `.await` allowed in Drop). If the bounded event channel
+            // is momentarily full the synthetic error is silently dropped. The consequence is
+            // worse than `TransferDoneGuard`'s slot leak: the `ConnectionId` stays in
+            // `open_connection_in_flight` indefinitely (it is only removed on `ConnectionOpened`),
+            // making the connection permanently un-openable for the lifetime of the process. In
+            // practice the channel (256 deep) is ~never near full when a single open task panics,
+            // so the race is negligible — but the asymmetry with transfer is worth documenting.
             let _ = self.event_tx.try_send(AppEvent::ConnectionOpened {
                 conn: self.conn,
                 result: Err("connection open task interrupted".to_owned()),
@@ -822,6 +832,7 @@ fn dispatch(
                 // Descriptor missing — coordinator bug or race on re-enumeration; report error.
                 tracing::error!(conn = %conn.0, "OpenConnection: no descriptor found for id");
                 let event_tx = event_tx.clone();
+                // No ConnectionOpenGuard needed: the spawn only calls `.send()` and cannot panic.
                 tokio::spawn(async move {
                     let _ = event_tx
                         .send(AppEvent::ConnectionOpened {
