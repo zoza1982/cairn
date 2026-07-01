@@ -194,7 +194,7 @@ impl ExecOutput {
 ///   requested context. Credentials are handled entirely by `kube-rs` (exec plugins, OIDC
 ///   refresh, client certs); no credential material is ever embedded in error messages.
 ///
-/// - **In-cluster mode** (`use_incluster = true`, constructed via [`new_incluster`]): uses the
+/// - **In-cluster mode** (`use_incluster = true`, constructed via `new_incluster`): uses the
 ///   pod's mounted service-account token and the `KUBERNETES_SERVICE_HOST` / `_PORT` env vars
 ///   to build a `kube::Client` for the local cluster. Context is ignored (there is only one).
 ///   Use this when Cairn is running *inside* a Kubernetes pod.

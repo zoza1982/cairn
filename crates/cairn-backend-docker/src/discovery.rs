@@ -17,7 +17,7 @@ use crate::real::BollardDocker;
 #[derive(Debug, Clone)]
 pub struct DiscoveredSocket {
     /// Stable key string used for `hidden`/`pinned` config matching and for
-    /// [`ConnectionKey::Docker::socket_path`].
+    /// the `socket_path` of the `ConnectionKey::Docker` variant.
     ///
     /// - `"default"` — the platform-default socket (probed via [`BollardDocker::connect_local`]).
     ///   P4 note: `"default"` tracks whatever `connect_local()` resolves at probe time (which

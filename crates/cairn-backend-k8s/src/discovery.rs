@@ -46,7 +46,7 @@ pub struct KubeconfigStatus {
 /// Probe for Kubernetes connectivity sources without making any network calls.
 ///
 /// Blocking FS/YAML I/O is offloaded to `spawn_blocking` and time-bounded by
-/// [`KUBECONFIG_READ_TIMEOUT`]. If the kubeconfig read fails, times out, or the spawned task
+/// `KUBECONFIG_READ_TIMEOUT`. If the kubeconfig read fails, times out, or the spawned task
 /// panics, `has_kubeconfig` is set to `false`. Parse errors are logged at `warn` level — the
 /// kube error Display exposes only path/syntax information, never credential material.
 pub async fn probe_kubeconfig() -> KubeconfigStatus {
