@@ -28,6 +28,15 @@ ignore = [
     # challenge with the user's key — it never decrypts attacker-controlled ciphertext — so the
     # client-side exposure is minimal. Mitigation: prefer Ed25519 keys. Revisit when `rsa` ships a fix.
     "RUSTSEC-2023-0071",
+    # `quick-xml` 0.31 DoS advisories: quadratic run time checking a start tag for duplicate
+    # attribute names (0194) and unbounded namespace-declaration allocation in `NsReader` (0195).
+    # Pinned transitively by `azure_core` 0.21 (`quick-xml = "0.31"`), behind the non-default `azure`
+    # feature. Both are memory/CPU DoS on XML parsing; Cairn only parses responses from the user's
+    # own configured Azure Blob endpoint, not arbitrary untrusted XML, so exposure is minimal. The
+    # fix landed in quick-xml 0.37+, which azure_core 0.21 cannot accept (no 0.31.x backport exists).
+    # Revisit on a move to the 1.0 Azure SDK (tracked with the other azure_core 0.21 advisories above).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
