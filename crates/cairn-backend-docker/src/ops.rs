@@ -26,6 +26,8 @@ pub struct ImageInfo {
     pub id: String,
     /// Tags pointing at the image.
     pub tags: Vec<String>,
+    /// Number of layers composing the image (from `RootFS.Layers`); `0` when unknown.
+    pub layers: u32,
 }
 
 /// One entry inside a container's filesystem.
@@ -55,6 +57,34 @@ pub trait ContainerOps: Send + Sync + 'static {
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, VfsError>;
     /// List images.
     async fn list_images(&self) -> Result<Vec<ImageInfo>, VfsError>;
+    /// Resolve `tag` (a repo:tag reference or a raw image id) to the image's canonical id.
+    ///
+    /// This is the cheap sibling of [`Self::list_images`]: it must **not** pay the per-image
+    /// `inspect_image` cost `list_images` pays to populate `ImageInfo::layers` — `layers` is
+    /// display-only metadata for the `/images` directory listing, irrelevant to id resolution.
+    /// Callers on the image-browse hot path (routing every `list_dir`/`stat`/`read` inside an
+    /// image) call this, not `list_images`, so a single navigation session doesn't multiply into
+    /// O(local image count) daemon round-trips per step.
+    ///
+    /// # Errors
+    /// [`VfsError::NotFound`] if `tag` matches no known local image.
+    async fn resolve_image_id(&self, tag: &str) -> Result<String, VfsError>;
+    /// Resolve a canonical image id to a live ephemeral container id for browsing the image's
+    /// rootfs, creating one (`docker create`, **never started**) on first call for that image id
+    /// and reusing it for the rest of the browse session. Concurrent callers for the same image id
+    /// single-flight to one `create_container` call.
+    ///
+    /// The returned id is a normal container id — callers pass it straight into `list_dir`/
+    /// `stat`/`read` exactly as they would a running container's id, reusing that proven path.
+    ///
+    /// Callers must key their own caches (if any) by `image_id`, not by tag: a tag is just one of
+    /// possibly several names for the same image and must resolve to the same ephemeral container.
+    ///
+    /// # Errors
+    /// [`VfsError::NotFound`] if `image_id` does not refer to a known local image. Other daemon
+    /// errors map to [`VfsError::Backend`]/[`VfsError::Auth`]/[`VfsError::Forbidden`]. A failed
+    /// creation is not permanently cached — the next call for the same `image_id` retries.
+    async fn ephemeral_for_image(&self, image_id: &str) -> Result<String, VfsError>;
     /// List a directory inside a container's filesystem.
     async fn list_dir(&self, container: &str, path: &str) -> Result<Vec<RemoteEntry>, VfsError>;
     /// Stat a path inside a container.
@@ -148,6 +178,12 @@ pub(crate) mod mock {
     use futures::StreamExt as _;
     use std::collections::BTreeMap;
 
+    /// A realistic, untagged canonical image id (`sha256:<hex>`, the real bollard/Docker format) —
+    /// used to regression-test that such an id round-trips as a single `VfsPath` segment (it
+    /// contains a `:` — already proven safe by the `nginx:latest` tag tests — but no `/`).
+    pub(crate) const UNTAGGED_SHA256_IMAGE_ID: &str =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+
     /// In-memory Docker engine for tests: a few containers, each with a file tree, and images.
     pub(crate) struct MockDocker {
         containers: Vec<ContainerInfo>,
@@ -164,6 +200,32 @@ pub(crate) mod mock {
             web.insert("/etc/hosts".to_owned(), b"127.0.0.1 localhost\n".to_vec());
             web.insert("/app/main.rs".to_owned(), b"fn main() {}\n".to_vec());
             files.insert("web".to_owned(), web);
+
+            // Canned rootfs for the ephemeral image-browse container, keyed the same way the real
+            // adapter would key it: `"ephemeral-<image id>"`. Seeding it here (rather than lazily
+            // on first `ephemeral_for_image` call) keeps the mock's `files` map immutable behind
+            // `&self`, matching `list_dir`/`stat`/`read`'s existing non-mutating signatures.
+            let mut img_root: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            img_root.insert("/etc/os-release".to_owned(), b"NAME=mock\n".to_vec());
+            img_root.insert("/bin/sh".to_owned(), b"#!/bin/sh\n".to_vec());
+            files.insert("ephemeral-img1".to_owned(), img_root);
+
+            // A second image with a namespaced (`/`-containing) tag — the common case for
+            // anything not from the Docker Hub official library (`grafana/grafana`,
+            // `myorg/app:v1`, …). `VfsPath` segments cannot contain `/`, so this image must be
+            // *listed* (and is browsed) by its id, not its tag; exercises that fallback.
+            let mut img2_root: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            img2_root.insert("/README".to_owned(), b"mock namespaced image\n".to_vec());
+            files.insert("ephemeral-img2".to_owned(), img2_root);
+
+            // A third, untagged image identified only by its canonical `sha256:<hex>` id — the
+            // form a caller gets from `EntryExt::Image.id` or `list_images`'s raw id, and the
+            // shape browsing-by-id must handle since it's what `["images"]` falls back to for any
+            // untagged or namespaced-tag image.
+            let mut img3_root: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            img3_root.insert("/manifest.json".to_owned(), b"{}\n".to_vec());
+            files.insert(format!("ephemeral-{UNTAGGED_SHA256_IMAGE_ID}"), img3_root);
+
             Self {
                 containers: vec![ContainerInfo {
                     id: "abc123".to_owned(),
@@ -171,10 +233,25 @@ pub(crate) mod mock {
                     image: "nginx:latest".to_owned(),
                     state: ContainerState::Running,
                 }],
-                images: vec![ImageInfo {
-                    id: "img1".to_owned(),
-                    tags: vec!["nginx:latest".to_owned()],
-                }],
+                images: vec![
+                    ImageInfo {
+                        id: "img1".to_owned(),
+                        tags: vec!["nginx:latest".to_owned()],
+                        // Matches the two entries seeded into `ephemeral-img1` above — exercises
+                        // the routing test that checks `layers` is plumbed through, not hardcoded.
+                        layers: 2,
+                    },
+                    ImageInfo {
+                        id: "img2".to_owned(),
+                        tags: vec!["myorg/app:v1".to_owned()],
+                        layers: 1,
+                    },
+                    ImageInfo {
+                        id: UNTAGGED_SHA256_IMAGE_ID.to_owned(),
+                        tags: vec![],
+                        layers: 1,
+                    },
+                ],
                 files,
             }
         }
@@ -192,6 +269,23 @@ pub(crate) mod mock {
 
         async fn list_images(&self) -> Result<Vec<ImageInfo>, VfsError> {
             Ok(self.images.clone())
+        }
+
+        async fn resolve_image_id(&self, tag: &str) -> Result<String, VfsError> {
+            self.images
+                .iter()
+                .find(|img| img.tags.iter().any(|t| t == tag) || img.id == tag)
+                .map(|img| img.id.clone())
+                .ok_or_else(|| Self::nf(tag))
+        }
+
+        async fn ephemeral_for_image(&self, image_id: &str) -> Result<String, VfsError> {
+            if !self.images.iter().any(|img| img.id == image_id) {
+                return Err(Self::nf(image_id));
+            }
+            // Trivial in-memory "create": a stable, deterministic id backed by the
+            // `ephemeral-<image_id>` entry seeded into `files` at construction time.
+            Ok(format!("ephemeral-{image_id}"))
         }
 
         async fn list_dir(

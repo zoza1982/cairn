@@ -1,10 +1,14 @@
 //! Docker/OCI container backend.
 //!
-//! Presents containers and images as a navigable tree: `/containers/<name>/…` browses a container's
-//! filesystem and `/images/<tag>` lists images. The path-routing and entry-mapping logic lives in
-//! [`DockerVfs`] over a [`ContainerOps`] seam and is fully unit-tested against an in-memory mock; the
-//! real engine access is the `BollardDocker` adapter, compiled only under the `docker` feature
-//! (off by default — it pulls bollard's hyper stack). See `docs/LLD.md` §3.6, RFC-0004, ADR-0006.
+//! Presents containers and images as a navigable tree: `/containers/<name>/…` browses a running
+//! (or stopped) container's filesystem, and `/images/<tag>/…` browses an image's rootfs. Image
+//! browsing is implemented via an **ephemeral container**: `DockerVfs` lazily creates (but never
+//! starts) a container from the image on first access and reuses it for the browse session,
+//! delegating to the same `ContainerOps::list_dir`/`stat`/`read` path used for real containers —
+//! see ADR-0010. The path-routing and entry-mapping logic lives in [`DockerVfs`] over a
+//! [`ContainerOps`] seam and is fully unit-tested against an in-memory mock; the real engine access
+//! is the `BollardDocker` adapter, compiled only under the `docker` feature (off by default — it
+//! pulls bollard's hyper stack). See `docs/LLD.md` §3.6, RFC-0004, ADR-0010, ADR-0006.
 
 #[cfg(feature = "docker")]
 pub mod discovery;
@@ -27,6 +31,34 @@ use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use smol_str::SmolStr;
 use std::sync::Arc;
+
+/// Map [`RemoteEntry`]s (the `ContainerOps` filesystem-listing shape) to VFS [`Entry`]s. Shared
+/// by the `["containers", name, rest @ ..]` and `["images", tag, rest @ ..]` arms of
+/// [`DockerVfs::list_dir`] — both ultimately list a container's filesystem (a real one, or an
+/// ephemeral image-browse one) and need the identical name/kind/size mapping.
+fn map_remote_entries(entries: Vec<RemoteEntry>) -> Vec<Entry> {
+    entries
+        .into_iter()
+        .map(|r| {
+            let mut e = Entry::new(r.name, r.kind);
+            if r.kind == EntryKind::File {
+                e.size = r.size;
+            }
+            e
+        })
+        .collect()
+}
+
+/// Map a [`RemoteMeta`] (the `ContainerOps` stat shape) to a VFS [`Entry`] named `display_name`.
+/// Shared by the `["containers", name, rest @ ..]` and `["images", tag, rest @ ..]` arms of
+/// [`Vfs::stat`](cairn_vfs::Vfs::stat) — see [`map_remote_entries`] for the `list_dir` sibling.
+fn map_remote_meta(m: RemoteMeta, display_name: &str) -> Entry {
+    let mut e = Entry::new(display_name, m.kind);
+    if m.kind == EntryKind::File {
+        e.size = m.size;
+    }
+    e
+}
 
 /// A [`Vfs`] over a Docker engine. Read-only browse of containers, images, and container filesystems.
 pub struct DockerVfs<O: ContainerOps> {
@@ -71,44 +103,38 @@ impl<O: ContainerOps> DockerVfs<O> {
                 .await?
                 .into_iter()
                 .map(|img| {
-                    let name = img.tags.first().cloned().unwrap_or_else(|| img.id.clone());
+                    // A tag containing `/` (namespaced/registry images — `grafana/grafana`,
+                    // `myorg/app:v1`, `registry.example.com/team/app` — the common case for
+                    // anything outside the Docker Hub official library) cannot be used as a
+                    // single `VfsPath` segment: `VfsPath::join` rejects `/` in a segment, so
+                    // navigating into such an entry would silently fail. Fall back to the
+                    // (always segment-safe) image id in that case; the tag is still preserved in
+                    // `EntryExt::Image.tags` for display.
+                    let name = img
+                        .tags
+                        .first()
+                        .filter(|t| !t.contains('/'))
+                        .cloned()
+                        .unwrap_or_else(|| img.id.clone());
                     let mut e = Entry::new(name, EntryKind::Dir);
                     e.ext = EntryExt::Image {
                         id: SmolStr::new(img.id),
-                        layers: 0,
+                        layers: img.layers,
                         tags: img.tags.into_iter().map(SmolStr::new).collect(),
                     };
                     e
                 })
                 .collect(),
-            ["images", tag] => {
-                // The image must exist; its layer browse is deferred (RFC-0004).
-                let exists = self
-                    .ops
-                    .list_images()
-                    .await?
-                    .iter()
-                    .any(|img| img.tags.iter().any(|t| t == tag) || img.id == *tag);
-                if exists {
-                    Vec::new()
-                } else {
-                    return Err(VfsError::NotFound(dir));
-                }
+            ["images", tag, rest @ ..] => {
+                // Browse the image's rootfs via an ephemeral (never-started) container created
+                // from the image — see RFC-0004 and ADR-0010. `rest` is empty for the image root.
+                let cid = self.ephemeral_image_container(tag, &dir).await?;
+                let in_path = join_abs_path(rest);
+                map_remote_entries(self.ops.list_dir(&cid, &in_path).await?)
             }
             ["containers", name, rest @ ..] => {
                 let in_path = join_abs_path(rest);
-                self.ops
-                    .list_dir(name, &in_path)
-                    .await?
-                    .into_iter()
-                    .map(|r| {
-                        let mut e = Entry::new(r.name, r.kind);
-                        if r.kind == EntryKind::File {
-                            e.size = r.size;
-                        }
-                        e
-                    })
-                    .collect()
+                map_remote_entries(self.ops.list_dir(name, &in_path).await?)
             }
             _ => return Err(VfsError::NotFound(dir)),
         };
@@ -117,6 +143,41 @@ impl<O: ContainerOps> DockerVfs<O> {
             cursor: None,
             done: true,
         })
+    }
+
+    /// Resolve `tag` (a repo:tag reference or a raw image id) to the id of a live ephemeral
+    /// container browsing that image's rootfs (see [`ContainerOps::ephemeral_for_image`] and
+    /// ADR-0010). `err_path` is used to build the [`VfsError::NotFound`] when `tag` matches no
+    /// known image.
+    ///
+    /// The cache key `ephemeral_for_image` uses internally is the image's **canonical id**, not
+    /// the tag — so `nginx:latest` and its digest form resolve to the same ephemeral container.
+    ///
+    /// Uses [`ContainerOps::resolve_image_id`] (not `list_images`) deliberately: this runs on
+    /// every `list_dir`/`stat`/`read` inside an image, so it must stay a single cheap lookup —
+    /// `list_images` pays a per-image `inspect_image` cost (for `layers`) that would otherwise be
+    /// repeated on every navigation step, multiplying into O(local image count) daemon
+    /// round-trips per step.
+    async fn ephemeral_image_container(
+        &self,
+        tag: &str,
+        err_path: &VfsPath,
+    ) -> Result<String, VfsError> {
+        let image_id = match self.ops.resolve_image_id(tag).await {
+            Ok(id) => id,
+            // Normalize the path context to the caller's path (e.g. `/images/nope/etc`) rather
+            // than whatever path the ops layer built around the bare `tag` string.
+            Err(VfsError::NotFound(_)) => return Err(VfsError::NotFound(err_path.clone())),
+            Err(e) => return Err(e),
+        };
+        match self.ops.ephemeral_for_image(&image_id).await {
+            Ok(cid) => Ok(cid),
+            // Same normalization as above: a TOCTOU 404 here (the image was removed between our
+            // `resolve_image_id` and `ephemeral_for_image`'s `docker create` call) must surface
+            // the user's original `/images/<tag>/…` path, not the bare canonical image id.
+            Err(VfsError::NotFound(_)) => Err(VfsError::NotFound(err_path.clone())),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -154,17 +215,20 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
                 Ok(Entry::new(path.file_name().unwrap_or(""), EntryKind::Dir))
             }
             ["images", tag] => {
-                let exists = self
-                    .ops
-                    .list_images()
-                    .await?
-                    .iter()
-                    .any(|img| img.tags.iter().any(|t| t == tag) || img.id == *tag);
-                if exists {
-                    Ok(Entry::new(*tag, EntryKind::Dir))
-                } else {
-                    Err(VfsError::NotFound(path.clone()))
+                // The image root itself: resolve via the cheap `resolve_image_id` lookup (no
+                // need to spin up an ephemeral container, or pay `list_images`'s per-image
+                // `inspect_image` cost, just to prove the directory exists).
+                match self.ops.resolve_image_id(tag).await {
+                    Ok(_) => Ok(Entry::new(*tag, EntryKind::Dir)),
+                    Err(VfsError::NotFound(_)) => Err(VfsError::NotFound(path.clone())),
+                    Err(e) => Err(e),
                 }
+            }
+            ["images", tag, rest @ ..] => {
+                // A path inside the image's rootfs: stat via the ephemeral browse container.
+                let cid = self.ephemeral_image_container(tag, path).await?;
+                let m = self.ops.stat(&cid, &join_abs_path(rest)).await?;
+                Ok(map_remote_meta(m, path.file_name().unwrap_or("")))
             }
             ["containers", name] => {
                 let exists = self
@@ -181,11 +245,7 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
             }
             ["containers", name, rest @ ..] => {
                 let m = self.ops.stat(name, &join_abs_path(rest)).await?;
-                let mut e = Entry::new(path.file_name().unwrap_or(""), m.kind);
-                if m.kind == EntryKind::File {
-                    e.size = m.size;
-                }
-                Ok(e)
+                Ok(map_remote_meta(m, path.file_name().unwrap_or("")))
             }
             _ => Err(VfsError::NotFound(path.clone())),
         }
@@ -200,6 +260,10 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
         let data = match segs.as_slice() {
             ["containers", name, rest @ ..] if !rest.is_empty() => {
                 self.ops.read(name, &join_abs_path(rest)).await?
+            }
+            ["images", tag, rest @ ..] if !rest.is_empty() => {
+                let cid = self.ephemeral_image_container(tag, path).await?;
+                self.ops.read(&cid, &join_abs_path(rest)).await?
             }
             _ => return Err(VfsError::Unsupported(Caps::READ)),
         };
@@ -329,7 +393,7 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ops::mock::MockDocker;
+    use ops::mock::{MockDocker, UNTAGGED_SHA256_IMAGE_ID};
     use tokio::io::AsyncReadExt;
 
     fn p(s: &str) -> VfsPath {
@@ -356,7 +420,92 @@ mod tests {
     #[tokio::test]
     async fn lists_containers_and_images() {
         assert_eq!(names(&backend(), "/containers").await, vec!["web"]);
-        assert_eq!(names(&backend(), "/images").await, vec!["nginx:latest"]);
+        // "img2" is the namespaced-tag image ("myorg/app:v1") listed by id — see
+        // `namespaced_image_tag_is_listed_and_browsed_by_id` below. The `sha256:…` entry is the
+        // untagged image — see `untagged_sha256_image_id_round_trips_as_a_path_segment` below.
+        assert_eq!(
+            names(&backend(), "/images").await,
+            vec!["img2", "nginx:latest", UNTAGGED_SHA256_IMAGE_ID]
+        );
+    }
+
+    /// A canonical `sha256:<hex>` image id (untagged image, or any image referenced by raw id)
+    /// must round-trip as a single navigable `VfsPath` segment: listed under `/images` by that id
+    /// and fully browsable beneath it. `:` is already proven safe by the tag tests; this
+    /// specifically guards the `sha256:` form since ADR-0010 discusses browsing images by
+    /// canonical id.
+    #[tokio::test]
+    async fn untagged_sha256_image_id_round_trips_as_a_path_segment() {
+        let vfs = backend();
+        let image_path = format!("/images/{UNTAGGED_SHA256_IMAGE_ID}");
+        assert_eq!(names(&vfs, &image_path).await, vec!["manifest.json"]);
+        assert!(vfs.stat(&p(&image_path)).await.unwrap().is_dir());
+        let mut rh = vfs
+            .open_read(&p(&format!("{image_path}/manifest.json")), None)
+            .await
+            .expect("open_read on the untagged image's rootfs file");
+        let mut out = String::new();
+        rh.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "{}\n");
+    }
+
+    /// A tag containing `/` (namespaced/registry images) cannot be a single `VfsPath` segment, so
+    /// `/images` must list — and route browsing for — that image by its id instead, never by the
+    /// slash-bearing tag. The tag itself must still be preserved in `EntryExt::Image.tags`.
+    #[tokio::test]
+    async fn namespaced_image_tag_is_listed_and_browsed_by_id() {
+        let vfs = backend();
+        let mut s = vfs.list(&p("/images"), ListOpts::default());
+        let page = s.next().await.unwrap().unwrap();
+        let img = page
+            .entries
+            .iter()
+            .find(|e| e.name == "img2")
+            .expect("the namespaced-tag image must be listed by its id (\"img2\")");
+        assert!(
+            !page.entries.iter().any(|e| e.name.contains('/')),
+            "no /images entry name may contain '/' (an invalid VfsPath segment): {:?}",
+            page.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        match &img.ext {
+            EntryExt::Image { tags, .. } => {
+                assert!(
+                    tags.iter().any(|t| t == "myorg/app:v1"),
+                    "the human tag must still be preserved in EntryExt::Image.tags: {tags:?}"
+                );
+            }
+            other => panic!("expected EntryExt::Image, got {other:?}"),
+        }
+
+        // Browsing by id must work exactly like any other image.
+        assert_eq!(names(&vfs, "/images/img2").await, vec!["README"]);
+        let mut rh = vfs
+            .open_read(&p("/images/img2/README"), None)
+            .await
+            .expect("open_read on the namespaced image's rootfs file");
+        let mut out = String::new();
+        rh.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "mock namespaced image\n");
+    }
+
+    /// `EntryExt::Image.layers` must come from the backend (`ImageInfo::layers`), not the old
+    /// hardcoded `0` — regression guard for the layer-count plumbing.
+    #[tokio::test]
+    async fn image_listing_reports_real_layer_count() {
+        let vfs = backend();
+        let mut s = vfs.list(&p("/images"), ListOpts::default());
+        let page = s.next().await.unwrap().unwrap();
+        let img = page
+            .entries
+            .iter()
+            .find(|e| e.name == "nginx:latest")
+            .expect("nginx:latest must be listed");
+        match &img.ext {
+            EntryExt::Image { layers, .. } => {
+                assert_eq!(*layers, 2, "layers must not be hardcoded 0")
+            }
+            other => panic!("expected EntryExt::Image, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -367,6 +516,91 @@ mod tests {
             names(&vfs, "/containers/web/etc").await,
             vec!["hostname", "hosts"]
         );
+    }
+
+    /// Entering `/images/<tag>` must list the image's rootfs (via the ephemeral container), not
+    /// silently return an empty page as the old RFC-0004 deferral did.
+    #[tokio::test]
+    async fn navigates_image_rootfs_by_tag() {
+        let vfs = backend();
+        assert_eq!(
+            names(&vfs, "/images/nginx:latest").await,
+            vec!["bin", "etc"]
+        );
+        assert_eq!(
+            names(&vfs, "/images/nginx:latest/etc").await,
+            vec!["os-release"]
+        );
+        assert_eq!(names(&vfs, "/images/nginx:latest/bin").await, vec!["sh"]);
+    }
+
+    /// Browsing by the raw image id must resolve to the same ephemeral container as browsing by
+    /// tag — the cache key is the canonical image id, not the tag.
+    #[tokio::test]
+    async fn navigates_image_rootfs_by_id_matches_tag() {
+        let vfs = backend();
+        assert_eq!(
+            names(&vfs, "/images/img1").await,
+            names(&vfs, "/images/nginx:latest").await
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_an_image_file() {
+        let vfs = backend();
+        let mut rh = vfs
+            .open_read(&p("/images/nginx:latest/etc/os-release"), None)
+            .await
+            .unwrap();
+        let mut out = String::new();
+        rh.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "NAME=mock\n");
+    }
+
+    #[tokio::test]
+    async fn stat_distinguishes_image_dirs_and_files() {
+        let vfs = backend();
+        assert!(vfs.stat(&p("/images/nginx:latest")).await.unwrap().is_dir());
+        assert!(vfs
+            .stat(&p("/images/nginx:latest/etc"))
+            .await
+            .unwrap()
+            .is_dir());
+        assert_eq!(
+            vfs.stat(&p("/images/nginx:latest/etc/os-release"))
+                .await
+                .unwrap()
+                .size,
+            Some(10)
+        );
+    }
+
+    /// An unknown image tag/id must be `NotFound` at every depth, not a silent empty listing.
+    #[tokio::test]
+    async fn unknown_image_browsing_is_not_found() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.list(&p("/images/nope"), ListOpts::default())
+                .next()
+                .await
+                .unwrap(),
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.list(&p("/images/nope/etc"), ListOpts::default())
+                .next()
+                .await
+                .unwrap(),
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.stat(&p("/images/nope/etc")).await,
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.open_read(&p("/images/nope/etc/os-release"), None).await,
+            Err(VfsError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

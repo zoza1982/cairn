@@ -37,6 +37,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Docker image content browsing** (M6-2 follow-up, ADR-0010): entering `/images/<tag>` in the
+  Docker backend now browses the image's actual rootfs instead of silently showing an empty
+  listing. `DockerVfs` resolves a tag or raw image id to an ephemeral, **never-started** container
+  (`docker create` only) on first access, keyed by the image's canonical id so tag and raw-id
+  aliases of the same image share one container (digest references, e.g. `nginx@sha256:…`, are not
+  yet resolved to the same container — tracked follow-up), and reuses the existing
+  container-filesystem archive/tar `list_dir`/`stat`/`read` path against it unchanged. Two cleanup
+  tiers keep the daemon clean: an idle-TTL reaper (5 min, with a re-check-under-lock immediately
+  before evicting so a browse that resumes mid-reap keeps its container — see
+  `evict_if_still_idle`) and a label+age crash-safety sweep (containers labeled
+  `cairn.role=image-browse-ephemeral` older than 30 min and not tracked live by the current
+  process are force-removed on real connection-open and every 10 min thereafter). A graceful-
+  shutdown hook, and a fix for cross-instance sweeps reaping another instance's >30-min browse
+  session, are deferred (see ADR-0010's Negatives). An image with neither `CMD` nor `ENTRYPOINT`
+  configured (e.g. some `FROM scratch` images) still can't be browsed this way, but now fails with
+  a clear `VfsError::Backend { code: "image_no_command", .. }` instead of an opaque daemon error.
+  `EntryExt::Image.layers` is now populated from `inspect_image`'s `RootFS.Layers` count instead
+  of a hardcoded `0`. `ContainerOps` gains `ephemeral_for_image` and `resolve_image_id` (the
+  latter a cheap tag/id-only lookup used on every image-browse navigation step, so the
+  `list_images`-only-needed-for-`layers` cost isn't paid per step). Extensive hermetic test
+  coverage: routing (list/stat/read, tag-and-id resolve to the same container, a `/`-containing
+  repo tag — e.g. `myorg/app:v1` — and an untagged `sha256:…` id are both listed/browsed by image
+  id, unknown image → `NotFound`), reaper race protection (`evict_if_still_idle`'s snapshot vs.
+  resumed-browse and slot-reuse cases), the tier-2 sweep's live-vs-orphan filtering, the
+  no-command error mapping, and the `OnceCell` retry-after-failed-create contract — plus one
+  `CAIRN_IT_DOCKER`-gated dind integration test.
+
 - **RFC-0011 Phase P5 — reference-first credential provisioning** (branch
   `feat/conn-p5-credentials`): users can now configure SSH/S3/GCS/Azure credentials through the
   connection form. Key details:
