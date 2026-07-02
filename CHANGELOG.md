@@ -37,6 +37,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Docker image content browsing** (M6-2 follow-up, ADR-0010): entering `/images/<tag>` in the
+  Docker backend now browses the image's actual rootfs instead of silently showing an empty
+  listing. `DockerVfs` resolves a tag or raw image id to an ephemeral, **never-started** container
+  (`docker create` only) on first access, keyed by the image's canonical id so tag/digest aliases
+  of the same image share one container, and reuses the existing container-filesystem archive/tar
+  `list_dir`/`stat`/`read` path against it unchanged. Two cleanup tiers keep the daemon clean: an
+  idle-TTL reaper (5 min) and a label+age crash-safety sweep (containers labeled
+  `cairn.role=image-browse-ephemeral` older than 30 min are force-removed on startup and every
+  10 min) — a graceful-shutdown hook is deferred pending a trait-shape review (see ADR-0010).
+  `EntryExt::Image.layers` is now populated from `inspect_image`'s `RootFS.Layers` count instead
+  of a hardcoded `0`. `ContainerOps` gains `ephemeral_for_image` and `resolve_image_id` (the
+  latter a cheap tag/id-only lookup used on every image-browse navigation step, so the
+  `list_images`-only-needed-for-`layers` cost isn't paid per step); 7 new hermetic routing tests
+  in the default build (list/stat/read, tag-and-id resolve to the same container, a
+  `/`-containing repo tag — e.g. `myorg/app:v1` — is listed and browsed by image id since
+  `VfsPath` can't hold a `/` in one segment, unknown image → `NotFound`) plus 3 pure-function unit
+  tests for the idle/age reaper thresholds and one `CAIRN_IT_DOCKER`-gated dind integration test
+  under the `docker` feature. The tier-2 crash-safety sweep skips containers this process's own
+  registry is still tracking as live, so it only reaps orphans (a prior crashed run, or another
+  exited instance) rather than a long-running active browse session in the current process.
+
 - **RFC-0011 Phase P5 — reference-first credential provisioning** (branch
   `feat/conn-p5-credentials`): users can now configure SSH/S3/GCS/Azure credentials through the
   connection form. Key details:

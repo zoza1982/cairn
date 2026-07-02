@@ -13,7 +13,8 @@ the top, each container's filesystem browsable beneath it.
 ## Design
 
 - **Tree model.** `/` → `containers/` and `images/`. `/containers/<name>/…` browses that container's
-  filesystem; `/images/<tag>` represents an image. Entries carry `EntryExt::Container`/`Image`.
+  filesystem; `/images/<tag>/…` browses that image's rootfs (via an ephemeral, never-started
+  container — see ADR-0010). Entries carry `EntryExt::Container`/`Image`.
 - **`ContainerOps` seam** — `list_containers`/`list_images`/`list_dir`/`stat`/`read`. The path-routing
   and entry-mapping logic (`DockerVfs`) depends only on this seam and is **fully unit-tested against
   an in-memory mock** (the routing — root vs `/containers` vs `/containers/<c>/<path>` — is where the
@@ -27,9 +28,15 @@ the top, each container's filesystem browsable beneath it.
 
 ## Drawbacks / deferred
 
-- In-container filesystem ops in the real adapter (tar/exec), `exec`/`logs` actions, image-layer
-  browsing, container writes, and Podman/containerd runtimes are deferred.
+- Container writes and Podman/containerd runtimes are deferred.
 - Container `state` enum mapping in the adapter is a refinement (currently `Unknown`).
+- **Image content browsing landed** (ADR-0010): `/images/<tag>/…` browses the image's merged
+  rootfs via an ephemeral (`docker create`, never started) container reusing the container-fs
+  archive/tar path, with an idle-TTL reaper + label/age crash-safety sweep. A graceful-shutdown
+  hook to remove an ephemeral container the instant its pane closes (rather than relying on the
+  time-based reapers) is deferred pending a `software-architect` review of the trait shape. A
+  true **per-layer** OCI view (`@layers/<n>/…`, inspecting individual layer diffs rather than the
+  merged rootfs) is a separate, later phase.
 
 ## Rationale & alternatives
 

@@ -12,6 +12,13 @@
 //! - **`docker_container_log_streaming`**: Pulls `busybox:latest`, creates a container that emits
 //!   a known marker line on stdout, drives `DockerVfs::invoke("logs")` (non-follow, bounded tail),
 //!   and asserts the collected stream contains the marker. Force-removes the container.
+//! - **`docker_image_ephemeral_browse_round_trip`**: Pulls `busybox:latest`, browses
+//!   `/images/busybox:latest` through the `Vfs` surface (no container created or started by the
+//!   test itself — `DockerVfs` creates the ephemeral browse container lazily), asserts real
+//!   rootfs entries, then force-removes the ephemeral container the backend created and asserts
+//!   it's gone — standing in for ADR-0010's idle-TTL/crash-sweep reapers, whose multi-minute
+//!   timers make exercising them directly infeasible in CI (this proves the container is a
+//!   normal, cleanly-removable one, not that the automated reapers themselves ran).
 #![cfg(feature = "docker")]
 
 use bollard::models::ContainerCreateBody;
@@ -709,4 +716,157 @@ async fn docker_container_exec_non_zero_exit() {
     )
     .await
     .expect("force-remove non-zero-exit test container");
+}
+
+/// Live image-browse round-trip: browses `/images/<tag>` through the `Vfs` surface, which lazily
+/// creates an ephemeral (never-started) container from the image — see ADR-0010. Asserts the
+/// listing/stat/read return real rootfs content, that the daemon-side container the backend
+/// created is never started, and that force-removing it (standing in for the idle-TTL/crash-sweep
+/// reapers, which run on multi-minute timers unsuitable for a CI test) actually cleans it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docker_image_ephemeral_browse_round_trip() {
+    if std::env::var("CAIRN_IT_DOCKER").is_err() {
+        eprintln!("CAIRN_IT_DOCKER unset — skipping live Docker image-browse integration test");
+        return;
+    }
+
+    let raw =
+        Docker::connect_with_local_defaults().expect("connect to Docker daemon for scaffolding");
+
+    // Pull the image (no-op when the dind sidecar has already cached it).
+    {
+        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
+            .from_image(TEST_IMAGE)
+            .build();
+        let mut pull = raw.create_image(Some(pull_opts), None, None);
+        while let Some(item) = pull.next().await {
+            item.expect("image pull progress should not error");
+        }
+    }
+
+    // Build the Vfs under test. `DockerVfs` itself never creates the ephemeral container until
+    // the image is actually browsed below.
+    let ops = BollardDocker::connect_local().expect("BollardDocker::connect_local");
+    let vfs = DockerVfs::new(ConnectionId(102), ops);
+
+    // /images should list our test image.
+    {
+        let mut stream = vfs.list(&p("/images"), ListOpts::default());
+        let page = stream
+            .next()
+            .await
+            .expect("stream has one page")
+            .expect("list /images");
+        let names: Vec<_> = page.entries.iter().map(|e| e.name.to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == TEST_IMAGE),
+            "expected {TEST_IMAGE} in /images listing, got {names:?}"
+        );
+    }
+
+    // Browsing the image root must list real rootfs entries (busybox always has /bin, /etc, …),
+    // not the old RFC-0004 silent-empty-list deferral.
+    let image_path = format!("/images/{TEST_IMAGE}");
+    {
+        let mut stream = vfs.list(&p(&image_path), ListOpts::default());
+        let page = stream
+            .next()
+            .await
+            .expect("stream has one page")
+            .expect("list image root");
+        assert!(!page.entries.is_empty(), "image root must be non-empty");
+        let has_dir = page.entries.iter().any(|e| e.is_dir());
+        assert!(has_dir, "image root should contain at least one directory");
+    }
+
+    // /bin must stat as a directory and list executables, exactly like the container-fs path.
+    {
+        let bin_path = format!("{image_path}/bin");
+        let meta = vfs.stat(&p(&bin_path)).await.expect("stat image /bin");
+        assert!(meta.is_dir(), "image /bin should be a directory");
+
+        let mut stream = vfs.list(&p(&bin_path), ListOpts::default());
+        let page = stream
+            .next()
+            .await
+            .expect("stream has one page")
+            .expect("list image /bin");
+        assert!(!page.entries.is_empty(), "image /bin must contain files");
+    }
+
+    // /bin/busybox must read back as a real ELF binary.
+    {
+        let busybox_path = format!("{image_path}/bin/busybox");
+        let mut rh = vfs
+            .open_read(&p(&busybox_path), None)
+            .await
+            .expect("open_read image /bin/busybox");
+        let mut data = Vec::new();
+        rh.read_to_end(&mut data).await.expect("read_to_end");
+        assert!(
+            data.starts_with(b"\x7fELF"),
+            "image /bin/busybox should be an ELF binary (got first 4 bytes: {:?})",
+            &data[..data.len().min(4)]
+        );
+    }
+
+    // A path that does not exist inside the image must be NotFound.
+    {
+        let missing = format!("{image_path}/no-such-path-cairn-it");
+        assert!(
+            matches!(vfs.stat(&p(&missing)).await, Err(VfsError::NotFound(_))),
+            "a missing path inside the image must be NotFound"
+        );
+    }
+
+    // Find the ephemeral container the backend created, via the ADR-0010 label. There must be
+    // exactly the one container, and it must never have been started.
+    let mut filters = std::collections::HashMap::new();
+    filters.insert(
+        "label".to_owned(),
+        vec!["cairn.role=image-browse-ephemeral".to_owned()],
+    );
+    let list = raw
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            filters: Some(filters),
+            ..Default::default()
+        }))
+        .await
+        .expect("list labeled ephemeral containers");
+    assert_eq!(
+        list.len(),
+        1,
+        "expected exactly one ephemeral image-browse container, found {list:?}"
+    );
+    let ephemeral_id = list[0]
+        .id
+        .clone()
+        .expect("ephemeral container must have an id");
+    assert_eq!(
+        list[0].state,
+        Some(bollard::models::ContainerSummaryStateEnum::CREATED),
+        "the ephemeral browse container must never be started"
+    );
+
+    // Explicit cleanup, standing in for the idle-TTL / crash-sweep reapers (ADR-0010): those run
+    // on multi-minute timers, too slow for a CI test. Removing it here — and then confirming the
+    // daemon no longer knows about it — proves the container is a normal, force-removable Docker
+    // container with no special teardown requirements.
+    raw.remove_container(
+        &ephemeral_id,
+        Some(
+            bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                .force(true)
+                .build(),
+        ),
+    )
+    .await
+    .expect("force-remove ephemeral image-browse container");
+
+    let inspect_after_removal = raw.inspect_container(&ephemeral_id, None).await;
+    assert!(
+        inspect_after_removal.is_err(),
+        "ephemeral container must be gone after force-remove"
+    );
 }
