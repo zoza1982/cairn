@@ -266,6 +266,11 @@ impl ConnectionOpener {
     #[cfg(feature = "docker")]
     async fn open_docker(&self, conn: ConnectionId) -> Result<Arc<dyn Vfs>, OpenError> {
         let docker = cairn_backend_docker::BollardDocker::connect_local()?;
+        // See the matching call in `cairn::app::open_docker_socket`: start the ADR-0010
+        // ephemeral-container reapers at real connection-open time, not deferred to first image
+        // browse, so the crash-safety sweep begins reaping orphans as soon as this daemon is
+        // talked to.
+        docker.ensure_background_tasks().await;
         Ok(Arc::new(cairn_backend_docker::DockerVfs::new(conn, docker)))
     }
 

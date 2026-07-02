@@ -178,6 +178,12 @@ pub(crate) mod mock {
     use futures::StreamExt as _;
     use std::collections::BTreeMap;
 
+    /// A realistic, untagged canonical image id (`sha256:<hex>`, the real bollard/Docker format) —
+    /// used to regression-test that such an id round-trips as a single `VfsPath` segment (it
+    /// contains a `:` — already proven safe by the `nginx:latest` tag tests — but no `/`).
+    pub(crate) const UNTAGGED_SHA256_IMAGE_ID: &str =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+
     /// In-memory Docker engine for tests: a few containers, each with a file tree, and images.
     pub(crate) struct MockDocker {
         containers: Vec<ContainerInfo>,
@@ -212,6 +218,14 @@ pub(crate) mod mock {
             img2_root.insert("/README".to_owned(), b"mock namespaced image\n".to_vec());
             files.insert("ephemeral-img2".to_owned(), img2_root);
 
+            // A third, untagged image identified only by its canonical `sha256:<hex>` id — the
+            // form a caller gets from `EntryExt::Image.id` or `list_images`'s raw id, and the
+            // shape browsing-by-id must handle since it's what `["images"]` falls back to for any
+            // untagged or namespaced-tag image.
+            let mut img3_root: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            img3_root.insert("/manifest.json".to_owned(), b"{}\n".to_vec());
+            files.insert(format!("ephemeral-{UNTAGGED_SHA256_IMAGE_ID}"), img3_root);
+
             Self {
                 containers: vec![ContainerInfo {
                     id: "abc123".to_owned(),
@@ -230,6 +244,11 @@ pub(crate) mod mock {
                     ImageInfo {
                         id: "img2".to_owned(),
                         tags: vec!["myorg/app:v1".to_owned()],
+                        layers: 1,
+                    },
+                    ImageInfo {
+                        id: UNTAGGED_SHA256_IMAGE_ID.to_owned(),
+                        tags: vec![],
                         layers: 1,
                     },
                 ],

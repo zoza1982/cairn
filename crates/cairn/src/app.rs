@@ -1763,6 +1763,12 @@ async fn open_docker_socket(
         None => cairn_backend_docker::BollardDocker::connect_local(),
     }
     .map_err(|e| format!("docker: {e}"))?;
+    // Start the image-browse ephemeral-container reapers (ADR-0010) now, at real connection-open
+    // time, rather than deferring to the first image browse — so the crash-safety sweep begins
+    // reaping any orphaned containers from a prior crashed run as soon as this daemon is talked
+    // to, not only if/when the user happens to enter `/images/<tag>`. Idempotent/cheap: harmless
+    // to call even if the user never browses an image on this connection.
+    ops.ensure_background_tasks().await;
     let vfs = cairn_backend_docker::DockerVfs::new(conn, ops);
     registry.insert(conn, Arc::new(vfs)).await;
     Ok(())

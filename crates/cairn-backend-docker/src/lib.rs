@@ -170,7 +170,14 @@ impl<O: ContainerOps> DockerVfs<O> {
             Err(VfsError::NotFound(_)) => return Err(VfsError::NotFound(err_path.clone())),
             Err(e) => return Err(e),
         };
-        self.ops.ephemeral_for_image(&image_id).await
+        match self.ops.ephemeral_for_image(&image_id).await {
+            Ok(cid) => Ok(cid),
+            // Same normalization as above: a TOCTOU 404 here (the image was removed between our
+            // `resolve_image_id` and `ephemeral_for_image`'s `docker create` call) must surface
+            // the user's original `/images/<tag>/…` path, not the bare canonical image id.
+            Err(VfsError::NotFound(_)) => Err(VfsError::NotFound(err_path.clone())),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -386,7 +393,7 @@ impl<O: ContainerOps> Vfs for DockerVfs<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ops::mock::MockDocker;
+    use ops::mock::{MockDocker, UNTAGGED_SHA256_IMAGE_ID};
     use tokio::io::AsyncReadExt;
 
     fn p(s: &str) -> VfsPath {
@@ -414,11 +421,32 @@ mod tests {
     async fn lists_containers_and_images() {
         assert_eq!(names(&backend(), "/containers").await, vec!["web"]);
         // "img2" is the namespaced-tag image ("myorg/app:v1") listed by id — see
-        // `namespaced_image_tag_is_listed_and_browsed_by_id` below.
+        // `namespaced_image_tag_is_listed_and_browsed_by_id` below. The `sha256:…` entry is the
+        // untagged image — see `untagged_sha256_image_id_round_trips_as_a_path_segment` below.
         assert_eq!(
             names(&backend(), "/images").await,
-            vec!["img2", "nginx:latest"]
+            vec!["img2", "nginx:latest", UNTAGGED_SHA256_IMAGE_ID]
         );
+    }
+
+    /// A canonical `sha256:<hex>` image id (untagged image, or any image referenced by raw id)
+    /// must round-trip as a single navigable `VfsPath` segment: listed under `/images` by that id
+    /// and fully browsable beneath it. `:` is already proven safe by the tag tests; this
+    /// specifically guards the `sha256:` form since ADR-0010 discusses browsing images by
+    /// canonical id.
+    #[tokio::test]
+    async fn untagged_sha256_image_id_round_trips_as_a_path_segment() {
+        let vfs = backend();
+        let image_path = format!("/images/{UNTAGGED_SHA256_IMAGE_ID}");
+        assert_eq!(names(&vfs, &image_path).await, vec!["manifest.json"]);
+        assert!(vfs.stat(&p(&image_path)).await.unwrap().is_dir());
+        let mut rh = vfs
+            .open_read(&p(&format!("{image_path}/manifest.json")), None)
+            .await
+            .expect("open_read on the untagged image's rootfs file");
+        let mut out = String::new();
+        rh.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "{}\n");
     }
 
     /// A tag containing `/` (namespaced/registry images) cannot be a single `VfsPath` segment, so

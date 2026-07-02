@@ -67,10 +67,16 @@ pub struct BollardDocker {
     docker: Docker,
     /// Ephemeral image-browse container bookkeeping (ADR-0010).
     ephemeral: Arc<EphemeralRegistry>,
-    /// Guards one-time spawn of the background reaper/sweep tasks (lazily started on first
-    /// `ephemeral_for_image` call, not at connect time — `discovery::probe_one` constructs and
-    /// immediately drops a `BollardDocker` per socket probe, and eagerly spawning here would
-    /// spin up and abort two tasks per probe for no benefit).
+    /// Guards one-time spawn of the background reaper/sweep tasks. **Not** started from
+    /// `connect_local`/`connect_with_socket` themselves — `discovery::probe_one` constructs and
+    /// immediately drops a `BollardDocker` per socket probe, and eagerly spawning here would spin
+    /// up and abort two tasks per probe for no benefit. Instead, two call sites trigger the
+    /// (idempotent, one-shot) start: [`Self::ensure_background_tasks`] called explicitly by real
+    /// connection-open call sites (`cairn::app::open_docker_socket`,
+    /// `cairn::connect::ConnectionOpener::open_docker`) right after construction, and the same
+    /// method called again defensively from [`Self::ephemeral_for_image_impl`] so a caller that
+    /// constructs a `BollardDocker` and goes straight to browsing (as the dind integration tests
+    /// do) still gets the reapers even without an explicit start call.
     reaper_started: OnceCell<()>,
     /// Handles for the spawned background tasks, aborted on `Drop` so a dropped `BollardDocker`
     /// never leaves orphaned tasks polling the daemon.
@@ -237,17 +243,27 @@ impl BollardDocker {
                 body,
             )
             .await
-            .map_err(|e| map_status_error(e, image_id))?;
+            .map_err(|e| map_create_container_error(e, image_id))?;
         Ok(Arc::new(EphemeralEntry {
             cid: resp.id,
             last_access: Mutex::new(Instant::now()),
         }))
     }
 
-    /// Lazily spawn the two background cleanup tasks (idle-TTL reaper + crash-safety sweep) at
-    /// most once per `BollardDocker`. Deferred to first `ephemeral_for_image` call rather than
-    /// construction time — see the `reaper_started` field doc for why.
-    async fn ensure_background_tasks(&self) {
+    /// Start the two background cleanup tasks (idle-TTL reaper + crash-safety sweep) — see
+    /// ADR-0010. Idempotent and safe to call multiple times or from multiple call sites: only the
+    /// first call actually spawns anything (guarded by the `reaper_started` `OnceCell`).
+    ///
+    /// **Callers, not `connect_local`/`connect_with_socket`, decide when this runs** — see the
+    /// `reaper_started` field doc for why eager spawn-at-construction would be wasteful for the
+    /// discovery probe path. Real connection-open call sites should call this explicitly right
+    /// after constructing a `BollardDocker` they intend to keep, so the crash-safety sweep (tier
+    /// 2) starts reaping orphans from the moment a Docker connection is actually opened — not
+    /// only once an image happens to be browsed on it, which was the behavior before this method
+    /// was made public. It is also called defensively from `ephemeral_for_image_impl`, so a
+    /// caller that skips the explicit start (e.g. a test constructing `BollardDocker` directly)
+    /// still gets the reapers as soon as it browses an image.
+    pub async fn ensure_background_tasks(&self) {
         self.reaper_started
             .get_or_init(|| async {
                 let idle = tokio::spawn(idle_reaper_loop(
@@ -271,29 +287,76 @@ impl BollardDocker {
 /// that has been idle (no `list_dir`/`stat`/`read` hit) for longer than [`IDLE_REAP_TTL`].
 async fn idle_reaper_loop(docker: Docker, registry: Arc<EphemeralRegistry>) {
     let mut ticker = tokio::time::interval(IDLE_REAP_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let stale: Vec<(String, String)> = {
-            let cells = match registry.cells.lock() {
-                Ok(c) => c,
-                Err(_) => continue, // poisoned: skip this tick rather than panic the task
-            };
-            cells
-                .iter()
-                .filter_map(|(image_id, cell)| {
-                    let entry = cell.get()?;
-                    let idle = is_idle(entry.last_access.lock().ok()?.elapsed(), IDLE_REAP_TTL);
-                    idle.then(|| (image_id.clone(), entry.cid.clone()))
-                })
-                .collect()
-        };
-        for (image_id, cid) in stale {
-            remove_ephemeral_container(&docker, &cid).await;
-            if let Ok(mut cells) = registry.cells.lock() {
-                cells.remove(&image_id);
-            }
-        }
+        reap_idle_pass(&docker, &registry).await;
     }
+}
+
+/// One pass of the idle-TTL reaper — factored out of the tick loop so it (and, via
+/// [`evict_if_still_idle`], the TOCTOU-sensitive part of it) is unit-testable without a live
+/// daemon or a real `interval`.
+async fn reap_idle_pass(docker: &Docker, registry: &EphemeralRegistry) {
+    // First pass: snapshot candidates that look idle right now, along with the cid they had at
+    // snapshot time. This snapshot can go stale before we act on it — a resumed browse can
+    // refresh `last_access` (or, in the pathological case, the slot could even be evicted and
+    // recreated with a fresh container) in the gap. `evict_if_still_idle` below re-checks both
+    // conditions under the lock immediately before committing to reap, which is what actually
+    // protects a resumed browse from having its container yanked out from under it.
+    let candidates: Vec<(String, String)> = {
+        let Ok(cells) = registry.cells.lock() else {
+            return; // poisoned: skip this pass rather than panic the task
+        };
+        cells
+            .iter()
+            .filter_map(|(image_id, cell)| {
+                let entry = cell.get()?;
+                let idle = is_idle(entry.last_access.lock().ok()?.elapsed(), IDLE_REAP_TTL);
+                idle.then(|| (image_id.clone(), entry.cid.clone()))
+            })
+            .collect()
+    };
+
+    for (image_id, snapshot_cid) in candidates {
+        // Evict-then-remove, not remove-then-evict: eviction and the re-check happen together in
+        // one critical section, so any concurrent `ephemeral_for_image` call either (a) ran
+        // BEFORE this section and already refreshed `last_access` — which the re-check observes
+        // and skips on — or (b) runs AFTER this section, finds no cell, and creates a fresh
+        // container instead of being handed the one we're about to remove. Only once eviction has
+        // committed do we make the (awaiting, therefore un-lockable) daemon removal call.
+        let Some(cid) = evict_if_still_idle(registry, &image_id, &snapshot_cid) else {
+            continue;
+        };
+        remove_ephemeral_container(docker, &cid).await;
+    }
+}
+
+/// Re-check-then-evict a single reap candidate under the registry lock.
+///
+/// Returns the container id to remove if `image_id`'s cell is still present, still initialized,
+/// still holds the same container (`entry.cid == expected_cid`), and is still idle right now —
+/// i.e. nothing has changed since the caller's earlier snapshot. Returns `None` (evicting
+/// nothing) if a concurrent access refreshed `last_access`, or if the cell's cid no longer
+/// matches what was snapshotted (the slot was reused by a freshly created container in the gap).
+fn evict_if_still_idle(
+    registry: &EphemeralRegistry,
+    image_id: &str,
+    expected_cid: &str,
+) -> Option<String> {
+    let mut cells = registry.cells.lock().ok()?;
+    let cid = {
+        let entry = cells.get(image_id)?.get()?;
+        if entry.cid != expected_cid {
+            return None; // the slot was reused since the snapshot; leave the new occupant alone
+        }
+        if !is_idle(entry.last_access.lock().ok()?.elapsed(), IDLE_REAP_TTL) {
+            return None; // a resumed browse refreshed last_access; do not reap
+        }
+        entry.cid.clone()
+    };
+    cells.remove(image_id);
+    Some(cid)
 }
 
 /// Tier 2 (ADR-0010, crash safety): every [`SWEEP_TICK`] (and once immediately — the first
@@ -301,12 +364,16 @@ async fn idle_reaper_loop(docker: Docker, registry: Arc<EphemeralRegistry>) {
 /// `cairn.role=image-browse-ephemeral` label and force-remove any older than [`SWEEP_MAX_AGE`]
 /// that this process's own [`EphemeralRegistry`] isn't actively tracking. The age threshold (not
 /// unconditional removal) is what lets a second, independent Cairn instance browse images
-/// against the same daemon without the two reaping each other's live ephemeral containers; the
-/// registry check on top of that is what stops this process's *own* sweep from reaping its own
-/// still-live, long-running browse session (tier 1's idle-TTL reaper owns that container's
-/// lifecycle instead — see `sweep_stale_labeled_containers`).
+/// against the same daemon without *the same instance's own* sweep reaping its own live
+/// container; it does **not** fully protect against a *different* instance's sweep reaping a
+/// browse session it doesn't know about that has simply run longer than the age threshold — see
+/// ADR-0010's Negatives for the honest limitation and the proper follow-up fix. The registry check
+/// is what stops this process's *own* sweep from reaping its own still-live, long-running browse
+/// session (tier 1's idle-TTL reaper owns that container's lifecycle instead — see
+/// `sweep_stale_labeled_containers`).
 async fn startup_sweep_loop(docker: Docker, registry: Arc<EphemeralRegistry>) {
     let mut ticker = tokio::time::interval(SWEEP_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
         sweep_stale_labeled_containers(&docker, &registry).await;
@@ -314,7 +381,9 @@ async fn startup_sweep_loop(docker: Docker, registry: Arc<EphemeralRegistry>) {
 }
 
 /// One pass of the label+age sweep — factored out so it runs identically on the immediate first
-/// tick and every subsequent one.
+/// tick and every subsequent one. The actual filtering decision lives in the pure
+/// [`stale_sweep_targets`] so it's unit-testable without a daemon; this wrapper only does I/O
+/// (fetch the labeled-container list, fetch the live-cid snapshot, issue the removals).
 async fn sweep_stale_labeled_containers(docker: &Docker, registry: &EphemeralRegistry) {
     let mut filters = HashMap::new();
     filters.insert(
@@ -331,35 +400,58 @@ async fn sweep_stale_labeled_containers(docker: &Docker, registry: &EphemeralReg
         return;
     };
 
-    // Containers this process currently tracks as live — never age-sweep these. A long-running,
-    // continuously-used browse session can easily exceed SWEEP_MAX_AGE without ever going idle
-    // long enough for tier 1 to reap it; sweeping by age alone (ignoring our own liveness
-    // tracking) would kill it out from under an active `list_dir`/`stat`/`read`. Tier 2 exists to
-    // catch orphans this process doesn't know about (a prior crashed run, or another instance
-    // that has since exited) — not to second-guess its own live cache.
-    let live_cids: std::collections::HashSet<String> = match registry.cells.lock() {
+    let live_cids = live_cid_snapshot(registry);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let candidates: Vec<(String, i64)> = list
+        .into_iter()
+        .filter_map(|c| Some((c.id?, c.created?)))
+        .collect();
+
+    for cid in stale_sweep_targets(&candidates, now_secs, SWEEP_MAX_AGE, &live_cids) {
+        remove_ephemeral_container(docker, &cid).await;
+    }
+}
+
+/// Containers this process currently tracks as live — the tier-2 sweep must never age-sweep
+/// these. A long-running, continuously-used browse session can easily exceed `SWEEP_MAX_AGE`
+/// without ever going idle long enough for tier 1 to reap it; sweeping by age alone (ignoring our
+/// own liveness tracking) would kill it out from under an active `list_dir`/`stat`/`read`. Tier 2
+/// exists to catch orphans this process doesn't know about (a prior crashed run of *this*
+/// process, or another instance that has since exited) — not to second-guess its own live cache.
+fn live_cid_snapshot(registry: &EphemeralRegistry) -> std::collections::HashSet<String> {
+    match registry.cells.lock() {
         Ok(cells) => cells
             .values()
             .filter_map(|cell| cell.get().map(|e| e.cid.clone()))
             .collect(),
         Err(_) => std::collections::HashSet::new(),
-    };
-
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    for c in list {
-        let (Some(id), Some(created)) = (c.id, c.created) else {
-            continue;
-        };
-        if live_cids.contains(&id) {
-            continue;
-        }
-        if is_stale_by_age(now_secs, created, SWEEP_MAX_AGE) {
-            remove_ephemeral_container(docker, &id).await;
-        }
     }
+}
+
+/// Pure filtering for the tier-2 sweep: given `candidates` (container id, daemon-reported
+/// `Created` unix-seconds) and the current process's `live_cids`, return the ids that should be
+/// force-removed — older than `max_age` **and** not tracked as live. Factored out (rather than
+/// inlined in `sweep_stale_labeled_containers`) so the actual reap decision is unit-testable
+/// without a daemon, including the cross-instance case: a candidate that is stale-by-age but
+/// absent from `live_cids` (e.g. because it belongs to a *different* Cairn instance) is still
+/// swept — see ADR-0010's Negatives for why that's an accepted, documented limitation rather than
+/// a bug.
+fn stale_sweep_targets(
+    candidates: &[(String, i64)],
+    now_secs: i64,
+    max_age: Duration,
+    live_cids: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|(id, created)| {
+            !live_cids.contains(id) && is_stale_by_age(now_secs, *created, max_age)
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Pure staleness check for the tier-2 sweep, factored out for hermetic unit testing of the
@@ -417,6 +509,41 @@ fn map_status_error(e: bollard::errors::Error, context: &str) -> VfsError {
             status_code: 403, ..
         } => VfsError::Forbidden(p),
         other => backend_err(other),
+    }
+}
+
+/// Map a `create_container` error for an ephemeral image-browse container. Gives the "no command
+/// specified" case (see [`is_no_command_specified`]) a clear, actionable `VfsError` instead of
+/// letting it fall through to [`map_status_error`]'s generic `Backend { code: "docker", .. }`,
+/// which would otherwise be a confusing daemon-quoted 500 with no indication of what to do about
+/// it. All other errors defer to `map_status_error`.
+fn map_create_container_error(e: bollard::errors::Error, image_id: &str) -> VfsError {
+    if is_no_command_specified(&e) {
+        return VfsError::Backend {
+            code: "image_no_command".to_owned(),
+            msg: format!(
+                "image has no CMD or ENTRYPOINT configured; cannot browse it via an ephemeral \
+                 container (image: {image_id})"
+            ),
+            retryable: false,
+        };
+    }
+    map_status_error(e, image_id)
+}
+
+/// True if `e` is the Docker daemon's "no command specified" `create_container` validation
+/// failure: an image whose own config declares neither `CMD` nor `ENTRYPOINT` (a bare
+/// `FROM scratch` + `COPY` image, some pause/utility images) fails the daemon's merged-command
+/// check at `create` time, since `create_ephemeral_container` deliberately never overrides
+/// `entrypoint`/`cmd` (see that method's doc comment). Matched on message content, not status
+/// code, because the Docker Engine reports this specific client-caused input problem as a 500
+/// rather than a 4xx — a long-standing quirk, not a bollard/cairn bug.
+fn is_no_command_specified(e: &bollard::errors::Error) -> bool {
+    match e {
+        bollard::errors::Error::DockerResponseServerError { message, .. } => {
+            message.to_lowercase().contains("no command specified")
+        }
+        _ => false,
     }
 }
 
@@ -1024,8 +1151,24 @@ impl ContainerOps for BollardDocker {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_idle, is_stale_by_age, strip_tar_prefix, tar_prefix};
-    use std::time::Duration;
+    use super::*;
+
+    /// Build a registry with a single, already-initialized cell for `image_id` → `cid`, with
+    /// `last_access` set to `last_access`. Test-only helper for the reaper-race tests below.
+    fn registry_with_entry(image_id: &str, cid: &str, last_access: Instant) -> EphemeralRegistry {
+        let entry = Arc::new(EphemeralEntry {
+            cid: cid.to_owned(),
+            last_access: Mutex::new(last_access),
+        });
+        let mut cells = HashMap::new();
+        cells.insert(
+            image_id.to_owned(),
+            Arc::new(OnceCell::new_with(Some(entry))),
+        );
+        EphemeralRegistry {
+            cells: Mutex::new(cells),
+        }
+    }
 
     #[test]
     fn is_idle_thresholds_correctly() {
@@ -1052,6 +1195,184 @@ mod tests {
         // "not stale", never underflow/panic via the subtraction.
         let max_age = Duration::from_secs(1800);
         assert!(!is_stale_by_age(1_000, 5_000, max_age));
+    }
+
+    // --- Tier-1 idle-reaper TOCTOU fix (`evict_if_still_idle`) ---------------------------------
+
+    #[test]
+    fn evict_if_still_idle_reaps_a_genuinely_idle_entry() {
+        let old = Instant::now() - IDLE_REAP_TTL - Duration::from_secs(1);
+        let registry = registry_with_entry("img", "cid1", old);
+        assert_eq!(
+            evict_if_still_idle(&registry, "img", "cid1"),
+            Some("cid1".to_owned())
+        );
+        // The cell must actually be gone once reaped.
+        assert!(registry.cells.lock().unwrap().get("img").is_none());
+    }
+
+    /// The exact race the reaper fix closes: a browse resumes (refreshing `last_access`) in the
+    /// window between the reaper's initial "looks idle" snapshot and its re-check. Before the
+    /// fix, the container would be force-removed anyway (remove-then-evict, no re-check),
+    /// breaking the resumed browse with a spurious mid-fetch error.
+    #[test]
+    fn evict_if_still_idle_skips_when_last_access_was_refreshed_after_snapshot() {
+        let old = Instant::now() - IDLE_REAP_TTL - Duration::from_secs(1);
+        let registry = registry_with_entry("img", "cid1", old);
+        {
+            let cells = registry.cells.lock().unwrap();
+            let entry = cells.get("img").unwrap().get().unwrap();
+            *entry.last_access.lock().unwrap() = Instant::now(); // simulate the resumed browse
+        }
+        assert_eq!(
+            evict_if_still_idle(&registry, "img", "cid1"),
+            None,
+            "a resumed browse must prevent the reap"
+        );
+        assert!(
+            registry.cells.lock().unwrap().get("img").is_some(),
+            "the entry must survive untouched"
+        );
+    }
+
+    /// Guards the cid-equality re-check: if the slot was evicted and recreated with a fresh
+    /// container between the snapshot and the re-check, the reaper must never remove the NEW
+    /// container just because it was scheduled to remove the OLD one at that map key.
+    #[test]
+    fn evict_if_still_idle_skips_when_cid_no_longer_matches_snapshot() {
+        let old = Instant::now() - IDLE_REAP_TTL - Duration::from_secs(1);
+        let registry = registry_with_entry("img", "cid-new", old);
+        assert_eq!(
+            evict_if_still_idle(&registry, "img", "cid-old-snapshot"),
+            None,
+            "a slot reused by a fresh container must not be reaped"
+        );
+        assert!(registry.cells.lock().unwrap().get("img").is_some());
+    }
+
+    #[test]
+    fn evict_if_still_idle_returns_none_when_entry_already_gone() {
+        let registry = EphemeralRegistry::default();
+        assert_eq!(evict_if_still_idle(&registry, "img", "cid1"), None);
+    }
+
+    // --- Tier-2 sweep filtering (`stale_sweep_targets`) -----------------------------------------
+
+    /// Documents and exercises the corrected ADR-0010 behavior: a candidate this process's own
+    /// registry tracks as live is never swept regardless of age (protects an active, long-running
+    /// browse session in *this* process); a candidate that is NOT in this process's registry
+    /// (an orphan from a crashed run, or — the accepted, documented limitation — a live browse
+    /// session belonging to a *different* Cairn instance) is swept once stale-by-age.
+    #[test]
+    fn stale_sweep_targets_skips_live_and_reaps_stale_unknown() {
+        let now = 100_000_i64;
+        let max_age = Duration::from_secs(1800);
+        let mut live = std::collections::HashSet::new();
+        live.insert("live-cid".to_owned());
+        let candidates = vec![
+            ("live-cid".to_owned(), now - 10_000), // very old, but tracked live -> skipped
+            ("orphan-cid".to_owned(), now - 2_000), // older than max_age, not tracked -> swept
+            ("fresh-cid".to_owned(), now - 10),    // recent, not tracked -> not stale, kept
+        ];
+        let targets = stale_sweep_targets(&candidates, now, max_age, &live);
+        assert_eq!(targets, vec!["orphan-cid".to_owned()]);
+    }
+
+    #[test]
+    fn stale_sweep_targets_empty_when_nothing_is_stale() {
+        let now = 100_000_i64;
+        let max_age = Duration::from_secs(1800);
+        let live = std::collections::HashSet::new();
+        let candidates = vec![("fresh-cid".to_owned(), now - 5)];
+        assert!(stale_sweep_targets(&candidates, now, max_age, &live).is_empty());
+    }
+
+    // --- No-CMD/no-ENTRYPOINT image create error (fix #2) ----------------------------------------
+
+    #[test]
+    fn is_no_command_specified_matches_message_case_insensitively() {
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "No command specified".to_owned(),
+        };
+        assert!(is_no_command_specified(&e));
+        let e2 = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "NO COMMAND SPECIFIED".to_owned(),
+        };
+        assert!(is_no_command_specified(&e2));
+    }
+
+    #[test]
+    fn is_no_command_specified_false_for_unrelated_errors() {
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "internal server error".to_owned(),
+        };
+        assert!(!is_no_command_specified(&e));
+    }
+
+    #[test]
+    fn map_create_container_error_gives_actionable_message_for_no_command() {
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "No command specified".to_owned(),
+        };
+        match map_create_container_error(e, "sha256:deadbeef") {
+            VfsError::Backend {
+                code,
+                msg,
+                retryable,
+            } => {
+                assert_eq!(code, "image_no_command");
+                assert!(
+                    msg.contains("CMD") || msg.contains("ENTRYPOINT"),
+                    "message should explain the image has no command: {msg:?}"
+                );
+                assert!(!retryable);
+            }
+            other => panic!("expected VfsError::Backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_create_container_error_falls_back_to_map_status_error_otherwise() {
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "no such image".to_owned(),
+        };
+        assert!(matches!(
+            map_create_container_error(e, "sha256:deadbeef"),
+            VfsError::NotFound(_)
+        ));
+    }
+
+    // --- Single-flight create-failure retry semantics (fix: TESTS §create-failure-retryable) ---
+
+    /// `EphemeralRegistry`'s single-flight cache relies on this exact `tokio::sync::OnceCell`
+    /// contract: a failed `get_or_try_init` leaves the cell uninitialized rather than permanently
+    /// poisoning it, so the *next* call retries the initializer from scratch — the "a failed
+    /// creation is not permanently cached" guarantee documented on
+    /// `ContainerOps::ephemeral_for_image`. There is no way to exercise this hermetically through
+    /// `BollardDocker` itself (`create_ephemeral_container` always talks to a real `bollard::
+    /// Docker` handle, which needs a live daemon), so this test pins the underlying primitive's
+    /// contract directly — the same guarantee `ephemeral_for_image_impl` depends on.
+    #[tokio::test]
+    async fn once_cell_get_or_try_init_allows_retry_after_error() {
+        let cell: OnceCell<i32> = OnceCell::new();
+
+        let first = cell
+            .get_or_try_init(|| async { Err::<i32, &str>("transient failure") })
+            .await;
+        assert_eq!(first, Err("transient failure"));
+        assert!(
+            cell.get().is_none(),
+            "a failed init must leave the cell uninitialized"
+        );
+
+        let second = cell.get_or_try_init(|| async { Ok::<i32, &str>(42) }).await;
+        assert_eq!(second, Ok(&42));
+        assert_eq!(cell.get(), Some(&42));
     }
 
     #[test]

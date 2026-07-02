@@ -47,8 +47,13 @@ is deferred to a later phase — see Consequences.
    `list_dir`/`stat`/`read` inside an image, so it must stay a single lookup rather than pay
    `list_images()`'s per-image `inspect_image` cost (see step 5's sibling note and Consequences).
 2. It calls `ContainerOps::ephemeral_for_image(image_id)` — **keyed by the canonical image id,
-   never the tag** — so `nginx:latest` and `nginx@sha256:…` (aliases of the same image) share one
-   ephemeral container instead of each getting their own.
+   never the tag** — so `nginx:latest` and the raw id `nginx` resolves to (e.g. `img1` in the
+   mock, `sha256:…` for a real daemon) share one ephemeral container instead of each getting their
+   own. **Caveat:** `resolve_image_id` currently matches only `repo_tags` and the raw id, **not**
+   `repo_digests` — a digest reference (`nginx@sha256:…`) is not yet resolved to the same
+   container as its tag. Matching `repo_digests` too is a cheap, tracked follow-up (see
+   Consequences); until then, browsing by digest reference isn't supported at all (`resolve_image_id`
+   returns `NotFound`), which is honest rather than silently wrong.
 3. `BollardDocker::ephemeral_for_image` single-flights creation per image id via
    `tokio::sync::OnceCell` in a `HashMap<image_id, Arc<OnceCell<Arc<EphemeralEntry>>>>`, guarded by
    a `std::sync::Mutex` around the map lookup/insert (not held across the `.await`). Concurrent
@@ -64,7 +69,13 @@ is deferred to a later phase — see Consequences.
    empty vectors would turn a working `create` into a spurious failure for any image whose own
    config has no `CMD`/`ENTRYPOINT` (some minimal/distroless-style images). `list_dir`/`stat`/
    `read` then run against the created container through the existing container-fs path,
-   unchanged.
+   unchanged. **An image with neither `CMD` nor `ENTRYPOINT` still cannot be browsed this way** —
+   Docker's `create` validation rejects it regardless of what we send — but `create_ephemeral_container`
+   detects the daemon's specific "No command specified" error (matched on message content, since
+   the Engine reports this as a 500 rather than a 4xx) and maps it to a clear
+   `VfsError::Backend { code: "image_no_command", .. }` instead of an opaque generic `Backend`
+   error, so the failure is at least legible. This is exactly the case a future OCI-layer view
+   (Approach B) would sidestep entirely, since it would never need a container at all.
 6. Every hit refreshes an in-memory `last_access: Instant` on the cache entry, read by the idle
    reaper (below).
 7. **Image directory-entry naming.** The `/images` listing names each entry by its first tag —
@@ -100,12 +111,29 @@ Consequences). Until it lands, two time-based safety nets do the job:
   second, independent Cairn instance may be legitimately browsing the same image against the same
   daemon right now, and an unconditional sweep would rip its live container out from under it.
 
-Both tasks are spawned lazily on the **first** `ephemeral_for_image` call, not at `BollardDocker`
-construction/`connect()` time, and their `JoinHandle`s are stored and `.abort()`ed on `Drop`. This
-matters because `discovery::probe_one` (RFC-0011 P3) constructs a `BollardDocker`, pings it, and
-drops it immediately per candidate socket — eagerly spawning two background tasks per probe (most
-of which never browse an image) would be pure waste, spun up and aborted milliseconds later on
-every discovery pass.
+Both tasks start via `BollardDocker::ensure_background_tasks` — an idempotent, `OnceCell`-guarded
+method safe to call from multiple sites — rather than automatically inside
+`connect_local`/`connect_with_socket` themselves. Two things call it:
+
+1. **Real connection-open call sites** (`cairn::app::open_docker_socket`, used for RFC-0011 P3
+   auto-discovered targets, and `cairn::connect::ConnectionOpener::open_docker`, used for saved/
+   pinned profiles) call it explicitly, immediately after constructing the `BollardDocker` they're
+   about to hand to a `DockerVfs` and keep. This means the crash-safety sweep (tier 2) starts
+   reaping orphans from the moment the user actually opens a Docker connection — not only once
+   they happen to browse an image on it, closing the gap an earlier version of this ADR left
+   between "on connect" (the claim) and "on first image browse" (the actual old behavior).
+2. `ephemeral_for_image_impl` also calls it defensively, so a caller that constructs a
+   `BollardDocker` and goes straight to browsing without an explicit start call (the dind
+   integration tests do this) still gets both reapers.
+
+Deliberately **not** called from `connect_local`/`connect_with_socket` themselves, because
+`discovery::probe_one` (RFC-0011 P3) calls exactly those two constructors, pings, and drops the
+`BollardDocker` immediately per candidate socket — spawning two background tasks per probe (which
+never browses an image) would be pure waste, spun up and aborted milliseconds later on every
+discovery pass. Making the constructors themselves "know" whether they're being used for a
+probe or a real connection would require a second constructor or a flag; calling
+`ensure_background_tasks()` explicitly from the real-connect call sites achieves the same
+separation without that extra API surface.
 
 ### Why not a graceful-shutdown hook now
 
@@ -123,10 +151,13 @@ here. Tiers 1+2 are the interim safety net; the hook is tracked as a follow-up i
   filesystem-access code, no new class of bugs in that path.
 - `stat`/`list_dir` on an image now give an honest answer (real rootfs, or a real error) instead
   of a silent empty list.
-- Tag and digest aliases of the same image share one ephemeral container (id-keyed cache), so
-  browsing `nginx:latest` and then `nginx@sha256:…` doesn't double the daemon-side footprint.
-- Two independent Cairn instances against the same daemon do not reap each other's live ephemeral
-  containers (age-thresholded sweep, not label-only).
+- Tag and raw-id aliases of the same image share one ephemeral container (id-keyed cache), so
+  browsing `nginx:latest` and then its raw image id doesn't double the daemon-side footprint.
+  (Digest references don't share yet — see the Lifecycle caveat and Negatives.)
+- The tier-2 sweep's age threshold (not label-only) means a Cairn instance's own sweep never reaps
+  its own still-live container, and it starts reaping crash orphans as soon as a Docker connection
+  is actually opened (see Lifecycle), not only once an image happens to be browsed on it. (This
+  does **not** fully protect against a *different* instance's browse session — see Negatives.)
 
 ### Negative / trade-offs
 
@@ -143,15 +174,42 @@ here. Tiers 1+2 are the interim safety net; the hook is tracked as a follow-up i
   `ContainerOps::resolve_image_id` instead, specifically to avoid multiplying this cost. Acceptable
   for typical local image counts; flagged in the code as a target for `join_all` parallelization if
   it proves slow on hosts with very large local image caches.
-- **Known limitation — narrow idle-reaper TOCTOU.** `last_access` is stamped once when
+- **Known limitation — residual idle-reaper TOCTOU.** The reaper (`idle_reaper_loop` /
+  `reap_idle_pass`) snapshots idle-looking `(image_id, cid)` candidates, then — for each — re-locks
+  the registry and only commits to evicting-and-removing if the entry's cid still matches the
+  snapshot *and* it is still idle right now (`evict_if_still_idle`); eviction happens **before**
+  the daemon-side `remove_container` call, in the same critical section as the re-check. This
+  closes the wide version of the race (a resumed browse's `last_access` refresh, which happens
+  synchronously before the caller uses the returned cid, is always visible to a re-check that
+  starts after it) and a unit test (`evict_if_still_idle_skips_when_last_access_was_refreshed_after_snapshot`)
+  pins it. A narrower residual window remains: the hand-off between `ephemeral_for_image_impl`
+  releasing the registry lock (after cloning the cell) and it re-acquiring a *different* lock to
+  write `last_access` is not itself atomic, so a reaper re-check landing in that exact multi-
+  instruction gap could still observe stale data. Additionally, `last_access` is stamped once when
   `ephemeral_for_image` resolves the container id, not continuously refreshed while a single
-  `list_dir`/`stat`/`read` call is in flight. A single operation that runs longer than the idle
-  TTL (5 minutes) — e.g. `list_dir` on a very large image over a slow daemon, given the archive
-  endpoint streams the whole recursive subtree into memory (see the `list_dir` M6 memory note) —
-  could in principle be force-removed by the idle reaper mid-fetch, surfacing a spurious error.
-  Narrow (needs a single op to exceed 5 minutes) and not fixed here; closing it properly needs an
-  in-flight "in-use" guard/refcount the reaper honors, which is more machinery than this phase
-  warrants. Tracked as a follow-up alongside the graceful-shutdown hook.
+  `list_dir`/`stat`/`read` call is in flight — a single operation exceeding the idle TTL (5
+  minutes; e.g. `list_dir` on a very large image over a slow daemon, given the archive endpoint
+  streams the whole recursive subtree into memory, see the `list_dir` M6 memory note) could still
+  be reaped mid-fetch. Closing both fully needs an in-flight "in-use" guard/refcount the reaper
+  honors, which is more machinery than this phase warrants. Tracked as a follow-up alongside the
+  graceful-shutdown hook.
+- **Known limitation — cross-instance sweep can reap another instance's long-running browse.** The
+  tier-2 sweep's registry check only protects *this* process's own live containers; a second Cairn
+  instance's sweep sees only the 30-minute age threshold for a container it doesn't have in its own
+  registry. A continuously-used browse session in instance A that runs longer than 30 minutes can
+  be force-removed by instance B's sweep, even though it's still live. The 30-minute age threshold
+  makes this unlikely for a typical browse (open, look around, close), but it is a real gap for a
+  pane left open on an image for a long time. **Not fixed here** — the earlier draft of this ADR
+  claimed instances "do not reap each other's live containers," which was true only within the
+  30-minute window; that claim is corrected above (Positive). The proper fix is to have
+  `ephemeral_for_image` periodically re-stamp a `cairn.last-access` label (or similar) on the
+  daemon-side container itself, so a *different* instance's sweep can see recent activity even for
+  containers outside its own local registry — deferred pending that follow-up (daemon chatter on
+  every access, plus scope) rather than implemented speculatively now.
+- `resolve_image_id` does not match `repo_digests` (see the Lifecycle caveat) — browsing by a
+  digest reference (`nginx@sha256:…`) is not currently supported; it resolves to `NotFound` rather
+  than silently matching the wrong image or duplicating a container. Matching `repo_digests` too
+  is a cheap follow-up.
 
 ### Neutral
 
@@ -176,11 +234,19 @@ here. Tiers 1+2 are the interim safety net; the hook is tracked as a follow-up i
 - **Unconditional label-based sweep (no age threshold)** — simpler, but two concurrent Cairn
   instances against one daemon would reap each other's live containers on every sweep tick.
   Rejected; the 30-minute age threshold is the fix.
-- **Eager background-task spawn at `connect()`/construction time** — matches the literal "on
-  connect" phrasing more closely, but spawns two tasks per `BollardDocker::connect_local()` call,
+- **Spawning inside `connect_local`/`connect_with_socket` themselves** — matches the literal "on
+  connect" phrasing most directly, but those two constructors are shared by every call site,
   including the short-lived probe-only instances `discovery::probe_one` creates on every socket
-  discovery pass. Deferred to first real use (`ephemeral_for_image`) instead; documented as a
-  deliberate deviation in the field doc comment.
+  discovery pass; spawning there would spin up and abort two tasks per probe for no benefit.
+  Rejected in favor of an explicit, idempotent `ensure_background_tasks()` the real connection-open
+  call sites invoke instead (see Lifecycle) — same "starts on real connect" behavior, without
+  forcing the constructors to know who's calling them.
+- **Deferring both tasks to the first `ephemeral_for_image` call only** (this ADR's original
+  design) — simpler (one trigger point), but meant the crash-safety sweep didn't start until the
+  user happened to browse an image, so a process that opened a Docker connection and only ever
+  browsed containers never reaped that daemon's crash orphans. Superseded by also calling
+  `ensure_background_tasks()` from the real connection-open call sites (see Lifecycle); the
+  first-browse trigger remains as a defensive fallback.
 
 ## References
 
