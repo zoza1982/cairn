@@ -305,6 +305,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         | Action::PageDown => Vec::new(),
         Action::OpenLogViewer => open_log_viewer(state),
         Action::View => open_pager_for_view(state),
+        Action::Edit => start_edit(state),
         Action::OpenExecSession => open_exec_session(state),
         Action::Refresh => reload(state, state.focus),
         Action::CycleSort => {
@@ -2816,15 +2817,14 @@ fn enter_dir(state: &mut AppState) -> Vec<AppEffect> {
     }
 }
 
-/// `Enter` on a non-directory entry: read a bounded prefix and classify it (text vs binary)
-/// before opening the pager, so a binary file opens directly in `Hex` mode instead of flashing
-/// garbled text first. Only [`EntryKind::File`] and [`EntryKind::Symlink`] are sniffed — `Stream`
-/// entries (e.g. container/pod logs) already have a dedicated live-tail flow
-/// ([`Action::OpenLogViewer`]), and `Special` nodes (sockets, devices, FIFOs) are not something a
-/// byte-stream pager can meaningfully show.
-///
-/// // P2: once the editor lands, a `FileKind::Text` result should route to `Action::Edit` instead
-/// // of (or in addition to) this read-only pager. For P1, Enter-on-text is view-only.
+/// `Enter` on a non-directory entry: read a bounded prefix and classify it (text vs binary). A
+/// `Text` result routes to the in-place editor (RFC-0012 P2, [`AppEffect::SuspendAndEdit`]); a
+/// `Binary` result opens the read-only hex pager (unchanged from P1) — so a binary file never
+/// flashes garbled text or gets loaded into an editor Cairn is not built to handle. Only
+/// [`EntryKind::File`] and [`EntryKind::Symlink`] are sniffed — `Stream` entries (e.g.
+/// container/pod logs) already have a dedicated live-tail flow ([`Action::OpenLogViewer`]), and
+/// `Special` nodes (sockets, devices, FIFOs) are not something a byte-stream pager/editor can
+/// meaningfully show. See the `AppEvent::FileSniffed` handler for the mode routing.
 fn sniff_current_file(state: &mut AppState) -> Vec<AppEffect> {
     let side = state.focus;
     let pane = state.active();
@@ -2884,6 +2884,36 @@ fn open_pager_for_view(state: &mut AppState) -> Vec<AppEffect> {
         total_size,
         Bytes::new(),
     )
+}
+
+/// Open the external editor directly via `F4` (`Action::Edit`) — MC-faithful: no text/binary
+/// sniff, `F4` always means "edit this" regardless of content. Guards to the same entry kinds as
+/// the pager (`File`/`Symlink`) and emits [`AppEffect::SuspendAndEdit`]; the local-path resolution,
+/// terminal suspend/resume, and editor spawn all happen in the runtime (`crates/cairn/src/app.rs`),
+/// never in this pure reducer.
+fn start_edit(state: &mut AppState) -> Vec<AppEffect> {
+    let pane = state.active();
+    let Some(entry) = pane.current() else {
+        state.status = Some("Nothing to edit".to_owned());
+        return Vec::new();
+    };
+    if entry.is_dotdot_sentinel() || entry.is_dir() {
+        state.status = Some("Cannot edit a directory".to_owned());
+        return Vec::new();
+    }
+    // Same restriction as the pager/sniff: only a plain byte stream is editable. `Stream` entries
+    // (container/pod logs) have their own live-tail flow; `Special` nodes (FIFO/device/socket)
+    // aren't meaningfully editable and opening one for write could block indefinitely.
+    if !matches!(entry.kind, EntryKind::File | EntryKind::Symlink) {
+        state.status = Some("Cannot edit this entry".to_owned());
+        return Vec::new();
+    }
+    let Ok(path) = pane.cwd.join(entry.name.as_ref()) else {
+        state.status = Some("Cannot open this entry".to_owned());
+        return Vec::new();
+    };
+    let conn = pane.conn;
+    vec![AppEffect::SuspendAndEdit { conn, path }]
 }
 
 /// Mint a fresh pager id, install [`Overlay::Pager`] in `mode` (seeded with `prefetch`, if any, so
@@ -3335,25 +3365,48 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             if !still_current {
                 return Vec::new();
             }
-            // Re-fetch rather than holding the borrow above across the mutation below; guarded
-            // by `still_current`, so this is expected to be `Some`, but we still pattern-match
-            // instead of `.expect()`ing (no panics on a backend/user-reachable path).
-            let Some(entry) = state.pane(pane).current() else {
-                return Vec::new();
-            };
-            let title = format!("{} — view", entry.name);
-            let total_size = entry.size;
-            let mode = match kind {
-                // P2: once the editor lands, `Text` should route to `Action::Edit` instead of
-                // (or in addition to) this read-only pager.
-                FileKind::Text => PagerMode::Text,
-                FileKind::Binary => PagerMode::Hex,
-            };
-            open_pager(state, conn, path, title, mode, total_size, prefetch)
+            match kind {
+                // RFC-0012 P2: a text file routes to the in-place editor, not the read-only
+                // pager. The runtime resolves the local path, suspends the TUI, and launches
+                // $VISUAL/$EDITOR/vi; see `AppEffect::SuspendAndEdit`.
+                FileKind::Text => vec![AppEffect::SuspendAndEdit { conn, path }],
+                FileKind::Binary => {
+                    // Re-fetch rather than holding the borrow above across the mutation below;
+                    // guarded by `still_current`, so this is expected to be `Some`, but we still
+                    // pattern-match instead of `.expect()`ing (no panics on a reachable path).
+                    let Some(entry) = state.pane(pane).current() else {
+                        return Vec::new();
+                    };
+                    let title = format!("{} — view", entry.name);
+                    let total_size = entry.size;
+                    open_pager(
+                        state,
+                        conn,
+                        path,
+                        title,
+                        PagerMode::Hex,
+                        total_size,
+                        prefetch,
+                    )
+                }
+            }
         }
         AppEvent::SniffFailed { message } => {
             state.status = Some(format!("error: {message}"));
             Vec::new()
+        }
+        AppEvent::EditFinished { status, error } => {
+            state.status = Some(status);
+            if error {
+                Vec::new()
+            } else {
+                // The file may have changed size/mtime under the editor — refresh the active
+                // pane's listing (same refresh path as `Action::Refresh`). Safe to assume the
+                // active pane is still the one that requested the edit: the whole runtime is
+                // suspended (input reader parked, event_loop parked on the editor's `.await`)
+                // for the entire duration, so no user action can change `state.focus` meanwhile.
+                reload(state, state.focus)
+            }
         }
         AppEvent::PagerChunk { id, bytes } => {
             if let Some(Overlay::Pager {
@@ -6802,10 +6855,11 @@ mod tests {
         assert!(s.overlay.is_none(), "stale sniff must not open the pager");
     }
 
-    /// A matching `FileSniffed` opens the pager, seeded with the prefetch bytes, in the mode the
-    /// classification picked.
+    /// RFC-0012 P2: a matching `FileSniffed { kind: Text }` now routes to the in-place editor
+    /// (`SuspendAndEdit`) instead of opening the read-only pager — no overlay is opened, the
+    /// prefetch bytes are simply discarded (the editor reloads the file itself).
     #[test]
-    fn file_sniffed_opens_pager_seeded_with_prefetch() {
+    fn file_sniffed_text_routes_to_edit_not_pager() {
         let mut s = state();
         deliver(
             &mut s,
@@ -6816,6 +6870,7 @@ mod tests {
         let AppEffect::SniffFile { pane, conn, path } = fx.into_iter().next().unwrap() else {
             panic!("expected SniffFile");
         };
+        let expected_path = path.clone();
         let fx = update(
             &mut s,
             Msg::Event(AppEvent::FileSniffed {
@@ -6827,22 +6882,17 @@ mod tests {
             }),
         );
         assert!(
-            matches!(&fx[..], [AppEffect::OpenPager { skip: 17, .. }]),
-            "skip must equal the raw prefetch length, got {fx:?}"
+            matches!(
+                &fx[..],
+                [AppEffect::SuspendAndEdit { conn: c, path: p }]
+                    if *c == conn && *p == expected_path
+            ),
+            "Text FileSniffed must emit SuspendAndEdit, got {fx:?}"
         );
-        let Some(Overlay::Pager {
-            mode,
-            lines,
-            status,
-            ..
-        }) = &s.overlay
-        else {
-            panic!("pager overlay must be open");
-        };
-        assert_eq!(*mode, PagerMode::Text);
-        assert_eq!(*status, PagerStatus::Loading);
-        // "line one" is a complete line (flushed on the '\n'); "line two" is still `partial`.
-        assert_eq!(lines.iter().next().map(String::as_str), Some("line one"));
+        assert!(
+            s.overlay.is_none(),
+            "no pager overlay should open for a text file in P2"
+        );
     }
 
     /// A `Binary` classification opens the pager in `Hex` mode.
@@ -7106,8 +7156,10 @@ mod tests {
     }
 
     /// Opening a pager while one is already open (e.g. F3 opened one, then an in-flight Enter sniff
-    /// resolves) must emit `ClosePager` for the superseded id so its stream can't be orphaned into
-    /// an uncapped, uncancellable read.
+    /// on a *binary* file resolves) must emit `ClosePager` for the superseded id so its stream
+    /// can't be orphaned into an uncapped, uncancellable read. (Since RFC-0012 P2 a `Text` result
+    /// no longer opens a pager at all — see `file_sniffed_text_routes_to_edit_not_pager` — so this
+    /// exercises the supersede path with `FileKind::Binary`, the only kind that still does.)
     #[test]
     fn opening_pager_over_existing_closes_the_old() {
         let mut s = state();
@@ -7140,7 +7192,7 @@ mod tests {
                 pane,
                 conn,
                 path,
-                kind: FileKind::Text,
+                kind: FileKind::Binary,
                 prefetch: Bytes::new(),
             }),
         );
@@ -7176,6 +7228,98 @@ mod tests {
             s.overlay.is_none(),
             "F3 on a special node must not open a pager"
         );
+    }
+
+    // ── RFC-0012 P2: in-place editor launch ───────────────────────────────────────────────────
+
+    /// `Action::Edit` (F4) on a file emits `SuspendAndEdit` with the entry's connection and path —
+    /// no sniff, no overlay (the runtime owns the terminal suspend/resume and editor spawn).
+    #[test]
+    fn edit_action_emits_suspend_and_edit() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let expected_conn = s.active().conn;
+        let fx = update(&mut s, Msg::Action(Action::Edit));
+        assert!(
+            matches!(
+                &fx[..],
+                [AppEffect::SuspendAndEdit { conn, path }]
+                    if *conn == expected_conn && path.as_str().ends_with("f.txt")
+            ),
+            "F4 must emit SuspendAndEdit, got {fx:?}"
+        );
+        assert!(s.overlay.is_none(), "F4 opens no overlay");
+    }
+
+    /// F4 on a directory (or `..`) is a no-op — mirrors F3's directory guard.
+    #[test]
+    fn edit_action_on_directory_does_nothing() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("dir", EntryKind::Dir)]);
+        let fx = update(&mut s, Msg::Action(Action::Edit));
+        assert!(fx.is_empty());
+        assert_eq!(s.status.as_deref(), Some("Cannot edit a directory"));
+    }
+
+    /// F4 on a `Special` entry (FIFO/device/socket) is refused, mirroring the pager/sniff guard.
+    #[test]
+    fn edit_action_on_special_entry_does_nothing() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("pipe", EntryKind::Special)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Edit));
+        assert!(fx.is_empty());
+        assert_eq!(s.status.as_deref(), Some("Cannot edit this entry"));
+    }
+
+    /// A successful `EditFinished` sets the status and refreshes the active pane's listing.
+    #[test]
+    fn edit_finished_success_sets_status_and_refreshes() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::EditFinished {
+                status: "edited f.txt".to_owned(),
+                error: false,
+            }),
+        );
+        assert_eq!(s.status.as_deref(), Some("edited f.txt"));
+        assert!(
+            matches!(&fx[..], [AppEffect::List { .. }]),
+            "a successful edit must refresh the active pane, got {fx:?}"
+        );
+    }
+
+    /// A failed `EditFinished` (e.g. no `$EDITOR`, non-local backend) sets the status but does
+    /// NOT refresh — nothing changed on disk.
+    #[test]
+    fn edit_finished_failure_sets_status_without_refresh() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::EditFinished {
+                status: "Editing remote files lands in P3 — copy it to a local pane to edit"
+                    .to_owned(),
+                error: true,
+            }),
+        );
+        assert_eq!(
+            s.status.as_deref(),
+            Some("Editing remote files lands in P3 — copy it to a local pane to edit")
+        );
+        assert!(fx.is_empty(), "a failed edit must not refresh, got {fx:?}");
     }
 
     /// `PagerDone` flushes a trailing (incomplete) line into `lines` and sets `Ready`.

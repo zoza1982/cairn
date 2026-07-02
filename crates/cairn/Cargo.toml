@@ -95,6 +95,12 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Deterministic, POSIX-shell-word splitting of `$VISUAL`/`$EDITOR` (RFC-0012 P2): allows fixed
+# flags (`code --wait`, `emacs -nw`) via quoting only — never glob/variable/command-substitution
+# expansion. Already a transitive dependency (pulled in by build tooling), pure-Rust, no_std-capable,
+# tiny and stable API (`shlex::split`) — a natural fit versus hand-rolling a shell-word splitter.
+shlex = "2"
+
 # Safe process-group kill for shell-action timeouts (no `unsafe`). Already in the dependency tree.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }

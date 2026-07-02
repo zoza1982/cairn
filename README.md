@@ -78,18 +78,21 @@ Keys can be remapped under `[ui.keybindings]` — a map of key-chord → action,
 built-in scheme. Chords combine optional `ctrl+`/`alt+`/`shift+` modifiers with a key (a single
 character, a named key like `enter`/`space`/`esc`/`tab`/arrows, or `f1`–`f24`); actions are
 snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `cycle_sort`, `toggle_hidden`,
-`filter`, `make_dir`, `rename`, `view`, `open_queue`, `toggle_pause`, `quit`, …). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
+`filter`, `make_dir`, `rename`, `view`, `edit`, `open_queue`, `toggle_pause`, `quit`, …). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
 
 By default `s` cycles the active pane's sort order (name → size → modified → type) and `.` toggles whether
 hidden entries (dotfiles) are listed; the current sort mode and hidden state show in each pane's
 bottom-right corner. `F7` creates a new directory and `F2` renames the entry under the cursor (both
 open a text prompt; `Enter` confirms, `Esc` cancels). `F3` opens a read-only pager on the entry
-under the cursor; `Enter` on a file does the same, auto-detecting text vs. binary content and
-switching to a hex view for the latter (there is no in-place editor yet — see
-[RFC-0012](docs/rfcs/0012-file-open-view-edit.md)). `/` filters the listing as you type
-(`Enter` keeps the filter, `Esc` clears it). During a transfer, `p` pauses/resumes and `Esc`
-cancels (all active transfers); `Ctrl-T` opens the transfer queue. Up to two transfers run at once by
-default — set `[transfers] concurrency = N` in config to change it.
+under the cursor, auto-detecting text vs. binary content and switching to a hex view for the
+latter. `F4` opens the entry under the cursor in an external editor — `$VISUAL`, then `$EDITOR`,
+then `vi` (Unix only; on Windows, set one of the two first); `Enter` on a text file opens the same
+editor, while `Enter` on a binary file still opens the read-only hex pager. Editing works on
+**local files only** for now — a file on a remote connection shows a message pointing at the
+still-designed remote-writeback phase (see [RFC-0012](docs/rfcs/0012-file-open-view-edit.md)).
+`/` filters the listing as you type (`Enter` keeps the filter, `Esc` clears it). During a transfer,
+`p` pauses/resumes and `Esc` cancels (all active transfers); `Ctrl-T` opens the transfer queue. Up
+to two transfers run at once by default — set `[transfers] concurrency = N` in config to change it.
 
 ```toml
 [ui.keybindings]

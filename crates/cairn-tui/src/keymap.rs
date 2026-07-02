@@ -159,6 +159,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "reject" => Action::Reject,
         "open_log_viewer" => Action::OpenLogViewer,
         "view" => Action::View,
+        "edit" => Action::Edit,
         "page_up" => Action::PageUp,
         "page_down" => Action::PageDown,
         "quit" => Action::Quit,
@@ -272,7 +273,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         // 'e' opens the edit-connection form for the selected profile in the switcher.
-        // P5: remove global 'e' binding when edit-in-place file editing lands (the two would conflict).
+        // RFC-0012 P2 binds in-place file editing to F4 (`Action::Edit`) instead of 'e', so this
+        // global binding is unaffected — no conflict.
         KeyCode::Char('e') => Some(Action::EditConnection),
         KeyCode::Char('r') => Some(Action::Refresh),
         // Shift-K/J move the selected pending transfer up/down in the queue view (no-op elsewhere).
@@ -288,6 +290,9 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::F(2) => Some(Action::Rename),
         // F3 = view (MC convention): opens the read-only pager on the entry under the cursor.
         KeyCode::F(3) => Some(Action::View),
+        // F4 = edit (MC convention): always opens $VISUAL/$EDITOR/vi on the entry under the
+        // cursor, regardless of text/binary content (no sniff — F3's is skipped intentionally).
+        KeyCode::F(4) => Some(Action::Edit),
         // '/' starts filter-as-you-type (vim/less convention).
         KeyCode::Char('/') => Some(Action::Filter),
         // Plan-overlay actions (no-ops when no overlay is open). These letters are safe because while
@@ -388,6 +393,11 @@ mod tests {
     #[test]
     fn view_key() {
         assert_eq!(action_for(press(KeyCode::F(3))), Some(Action::View));
+    }
+
+    #[test]
+    fn edit_key() {
+        assert_eq!(action_for(press(KeyCode::F(4))), Some(Action::Edit));
     }
 
     #[test]
@@ -580,6 +590,7 @@ mod tests {
             "reject",
             "open_log_viewer",
             "view",
+            "edit",
             "page_up",
             "page_down",
             "quit",
@@ -593,7 +604,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 36);
+        assert_eq!(names.len(), 37);
     }
 
     #[test]

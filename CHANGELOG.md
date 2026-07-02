@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Teredo (`2001::/32`), and NAT64 (`64:ff9b::/96`) prefixes are now classified by extracting
   the embedded IPv4 address and recursing through `is_ssrf_blocked_ip`.
 
+- **Editor launch is hardened like the existing shell-action runner** (RFC-0012 P2, ADR-0011): the
+  resolved `$VISUAL`/`$EDITOR` command is split via deterministic POSIX shell-word quoting
+  (`shlex`) — never a shell, never glob/variable/command-substitution expansion — and spawned as a
+  plain argv with a `--` terminator before the always-absolute target path (so a file named like a
+  flag is never misparsed), a scrubbed environment (`env_clear()` + an explicit allow-list + a
+  sanitized `PATH` — secrets such as `AWS_*`/`GITHUB_TOKEN`/`CAIRN_*`/`LD_PRELOAD` never reach the
+  child), and its own process group.
+
 ### Added
 
 - **Read-only file pager** (RFC-0012 P1, M4-7): `F3` opens the entry under the cursor in a
@@ -44,8 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows the filename, a line/percentage position, and a status (`Loading…` / `Ready` /
   `Truncated — showing first N` / `Error: …`); the view is capped at ~8 MiB. `j`/`k`/arrows,
   `PageUp`/`PageDown`, `g`/`G`/`Home`/`End`, and `q`/`Esc` all work as in the existing log viewer.
-  No editor yet — Enter-on-text is view-only for now (`F4`/edit is a later phase; see
-  `docs/rfcs/0012-file-open-view-edit.md` for the full pager → editor → remote-writeback design).
+
+- **Edit files with `$EDITOR`** (RFC-0012 P2, M4-7, ADR-0011): `F4` always opens
+  `$VISUAL`/`$EDITOR`/`vi` on the entry under the cursor (MC-faithful — no text/binary sniff);
+  `Enter` on a text file now opens the same editor instead of the read-only pager (`Enter` on a
+  binary file is unchanged — still the hex pager). Cairn suspends its own screen, hands the editor
+  the real terminal (a new `InputGate` pauses the blocking input-reader thread and waits for its
+  ack so it never races the editor for keystrokes), and resumes with a full repaint on exit. Local
+  files only for now — a file on a remote connection shows *"Editing remote files lands in P3 —
+  copy it to a local pane to edit"* without disturbing the TUI. After the editor exits, the active
+  pane's listing refreshes and the status line shows the outcome.
 
 - **Docker image content browsing** (M6-2 follow-up, ADR-0010): entering `/images/<tag>` in the
   Docker backend now browses the image's actual rootfs instead of silently showing an empty

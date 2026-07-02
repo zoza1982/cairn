@@ -1,6 +1,6 @@
 # RFC-0012: File Open, View & Edit — Read-Only Pager, In-Place Editor, Remote Writeback
 
-- **Status:** Draft (P1 implemented; P2–P3 designed, not yet implemented)
+- **Status:** Draft (P1 + P2 implemented; P3 designed, not yet implemented)
 - **Author(s):** tui-engineer, software-architect (synthesized)
 - **Date:** 2026-07-02
 - **Tracking item:** M4-7 (see `docs/IMPLEMENTATION_PLAN.md`)
@@ -10,18 +10,22 @@
 Cairn can browse every backend but has no way to *look inside* a file. This RFC specifies the
 whole file-open experience in three phases:
 
-1. **P1 (this PR): a built-in, read-only pager** (MC's `F3`) — `F3` opens the entry under the
+1. **P1 (implemented): a built-in, read-only pager** (MC's `F3`) — `F3` opens the entry under the
    cursor; `Enter` on a file classifies it (text vs binary) and opens the pager in the matching
    mode (`Text` or `Hex`). No editor yet.
-2. **P2 (designed, not implemented): in-place text editing.** `Enter` on a text file (or a new
-   `F4`) opens an editable buffer; `Ctrl-S` writes it back through the same `Vfs` the pane is
-   browsing.
+2. **P2 (this PR): in-place editing via `$EDITOR`, local files only.** `F4` always opens
+   `$VISUAL`/`$EDITOR`/`vi` on the entry under the cursor; `Enter` on a `FileKind::Text` result now
+   routes to the editor instead of the read-only pager (binary files still open the hex pager).
+   Cairn suspends the terminal, hands the real TTY to the editor, and resumes on exit. Remote
+   backends refuse cleanly with a pointer to P3 — this phase does not shell out over the wire.
 3. **P3 (designed, not implemented): remote writeback hardening.** Conflict detection (the file
    changed underneath the editor), atomic replace-on-save semantics where the backend supports
-   them, and large-file editing limits.
+   them, and large-file editing limits — the from-scratch in-app buffer editor originally sketched
+   for P2 was superseded by the `$EDITOR`-shell-out design once ux-engineer/tui-engineer weighed in
+   (see "P2 — implemented" below); P3 now covers making that shell-out safe for non-local backends.
 
 This document covers the full arc so the P1 pager's data model doesn't have to be revisited when
-P2/P3 land — the `Overlay::Pager` shape, the `AppEffect`/`AppEvent` naming, and the reducer's
+P3 lands — the `Overlay::Pager` shape, the `AppEffect`/`AppEvent` naming, and the reducer's
 sniff-then-open flow are all chosen to extend cleanly.
 
 ## Motivation
@@ -49,22 +53,33 @@ loading the whole thing and writing it back. Cairn had neither. Concretely:
 - **`F3`** opens the entry under the cursor in the pager immediately, defaulting to `Text` mode.
   If the stream turns out to be binary (a `NUL` byte appears in the first chunk), the view flips
   to `Hex` mode automatically — no flash of garbled text.
-- **`Enter` on a file** (previously a no-op) reads a small prefix, classifies it, and opens the
-  pager already in the right mode (`Text` for text, `Hex` for binary) — no flip needed, at the
-  cost of a short classification round-trip before the overlay appears. `Enter` on a directory is
-  unchanged (navigates into it).
+- **`Enter` on a file** reads a small prefix and classifies it. A **binary** result opens the pager
+  in `Hex` mode. A **text** result now opens the external editor (P2 — see below); `Enter` on a
+  directory is unchanged (navigates into it).
 - **Pager keys:** `j`/`k`/`↑`/`↓` scroll a line/row; `PageUp`/`PageDown` scroll a page; `g`/`G` (or
   `Home`/`End`) jump to the top/loaded-bottom; `q`/`Esc` closes.
 - **Title bar** shows the filename, a `line/total (pct%)` position (pct only when the backend
   reports the entry's size), and a status (`Loading…` / `Ready` / `Truncated — showing first N` /
   `Error: …`).
 - **Hex mode** renders classic `offset | hex bytes | ascii` rows, 16 bytes per row.
-- **No editor yet.** Enter-on-text opens the same read-only pager as Enter-on-binary; there is no
-  `F4`/edit action in P1. See P2.
+
+### What changes for a user (P2)
+
+- **`F4`** always opens `$VISUAL`/`$EDITOR`/`vi` on the entry under the cursor — no text/binary
+  sniff, MC-faithful ("edit this, whatever it is"). Cairn suspends its own screen, hands the
+  editor the real terminal, and restores itself the moment the editor exits.
+- **`Enter` on a text file** now opens the same editor (a behavioral change from P1, where it
+  opened the read-only pager). `Enter` on a binary file is unchanged — still the hex pager, since
+  Cairn is not a hex editor.
+- **Local files only.** Editing a file on a remote backend (SSH, S3, a container, …) shows
+  *"Editing remote files lands in P3 — copy it to a local pane to edit"* and does nothing else —
+  the TUI is never disturbed for a file that can't be edited this way yet.
+- After the editor exits, the active pane's listing refreshes (the file's size/mtime may have
+  changed) and the status line shows the outcome (`edited <name>`, or a redacted failure).
 
 ### What doesn't change
 
-- `Enter` on a directory: unchanged (navigates).
+- `Enter`/`F3` on a directory: unchanged (navigates / no-op).
 - The live log-tail viewer (`Overlay::LogViewer`, `Action::OpenLogViewer`): untouched, still the
   dedicated flow for `Stream` entries (container/pod logs). The pager and the log viewer are
   deliberately separate overlays — a static file's "first N bytes, then stop" contract is the
@@ -206,49 +221,99 @@ skip/take virtualization (only the on-screen rows are materialized per frame). `
 `Paragraph` with optional `Wrap`; `Hex` mode uses a `List` of pre-formatted
 `offset | hex | ascii` rows built by `format_hex_row`.
 
-## Reference-level explanation (P2 — designed, not implemented)
+## Reference-level explanation (P2 — implemented)
 
-**Goal:** `Enter` on a `FileKind::Text` result routes to a new `Action::Edit` instead of (or in
-addition to) the read-only pager; `F4` opens the editor directly, mirroring MC.
+**Goal (as shipped):** `F4` (`Action::Edit`) always opens `$VISUAL`/`$EDITOR`/`vi` on the entry
+under the cursor; `Enter` on a `FileKind::Text` result routes to the same editor instead of the
+read-only pager. **Local backends only** — a non-local `Vfs::local_path` result refuses cleanly
+before the terminal is touched.
 
-Sketch (not implemented in this PR — every touch point below is marked `// P2:` in the P1 code):
+This supersedes the from-scratch in-app buffer editor originally sketched here (see "Rationale and
+alternatives" for why) in favor of shelling out to the user's own editor, on the real terminal,
+after a full design pass with `ux-engineer`/`tui-engineer`/`security-engineer`. The full design
+rationale — the terminal suspend/resume sequence, the input-reader pause/resume mechanism, and the
+process-hardening model — is recorded in
+[ADR-0011](../adr/0011-terminal-suspend-and-editor-launch.md); this section summarizes the
+data-model-level changes.
 
-- A new `Overlay::Editor` holding an editable line buffer (likely `Vec<String>` plus a cursor
-  `(row, col)`), reusing the pager's streaming-load path to populate the initial content (bounded
-  by an editable-size cap, smaller than `PAGER_MAX_BYTES` — editing an 8 MiB buffer line-by-line
-  in a `TextEdit`-per-keystroke model is a different performance problem than paging one).
-- `TextEdit` gains cursor-motion and line-editing variants (or the editor captures raw `KeyEvent`s
-  directly, bypassing `TextEdit`'s single-line-field model — single-line assumptions run
-  throughout today's `TextEdit`, e.g. `Backspace`/`Insert(char)`/`Submit`, and a multi-line buffer
-  needs at minimum arrow-key motion and a newline-insert, which don't fit that shape cleanly).
-- `Ctrl-S` (or a `PromptKind`-style confirm) emits a new `AppEffect::SaveFile { conn, path,
-  contents }`; the effect runner calls `Vfs::open_write` and streams the buffer back.
-- Binary files never route to the editor (P1's `FileKind::Binary` keeps going to the read-only hex
-  pager) — Cairn is not a hex editor.
-- Every backend's `Vfs::open_write` already exists (used by the transfer engine), so P2 is mostly
-  TUI/reducer work plus a size-gated "load fully, then write fully" contract — no new backend
-  capability is required for the *local* happy path. Remote conflict handling is P3.
+### New actions/effects/events
+
+```rust
+enum Action {
+    // ...
+    Edit, // F4
+}
+
+enum AppEffect {
+    // ...
+    /// Not routed through the normal effect runner — special-cased inline in `event_loop`
+    /// because it needs exclusive terminal + stdin ownership (see ADR-0011).
+    SuspendAndEdit { conn: ConnectionId, path: VfsPath },
+}
+
+enum AppEvent {
+    // ...
+    EditFinished { status: String, error: bool },
+}
+```
+
+### Reducer changes
+
+- `Action::Edit` guards the entry under the cursor to `File`/`Symlink` (same restriction as the
+  pager/sniff) and emits `AppEffect::SuspendAndEdit` directly — no sniff, since `F4` always means
+  "edit this" regardless of content (MC-faithful).
+- `AppEvent::FileSniffed`'s `Text` arm (previously: open the pager in `Text` mode) now emits
+  `AppEffect::SuspendAndEdit` instead. The `Binary` arm is unchanged — still opens the read-only
+  hex pager, since Cairn is not a hex editor.
+- `AppEvent::EditFinished` sets the status line; on success it also re-emits the active pane's
+  `List` effect (the file's size/mtime may have changed), reusing the same refresh path as
+  `Action::Refresh`.
+
+### Runtime (effect-runner) changes
+
+`AppEffect::SuspendAndEdit` is handled inline in `event_loop`'s effect loop (`crates/cairn/src/app.rs`),
+not via `dispatch` — see ADR-0011 for the full sequence (resolve `local_path` → pause the input
+reader and wait for its ack → suspend the terminal → spawn the hardened editor and await it in the
+foreground → resume the terminal with a full repaint → resume the reader → report the outcome).
+The editor is spawned with **argv only** (never a shell), a `--` terminator before the always-
+absolute path, a scrubbed environment (`env_clear()` + an explicit allow-list + a sanitized `PATH`),
+its own process group, and no timeout (editing is open-ended interactive work) — modeled on the
+existing `spawn_shell_action`/`sanitized_path` hardening (`docs/adr/0005-shell-command-actions.md`).
+
+### Scope explicitly deferred to P3
+
+- Remote backends: refused with a clear message, not shelled out to (no temp-copy-and-upload yet).
+- Conflict detection (the file changed underneath the editor) and atomic replace-on-save.
+- Size limits for very large files on backends without cheap ranged writes.
 
 ## Reference-level explanation (P3 — designed, not implemented)
 
-**Goal:** make P2's writeback safe on backends where "load fully, edit, write fully" is unsafe
-(the file changed underneath you) or expensive (very large remote files).
+**Goal:** extend P2's `$EDITOR` shell-out to remote backends safely — "load fully, edit, write
+fully" is unsafe if the file changed underneath you, and expensive for very large remote files.
 
 Sketch:
 
-- **Conflict detection:** capture the entry's `etag`/`modified` at load time (already present on
-  `Entry`); before `SaveFile` commits, re-`stat` and compare. A mismatch surfaces a
-  `ConfirmOverwrite`-style overlay (an existing pattern — `Overlay::ConfirmOverwrite` already
-  covers the analogous transfer-collision case) rather than silently clobbering a concurrent
-  change.
+- **Temp-copy-edit-upload**, not an in-app buffer: download the remote file to a local temp path
+  (reusing the transfer engine's download path), run the same `spawn_editor_hardened` flow against
+  the temp copy, and on a clean exit upload it back (reusing the transfer engine's upload path).
+  This keeps P3 architecturally consistent with P2's "the real `$EDITOR`, on a real local file"
+  model instead of reviving the previously-sketched in-app line-buffer editor.
+- **Conflict detection:** capture the entry's `etag`/`modified` at download time (already present
+  on `Entry`); before uploading the edited temp copy back, re-`stat` the remote original and
+  compare. A mismatch surfaces a `ConfirmOverwrite`-style overlay (an existing pattern —
+  `Overlay::ConfirmOverwrite` already covers the analogous transfer-collision case) rather than
+  silently clobbering a concurrent change.
 - **Atomic replace where the backend supports it:** local/SFTP can write to a temp path and
   rename; object stores are naturally atomic per-object (a `PUT` fully replaces); this is a
   per-backend capability, likely a new `Caps` flag, not a core reducer concern.
-- **Size limits:** the editor should refuse (with a clear status message) to load a file above
-  some cap on backends without cheap ranged writes, rather than hanging on a multi-hundred-MB
-  load. Exact threshold is a UX call for `ux-engineer` at P3 implementation time.
+- **Size limits:** refuse (with a clear status message) to download-and-edit a file above some cap
+  on backends without cheap ranged writes, rather than hanging on a multi-hundred-MB round trip.
+  Exact threshold is a UX call for `ux-engineer` at P3 implementation time.
+- **Temp-file hygiene:** the downloaded copy must live in a per-session, permission-restricted temp
+  directory and be cleaned up after upload (or on error) — a security-engineer pass is required
+  before this lands, per RFC-0012's Security section below.
 - **Whether P3 lands before or after other backends is a v2 scheduling call**, not architecturally
-  blocking — it can start as soon as P2 lands.
+  blocking — it can start as soon as P2 lands (now merged).
 
 ## Drawbacks
 
@@ -276,6 +341,21 @@ Sketch:
 - **Lossless byte↔char encoding for hex rows vs. a separate raw-bytes field:** keeps
   `Overlay::Pager` a single `VecDeque<String>` shape for both modes (simpler `Debug`, simpler
   reducer helpers) instead of adding a parallel `Vec<u8>`-shaped field that only one mode uses.
+- **P2: shell out to `$VISUAL`/`$EDITOR`/`vi` over a from-scratch in-app buffer editor** (resolving
+  Unresolved Question 1 below). The from-scratch widget originally sketched in this RFC would have
+  needed a new multi-line text-editing model (`TextEdit` is single-line-field shaped throughout),
+  its own undo/redo and syntax-agnostic rendering, and would still only give users a plain-text
+  editor no better than what every terminal already has. Shelling out gives users their actual,
+  already-configured editor (syntax highlighting, their keybindings, plugins, `--wait` support for
+  GUI editors) at the cost of the terminal-suspend/resume complexity documented in ADR-0011 — a
+  one-time cost paid once, in the runtime layer, rather than an ongoing cost of reimplementing an
+  editor. This does mean P2 is local-only (P3 needed for remote), whereas an in-app buffer editor
+  could in principle have worked identically over any backend from day one; the `ux-engineer`/
+  `tui-engineer` consultation (Unresolved Question 1) judged the UX and correctness win of a real
+  editor worth deferring remote support to P3.
+- **Terminal suspend/resume design** (special-casing the one effect in `event_loop`, the
+  `InputGate` pause/resume mechanism, manual re-init over `ratatui::init()`) — see ADR-0011 for the
+  full alternatives analysis on that sub-decision.
 
 ## Security and privacy considerations
 
@@ -286,18 +366,26 @@ Sketch:
 - All I/O errors are redacted via the existing `VfsError::redacted()` convention before reaching
   `AppEvent`/the status line — no host names, paths beyond what the user already navigated to, or
   credential material.
-- P2/P3 (writeback) will need a fresh look from `security-engineer` before landing — a save path
-  is new attack surface (e.g. symlink races on local backends) that the read-only P1 pager does
-  not have.
+- **P2's editor-launch hardening** (implemented, security-reviewed): argv-only spawn (never a
+  shell), a `--` terminator before the always-absolute target path, `$VISUAL`/`$EDITOR` split via
+  deterministic POSIX shell-word quoting (`shlex`, no glob/variable/command-substitution
+  expansion), `env_clear()` + an explicit allow-list + a sanitized `PATH`, its own process group,
+  and a local-only guard resolved *before* the terminal is touched. See ADR-0011 for the full
+  model and `crates/cairn/src/app.rs`'s `spawn_editor_hardened` test suite for the adversarial
+  cases exercised (shell-injection attempt via `$EDITOR`, command-substitution attempt, a
+  flag-shaped filename, environment scrubbing, and a secret canary).
+- **P3 (writeback to remote backends)** will need a fresh `security-engineer` pass before landing —
+  a temp-copy-edit-upload path is new attack surface (temp-file permissions/predictability, upload
+  race windows, conflict-detection correctness) that P2's local-only, no-network-I/O editor launch
+  does not have.
 
 ## Unresolved questions
 
-1. Whether P2's editor is a from-scratch line-buffer widget or should defer to a "shell out to
-   `$EDITOR` on a local temp copy, then upload" model for remote backends (simpler for P2, but
-   breaks the keyboard-first non-blocking-UI principle for remote files and duplicates local disk
-   I/O) — needs `ux-engineer` + `tui-engineer` input before P2 starts.
-2. The exact P3 size threshold for refusing to load a file into the editor.
-3. Whether `wrap` gets a keybinding before or alongside P2.
+1. ~~Whether P2's editor is a from-scratch line-buffer widget or should defer to a "shell out to
+   `$EDITOR`..." model~~ — **Resolved for P2**: shell out to `$VISUAL`/`$EDITOR`/`vi`, local files
+   only; see "Rationale and alternatives" and ADR-0011.
+2. The exact P3 size threshold for refusing to download-and-edit a large remote file.
+3. Whether `wrap` gets a keybinding — still open, unrelated to P2's scope.
 
 ## Crate, dependency, and feature impact
 
@@ -311,3 +399,12 @@ Sketch:
 - `cairn`: `run_sniff_file_effect`/`run_pager_effect` + `pager_controls` control map in
   `event_loop`/`dispatch`, mirroring `log_viewer_controls`.
 - No new backend capability, no `Caps` flag, no config schema change in P1.
+- **P2 additive:** `cairn-core`: `Action::Edit`; `AppEffect::SuspendAndEdit`;
+  `AppEvent::EditFinished`. `cairn-tui`: `F4` keybinding; `"edit"` config action name.
+  `cairn`: `run_editor_suspend`/`spawn_editor_hardened`/`resolve_editor_argv`/`InputGate`/
+  `EditorRestoreGuard` in `app.rs` (see ADR-0011). New dependency: `shlex` (already a transitive
+  dependency present in `Cargo.lock`; pure-Rust, small, audited-by-widespread-use POSIX
+  shell-word splitter — chosen over hand-rolling quote/escape parsing for a security-sensitive
+  input). No new backend capability, no `Caps` flag, no config schema change in P2 — P2 is
+  entirely TUI/runtime work plus the existing `Vfs::local_path` capability the local backend
+  already provides.
