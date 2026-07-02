@@ -1232,6 +1232,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

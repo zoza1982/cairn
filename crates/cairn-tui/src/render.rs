@@ -1228,7 +1228,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     } else if let Some(msg) = &state.status {
         Line::from(format!(" {count}   {msg}"))
     } else {
-        let help = "q quit · Tab · ↵ open · F3 view · Space mark · c copy · m move · d del · p pause · r refresh · ^O conn · ^T queue · ^A ai";
+        let help = "q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move · d del · p pause · r refresh · ^O conn · ^T queue · ^A ai";
         Line::from(format!(" {count}   {help}"))
     };
     frame.render_widget(

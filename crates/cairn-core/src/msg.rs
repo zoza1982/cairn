@@ -83,6 +83,11 @@ pub enum Action {
     /// the async text/binary sniff — F3 always opens the pager immediately in `Text` mode,
     /// flipping to `Hex` if the first streamed chunk contains a NUL byte.
     View,
+    /// Edit the entry under the cursor in an external editor (`F4`, MC-faithful — no sniff, always
+    /// opens the editor regardless of text/binary content). `Enter` on a `FileKind::Text` result
+    /// (RFC-0012 P2) also routes here via [`AppEvent::FileSniffed`]. Local backends only in P2 —
+    /// see [`AppEffect::SuspendAndEdit`].
+    Edit,
     /// Scroll the active overlay up one page (log viewer, future overlays).
     PageUp,
     /// Scroll the active overlay down one page.
@@ -398,6 +403,20 @@ pub enum AppEvent {
         /// and when `result` is `Ok`. Only meaningful when `result` is `Err`.
         already_exists: bool,
     },
+    /// The external editor launched by [`AppEffect::SuspendAndEdit`] has finished (RFC-0012 P2).
+    ///
+    /// The reducer always sets `status` to this message. On success (`error: false`) it also
+    /// re-emits the active pane's `List` effect (via the same refresh path as `Action::Refresh`)
+    /// since the file's size/mtime may have changed. `status` is already secret-free (a filename
+    /// and an exit outcome only — never editor output, which is never captured in P2 since the
+    /// editor inherits the real TTY).
+    EditFinished {
+        /// Human-readable, secret-free status (e.g. `"edited notes.txt"`, or a redacted failure).
+        status: String,
+        /// Whether the edit did not complete successfully (editor missing, non-zero exit, spawn
+        /// failure, or the file being on a non-local backend).
+        error: bool,
+    },
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -711,5 +730,22 @@ pub enum AppEffect {
         /// Whether to persist the passphrase in the OS keychain after successful creation.
         /// Honoured only when the `keychain` feature is enabled; otherwise silently ignored.
         remember: bool,
+    },
+    /// Suspend the TUI and launch `$VISUAL`/`$EDITOR`/`vi` on `path`, in place, on the real TTY
+    /// (RFC-0012 P2 — `Action::Edit` (`F4`), or `Enter` on a `FileKind::Text` sniff result).
+    ///
+    /// **Not run through the normal effect runner** (`dispatch`, which has no `&mut Terminal` and
+    /// runs effects concurrently): this variant is special-cased inline in the `event_loop`'s
+    /// effect loop, which owns the terminal and can pause/resume the blocking input reader around
+    /// the editor's exclusive TTY ownership. See `docs/adr/0011-terminal-suspend-and-editor-launch.md`.
+    ///
+    /// **Local backends only in P2** — the runtime resolves `Vfs::local_path(&path)` *before*
+    /// touching the terminal; a `None` (remote backend) result in [`AppEvent::EditFinished`] with
+    /// a P3 pointer, leaving the TUI completely undisturbed.
+    SuspendAndEdit {
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The file to edit.
+        path: VfsPath,
     },
 }

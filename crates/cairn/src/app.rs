@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::connect::coordinator::ConnectionCoordinator;
@@ -28,6 +28,8 @@ use cairn_vault::Vault;
 use cairn_vfs::{ByteRange, ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -264,7 +266,11 @@ async fn run_async() -> anyhow::Result<()> {
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(256);
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
-    spawn_input_reader(input_tx);
+    // Shared with the blocking input-reader thread so the editor-suspend path (RFC-0012 P2) can
+    // pause it (and wait for its ack) before an external editor takes over the real TTY, and
+    // resume it afterward. See `InputGate` and `run_editor_suspend`.
+    let input_gate = InputGate::new();
+    spawn_input_reader(input_tx, input_gate.clone());
 
     let mut terminal = ratatui::init();
     install_terminal_panic_hook();
@@ -315,6 +321,7 @@ async fn run_async() -> anyhow::Result<()> {
         &shell_action_defs,
         &vault_ctx,
         descriptors,
+        &input_gate,
     )
     .await;
 
@@ -769,6 +776,7 @@ async fn event_loop(
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
     vault_ctx: &VaultContext,
     descriptor_map: HashMap<ConnectionId, ConnectionDescriptor>,
+    input_gate: &Arc<InputGate>,
 ) -> anyhow::Result<()> {
     // `descriptor_map` is looked up by the OpenConnection effect runner to find what to open.
     // P3: needs Arc<RwLock<_>> or a re-enumeration message to swap this map without restarting
@@ -834,6 +842,15 @@ async fn event_loop(
         }
         terminal.draw(|f| cairn_tui::render(f, state, &ui.theme))?;
         for effect in effects {
+            // `SuspendAndEdit` needs exclusive terminal + stdin ownership to hand off to an
+            // external editor — `dispatch` has neither (no `&mut Terminal`, and effects normally
+            // run concurrently via `tokio::spawn`), so it is special-cased here instead of routed
+            // through the normal effect runner. See `run_editor_suspend` and
+            // `docs/adr/0011-terminal-suspend-and-editor-launch.md`.
+            if let AppEffect::SuspendAndEdit { conn, path } = effect {
+                run_editor_suspend(terminal, input_gate, registry, event_tx, conn, path).await;
+                continue;
+            }
             dispatch(
                 effect,
                 registry,
@@ -2617,20 +2634,31 @@ async fn collect_pages(vfs: Arc<dyn Vfs>, dir: &VfsPath, all: bool) -> Result<Li
 
 /// Spawn a blocking OS thread that reads terminal events and forwards them over the channel. Reading
 /// input off the async runtime keeps a slow render from starving input and vice versa.
-fn spawn_input_reader(tx: mpsc::Sender<Event>) {
-    std::thread::spawn(move || loop {
-        match event::poll(Duration::from_millis(200)) {
-            Ok(true) => match event::read() {
-                Ok(ev) => {
-                    if tx.blocking_send(ev).is_err() {
-                        break; // receiver dropped; app is shutting down
+///
+/// `gate` lets the RFC-0012 P2 editor-suspend path pause this thread (so it never steals
+/// keystrokes meant for an external editor holding the real TTY) and resume it afterward. The gate
+/// is checked once per loop iteration, strictly *between* a `poll`/`read` pair and the next
+/// `poll` — never mid-`read()` — so a pause request can't interrupt an in-flight read.
+fn spawn_input_reader(tx: mpsc::Sender<Event>, gate: Arc<InputGate>) {
+    std::thread::spawn(move || {
+        loop {
+            gate.reader_tick();
+            match event::poll(Duration::from_millis(200)) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if tx.blocking_send(ev).is_err() {
+                            break; // receiver dropped; app is shutting down
+                        }
                     }
-                }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
                 Err(_) => break,
-            },
-            Ok(false) => {}
-            Err(_) => break,
+            }
         }
+        // The reader is exiting: mark the gate `Dead` so a concurrent/subsequent `request_pause`
+        // (from an edit) bails instead of blocking forever on an ack that will never arrive.
+        gate.mark_dead();
     });
 }
 
@@ -2642,6 +2670,439 @@ fn install_terminal_panic_hook() {
         ratatui::restore();
         previous(info);
     }));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// RFC-0012 P2: terminal suspend + external-editor launch
+//
+// See `docs/adr/0011-terminal-suspend-and-editor-launch.md` for the full design rationale.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The blocking input-reader thread's pause/resume state, coordinated with the async
+/// editor-suspend path via a [`Condvar`]. Three states rather than a plain bool so the pausing
+/// side can block until the reader has actually *acknowledged* the request (rather than racing a
+/// `poll`/`read` that was already in flight): `PauseRequested` is the ask, `Paused` is the ack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderState {
+    Running,
+    PauseRequested,
+    Paused,
+    /// The reader thread has exited (a `poll`/`read` error, or the event channel closed). It will
+    /// never acknowledge a pause again, so `request_pause` must observe this and bail rather than
+    /// wait for an ack that can never come.
+    Dead,
+}
+
+/// Shared handle used to pause the blocking input-reader thread (`spawn_input_reader`) while an
+/// external editor owns the real TTY, and to resume it afterward.
+///
+/// `std::sync::Mutex`/`Condvar` (not tokio's) are correct here: the reader is a real OS thread
+/// doing blocking I/O (`crossterm::event::poll`/`read`), not a tokio task, so it must synchronize
+/// with a real OS-level primitive. The pausing side (`request_pause`) performs a genuine blocking
+/// wait and must be run inside `tokio::task::spawn_blocking` by its caller — never awaited
+/// directly on a tokio worker thread.
+struct InputGate {
+    state: Mutex<ReaderState>,
+    cv: Condvar,
+}
+
+impl InputGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ReaderState::Running),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Recover a poisoned lock rather than propagating the panic: `ReaderState` is plain data with
+    /// no invariants that a panicking holder could have left inconsistent, so continuing with
+    /// whatever value is there is safe and preferable to taking down the whole app over a
+    /// (currently unreachable) panic elsewhere while the lock was held.
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReaderState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Ask the reader thread to pause, and **block the calling OS thread** until it acknowledges
+    /// (flips to `Paused`). Must be called from inside `tokio::task::spawn_blocking` — this is a
+    /// real `Condvar::wait`, not an async operation. Returns `Err(())` if the reader thread has
+    /// already died (state `Dead`): it will never ack, so the caller must not wait forever.
+    fn request_pause(&self) -> Result<(), ()> {
+        let mut guard = self.lock();
+        if *guard == ReaderState::Dead {
+            return Err(());
+        }
+        *guard = ReaderState::PauseRequested;
+        self.cv.notify_all();
+        loop {
+            match *guard {
+                ReaderState::Paused => return Ok(()),
+                ReaderState::Dead => return Err(()),
+                _ => {
+                    guard = self
+                        .cv
+                        .wait(guard)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        }
+    }
+
+    /// Flip back to `Running` and wake the parked reader thread. Cheap and non-blocking; safe to
+    /// call from async code directly. Never resurrects a `Dead` reader.
+    fn resume(&self) {
+        let mut guard = self.lock();
+        if *guard != ReaderState::Dead {
+            *guard = ReaderState::Running;
+        }
+        self.cv.notify_all();
+    }
+
+    /// Called by the reader thread when it exits (poll/read error, or the event channel closed), so
+    /// a subsequent `request_pause` bails instead of waiting for an ack that will never come.
+    fn mark_dead(&self) {
+        let mut guard = self.lock();
+        *guard = ReaderState::Dead;
+        self.cv.notify_all();
+    }
+
+    /// Called by the reader thread at the top of each loop iteration (after the previous
+    /// `poll`/`read`, before the next `poll`). A no-op unless a pause is pending; otherwise acks
+    /// the request and parks (zero stdin access, zero CPU) until `resume()` flips it back.
+    fn reader_tick(&self) {
+        let mut guard = self.lock();
+        if *guard == ReaderState::PauseRequested {
+            *guard = ReaderState::Paused;
+            self.cv.notify_all();
+            while *guard == ReaderState::Paused {
+                guard = self
+                    .cv
+                    .wait(guard)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+}
+
+/// RAII guard that restores the TUI's terminal mode (raw + alternate screen) and unpauses the
+/// input reader if dropped while still armed — i.e. if `run_editor_suspend` panics or returns
+/// early anywhere between suspending the terminal and performing its own explicit resume. Without
+/// this, such a path would leave the reader thread parked forever (the whole app going deaf to
+/// input — a hang, not just a cosmetic issue) and/or the terminal in the wrong mode for Cairn's
+/// own subsequent `terminal.draw()` calls.
+///
+/// Constructed *after* the terminal has been suspended (so its Drop path mirrors "resume"), and
+/// disarmed only after `run_editor_suspend` has performed the resume itself. The re-entry this
+/// performs (`enable_raw_mode`/`EnterAlternateScreen`) is best-effort and does not call
+/// `Terminal::clear` (Drop has no `&mut Terminal` to work with) — acceptable because this path is
+/// a safety net for an exceptional early exit, not the normal-completion path (which does call
+/// `clear()`). On an actual panic, [`install_terminal_panic_hook`] restores the terminal to normal
+/// mode *before* unwinding begins (panic hooks run pre-unwind) and prints the panic message there;
+/// this guard's Drop running afterward during unwind is a deliberately accepted, pre-existing
+/// class of risk for any raw-mode TUI that suspends around a child process — always resuming the
+/// input reader (preventing a permanent hang) is the invariant that must never be skipped, and is
+/// unconditional here regardless of the terminal-mode outcome.
+struct EditorRestoreGuard<'a> {
+    input_gate: &'a Arc<InputGate>,
+    armed: bool,
+}
+
+impl Drop for EditorRestoreGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = enable_raw_mode();
+            let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+            self.input_gate.resume();
+        }
+    }
+}
+
+/// Environment variables always forwarded to the editor child (never secrets/vault material). Both
+/// broader than `spawn_shell_action`'s allow-list (an interactive editor needs `TERM`/`SHELL`/XDG
+/// dirs to render and behave correctly) and just as strict about excluding everything else —
+/// `AWS_*`/`GOOGLE_*`/`AZURE_*`/`GITHUB_TOKEN`/`VAULT_*`/`CAIRN_*`/`SSH_AUTH_SOCK`/`LD_PRELOAD`/
+/// `LD_LIBRARY_PATH`/`DYLD_*` are all dropped by `env_clear()` and never re-added. `LC_*` is
+/// handled separately below (prefix match, like `spawn_shell_action`).
+const EDITOR_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "TZ",
+    "TMPDIR",
+    "TERM",
+    "COLORTERM",
+    "TERMINFO",
+    "SHELL",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+];
+
+/// Resolve the editor command string: `$VISUAL` → `$EDITOR` → `vi` (Unix). On Windows, if neither
+/// is set, this is a hard refusal (never guess `notepad`) with a clear, actionable message.
+fn resolve_editor_command() -> Result<String, String> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                return Ok(v);
+            }
+        }
+    }
+    if cfg!(windows) {
+        Err("No editor configured — set $EDITOR (or $VISUAL) and try again".to_owned())
+    } else {
+        Ok("vi".to_owned())
+    }
+}
+
+/// Split the resolved editor command into `(program, fixed_args)` via **POSIX shell-word quoting
+/// only** (`shlex`) — deterministic, and never glob/variable/command-substitution expansion. E.g.
+/// `"code --wait"` → `("code", ["--wait"])`; `emacs -nw` → `("emacs", ["-nw"])`; a value containing
+/// `$(...)` or `*` is passed through as inert literal text, never interpreted.
+fn resolve_editor_argv() -> Result<(String, Vec<String>), String> {
+    let cmd = resolve_editor_command()?;
+    let mut argv =
+        shlex::split(&cmd).ok_or_else(|| "$EDITOR/$VISUAL has unmatched quoting".to_owned())?;
+    if argv.is_empty() {
+        return Err("$EDITOR/$VISUAL is empty".to_owned());
+    }
+    let program = argv.remove(0);
+    Ok((program, argv))
+}
+
+/// Spawn the editor as a hardened child: **argv only, never a shell** (`Command::new(program)`,
+/// never `sh -c`), a `--` terminator before the (always-absolute) file path so a filename like
+/// `-c :!sh` is treated as a plain argument rather than a flag (Unix only — see below), a scrubbed
+/// environment (`env_clear()` + [`EDITOR_ENV_ALLOWLIST`] + a sanitized `PATH`), and the file's
+/// parent directory as `cwd`. Unlike `spawn_shell_action`, stdio is **inherited** (the editor needs
+/// the real TTY) and there is **no timeout** (editing is open-ended, interactive, foreground work).
+///
+/// Crucially — and unlike `spawn_shell_action` — the editor is **not** put in its own process group
+/// (`process_group(0)`). That helper can safely reparent because its child never touches the TTY
+/// (stdin is `/dev/null`, stdout/stderr piped). A full-screen editor *reads* the inherited
+/// controlling terminal, and a process in a **background** process group that reads the TTY is sent
+/// `SIGTTIN` (default: stop) — so reparenting would freeze the editor (and Cairn, parked in
+/// `wait().await`) on its first keystroke. The editor therefore inherits Cairn's process group,
+/// which is the terminal's foreground group, and reads without `SIGTTIN`. Interactive editors put
+/// the terminal into their own raw mode (ISIG off) so a Ctrl-C during editing is delivered to the
+/// editor as a keystroke, not as a `SIGINT` to the shared group; the only residual exposure is the
+/// sub-millisecond cooked-mode windows around spawn/exit, an accepted trade-off shared by every
+/// program that shells out to `$EDITOR` (e.g. `git`).
+async fn spawn_editor_hardened(
+    program: &str,
+    fixed_args: &[String],
+    abs_path: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Result<std::process::ExitStatus, String> {
+    let mut std_cmd = std::process::Command::new(program);
+    std_cmd.args(fixed_args);
+    // `--` end-of-options terminator: Unix editors (vi/vim/nano/emacs, `code --wait`) honor it, so a
+    // file named `-c :!sh` can't be read as a flag. Skipped on Windows — plain GUI editors like
+    // `notepad.exe` don't recognize `--` and would try to open a file literally named `--`; the file
+    // path is always absolute (`C:\…`) there anyway, so it can never be mistaken for a flag.
+    #[cfg(unix)]
+    std_cmd.arg("--");
+    std_cmd
+        .arg(abs_path)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    std_cmd.env_clear();
+    if let Some(path) = sanitized_path() {
+        std_cmd.env("PATH", path);
+    }
+    for key in EDITOR_ENV_ALLOWLIST {
+        if let Some(v) = std::env::var_os(key) {
+            std_cmd.env(key, v);
+        }
+    }
+    for (k, v) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("LC_") {
+            std_cmd.env(k, v);
+        }
+    }
+
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start editor '{program}': {e}"))?;
+    child
+        .wait()
+        .await
+        .map_err(|e| format!("editor wait failed: {e}"))
+}
+
+/// Format a child [`std::process::ExitStatus`] as a short, secret-free description (exit code, or
+/// the terminating signal on Unix).
+fn describe_exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("killed by signal {sig}");
+        }
+    }
+    "terminated abnormally".to_owned()
+}
+
+/// Send an `AppEvent` without blocking the caller on a full channel. [`run_editor_suspend`] runs
+/// *inline on the event-loop task*, which is the sole consumer of `event_rx`; while it runs (for the
+/// whole open-ended duration of an edit) nothing drains the channel. An awaited `send` on a
+/// momentarily-full bounded channel would therefore deadlock permanently — the only task that could
+/// free capacity is the one parked on the send. Spawning the send lets `run_editor_suspend` return;
+/// the event loop then resumes, drains, and this detached send completes.
+fn send_event_detached(event_tx: &mpsc::Sender<AppEvent>, ev: AppEvent) {
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(ev).await;
+    });
+}
+
+/// Handle [`AppEffect::SuspendAndEdit`] — the one effect not routed through [`dispatch`] because it
+/// needs exclusive terminal + stdin ownership. Resolves the local path *before* touching the
+/// terminal (so a remote-backend refusal never disturbs the TUI), pauses the blocking input reader
+/// and waits for its ack, suspends the terminal, spawns the hardened editor and awaits it
+/// (foreground — the deliberate, documented exception to "the render path never blocks": the whole
+/// point is that the editor exclusively owns the TTY while it runs), manually resumes the terminal
+/// with a full non-diffed repaint, resumes the reader, and reports the outcome.
+async fn run_editor_suspend(
+    terminal: &mut ratatui::DefaultTerminal,
+    input_gate: &Arc<InputGate>,
+    registry: &VfsRegistry,
+    event_tx: &mpsc::Sender<AppEvent>,
+    conn: ConnectionId,
+    path: VfsPath,
+) {
+    // 1. Resolve the real, local OS path *before* touching the terminal at all. `local_path` does
+    // a blocking `canonicalize`, so it runs off the async runtime.
+    let Some(vfs) = registry.get(conn).await else {
+        send_event_detached(
+            event_tx,
+            AppEvent::EditFinished {
+                status: "connection unavailable".to_owned(),
+                error: true,
+            },
+        );
+        return;
+    };
+    let real = {
+        let (vfs, path) = (vfs.clone(), path.clone());
+        match tokio::task::spawn_blocking(move || vfs.local_path(&path)).await {
+            Ok(Some(p)) => p,
+            _ => {
+                // `None` covers "remote backend" *and* a local path that won't resolve (a dangling
+                // symlink, or one that escapes the confined root) — all mean "do not proceed" (see
+                // `Vfs::local_path`'s doc). The message avoids claiming "remote" for what may be a
+                // broken local link. Neither case has touched the terminal.
+                send_event_detached(
+                    event_tx,
+                    AppEvent::EditFinished {
+                        status: "Cannot edit this file — only local, resolvable files are \
+                                 editable (remote editing lands in P3)"
+                            .to_owned(),
+                        error: true,
+                    },
+                );
+                return;
+            }
+        }
+    };
+    let name = real
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let cwd = real
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| real.clone());
+
+    // Resolve $VISUAL/$EDITOR/vi and split it *before* pausing input / suspending the terminal, so
+    // a misconfigured editor var is reported without ever touching the TTY either.
+    let (program, fixed_args) = match resolve_editor_argv() {
+        Ok(pair) => pair,
+        Err(message) => {
+            send_event_detached(
+                event_tx,
+                AppEvent::EditFinished {
+                    status: message,
+                    error: true,
+                },
+            );
+            return;
+        }
+    };
+
+    // 2. Pause the blocking input-reader thread and wait for its ack. `request_pause` performs a
+    // real OS-level `Condvar::wait`, so it must run inside `spawn_blocking`, not directly `.await`ed.
+    {
+        let gate = input_gate.clone();
+        let paused = tokio::task::spawn_blocking(move || gate.request_pause()).await;
+        // `Ok(Ok(()))` = the reader acknowledged the pause. `Ok(Err(()))` = the reader thread has
+        // died (e.g. the controlling terminal dropped), so it will never ack — bail rather than
+        // wait forever. `Err(_)` = the blocking task panicked (has no panicking path, but handle it).
+        // In every non-ack case we have NOT touched the terminal yet, so fail cleanly.
+        if !matches!(paused, Ok(Ok(()))) {
+            send_event_detached(
+                event_tx,
+                AppEvent::EditFinished {
+                    status: "cannot edit: input is unavailable".to_owned(),
+                    error: true,
+                },
+            );
+            return;
+        }
+    }
+
+    // 3. Suspend: leave raw mode + the alternate screen. Deliberately NOT `ratatui::init()` again
+    // on resume (see the ADR) — `init()` re-installs a panic hook and stacks a new closure on
+    // every call; `restore()` here is the suspend half, the manual re-init below is the resume half.
+    ratatui::restore();
+
+    // RAII guard: if anything below panics or returns early before the explicit resume, this
+    // still re-enters raw mode/alt-screen and unpauses the reader rather than leaving the app
+    // permanently deaf to input.
+    let mut guard = EditorRestoreGuard {
+        input_gate,
+        armed: true,
+    };
+
+    // 4. Spawn the editor and await it in the foreground — the documented exception to "the
+    // render path never blocks": this specific await is the entire point of suspending.
+    let outcome = spawn_editor_hardened(&program, &fixed_args, &real, &cwd).await;
+
+    // 5. Resume: manual re-init (not `ratatui::init()`) + a full non-diffed repaint, since the
+    // terminal size may have changed and the editor's own screen is sitting in ratatui's diff
+    // buffer's blind spot.
+    if let Err(e) = enable_raw_mode() {
+        tracing::error!(error = %e, "failed to re-enable raw mode after editor exit");
+    }
+    if let Err(e) = execute!(std::io::stdout(), EnterAlternateScreen) {
+        tracing::error!(error = %e, "failed to re-enter the alternate screen after editor exit");
+    }
+    if let Err(e) = terminal.clear() {
+        tracing::error!(error = %e, "failed to repaint the terminal after editor exit");
+    }
+    input_gate.resume();
+    guard.armed = false; // resume already performed above; disarm so Drop is a no-op
+
+    let (status, error) = match outcome {
+        Ok(status) if status.success() => (format!("edited {name}"), false),
+        Ok(status) => (
+            format!("editor exited: {}", describe_exit_status(&status)),
+            true,
+        ),
+        Err(message) => (message, true),
+    };
+    send_event_detached(event_tx, AppEvent::EditFinished { status, error });
 }
 
 /// Decode as much valid UTF-8 as possible from `carry ++ bytes`, returning the decoded
@@ -3771,6 +4232,336 @@ mod tests {
             !dir.path().join("pwned").exists(),
             "a shell would have created 'pwned'; argv exec must not"
         );
+    }
+
+    // ── RFC-0012 P2: editor-launch hardening ──────────────────────────────────────────────────
+    //
+    // These tests mutate process-global environment variables (`$EDITOR`/`$VISUAL` and a handful
+    // of canary secrets), which is inherently racy against other tests in this binary running
+    // concurrently on other threads. `env_test_lock()` serializes every test below against each
+    // other; `EnvVarGuard` snapshots and restores the prior value of each var it touches.
+
+    /// Serializes every test that mutates process env vars below, so parallel test threads don't
+    /// race on `$EDITOR`/`$VISUAL`/the canary vars. A `tokio::sync::Mutex` (not `std::sync::Mutex`)
+    /// so both plain `#[test]` fns (`blocking_lock`) and `#[tokio::test]` fns (`lock().await`) can
+    /// use the same lock.
+    fn env_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// RAII guard: sets each `(key, value)` pair, remembering the prior value (if any), and
+    /// restores it (or removes the key if it was previously unset) on drop.
+    struct EnvVarGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let mut saved = Vec::with_capacity(vars.len());
+            for (key, value) in vars {
+                saved.push(((*key).to_owned(), std::env::var(key).ok()));
+                std::env::set_var(key, value);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (key, prev) in self.saved.drain(..) {
+                match prev {
+                    Some(v) => std::env::set_var(&key, v),
+                    None => std::env::remove_var(&key),
+                }
+            }
+        }
+    }
+
+    /// Writes a tiny POSIX-sh "fake editor" into `dir` that dumps its argv (one element per line)
+    /// to `argv.out` and its full environment to `env.out`, both alongside the script itself
+    /// (resolved via the script's own `$0`, not `cwd`, since `spawn_editor_hardened` sets `cwd` to
+    /// the *target file's* parent directory, which may differ from `dir`). Exits `0`.
+    #[cfg(unix)]
+    fn write_fake_editor(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake_editor.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             SCRIPT_DIR=$(cd \"$(dirname \"$0\")\" && pwd)\n\
+             for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$SCRIPT_DIR/argv.out\"\n\
+             env > \"$SCRIPT_DIR/env.out\"\n\
+             exit 0\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        script
+    }
+
+    /// A value that would chain a shell command (`; touch pwned`) if `$EDITOR` were ever handed to
+    /// a shell. Since we spawn argv-only, the whole string `"vi; touch pwned"` splits (via
+    /// `shlex`, whitespace-only, no metacharacter awareness) into a program literally named `"vi;"`
+    /// plus args `["touch", "pwned"]` — `"vi;"` cannot exist as an executable, so the spawn fails
+    /// cleanly and, crucially, `touch pwned` is never *run* as a separate command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn editor_command_is_never_shell_interpreted() {
+        let _serialize = env_test_lock().lock().await;
+        let _env = EnvVarGuard::set(&[("VISUAL", ""), ("EDITOR", "vi; touch pwned")]);
+        let dir = tempfile_dir();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, b"x").unwrap();
+
+        let (program, args) =
+            resolve_editor_argv().expect("well-formed quoting must split successfully");
+        let result = spawn_editor_hardened(&program, &args, &target, dir.path()).await;
+
+        assert!(
+            result.is_err(),
+            "a program literally named 'vi;' cannot exist; spawn must fail cleanly, got {result:?}"
+        );
+        assert!(
+            !dir.path().join("pwned").exists(),
+            "a shell would have created 'pwned' via `; touch pwned`; argv exec must not"
+        );
+    }
+
+    /// `$EDITOR` splitting uses POSIX shell-word *quoting* only — never variable/command
+    /// substitution. `vi "$(id)"` must split to the literal argv `["vi", "$(id)"]`; the `$(id)`
+    /// text is inert (never handed to a shell to expand).
+    #[test]
+    fn editor_argv_split_never_expands_command_substitution() {
+        let _serialize = env_test_lock().blocking_lock();
+        let _env = EnvVarGuard::set(&[("VISUAL", ""), ("EDITOR", r#"vi "$(id)""#)]);
+
+        let (program, args) = resolve_editor_argv().expect("well-formed quoting must split");
+        assert_eq!(program, "vi");
+        assert_eq!(
+            args,
+            vec!["$(id)".to_owned()],
+            "the quoted section must be preserved literally, not substituted"
+        );
+    }
+
+    /// Fixed flags survive splitting too — `code --wait` must resolve to `("code", ["--wait"])`,
+    /// not a single mangled token.
+    #[test]
+    fn editor_argv_split_preserves_fixed_flags() {
+        let _serialize = env_test_lock().blocking_lock();
+        let _env = EnvVarGuard::set(&[("VISUAL", ""), ("EDITOR", "code --wait")]);
+
+        let (program, args) = resolve_editor_argv().expect("well-formed quoting must split");
+        assert_eq!(program, "code");
+        assert_eq!(args, vec!["--wait".to_owned()]);
+    }
+
+    /// A `--` terminator always precedes the (always-absolute) target path, and the path is
+    /// forwarded as one unmodified argv element — so a file literally named `-c :!sh` is passed as
+    /// a plain filename, never parsed as a flag by the editor's own argument parser.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_editor_terminates_flags_with_double_dash_before_the_path() {
+        // `spawn_editor_hardened` reads process env (PATH + allowlist) while building the child, so
+        // it must not run concurrently with the env-mutating editor tests — a transiently-cleared
+        // PATH would break the fake `#!/bin/sh` editor's `dirname`/`env`/`printf` and fail the spawn.
+        let _serialize = env_test_lock().lock().await;
+        let dir = tempfile_dir();
+        let editor = write_fake_editor(dir.path());
+        let target = dir.path().join("-c :!sh");
+        std::fs::write(&target, b"contents").unwrap();
+
+        let status = spawn_editor_hardened(&editor.to_string_lossy(), &[], &target, dir.path())
+            .await
+            .expect("the fake editor must spawn and exit cleanly");
+        assert!(status.success());
+
+        let argv_dump = std::fs::read_to_string(dir.path().join("argv.out")).unwrap();
+        let lines: Vec<&str> = argv_dump.lines().collect();
+        let target_str = target.to_string_lossy().into_owned();
+        assert_eq!(
+            lines.last().copied(),
+            Some(target_str.as_str()),
+            "the absolute path must be the final, unmodified argv element, got {lines:?}"
+        );
+        assert_eq!(
+            lines.get(lines.len().wrapping_sub(2)).copied(),
+            Some("--"),
+            "a `--` terminator must immediately precede the path, got {lines:?}"
+        );
+    }
+
+    /// The editor child's environment is `env_clear()` + an explicit allow-list + a sanitized
+    /// `PATH` — secret-shaped variables (`AWS_*`, `GITHUB_TOKEN`, `LD_PRELOAD`, `CAIRN_*`) never
+    /// reach it, while a plain, non-secret var the editor needs to render correctly (`TERM`) does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_editor_scrubs_environment_to_an_allowlist() {
+        let _serialize = env_test_lock().lock().await;
+        let _env = EnvVarGuard::set(&[
+            ("TERM", "xterm-cairn-test"),
+            ("AWS_SECRET_ACCESS_KEY", "leak-aws-secret"),
+            ("GITHUB_TOKEN", "leak-gh-token"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("CAIRN_SOMETHING", "leak-cairn-internal"),
+        ]);
+        let dir = tempfile_dir();
+        let editor = write_fake_editor(dir.path());
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, b"x").unwrap();
+
+        let status = spawn_editor_hardened(&editor.to_string_lossy(), &[], &target, dir.path())
+            .await
+            .expect("the fake editor must spawn and exit cleanly");
+        assert!(status.success());
+
+        let env_dump = std::fs::read_to_string(dir.path().join("env.out")).unwrap();
+        assert!(
+            env_dump.contains("TERM=xterm-cairn-test"),
+            "TERM must reach the editor so it can render correctly, got env: {env_dump}"
+        );
+        for blocked in [
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "LD_PRELOAD",
+            "CAIRN_SOMETHING",
+        ] {
+            assert!(
+                !env_dump.contains(blocked),
+                "{blocked} must never reach the editor child, got env: {env_dump}"
+            );
+        }
+    }
+
+    /// A vault-adjacent secret value must appear in **neither** the child's environment nor its
+    /// argv — the structural guarantee is that `AppEffect::SuspendAndEdit` never carries secret
+    /// material in the first place (only a `ConnectionId` + `VfsPath`), and this test additionally
+    /// proves the env-scrub doesn't accidentally forward an ambient secret sitting in Cairn's own
+    /// process environment (e.g. inherited from a parent shell) either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_editor_never_leaks_a_vault_secret_canary() {
+        let _serialize = env_test_lock().lock().await;
+        const CANARY_KEY: &str = "CAIRN_VAULT_CANARY_TEST_ONLY";
+        const CANARY_VALUE: &str = "do-not-leak-canary-4f7a9c21";
+        let _env = EnvVarGuard::set(&[(CANARY_KEY, CANARY_VALUE)]);
+        let dir = tempfile_dir();
+        let editor = write_fake_editor(dir.path());
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, b"x").unwrap();
+
+        let status = spawn_editor_hardened(&editor.to_string_lossy(), &[], &target, dir.path())
+            .await
+            .expect("the fake editor must spawn and exit cleanly");
+        assert!(status.success());
+
+        let env_dump = std::fs::read_to_string(dir.path().join("env.out")).unwrap();
+        let argv_dump = std::fs::read_to_string(dir.path().join("argv.out")).unwrap();
+        assert!(
+            !env_dump.contains(CANARY_VALUE),
+            "the canary secret must never reach the child's environment"
+        );
+        assert!(
+            !argv_dump.contains(CANARY_VALUE),
+            "the canary secret must never reach the child's argv"
+        );
+    }
+
+    /// On Windows, with neither `$EDITOR` nor `$VISUAL` set, we must refuse with a clear message
+    /// rather than guess `notepad`.
+    #[test]
+    fn resolve_editor_command_unix_falls_back_to_vi() {
+        let _serialize = env_test_lock().blocking_lock();
+        let _env = EnvVarGuard::set(&[("VISUAL", ""), ("EDITOR", "")]);
+        if cfg!(windows) {
+            assert!(resolve_editor_command().is_err());
+        } else {
+            assert_eq!(resolve_editor_command(), Ok("vi".to_owned()));
+        }
+    }
+
+    /// `$VISUAL` takes priority over `$EDITOR` when both are set.
+    #[test]
+    fn resolve_editor_command_prefers_visual_over_editor() {
+        let _serialize = env_test_lock().blocking_lock();
+        let _env = EnvVarGuard::set(&[("VISUAL", "myvisual"), ("EDITOR", "myeditor")]);
+        assert_eq!(resolve_editor_command(), Ok("myvisual".to_owned()));
+    }
+
+    /// Malformed quoting (an unterminated quote) is a clean, typed error — never a panic.
+    #[test]
+    fn editor_argv_split_rejects_malformed_quoting() {
+        let _serialize = env_test_lock().blocking_lock();
+        let _env = EnvVarGuard::set(&[("VISUAL", ""), ("EDITOR", "vi 'unterminated")]);
+        assert!(resolve_editor_argv().is_err());
+    }
+
+    // --- InputGate pause/resume handshake ---
+
+    /// `request_pause` must block until a live reader thread acknowledges (flips to `Paused`), then
+    /// `resume` must unpark it. Failure mode of the primitive is a permanent hang, so this drives it
+    /// with a real second thread and bounds the whole thing with a timeout.
+    #[test]
+    fn input_gate_pause_waits_for_reader_ack_then_resume_unparks() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let gate = InputGate::new();
+        let ticks = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // A stand-in reader thread: loop calling reader_tick (which parks it while Paused) and
+        // counting iterations, until told to stop.
+        let reader = {
+            let (gate, ticks, stop) = (gate.clone(), ticks.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    gate.reader_tick();
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+
+        // request_pause blocks until the reader acks; it must return Ok and leave state Paused.
+        assert_eq!(gate.request_pause(), Ok(()));
+        assert_eq!(*gate.lock(), ReaderState::Paused);
+
+        // While paused, the reader is parked inside reader_tick → the tick count must not advance.
+        let parked_at = ticks.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            parked_at,
+            "reader must be parked (no ticks) while Paused"
+        );
+
+        // Resume unparks it → ticks advance again.
+        gate.resume();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            ticks.load(Ordering::SeqCst) > parked_at,
+            "reader must resume ticking after resume()"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
+    }
+
+    /// If the reader thread has died (`mark_dead`), `request_pause` must return `Err(())` promptly
+    /// rather than block forever waiting for an ack that can never come.
+    #[test]
+    fn input_gate_pause_returns_err_when_reader_is_dead() {
+        let gate = InputGate::new();
+        gate.mark_dead();
+        assert_eq!(
+            gate.request_pause(),
+            Err(()),
+            "a dead reader must make request_pause bail, not hang"
+        );
+        // resume() must not resurrect a dead reader.
+        gate.resume();
+        assert_eq!(*gate.lock(), ReaderState::Dead);
     }
 
     // --- split_cwd_root ---
