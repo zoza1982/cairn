@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Read-only file pager** (RFC-0012 P1, M4-7): `F3` opens the entry under the cursor in a
+  scrollable, read-only pager; `Enter` on a file (previously a no-op) now reads a bounded prefix,
+  classifies it as text or binary (a NUL-byte heuristic), and opens the pager in the matching
+  `Text`/`Hex` mode. Binary content renders as classic `offset | hex | ascii` rows. The title bar
+  shows the filename, a line/percentage position, and a status (`Loading…` / `Ready` /
+  `Truncated — showing first N` / `Error: …`); the view is capped at ~8 MiB. `j`/`k`/arrows,
+  `PageUp`/`PageDown`, `g`/`G`/`Home`/`End`, and `q`/`Esc` all work as in the existing log viewer.
+  No editor yet — Enter-on-text is view-only for now (`F4`/edit is a later phase; see
+  `docs/rfcs/0012-file-open-view-edit.md` for the full pager → editor → remote-writeback design).
+
 - **Docker image content browsing** (M6-2 follow-up, ADR-0010): entering `/images/<tag>` in the
   Docker backend now browses the image's actual rootfs instead of silently showing an empty
   listing. `DockerVfs` resolves a tag or raw image id to an ephemeral, **never-started** container

@@ -18,14 +18,14 @@ use cairn_broker::{Actor, Broker};
 use cairn_config::Config;
 use cairn_core::{
     initial_effects, update, Action, AppEffect, AppEvent, AppState, ChoiceStatus, ConnectionChoice,
-    LogViewerId, Msg, Overlay, ShellActionMeta, TransferId,
+    LogViewerId, Msg, Overlay, PagerId, ShellActionMeta, Side, TransferId,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
 use cairn_types::SessionId;
 use cairn_types::{ConnectionId, VfsPath};
 use cairn_vault::Vault;
-use cairn_vfs::{ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
+use cairn_vfs::{ByteRange, ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use tokio::sync::{mpsc, watch};
@@ -279,6 +279,7 @@ async fn run_async() -> anyhow::Result<()> {
     );
     let mut startup_controls = HashMap::new();
     let mut startup_log_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
+    let mut startup_pager_controls: HashMap<PagerId, CancellationToken> = HashMap::new();
     let mut startup_session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
     // Initial effects are List effects only (asserted above); empty descriptor map and an
     // empty in-flight set are safe here because OpenConnection is never emitted before the
@@ -293,6 +294,7 @@ async fn run_async() -> anyhow::Result<()> {
             &mut startup_controls,
             &mut None,
             &mut startup_log_controls,
+            &mut startup_pager_controls,
             &mut startup_session_controls,
             &shell_action_defs,
             &vault_ctx,
@@ -779,6 +781,7 @@ async fn event_loop(
     let mut transfer_controls: HashMap<TransferId, TransferControls> = HashMap::new();
     let mut ai_cancel: Option<CancellationToken> = None;
     let mut log_viewer_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
+    let mut pager_controls: HashMap<PagerId, CancellationToken> = HashMap::new();
     let mut session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
     // Tracks which ConnectionIds currently have an open task in flight. A duplicate
     // OpenConnection effect for the same id (e.g. the user selects a NeedsOpen entry twice
@@ -808,6 +811,12 @@ async fn event_loop(
         if let Msg::Event(AppEvent::LogStreamEnded { id, .. }) = &msg {
             log_viewer_controls.remove(id);
         }
+        // The reducer's own cap-hit path (`AppEvent::PagerChunk` reaching `PAGER_MAX_BYTES`)
+        // fires `AppEffect::ClosePager` itself (handled in `dispatch`, below) rather than waiting
+        // for `PagerDone` — so this only needs to clean up the natural EOF/error/cancel paths.
+        if let Msg::Event(AppEvent::PagerDone { id, .. }) = &msg {
+            pager_controls.remove(id);
+        }
         // Session cleanup: remove the controls entry when the session ends so the oneshot/mpsc
         // senders are dropped (closing stdin and signalling the relay task) if they haven't been
         // consumed already. The session record in `AppState::sessions` is cleaned up by the reducer.
@@ -832,6 +841,7 @@ async fn event_loop(
                 &mut transfer_controls,
                 &mut ai_cancel,
                 &mut log_viewer_controls,
+                &mut pager_controls,
                 &mut session_controls,
                 shell_action_defs,
                 vault_ctx,
@@ -1027,6 +1037,7 @@ fn dispatch(
     transfer_controls: &mut HashMap<TransferId, TransferControls>,
     ai_cancel: &mut Option<CancellationToken>,
     log_viewer_controls: &mut HashMap<LogViewerId, CancellationToken>,
+    pager_controls: &mut HashMap<PagerId, CancellationToken>,
     session_controls: &mut HashMap<SessionId, SessionControls>,
     shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
     vault_ctx: &VaultContext,
@@ -1324,6 +1335,33 @@ fn dispatch(
                 token.cancel();
             }
         }
+        AppEffect::SniffFile { pane, conn, path } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_sniff_file_effect(&registry, pane, conn, path).await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::OpenPager {
+            id,
+            conn,
+            path,
+            skip,
+        } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            let cancel = CancellationToken::new();
+            pager_controls.insert(id, cancel.clone());
+            tokio::spawn(async move {
+                run_pager_effect(registry, id, conn, path, skip, event_tx, cancel).await;
+            });
+        }
+        AppEffect::ClosePager { id } => {
+            if let Some(token) = pager_controls.remove(&id) {
+                token.cancel();
+            }
+        }
         AppEffect::OpenExecSession {
             id,
             conn,
@@ -1547,6 +1585,179 @@ async fn run_log_viewer_effect(
                     return;
                 }
             },
+        }
+    }
+}
+
+/// Bounded prefix read for file classification (`Action::Enter` on a non-directory entry). ~8 KiB
+/// is enough for the NUL-byte heuristic ([`cairn_core::detect_file_kind`]) while keeping the
+/// synchronous-feeling "Enter → pager" path fast even over a slow remote connection.
+const SNIFF_PREFIX_BYTES: usize = 8 * 1024;
+
+/// Read up to [`SNIFF_PREFIX_BYTES`] from the start of `path`, classify it, and report the result.
+/// Runs off the render path (spawned by `dispatch`). Requests a ranged read as a hint (cheaper
+/// over the wire for backends that support `Caps::RANDOM_READ`); backends that ignore the hint
+/// and stream the whole file are still bounded by the `take` below. Never panics on
+/// backend/user-reachable input — every I/O error becomes a redacted `AppEvent::SniffFailed`.
+async fn run_sniff_file_effect(
+    registry: &VfsRegistry,
+    pane: Side,
+    conn: ConnectionId,
+    path: VfsPath,
+) -> AppEvent {
+    use tokio::io::AsyncReadExt;
+
+    let Some(vfs) = registry.get(conn).await else {
+        return AppEvent::SniffFailed {
+            message: "connection unavailable".to_owned(),
+        };
+    };
+    let range = Some(ByteRange {
+        offset: 0,
+        len: Some(SNIFF_PREFIX_BYTES as u64),
+    });
+    let reader = match vfs.open_read(&path, range).await {
+        Ok(r) => r,
+        Err(e) => {
+            return AppEvent::SniffFailed {
+                message: e.redacted().to_string(),
+            };
+        }
+    };
+    let mut buf = Vec::with_capacity(SNIFF_PREFIX_BYTES);
+    if let Err(e) = reader
+        .take(SNIFF_PREFIX_BYTES as u64)
+        .read_to_end(&mut buf)
+        .await
+    {
+        return AppEvent::SniffFailed {
+            message: VfsError::Io(e).redacted().to_string(),
+        };
+    }
+    let kind = cairn_core::detect_file_kind(&buf);
+    AppEvent::FileSniffed {
+        pane,
+        conn,
+        path,
+        kind,
+        prefetch: bytes::Bytes::from(buf),
+    }
+}
+
+/// Read buffer size for the pager stream (matches the transfer engine's chunk size).
+const PAGER_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Stream `path`'s contents into the pager overlay `id`, forwarding each chunk as
+/// [`AppEvent::PagerChunk`] until EOF (`PagerDone{error: None, truncated: false}`), the
+/// [`CancellationToken`] fires (the pager closed, or the reducer itself hit
+/// [`cairn_core::PAGER_MAX_BYTES`] and fired `AppEffect::ClosePager` — no terminal event needed in
+/// that case, the reducer already marked the view `Truncated`), or an I/O error occurs (a
+/// redacted `PagerDone`).
+///
+/// `skip` bytes are always discarded client-side after a plain `open_read(path, None)` rather
+/// than re-deriving backend range-read support (already probed once by the sniff): this keeps the
+/// resume logic correct even for backends that don't support `Caps::RANDOM_READ`, at the cost of a
+/// tiny (≤ ~8 KiB) redundant read over the wire for remote backends.
+async fn run_pager_effect(
+    registry: VfsRegistry,
+    id: PagerId,
+    conn: ConnectionId,
+    path: VfsPath,
+    skip: u64,
+    event_tx: mpsc::Sender<AppEvent>,
+    cancel: CancellationToken,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let Some(vfs) = registry.get(conn).await else {
+        let _ = event_tx
+            .send(AppEvent::PagerDone {
+                id,
+                error: Some("connection unavailable".to_owned()),
+                truncated: false,
+            })
+            .await;
+        return;
+    };
+    // Race the open against cancellation: opening a special file (a symlink pointing at a FIFO, say)
+    // or a slow remote path can block inside `open_read` before the read loop's cancel check is ever
+    // reached, so a closed pager could otherwise leave this task hung indefinitely.
+    let opened = tokio::select! {
+        () = cancel.cancelled() => return,
+        r = vfs.open_read(&path, None) => r,
+    };
+    let mut reader = match opened {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = event_tx
+                .send(AppEvent::PagerDone {
+                    id,
+                    error: Some(e.redacted().to_string()),
+                    truncated: false,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let mut to_skip = skip;
+    // Independent safety cap: the reducer normally fires `ClosePager` once its own decoded
+    // `PAGER_MAX_BYTES` budget is hit, but a superseded/orphaned stream (whose `ClosePager` raced or
+    // whose chunks are dropped by the id guard) must still terminate on its own rather than read a
+    // multi-GB file to EOF. Count forwarded (post-skip) bytes and stop at the same ceiling.
+    let mut forwarded: u64 = 0;
+    let mut buf = vec![0u8; PAGER_CHUNK_BYTES];
+    loop {
+        let n = tokio::select! {
+            () = cancel.cancelled() => return,
+            r = reader.read(&mut buf) => match r {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::PagerDone {
+                            id,
+                            error: Some(VfsError::Io(e).redacted().to_string()),
+                            truncated: false,
+                        })
+                        .await;
+                    return;
+                }
+            },
+        };
+        if n == 0 {
+            let _ = event_tx
+                .send(AppEvent::PagerDone {
+                    id,
+                    error: None,
+                    truncated: false,
+                })
+                .await;
+            return;
+        }
+        let mut chunk = &buf[..n];
+        if to_skip > 0 {
+            let skip_now = to_skip.min(n as u64) as usize;
+            chunk = &chunk[skip_now..];
+            to_skip -= skip_now as u64;
+        }
+        if !chunk.is_empty() {
+            let _ = event_tx
+                .send(AppEvent::PagerChunk {
+                    id,
+                    bytes: bytes::Bytes::copy_from_slice(chunk),
+                })
+                .await;
+            forwarded = forwarded.saturating_add(chunk.len() as u64);
+            if forwarded >= cairn_core::PAGER_MAX_BYTES as u64 {
+                let _ = event_tx
+                    .send(AppEvent::PagerDone {
+                        id,
+                        error: None,
+                        truncated: true,
+                    })
+                    .await;
+                return;
+            }
         }
     }
 }

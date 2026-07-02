@@ -17,10 +17,11 @@ pub use forms::{
 };
 pub use msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 pub use state::{
-    ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionChoice,
-    ConnectionFormStage, ConnectionKind, DiscoverySource, FieldValue, Listing, LogViewerId,
-    LogViewerStatus, MaskedInput, Overlay, PaneState, PendingSave, PromptKind, QueuedTransfer,
-    SessionEnd, SessionRecord, ShellActionMeta, Side, SortMode, TransferId, LOG_VIEWER_MAX_BYTES,
-    LOG_VIEWER_MAX_LINES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
+    detect_file_kind, ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionChoice,
+    ConnectionFormStage, ConnectionKind, DiscoverySource, FieldValue, FileKind, Listing,
+    LogViewerId, LogViewerStatus, MaskedInput, Overlay, PagerId, PagerMode, PagerStatus, PaneState,
+    PendingSave, PromptKind, QueuedTransfer, SessionEnd, SessionRecord, ShellActionMeta, Side,
+    SortMode, TransferId, LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES, PAGER_HEX_ROW_BYTES,
+    PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
 pub use update::{initial_effects, update, VAULT_PASSPHRASE_MIN_LEN};

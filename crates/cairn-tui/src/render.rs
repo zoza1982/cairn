@@ -5,12 +5,13 @@ use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{
     credential_method_fields, credential_methods, scheme_fields, AppState, ChoiceProvenance,
     ConnectionFormStage, ConnectionKind, CredentialMethod, FieldValue, Listing, LogViewerStatus,
-    MaskedInput, Overlay, PaneState, PromptKind, SessionEnd, SessionRecord, Side, KNOWN_SCHEMES,
+    MaskedInput, Overlay, PagerMode, PagerStatus, PaneState, PromptKind, SessionEnd, SessionRecord,
+    Side, KNOWN_SCHEMES, PAGER_HEX_ROW_BYTES,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 /// Render the whole application: two panes over a one-line status bar, themed by `theme`.
@@ -190,6 +191,27 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             status,
             ..
         } => render_log_viewer(frame, title, lines, *follow, *scroll, status),
+        Overlay::Pager {
+            title,
+            mode,
+            lines,
+            byte_size,
+            total_size,
+            scroll,
+            status,
+            wrap,
+            ..
+        } => render_pager(
+            frame,
+            title,
+            *mode,
+            lines,
+            *byte_size,
+            *total_size,
+            *scroll,
+            status,
+            *wrap,
+        ),
         Overlay::ExecPane {
             id,
             input,
@@ -972,6 +994,127 @@ fn render_log_viewer(
     frame.render_widget(List::new(visible).block(block), area);
 }
 
+/// Draw the read-only file pager overlay (`F3` / `Enter` on a file — RFC-0012 P1): a scrollable
+/// view of the buffered content in `Text` or `Hex` mode, plus a status indicator and a
+/// line/percentage position in the border.
+///
+/// `scroll` is the 0-based index of the topmost visible *stored* line/row (managed by the
+/// reducer). In `Text` mode with `wrap` enabled, a long stored line can still occupy more than one
+/// terminal row inside the viewport — the visible window is a windowed approximation, not an
+/// exact line-for-row mapping, matching the log viewer's existing trade-off for the same reason:
+/// precise re-flow bookkeeping would require the pure reducer to know the render width, which it
+/// must not depend on.
+#[allow(clippy::too_many_arguments)]
+fn render_pager(
+    frame: &mut Frame,
+    title: &str,
+    mode: PagerMode,
+    lines: &std::collections::VecDeque<String>,
+    byte_size: usize,
+    total_size: Option<u64>,
+    scroll: usize,
+    status: &PagerStatus,
+    wrap: bool,
+) {
+    let area = centered(
+        frame.area(),
+        80,
+        frame.area().height.saturating_sub(2).max(3),
+    );
+    frame.render_widget(Clear, area);
+
+    let status_label = match status {
+        PagerStatus::Loading => " Loading… ".to_owned(),
+        PagerStatus::Ready => " Ready ".to_owned(),
+        PagerStatus::Truncated => {
+            format!(
+                " Truncated — showing first {} ",
+                human_bytes(byte_size as u64)
+            )
+        }
+        PagerStatus::Error(msg) => format!(" Error: {msg} "),
+    };
+    // Position: `line/total (pct%)` when the entry's size is known, else just `line/total`.
+    let total_lines = lines.len().max(1);
+    let current_line = scroll.min(total_lines - 1) + 1;
+    let position = match total_size {
+        Some(total) if total > 0 => {
+            format!(
+                " {current_line}/{total_lines} ({}%) ",
+                pct_of(byte_size as u64, total)
+            )
+        }
+        _ => format!(" {current_line}/{total_lines} "),
+    };
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .title_bottom(Line::from(status_label).right_aligned())
+        .title_bottom(Line::from(position).left_aligned())
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let viewport = usize::from(area.height.saturating_sub(2));
+    let top = scroll.min(lines.len().saturating_sub(1));
+    let end = (top + viewport).min(lines.len());
+
+    match mode {
+        PagerMode::Text => {
+            let text: Vec<Line> = lines
+                .iter()
+                .skip(top)
+                .take(end.saturating_sub(top))
+                .map(|l| Line::from(l.as_str()))
+                .collect();
+            let mut p = Paragraph::new(text).block(block);
+            if wrap {
+                p = p.wrap(Wrap { trim: false });
+            }
+            frame.render_widget(p, area);
+        }
+        PagerMode::Hex => {
+            let items: Vec<ListItem> = lines
+                .iter()
+                .skip(top)
+                .take(end.saturating_sub(top))
+                .enumerate()
+                .map(|(i, raw)| {
+                    let offset = (top + i) * PAGER_HEX_ROW_BYTES;
+                    ListItem::new(format_hex_row(offset, raw))
+                })
+                .collect();
+            frame.render_widget(List::new(items).block(block), area);
+        }
+    }
+}
+
+/// Decode one raw pager row — [`PAGER_HEX_ROW_BYTES`] bytes stored one `char` per byte (see
+/// `cairn_core`'s pager row-assembly convention) — into an `offset | hex | ascii` display line.
+/// A short trailing row (fewer than [`PAGER_HEX_ROW_BYTES`] bytes) pads the hex column with
+/// spaces so the ascii column still lines up.
+fn format_hex_row(offset: usize, raw: &str) -> String {
+    let bytes: Vec<u8> = raw.chars().map(|c| c as u32 as u8).collect();
+    let mut hex = String::with_capacity(PAGER_HEX_ROW_BYTES * 3);
+    for i in 0..PAGER_HEX_ROW_BYTES {
+        if i > 0 {
+            hex.push(' ');
+        }
+        match bytes.get(i) {
+            Some(b) => hex.push_str(&format!("{b:02x}")),
+            None => hex.push_str("  "),
+        }
+    }
+    let ascii: String = bytes
+        .iter()
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    format!("{offset:08x}  {hex}  {ascii}")
+}
+
 /// A centered rect of at most `w`×`h`, clamped to `area`.
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
@@ -1085,7 +1228,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     } else if let Some(msg) = &state.status {
         Line::from(format!(" {count}   {msg}"))
     } else {
-        let help = "q quit · Tab · ↵ open · Space mark · c copy · m move · d del · p pause · r refresh · ^O conn · ^T queue · ^A ai";
+        let help = "q quit · Tab · ↵ open · F3 view · Space mark · c copy · m move · d del · p pause · r refresh · ^O conn · ^T queue · ^A ai";
         Line::from(format!(" {count}   {help}"))
     };
     frame.render_widget(
@@ -1846,6 +1989,81 @@ mod tests {
         assert!(text.contains("line two"), "second log line: {text}");
         assert!(text.contains("Streaming"), "status indicator: {text}");
         assert!(text.contains("follow"), "follow indicator: {text}");
+    }
+
+    #[test]
+    fn pager_overlay_text_mode_shows_lines_and_status() {
+        let mut s = ready_state();
+        let mut lines = std::collections::VecDeque::new();
+        lines.push_back("fn main() {".to_owned());
+        lines.push_back("    println!(\"hi\");".to_owned());
+        s.overlay = Some(cairn_core::Overlay::Pager {
+            id: 1,
+            title: "main.rs — view".to_owned(),
+            mode: cairn_core::PagerMode::Text,
+            lines,
+            partial: String::new(),
+            byte_size: 32,
+            total_size: Some(64),
+            scroll: 0,
+            status: cairn_core::PagerStatus::Ready,
+            wrap: true,
+        });
+        let text = render_text(&s, 100, 24);
+        assert!(text.contains("main.rs"), "title in border: {text}");
+        assert!(text.contains("fn main"), "first line: {text}");
+        assert!(text.contains("println"), "second line: {text}");
+        assert!(text.contains("Ready"), "status indicator: {text}");
+        assert!(text.contains("50%"), "percentage position: {text}");
+    }
+
+    #[test]
+    fn pager_overlay_hex_mode_shows_offset_hex_and_ascii() {
+        let mut s = ready_state();
+        let mut lines = std::collections::VecDeque::new();
+        // "Hello, world!\0\0\0" — 16 raw bytes stored one char per byte (the reducer's
+        // byte↔char convention); the last three are NUL so they show as `.` in the ascii column.
+        lines.push_back("Hello, world!\u{0}\u{0}\u{0}".to_owned());
+        s.overlay = Some(cairn_core::Overlay::Pager {
+            id: 2,
+            title: "photo.png — view".to_owned(),
+            mode: cairn_core::PagerMode::Hex,
+            lines,
+            partial: String::new(),
+            byte_size: 16,
+            total_size: None,
+            scroll: 0,
+            status: cairn_core::PagerStatus::Loading,
+            wrap: true,
+        });
+        let text = render_text(&s, 100, 24);
+        assert!(text.contains("photo.png"), "title in border: {text}");
+        assert!(text.contains("00000000"), "offset column: {text}");
+        assert!(
+            text.contains("48 65 6c 6c 6f"),
+            "hex bytes for 'Hello' (0x48 0x65 0x6c 0x6c 0x6f): {text}"
+        );
+        assert!(text.contains("Hello, world!"), "ascii column: {text}");
+        assert!(text.contains("Loading"), "status indicator: {text}");
+    }
+
+    #[test]
+    fn pager_overlay_truncated_status_shown() {
+        let mut s = ready_state();
+        s.overlay = Some(cairn_core::Overlay::Pager {
+            id: 3,
+            title: "huge.log — view".to_owned(),
+            mode: cairn_core::PagerMode::Text,
+            lines: std::collections::VecDeque::new(),
+            partial: String::new(),
+            byte_size: 8 * 1024 * 1024,
+            total_size: Some(16 * 1024 * 1024),
+            scroll: 0,
+            status: cairn_core::PagerStatus::Truncated,
+            wrap: true,
+        });
+        let text = render_text(&s, 100, 24);
+        assert!(text.contains("Truncated"), "truncated indicator: {text}");
     }
 
     fn make_session_record(title: &str) -> SessionRecord {

@@ -1,6 +1,7 @@
 //! Messages, events, and effects — the three families of the TEA loop.
 
-use crate::state::{LogViewerId, Side, TransferId};
+use crate::state::{FileKind, LogViewerId, PagerId, Side, TransferId};
+use bytes::Bytes;
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
 use cairn_types::{ConnectionId, SessionId, VfsPath};
@@ -78,6 +79,10 @@ pub enum Action {
     /// the `"exec"` action (e.g. Kubernetes/Docker exec, SSH). The reducer uses `["sh"]` as the
     /// default argv. Wired to a configurable key once exec-capable backends land.
     OpenExecSession,
+    /// Open the read-only pager on the entry under the cursor (`F3`). Unlike `Enter`, this skips
+    /// the async text/binary sniff — F3 always opens the pager immediately in `Text` mode,
+    /// flipping to `Hex` if the first streamed chunk contains a NUL byte.
+    View,
     /// Scroll the active overlay up one page (log viewer, future overlays).
     PageUp,
     /// Scroll the active overlay down one page.
@@ -245,6 +250,51 @@ pub enum AppEvent {
         id: LogViewerId,
         /// `None` on clean EOF; `Some(redacted_message)` on error.
         error: Option<String>,
+    },
+    /// A bounded prefix of a file was read and classified as text or binary (`Action::Enter` on a
+    /// non-directory entry — see [`AppEffect::SniffFile`]). The reducer opens the read-only pager
+    /// ([`crate::Overlay::Pager`]) seeded with `prefetch` for an instant first frame, then emits
+    /// [`AppEffect::OpenPager`] to keep streaming past it.
+    FileSniffed {
+        /// The pane that issued the sniff (from [`AppEffect::SniffFile`]). The reducer opens the
+        /// pager only if this pane is still positioned on `path`, so a result arriving after a pane
+        /// switch is honored against the requesting pane rather than silently dropped.
+        pane: Side,
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The file that was sniffed.
+        path: VfsPath,
+        /// Text vs binary, from the NUL-byte heuristic ([`crate::detect_file_kind`]).
+        kind: FileKind,
+        /// The bytes already read during classification — seeded into the pager so the first
+        /// frame renders instantly instead of waiting for `AppEffect::OpenPager`'s stream to
+        /// start. Never forwarded to the AI layer (raw file bytes).
+        prefetch: Bytes,
+    },
+    /// The [`AppEffect::SniffFile`] read failed (e.g. permission denied, or the file vanished
+    /// after the listing was taken). No overlay is opened; the reducer just shows the message.
+    SniffFailed {
+        /// Secret-free, redacted error message.
+        message: String,
+    },
+    /// A decoded chunk of raw bytes from an open pager stream ([`AppEffect::OpenPager`]). Always
+    /// the raw file bytes — text-vs-hex formatting happens in the reducer/render layer, never
+    /// here, so a stream can flip mode (F3's Text → Hex on a NUL) after the fact.
+    PagerChunk {
+        /// Which pager session this belongs to.
+        id: PagerId,
+        /// The raw bytes read in this chunk.
+        bytes: Bytes,
+    },
+    /// The pager's read stream ended: cleanly (`error: None, truncated: false`), because it hit
+    /// [`crate::PAGER_MAX_BYTES`] (`truncated: true`), or with a redacted error.
+    PagerDone {
+        /// Which pager session ended.
+        id: PagerId,
+        /// `None` on clean EOF; `Some(redacted_message)` on error.
+        error: Option<String>,
+        /// Whether the byte cap was hit before EOF.
+        truncated: bool,
     },
     /// A decoded chunk of output from an exec session (stdout/stderr combined).
     SessionOutput {
@@ -470,6 +520,44 @@ pub enum AppEffect {
     CloseLogViewer {
         /// Session id to cancel.
         id: LogViewerId,
+    },
+    /// Read a bounded prefix of a file (~8 KiB) and classify it as text or binary. Emitted by the
+    /// reducer on `Action::Enter` over a non-directory entry; the result arrives as
+    /// [`AppEvent::FileSniffed`] (or [`AppEvent::SniffFailed`] on a read error).
+    SniffFile {
+        /// The pane that issued the sniff — carried back on [`AppEvent::FileSniffed`] so a result
+        /// that resolves after the user has switched panes is matched against the pane that asked,
+        /// not whichever pane happens to be focused when it arrives (mirrors [`AppEvent::Listed`]).
+        pane: Side,
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The file to sniff.
+        path: VfsPath,
+    },
+    /// Stream a file's contents into the pager overlay `id`. The runtime calls
+    /// `Vfs::open_read(path, None)` and reads in fixed-size chunks, forwarding each as
+    /// [`AppEvent::PagerChunk`] and a final [`AppEvent::PagerDone`] on completion or error.
+    ///
+    /// `skip` is the number of bytes at the start of the file already shown from a sniff's
+    /// `prefetch` ([`AppEvent::FileSniffed`]) — `0` when opened directly via `Action::View`,
+    /// which has no prefetch. The runner discards `skip` bytes from the fresh stream before
+    /// forwarding any `PagerChunk`, so the prefetched window is never shown twice.
+    OpenPager {
+        /// Session id minted by the reducer.
+        id: PagerId,
+        /// Connection to read from.
+        conn: ConnectionId,
+        /// Path of the file to stream.
+        path: VfsPath,
+        /// Bytes to discard from the start of the stream (already shown via `prefetch`).
+        skip: u64,
+    },
+    /// Cancel the in-flight pager stream with this id. Fired when the pager overlay closes
+    /// (`Esc`/`q`), or by the reducer itself when [`crate::PAGER_MAX_BYTES`] is reached and no
+    /// more bytes are needed.
+    ClosePager {
+        /// Session id to cancel.
+        id: PagerId,
     },
     /// Start an interactive cooked exec session and open an `Overlay::ExecPane` for it.
     ///
