@@ -140,11 +140,13 @@ impl Broker {
         // Capture kind before `add` consumes `secret`.
         let kind_str = secret.shape().kind.as_str().to_owned();
         let id = vault.add(label, secret);
-        // Save after add: if save fails the credential is NOT persisted to disk (the in-memory
-        // vault has it, but a process restart would lose it). Returning Err here gives the caller
-        // a chance to retry or surface the error; the in-memory add is idempotent on retry since
-        // `add` assigns a fresh UUID each time.
-        vault.save().map_err(BrokerError::Vault)?;
+        // Save after add: if save fails, roll back the in-memory add so the vault stays
+        // consistent with disk. Each `add` mints a fresh UUID, so a caller retry will get a
+        // different id — callers must treat the returned id as valid only on `Ok`.
+        if let Err(e) = vault.save() {
+            vault.remove(id); // undo the in-memory insertion
+            return Err(BrokerError::Vault(e));
+        }
         // Release the lock before journaling so journal contention never stalls the vault lock.
         drop(guard);
         self.record(JournalEntry {
@@ -152,6 +154,34 @@ impl Broker {
             action: format!("store {kind_str} as '{label}' → {id}"),
         });
         Ok(id)
+    }
+
+    /// Remove a credential from the vault, persist to disk, and record the operation.
+    ///
+    /// Returns `true` if the id was present and removed, `false` if it was not found (idempotent).
+    ///
+    /// **Security invariant:** the journal entry records only the actor and the id — never secret
+    /// material.
+    ///
+    /// # Errors
+    /// - [`BrokerError::Locked`] if the vault is not installed.
+    /// - [`BrokerError::Vault`] if the vault save fails (I/O or serialization error).
+    pub fn remove(&self, actor: Actor, id: CredentialId) -> Result<bool, BrokerError> {
+        let mut guard = self.vault.lock().expect("broker mutex");
+        let vault = guard.as_mut().ok_or(BrokerError::Locked)?;
+        let found = vault.remove(id);
+        if found {
+            vault.save().map_err(BrokerError::Vault)?;
+        }
+        // Release the vault lock before journaling.
+        drop(guard);
+        if found {
+            self.record(JournalEntry {
+                actor,
+                action: format!("remove {id}"),
+            });
+        }
+        Ok(found)
     }
 
     /// Resolve a credential reference to its secret value, recording the request in the journal.
@@ -411,6 +441,102 @@ mod tests {
         broker.lock();
         assert!(matches!(
             broker.resolve(Actor::User, id),
+            Err(BrokerError::Locked)
+        ));
+    }
+
+    // ── Broker::store tests ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn store_adds_credential_and_journals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let v = Vault::create_with_params(
+            &path,
+            &SecretString::from("pw".to_owned()),
+            KdfParams::fast_for_tests(),
+        )
+        .unwrap();
+        let broker = Broker::new(v);
+
+        let new_id = broker
+            .store(
+                Actor::User,
+                "my-key",
+                CredentialSecret::Ssh(SshCredential::Agent),
+            )
+            .expect("store should succeed");
+
+        // Resolution must return the stored credential.
+        let secret = broker.resolve(Actor::User, new_id).unwrap();
+        assert!(matches!(
+            secret,
+            CredentialSecret::Ssh(SshCredential::Agent)
+        ));
+
+        // Journal must have two entries: store + resolve. Neither may contain key material.
+        let journal = broker.journal();
+        assert_eq!(journal.len(), 2);
+        let store_entry = &journal[0];
+        assert_eq!(store_entry.actor, Actor::User);
+        assert!(store_entry.action.contains("ssh"));
+        assert!(store_entry.action.contains("my-key"));
+    }
+
+    #[test]
+    fn store_on_locked_broker_returns_locked() {
+        let broker = Broker::locked();
+        assert!(matches!(
+            broker.store(
+                Actor::User,
+                "label",
+                CredentialSecret::Ssh(SshCredential::Agent)
+            ),
+            Err(BrokerError::Locked)
+        ));
+    }
+
+    // ── Broker::remove tests ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn remove_existing_credential_and_journals() {
+        let (broker, id, _dir) = unlocked_with_one();
+
+        let found = broker
+            .remove(Actor::User, id)
+            .expect("remove should succeed");
+        assert!(found, "remove must return true for a known id");
+
+        // After removal, resolution must fail with NotFound.
+        assert!(matches!(
+            broker.resolve(Actor::User, id),
+            Err(BrokerError::NotFound)
+        ));
+
+        // Journal must have a remove entry. The entry must not contain key material.
+        let journal = broker.journal();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].actor, Actor::User);
+        assert!(journal[0].action.contains("remove"));
+        assert!(!journal[0].action.contains("AKIAsecret"));
+    }
+
+    #[test]
+    fn remove_unknown_id_returns_false_without_error() {
+        let (broker, _id, _dir) = unlocked_with_one();
+        let found = broker
+            .remove(Actor::User, CredentialId::nil())
+            .expect("remove of unknown id must not error");
+        assert!(!found, "remove must return false for an unknown id");
+        // No journal entry for a no-op remove.
+        assert!(broker.journal().is_empty());
+    }
+
+    #[test]
+    fn remove_on_locked_broker_returns_locked() {
+        let broker = Broker::locked();
+        assert!(matches!(
+            broker.remove(Actor::User, CredentialId::nil()),
             Err(BrokerError::Locked)
         ));
     }

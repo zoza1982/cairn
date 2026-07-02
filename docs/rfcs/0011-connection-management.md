@@ -225,7 +225,9 @@ no managed home (a bare SSH password, a SAS token, a static MinIO keypair).
 **Four gaps to close:**
 
 1. `Broker::store(actor, label, secret) -> CredentialId` (execution-layer only; `vault.add` +
-   `save`; journal records *kind + label only*) and a `BrokerError::Io`.
+   `save` with rollback on failure; journal records *kind + label only*) and a `BrokerError::Vault`
+   (not `BrokerError::Io` — the vault error type subsumes I/O and serialisation failures).
+   Also `Broker::remove(actor, id) -> bool` for clean delete and edit-credential-change paths.
 2. **Vault-create-from-UI** — a new `Overlay::VaultCreate` (passphrase + confirm via `MaskedInput`,
    optional "remember on this device" → OS keychain) and `AppEffect::CreateVault`, lifting the
    `run_vault_unlock_effect` "not yet available" block. Storing requires an unlocked vault, so this

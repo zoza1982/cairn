@@ -66,6 +66,13 @@ Four additional invariants are enforced:
 - **PEM bytes zeroized.** For `PrivateKeyFile` connections, the PEM bytes read from disk are
   wrapped in `zeroize::Zeroizing<String>` and wiped when the stack frame drops, so key material
   does not linger on the heap after `decode_secret_key` has parsed it.
+- **Credential-removal lifecycle.** When a connection profile is deleted, or when an edit
+  changes the credential method (including switching to a deferred method), the old vault entry
+  is removed via `Broker::remove` to prevent orphaned vault entries. For deletes, the vault
+  removal happens before the config file update so a crash between the two leaves an
+  unreferenced vault entry (safe) rather than a dangling config reference (unsafe). For edits,
+  the new vault entry is stored first; the old one is removed only after the new entry is
+  confirmed written, ensuring the profile always has a valid credential reference.
 
 GCS (service-account JSON) and Azure (shared key, SAS token, connection string) non-delegation
 methods are P5-present but field-capture-deferred: the user sees a "coming in a future update"

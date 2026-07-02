@@ -450,12 +450,31 @@ async fn run_save_connection_effect(
     }
 }
 
-/// Delete a connection profile from the cairn config file.
+/// Delete a connection profile from the cairn config file, and remove its vault credential.
 ///
 /// Does NOT call `register_connections` (which would alias ConnectionIds). The reducer handles
 /// the in-memory switcher update via `ConnectionDeleted`. Always returns an `AppEvent` (success
 /// or `ConnectionOpFailed`).
-async fn run_delete_connection_effect(id: uuid::Uuid) -> AppEvent {
+///
+/// If `secret_ref` is `Some`, the vault credential is removed first. A vault removal failure is
+/// logged but does not abort the config delete — the profile would be orphaned from the vault
+/// entry in that case (a recoverable inconsistency), and leaving the config entry in place would
+/// be worse.
+async fn run_delete_connection_effect(
+    broker: Arc<Broker>,
+    id: uuid::Uuid,
+    secret_ref: Option<uuid::Uuid>,
+) -> AppEvent {
+    use cairn_broker::Actor;
+
+    // Remove the vault credential before the config entry so that a crash between the two
+    // leaves an unreferenced vault entry (safe, just wasteful) rather than a dangling reference.
+    if let Some(cred_id) = secret_ref {
+        if let Err(e) = broker.remove(Actor::User, cred_id) {
+            tracing::warn!(error = %e, %cred_id, "failed to remove vault credential on delete; proceeding");
+        }
+    }
+
     let Some(config_path) = cairn_config::default_config_path() else {
         return AppEvent::ConnectionOpFailed {
             message: "Cannot determine config file path".to_owned(),
@@ -494,7 +513,10 @@ async fn run_delete_connection_effect(id: uuid::Uuid) -> AppEvent {
 /// - `CredentialDraft::SshAgent`, `AwsDefaultChain`, `AwsProfile`, `GcpApplicationDefault`,
 ///   `AzureAd`, and `KeepExisting` are delegation methods: no vault op is performed (they either
 ///   need no vault entry or preserve the existing `secret_ref`). The profile is saved directly.
-/// - Deferred-P5 drafts (non-functional variants): the profile is saved without a `secret_ref`.
+/// - Deferred drafts (non-functional variants): the profile is saved without a `secret_ref`. If
+///   in edit mode with an existing credential, the old vault entry is removed to avoid orphaning.
+/// - On edit with a new vault-backed credential, the old `secret_ref` vault entry is removed
+///   after the new entry is successfully stored.
 /// - Error messages are redacted (no host, no secret, no path).
 async fn run_provision_and_save_connection_effect(
     broker: Arc<Broker>,
@@ -507,6 +529,10 @@ async fn run_provision_and_save_connection_effect(
     use cairn_vault::{
         AwsCredential, AzureCredential, CredentialSecret, GcpCredential, SshCredential,
     };
+
+    // Capture the old credential reference before we potentially overwrite it.
+    // Used after a successful edit to remove the now-orphaned vault entry.
+    let old_secret_ref = profile.secret_ref;
 
     // Assemble a CredentialSecret from the draft. For delegation and KeepExisting, we skip the
     // vault operation and fall through to the profile save.
@@ -552,10 +578,23 @@ async fn run_provision_and_save_connection_effect(
         })),
 
         // ── Deferred / placeholder drafts — save profile without vault credential ──
-        CredentialDraft::GcpServiceAccountJson { .. } => None,
-        CredentialDraft::AzureSharedKey { .. } => None,
-        CredentialDraft::AzureSasToken { .. } => None,
-        CredentialDraft::AzureConnectionString { .. } => None,
+        //
+        // If this is an edit and the profile previously had a vault entry, remove it now so
+        // the user switching to a deferred method does not leave an orphaned vault entry.
+        CredentialDraft::GcpServiceAccountJson { .. }
+        | CredentialDraft::AzureSharedKey { .. }
+        | CredentialDraft::AzureSasToken { .. }
+        | CredentialDraft::AzureConnectionString { .. } => {
+            if is_edit {
+                if let Some(old_ref) = old_secret_ref {
+                    if let Err(e) = broker.remove(Actor::User, old_ref) {
+                        tracing::warn!(error = %e, "failed to remove old vault entry for deferred edit");
+                    }
+                }
+            }
+            profile.secret_ref = None;
+            None
+        }
 
         // ── Edit mode: preserve existing secret_ref, no vault operation ──
         CredentialDraft::KeepExisting => {
@@ -563,18 +602,31 @@ async fn run_provision_and_save_connection_effect(
             // Just save the profile as-is.
             return run_save_connection_effect(profile, is_edit).await;
         }
-        // Catch-all for future non-exhaustive variants — save without vault.
+        // Catch-all for future non-exhaustive variants added without updating this match.
+        // `CredentialDraft` is `#[non_exhaustive]` and this crate controls both sides, so this
+        // arm should never be reached at runtime.
         _ => None,
     };
 
     if let Some(secret) = secret {
-        // Check if this is a pure delegation (no secret material stored) — they still get a vault
-        // entry so `secret_ref` can be set and the backend knows which credential to use.
+        // All methods — including delegation — store a vault entry so the connect layer can look
+        // up which OS credential source to use via `secret_ref`.
         let label = profile.display_name.clone();
         match broker.store(Actor::User, &label, secret) {
-            Ok(id) => {
-                // Wire the vault id into the profile.
-                profile.secret_ref = Some(id);
+            Ok(new_id) => {
+                // Wire the new vault id into the profile.
+                profile.secret_ref = Some(new_id);
+                // If this is an edit, the old vault entry is now orphaned. Remove it after the
+                // new entry is safely stored (so a remove failure doesn't block the save).
+                if is_edit {
+                    if let Some(old_ref) = old_secret_ref {
+                        if old_ref != new_id {
+                            if let Err(e) = broker.remove(Actor::User, old_ref) {
+                                tracing::warn!(error = %e, "failed to remove old vault entry on edit");
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to store credential in vault");
@@ -646,39 +698,57 @@ async fn run_detect_os_sources_effect() -> cairn_core::OsSources {
     })
 }
 
-/// Parse AWS profile names from `~/.aws/credentials`.
+/// Parse AWS profile names from `~/.aws/credentials` (or `$AWS_SHARED_CREDENTIALS_FILE`).
 ///
 /// Returns only the section header names (`[profile]`), never any key values.
 /// Returns an empty `Vec` if the file is absent or unreadable.
 ///
 /// **Security invariant:** reads line-by-line via `BufReader` so the secret key values on
-/// non-header lines are never accumulated in a heap-allocated `String`. Only the `[header]`
-/// lines (which hold only the profile name) are retained and returned.
+/// non-header lines are never held in a heap-allocated `String`. Non-header lines are processed
+/// in the iterator and dropped immediately; only the `[header]` names are retained.
 fn detect_aws_profiles() -> Vec<String> {
     use std::io::{BufRead, BufReader};
+    use zeroize::Zeroizing;
 
-    // `HOME` on Unix/macOS; `USERPROFILE` on Windows.
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-    if home.is_empty() {
-        return Vec::new();
-    }
-    let path = PathBuf::from(home).join(".aws").join("credentials");
+    // Honour the AWS SDK override env var; fall back to the conventional location.
+    // `HOME` on Unix/macOS, `USERPROFILE` on Windows (both are set in standard environments).
+    let path = if let Ok(custom) = std::env::var("AWS_SHARED_CREDENTIALS_FILE") {
+        PathBuf::from(custom)
+    } else {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .filter(|s| !s.is_empty());
+        match home {
+            Some(h) => PathBuf::from(h).join(".aws").join("credentials"),
+            None => return Vec::new(),
+        }
+    };
+
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
+
     // Parse ini-style section headers: `[profile_name]` on their own line.
-    // Reading line-by-line means secret key values on other lines are never accumulated.
+    // Non-header lines (the key/secret pairs) are wrapped in `Zeroizing` and dropped
+    // immediately so they never linger in memory beyond the iterator step.
     BufReader::new(file)
         .lines()
         .filter_map(|line| {
-            let line = line.ok()?;
-            let trimmed = line.trim().to_owned();
+            // Wrap the raw line in Zeroizing so it is wiped when this closure returns.
+            let line = Zeroizing::new(line.ok()?);
+            let trimmed = line.trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                Some(trimmed[1..trimmed.len() - 1].trim().to_owned())
+                let name = trimmed[1..trimmed.len() - 1].trim().to_owned();
+                // Skip empty section names (malformed INI files).
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
             } else {
+                // Non-header line: `line` is dropped and zeroized here.
                 None
             }
         })
@@ -1357,10 +1427,11 @@ fn dispatch(
                 let _ = event_tx.send(ev).await;
             });
         }
-        AppEffect::DeleteConnection { id } => {
+        AppEffect::DeleteConnection { id, secret_ref } => {
             let event_tx = event_tx.clone();
+            let broker = vault_ctx.broker.clone();
             tokio::spawn(async move {
-                let ev = run_delete_connection_effect(id).await;
+                let ev = run_delete_connection_effect(broker, id, secret_ref).await;
                 let _ = event_tx.send(ev).await;
             });
         }

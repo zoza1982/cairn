@@ -604,7 +604,7 @@ fn render_credential_method_picker(frame: &mut Frame, scheme: &str, is_edit: boo
     let items: Vec<ListItem> = methods
         .iter()
         .map(|m| {
-            let suffix = if m.is_deferred_p5() {
+            let suffix = if m.is_field_capture_deferred() {
                 " (coming soon)"
             } else {
                 ""
@@ -642,7 +642,7 @@ fn render_credential_fields(
     };
     let fields = credential_method_fields(method);
 
-    if method.is_deferred_p5() {
+    if method.is_field_capture_deferred() {
         // Deferred method: show a placeholder message.
         let area = centered(frame.area(), 60, 5);
         frame.render_widget(Clear, area);

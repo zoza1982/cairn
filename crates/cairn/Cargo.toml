@@ -69,6 +69,9 @@ cairn-ai = { workspace = true }
 cairn-config = { workspace = true }
 thiserror = "2"
 anyhow = "1"
+# Used to zeroize non-header lines from the AWS credentials file so key material does not
+# linger in memory. Already a transitive dep via cairn-vault/cairn-secrets.
+zeroize = { version = "1", features = ["alloc"] }
 # `bytes::Bytes` is the stdin channel payload type on `SessionHandle` (cairn-vfs); the effect runner
 # forwards it directly from `SendSessionInput` — no copy needed.
 bytes = "1"

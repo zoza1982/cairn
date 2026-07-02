@@ -1089,7 +1089,7 @@ fn apply_credential_method_picker_action(state: &mut AppState, action: Action) -
             // Deferred methods (GcpServiceAccountJson, AzureSharedKey, …): commit the method
             // and immediately submit — the profile is saved without vault credentials; the
             // backend will prompt or fail on first open.
-            if chosen.is_deferred_p5() {
+            if chosen.is_field_capture_deferred() {
                 if let Some(Overlay::ConnectionForm { cred_method, .. }) = &mut state.overlay {
                     *cred_method = Some(chosen);
                 }
@@ -1174,7 +1174,7 @@ fn submit_credential_draft(state: &mut AppState) -> Vec<AppEffect> {
         };
 
     // Validate credential fields for non-delegation, non-deferred methods.
-    if !method.is_delegation() && !method.is_deferred_p5() {
+    if !method.is_delegation() && !method.is_field_capture_deferred() {
         let fields = credential_method_fields(&method);
         // Borrow immutably — do NOT clone! MaskedInput::Clone returns an empty field
         // (by design, to prevent silent secret duplication), so cloning cred_fields
@@ -1184,7 +1184,13 @@ fn submit_credential_draft(state: &mut AppState) -> Vec<AppEffect> {
         if let Some(Overlay::ConnectionForm { cred_fields, .. }) = &state.overlay {
             for (i, spec) in fields.iter().enumerate() {
                 if spec.required {
-                    let empty = cred_fields.get(spec.key).is_none_or(|fv| fv.is_empty());
+                    // For plain fields, trim whitespace before the emptiness check so that a
+                    // field containing only spaces is treated as empty. Secret fields are not
+                    // trimmed — leading/trailing whitespace in a passphrase is intentional.
+                    let empty = cred_fields.get(spec.key).is_none_or(|fv| match fv {
+                        FieldValue::Plain(s) => s.trim().is_empty(),
+                        FieldValue::Secret(m) => m.is_empty(),
+                    });
                     if empty && first_err_idx.is_none() {
                         first_err_idx = Some(i);
                         has_error = true;
@@ -1233,10 +1239,10 @@ fn submit_credential_draft(state: &mut AppState) -> Vec<AppEffect> {
     // (e.g. `SshCredential::Agent`) so the connect layer can look up which OS source to use.
     // Excludes:
     //   KeepExisting — preserves the existing secret_ref without a new vault write.
-    //   is_deferred_p5() — deferred methods save the profile without any vault credential.
+    //   is_field_capture_deferred() — deferred methods save the profile without any vault credential.
     if !state.vault_unlocked
         && !matches!(method, CredentialMethod::KeepExisting)
-        && !method.is_deferred_p5()
+        && !method.is_field_capture_deferred()
     {
         let pending = Box::new(crate::state::PendingSave {
             profile,
@@ -1329,7 +1335,13 @@ fn assemble_draft(
 
     let cred_fields = match &mut state.overlay {
         Some(Overlay::ConnectionForm { cred_fields, .. }) => cred_fields,
-        _ => return CredentialDraft::SshAgent, // unreachable
+        _ => {
+            debug_assert!(
+                false,
+                "assemble_draft called with non-ConnectionForm overlay"
+            );
+            return CredentialDraft::KeepExisting;
+        }
     };
 
     match method {
@@ -1898,10 +1910,12 @@ fn apply_confirm_delete_connection_action(state: &mut AppState, action: Action) 
             if state.connection_saving {
                 return Vec::new();
             }
+            // Look up the vault credential id before the profile is removed from state.
+            let secret_ref = state.saved_profiles.get(&id).and_then(|p| p.secret_ref);
             state.connection_saving = true;
             state.status = Some("Deleting connection…".to_owned());
             state.overlay = None;
-            vec![AppEffect::DeleteConnection { id }]
+            vec![AppEffect::DeleteConnection { id, secret_ref }]
         }
         Action::Cancel => {
             state.overlay = None;
@@ -3324,8 +3338,11 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             }
         }
         AppEvent::OsSourcesDetected { os_sources } => {
-            // Update the default credential method cursor if the picker is currently open.
-            // This handles the race where the picker opens before detection completes.
+            // Update the default credential method cursor if the picker is currently open AND
+            // the user has not manually moved it. We detect "user moved" by comparing the
+            // current cursor against what the open-time default would have been (using the
+            // pre-detection `state.os_sources`). If they match, the cursor is still at the
+            // auto-default and it is safe to advance it to the post-detection default.
             if let Some(Overlay::ConnectionForm {
                 stage: ConnectionFormStage::CredentialMethodPicker,
                 scheme,
@@ -3335,8 +3352,12 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             }) = &mut state.overlay
             {
                 let is_edit = editing_id.is_some();
-                *cred_method_cursor =
-                    crate::forms::default_credential_cursor(scheme, &os_sources, is_edit);
+                let open_time_default =
+                    crate::forms::default_credential_cursor(scheme, &state.os_sources, is_edit);
+                if *cred_method_cursor == open_time_default {
+                    *cred_method_cursor =
+                        crate::forms::default_credential_cursor(scheme, &os_sources, is_edit);
+                }
             }
             state.os_sources = os_sources;
             Vec::new()
@@ -8832,5 +8853,163 @@ mod p5_cred_tests {
             c_after, 0,
             "cursor must update to SshAgent after OS detection"
         );
+    }
+
+    #[test]
+    fn os_sources_detected_does_not_clobber_manually_moved_cursor() {
+        // If the user has moved the cursor away from the open-time default, OsSourcesDetected
+        // must NOT overwrite it.
+        let mut s = base();
+        pick_scheme(&mut s, 0); // ssh (no ssh_agent in default os_sources)
+        fill_field(&mut s, 0, "S");
+        fill_field(&mut s, 1, "h");
+        fill_field(&mut s, 2, "u");
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit)); // → CredentialMethodPicker
+
+        // Default cursor (no agent) = 1; user moves it to 3 (SshPassword).
+        let _ = update(&mut s, Msg::Action(Action::CursorDown)); // → 2
+        let _ = update(&mut s, Msg::Action(Action::CursorDown)); // → 3
+        let cursor_after_move = match &s.overlay {
+            Some(Overlay::ConnectionForm {
+                cred_method_cursor, ..
+            }) => *cred_method_cursor,
+            _ => panic!(),
+        };
+        assert_eq!(cursor_after_move, 3, "user moved cursor to SshPassword");
+
+        // Now detection arrives with ssh_agent=true (would set default to 0 if cursor not moved).
+        let os = crate::forms::OsSources {
+            ssh_agent: true,
+            ..Default::default()
+        };
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::OsSourcesDetected { os_sources: os }),
+        );
+
+        let cursor_after_detection = match &s.overlay {
+            Some(Overlay::ConnectionForm {
+                cred_method_cursor, ..
+            }) => *cred_method_cursor,
+            _ => panic!(),
+        };
+        assert_eq!(
+            cursor_after_detection, 3,
+            "user-moved cursor must not be clobbered by OsSourcesDetected"
+        );
+    }
+
+    // ── SshInlinePem and AwsStatic assemble_draft paths ──────────────────────────────────────────
+
+    /// Set the `cred_focus` in the ConnectionForm overlay (test helper).
+    fn set_cred_focus(s: &mut AppState, idx: usize) {
+        if let Some(Overlay::ConnectionForm { cred_focus, .. }) = &mut s.overlay {
+            *cred_focus = idx;
+        }
+    }
+
+    /// Type `text` into the current `cred_focus` credential field.
+    fn type_cred(s: &mut AppState, text: &str) {
+        for c in text.chars() {
+            let _ = update(s, Msg::Text(TextEdit::Insert(c)));
+        }
+    }
+
+    #[test]
+    fn ssh_inline_pem_assemble_draft_carries_pem_and_emits_provision() {
+        // Full flow for SshInlinePem: endpoint → picker (index 2) → CredentialFields → submit.
+        // Checks that the emitted draft is SshInlinePem (not SshAgent or SshPrivateKeyFile).
+        let mut s = base();
+        s.vault_unlocked = true;
+
+        pick_scheme(&mut s, 0); // ssh
+        fill_field(&mut s, 0, "PemServer");
+        fill_field(&mut s, 1, "pem.example.com");
+        fill_field(&mut s, 2, "admin");
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit)); // → CredentialMethodPicker
+
+        // SSH methods: [SshAgent=0, SshPrivateKeyFile=1, SshInlinePem=2, SshPassword=3]
+        if let Some(Overlay::ConnectionForm {
+            cred_method_cursor, ..
+        }) = &mut s.overlay
+        {
+            *cred_method_cursor = 2; // SshInlinePem
+        }
+        let _ = update(&mut s, Msg::Action(Action::Enter)); // → CredentialFields
+
+        // cred_focus 0 = cred_key_pem (required, secret)
+        set_cred_focus(&mut s, 0);
+        type_cred(&mut s, "-----BEGIN OPENSSH PRIVATE KEY-----");
+
+        let effects = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert_eq!(effects.len(), 1, "must emit one effect: {effects:?}");
+        match &effects[0] {
+            AppEffect::ProvisionAndSaveConnection { draft, .. } => {
+                assert!(
+                    matches!(draft, crate::forms::CredentialDraft::SshInlinePem { .. }),
+                    "draft must be SshInlinePem: {draft:?}"
+                );
+                // The debug output must not contain the PEM material.
+                let dbg = format!("{draft:?}");
+                assert!(
+                    !dbg.contains("BEGIN OPENSSH"),
+                    "debug must not contain PEM key material: {dbg}"
+                );
+            }
+            other => panic!("expected ProvisionAndSaveConnection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aws_static_assemble_draft_carries_access_key_and_emits_provision() {
+        // Full flow for AwsStatic: fill access_key_id (plain) and secret_access_key (secret).
+        let mut s = base();
+        s.vault_unlocked = true;
+
+        pick_scheme(&mut s, 1); // s3
+        fill_field(&mut s, 0, "StaticBucket");
+        fill_field(&mut s, 1, "my-static-bucket");
+        let _ = update(&mut s, Msg::Text(TextEdit::Submit)); // → CredentialMethodPicker
+
+        // S3 methods: [AwsDefaultChain=0, AwsProfile=1, AwsStatic=2]
+        if let Some(Overlay::ConnectionForm {
+            cred_method_cursor, ..
+        }) = &mut s.overlay
+        {
+            *cred_method_cursor = 2; // AwsStatic
+        }
+        let _ = update(&mut s, Msg::Action(Action::Enter)); // → CredentialFields
+
+        // cred_focus 0 = cred_access_key_id (required, plain)
+        set_cred_focus(&mut s, 0);
+        type_cred(&mut s, "AKIAIOSFODNN7EXAMPLE");
+
+        // cred_focus 1 = cred_secret_access_key (required, secret)
+        set_cred_focus(&mut s, 1);
+        type_cred(&mut s, "wJalrXUtnFEMI");
+
+        let effects = update(&mut s, Msg::Text(TextEdit::Submit));
+        assert_eq!(effects.len(), 1, "must emit one effect: {effects:?}");
+        match &effects[0] {
+            AppEffect::ProvisionAndSaveConnection { draft, .. } => {
+                assert!(
+                    matches!(
+                        draft,
+                        crate::forms::CredentialDraft::AwsStatic {
+                            access_key_id,
+                            ..
+                        } if access_key_id == "AKIAIOSFODNN7EXAMPLE"
+                    ),
+                    "draft must be AwsStatic with correct access_key_id: {draft:?}"
+                );
+                // The secret key must not appear in the debug output.
+                let dbg = format!("{draft:?}");
+                assert!(
+                    !dbg.contains("wJalrXUtnFEMI"),
+                    "debug must not contain the secret key: {dbg}"
+                );
+            }
+            other => panic!("expected ProvisionAndSaveConnection: {other:?}"),
+        }
     }
 }

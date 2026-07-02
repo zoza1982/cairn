@@ -412,7 +412,7 @@ impl CredentialMethod {
     /// deferred methods. The profile is still saved (without vault credentials); the backend
     /// will prompt or fail when the connection is first opened.
     #[must_use]
-    pub fn is_deferred_p5(&self) -> bool {
+    pub fn is_field_capture_deferred(&self) -> bool {
         matches!(
             self,
             Self::GcpServiceAccountJson
@@ -586,7 +586,7 @@ static AWS_STATIC_FIELDS: &[FieldSpec] = &[
 ///
 /// Returns an empty slice for delegation methods ([`SshAgent`], [`AwsDefaultChain`], etc.) and
 /// for deferred methods ([`GcpServiceAccountJson`], [`AzureSharedKey`], …). The TUI decides
-/// whether to show a deferred note by calling [`CredentialMethod::is_deferred_p5`].
+/// whether to show a deferred note by calling [`CredentialMethod::is_field_capture_deferred`].
 ///
 /// [`SshAgent`]: CredentialMethod::SshAgent
 /// [`AwsDefaultChain`]: CredentialMethod::AwsDefaultChain
@@ -629,7 +629,7 @@ pub fn credential_method_fields(method: &CredentialMethod) -> &'static [FieldSpe
 ///
 /// ## Security invariants
 ///
-/// - `SecretString`'s `Debug` impl always prints `Secret([REDACTED])`, so a `{:?}` of an
+/// - `SecretString`'s `Debug` impl always prints `SecretBox<str>([REDACTED])`, so a `{:?}` of an
 ///   `AppEffect` or overlay containing a `CredentialDraft` never leaks key material.
 /// - `Clone` is required because `AppEffect` derives `Clone`; it duplicates the `SecretString`
 ///   heap allocation rather than moving it. This mirrors `AppEffect::UnlockVault`'s pattern.
@@ -878,5 +878,177 @@ mod tests {
         assert_eq!(profile.display_name, "Test SSH");
         assert_eq!(profile.endpoint, ep);
         assert!(profile.secret_ref.is_none());
+    }
+
+    // ── is_delegation ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_delegation_true_for_agent_and_chain() {
+        assert!(CredentialMethod::SshAgent.is_delegation());
+        assert!(CredentialMethod::AwsDefaultChain.is_delegation());
+        assert!(CredentialMethod::GcpApplicationDefault.is_delegation());
+        assert!(CredentialMethod::AzureAd.is_delegation());
+        assert!(CredentialMethod::KeepExisting.is_delegation());
+    }
+
+    #[test]
+    fn is_delegation_false_for_secret_bearing() {
+        assert!(!CredentialMethod::SshPrivateKeyFile.is_delegation());
+        assert!(!CredentialMethod::SshInlinePem.is_delegation());
+        assert!(!CredentialMethod::SshPassword.is_delegation());
+        assert!(!CredentialMethod::AwsProfile.is_delegation());
+        assert!(!CredentialMethod::AwsStatic.is_delegation());
+    }
+
+    #[test]
+    fn is_delegation_false_for_deferred() {
+        assert!(!CredentialMethod::GcpServiceAccountJson.is_delegation());
+        assert!(!CredentialMethod::AzureSharedKey.is_delegation());
+        assert!(!CredentialMethod::AzureSasToken.is_delegation());
+        assert!(!CredentialMethod::AzureConnectionString.is_delegation());
+    }
+
+    // ── is_field_capture_deferred ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_field_capture_deferred_true_for_unimplemented_methods() {
+        assert!(CredentialMethod::GcpServiceAccountJson.is_field_capture_deferred());
+        assert!(CredentialMethod::AzureSharedKey.is_field_capture_deferred());
+        assert!(CredentialMethod::AzureSasToken.is_field_capture_deferred());
+        assert!(CredentialMethod::AzureConnectionString.is_field_capture_deferred());
+    }
+
+    #[test]
+    fn is_field_capture_deferred_false_for_implemented_methods() {
+        assert!(!CredentialMethod::SshAgent.is_field_capture_deferred());
+        assert!(!CredentialMethod::SshPrivateKeyFile.is_field_capture_deferred());
+        assert!(!CredentialMethod::SshInlinePem.is_field_capture_deferred());
+        assert!(!CredentialMethod::SshPassword.is_field_capture_deferred());
+        assert!(!CredentialMethod::AwsDefaultChain.is_field_capture_deferred());
+        assert!(!CredentialMethod::AwsProfile.is_field_capture_deferred());
+        assert!(!CredentialMethod::AwsStatic.is_field_capture_deferred());
+        assert!(!CredentialMethod::GcpApplicationDefault.is_field_capture_deferred());
+        assert!(!CredentialMethod::AzureAd.is_field_capture_deferred());
+        assert!(!CredentialMethod::KeepExisting.is_field_capture_deferred());
+    }
+
+    // ── credential_methods ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn credential_methods_ssh_starts_with_agent_for_new() {
+        let methods = credential_methods("ssh", false);
+        assert!(!methods.is_empty());
+        assert_eq!(methods[0], CredentialMethod::SshAgent);
+        // KeepExisting must not appear for new connections.
+        assert!(!methods.contains(&CredentialMethod::KeepExisting));
+    }
+
+    #[test]
+    fn credential_methods_ssh_starts_with_keep_existing_for_edit() {
+        let methods = credential_methods("ssh", true);
+        assert_eq!(methods[0], CredentialMethod::KeepExisting);
+    }
+
+    #[test]
+    fn credential_methods_local_is_empty() {
+        // Local scheme needs no credentials.
+        assert!(credential_methods("local", false).is_empty());
+        assert!(credential_methods("local", true).is_empty());
+    }
+
+    #[test]
+    fn credential_methods_s3_contains_default_chain_and_profile() {
+        let methods = credential_methods("s3", false);
+        assert!(methods.contains(&CredentialMethod::AwsDefaultChain));
+        assert!(methods.contains(&CredentialMethod::AwsProfile));
+        assert!(methods.contains(&CredentialMethod::AwsStatic));
+    }
+
+    // ── default_credential_cursor ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_credential_cursor_ssh_no_agent_gives_private_key_file() {
+        let os = OsSources {
+            ssh_agent: false,
+            ..OsSources::default()
+        };
+        let cursor = default_credential_cursor("ssh", &os, false);
+        let methods = credential_methods("ssh", false);
+        assert_eq!(methods[cursor], CredentialMethod::SshPrivateKeyFile);
+    }
+
+    #[test]
+    fn default_credential_cursor_ssh_with_agent_gives_agent() {
+        let os = OsSources {
+            ssh_agent: true,
+            ..OsSources::default()
+        };
+        let cursor = default_credential_cursor("ssh", &os, false);
+        let methods = credential_methods("ssh", false);
+        assert_eq!(methods[cursor], CredentialMethod::SshAgent);
+    }
+
+    #[test]
+    fn default_credential_cursor_edit_always_zero() {
+        // Edit mode: KeepExisting is always at index 0 regardless of OS sources.
+        let os = OsSources::default();
+        assert_eq!(default_credential_cursor("ssh", &os, true), 0);
+        assert_eq!(default_credential_cursor("s3", &os, true), 0);
+    }
+
+    #[test]
+    fn default_credential_cursor_s3_with_profiles_gives_aws_profile() {
+        let os = OsSources {
+            aws_profiles: vec!["default".to_owned()],
+            ..OsSources::default()
+        };
+        let cursor = default_credential_cursor("s3", &os, false);
+        let methods = credential_methods("s3", false);
+        assert_eq!(methods[cursor], CredentialMethod::AwsProfile);
+    }
+
+    // ── CredentialDraft debug redaction (item 8) ──────────────────────────────────────────────
+
+    #[test]
+    fn credential_draft_ssh_password_does_not_leak_in_debug() {
+        let secret = cairn_secrets::SecretString::from("s3cr3t-password".to_owned());
+        let draft = CredentialDraft::SshPassword { password: secret };
+        let dbg = format!("{draft:?}");
+        assert!(
+            !dbg.contains("s3cr3t-password"),
+            "SshPassword draft must not expose the secret in Debug: {dbg}"
+        );
+    }
+
+    #[test]
+    fn credential_draft_ssh_inline_pem_does_not_leak_in_debug() {
+        let key = cairn_secrets::SecretString::from("-----BEGIN RSA PRIVATE KEY-----".to_owned());
+        let draft = CredentialDraft::SshInlinePem {
+            key_pem: key,
+            passphrase: None,
+        };
+        let dbg = format!("{draft:?}");
+        assert!(
+            !dbg.contains("BEGIN RSA PRIVATE KEY"),
+            "SshInlinePem draft must not expose the PEM in Debug: {dbg}"
+        );
+    }
+
+    #[test]
+    fn credential_draft_aws_static_does_not_leak_secret_in_debug() {
+        use cairn_secrets::SecretString;
+        let draft = CredentialDraft::AwsStatic {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_owned(),
+            secret_access_key: SecretString::from(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned(),
+            ),
+            session_token: None,
+        };
+        let dbg = format!("{draft:?}");
+        // Access key id is not a secret and may appear.
+        assert!(
+            !dbg.contains("wJalrXUtnFEMI"),
+            "AwsStatic draft must not expose the secret access key in Debug: {dbg}"
+        );
     }
 }

@@ -560,9 +560,13 @@ pub enum AppEffect {
     },
     /// Delete a connection profile by its stable UUID. The runtime removes it from `cairn.toml`
     /// and rebuilds the switcher list, then reports back via [`AppEvent::ConnectionDeleted`].
+    /// If the profile had a vault credential, `secret_ref` carries the id so the effect runner
+    /// can call [`Broker::remove`](cairn_broker::Broker::remove) to avoid orphaning vault entries.
     DeleteConnection {
         /// The profile to remove.
         id: uuid::Uuid,
+        /// The vault credential id to remove, if any.
+        secret_ref: Option<uuid::Uuid>,
     },
     /// Provision a credential in the vault and save the connection profile.
     ///
@@ -582,7 +586,7 @@ pub enum AppEffect {
     /// The `CredentialSecret` assembly lives exclusively in `crates/cairn/src/app.rs`
     /// (the binary edge). `cairn-core` emits only the `CredentialDraft` in this effect;
     /// `cairn-vault` is never in `cairn-core`'s dependency graph. The `Debug` of this variant
-    /// is safe to log: `SecretString`'s `Debug` always prints `Secret([REDACTED])`.
+    /// is safe to log: `SecretString`'s `Debug` always prints `SecretBox<str>([REDACTED])`.
     ProvisionAndSaveConnection {
         /// Profile data (endpoint fields + display name). `secret_ref` will be set by the runner.
         profile: crate::forms::ProfileData,
