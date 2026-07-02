@@ -15,6 +15,9 @@ workspace = true
 [dependencies]
 cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
+# Carries raw file bytes for the read-only pager (`AppEvent::FileSniffed::prefetch`,
+# `AppEvent::PagerChunk::bytes`) — a plain data holder here, no I/O in this crate.
+bytes = "1"
 # Zeroizing secret types: the vault-unlock overlay holds the typed passphrase in a `SecretString`
 # (masked, never logged, wiped on drop) carried by `AppEffect::UnlockVault` to the effect runner.
 cairn-secrets = { workspace = true }

@@ -158,6 +158,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "approve_all" => Action::ApproveAll,
         "reject" => Action::Reject,
         "open_log_viewer" => Action::OpenLogViewer,
+        "view" => Action::View,
         "page_up" => Action::PageUp,
         "page_down" => Action::PageDown,
         "quit" => Action::Quit,
@@ -285,6 +286,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         // F7 = make directory, F2 = rename (Total Commander / Norton convention).
         KeyCode::F(7) => Some(Action::MakeDir),
         KeyCode::F(2) => Some(Action::Rename),
+        // F3 = view (MC convention): opens the read-only pager on the entry under the cursor.
+        KeyCode::F(3) => Some(Action::View),
         // '/' starts filter-as-you-type (vim/less convention).
         KeyCode::Char('/') => Some(Action::Filter),
         // Plan-overlay actions (no-ops when no overlay is open). These letters are safe because while
@@ -380,6 +383,11 @@ mod tests {
     #[test]
     fn unbound_key_is_none() {
         assert_eq!(action_for(press(KeyCode::Char('z'))), None);
+    }
+
+    #[test]
+    fn view_key() {
+        assert_eq!(action_for(press(KeyCode::F(3))), Some(Action::View));
     }
 
     #[test]
@@ -571,6 +579,7 @@ mod tests {
             "approve_all",
             "reject",
             "open_log_viewer",
+            "view",
             "page_up",
             "page_down",
             "quit",
@@ -584,7 +593,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 35);
+        assert_eq!(names.len(), 36);
     }
 
     #[test]

@@ -3,10 +3,12 @@
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 use crate::state::{
     ActiveTransfer, AppState, ChoiceStatus, ConnectionFormStage, ConnectionKind, FieldValue,
-    Listing, LogViewerStatus, MaskedInput, Overlay, PromptKind, QueuedTransfer, SessionEnd,
-    SessionRecord, Side, SortMode, TransferId, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
+    FileKind, Listing, LogViewerStatus, MaskedInput, Overlay, PagerMode, PagerStatus, PromptKind,
+    QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId, PAGER_HEX_ROW_BYTES,
+    PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
-use cairn_types::{Entry, SessionId, VfsPath};
+use bytes::Bytes;
+use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, VfsPath};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -302,6 +304,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         | Action::PageUp
         | Action::PageDown => Vec::new(),
         Action::OpenLogViewer => open_log_viewer(state),
+        Action::View => open_pager_for_view(state),
         Action::OpenExecSession => open_exec_session(state),
         Action::Refresh => reload(state, state.focus),
         Action::CycleSort => {
@@ -1735,6 +1738,7 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::Connections { .. }) => apply_connections_action(state, action),
         Some(Overlay::TransferQueue { .. }) => apply_transfer_queue_action(state, action),
         Some(Overlay::LogViewer { .. }) => apply_log_viewer_action(state, action),
+        Some(Overlay::Pager { .. }) => apply_pager_action(state, action),
         Some(Overlay::ExecPane { .. }) => apply_exec_pane_action(state, action),
         Some(Overlay::PortForwardStatus { .. }) => apply_port_forward_status_action(state, action),
         Some(Overlay::ConnectionForm { .. }) => apply_connection_form_action(state, action),
@@ -2805,7 +2809,299 @@ fn enter_dir(state: &mut AppState) -> Vec<AppEffect> {
     };
     match target {
         Some(dir) => navigate(state, side, dir),
-        None => Vec::new(),
+        // Not a directory: kick off the async sniff so `Enter` opens the read-only pager in the
+        // right mode (RFC-0012 P1). `sniff_current_file` no-ops on entry kinds that have their
+        // own dedicated flow (Stream/Special) rather than a plain byte stream.
+        None => sniff_current_file(state),
+    }
+}
+
+/// `Enter` on a non-directory entry: read a bounded prefix and classify it (text vs binary)
+/// before opening the pager, so a binary file opens directly in `Hex` mode instead of flashing
+/// garbled text first. Only [`EntryKind::File`] and [`EntryKind::Symlink`] are sniffed — `Stream`
+/// entries (e.g. container/pod logs) already have a dedicated live-tail flow
+/// ([`Action::OpenLogViewer`]), and `Special` nodes (sockets, devices, FIFOs) are not something a
+/// byte-stream pager can meaningfully show.
+///
+/// // P2: once the editor lands, a `FileKind::Text` result should route to `Action::Edit` instead
+/// // of (or in addition to) this read-only pager. For P1, Enter-on-text is view-only.
+fn sniff_current_file(state: &mut AppState) -> Vec<AppEffect> {
+    let side = state.focus;
+    let pane = state.active();
+    let Some(entry) = pane.current() else {
+        return Vec::new();
+    };
+    if !matches!(entry.kind, EntryKind::File | EntryKind::Symlink) {
+        return Vec::new();
+    }
+    let Ok(path) = pane.cwd.join(entry.name.as_ref()) else {
+        state.status = Some("Cannot open this entry".to_owned());
+        return Vec::new();
+    };
+    let conn = pane.conn;
+    vec![AppEffect::SniffFile {
+        pane: side,
+        conn,
+        path,
+    }]
+}
+
+/// Open the pager directly via `F3` (`Action::View`) — skips the sniff that `Enter` does, since
+/// F3 always means "view this". Starts in `Text` mode with no prefetch; the reducer flips to
+/// `Hex` if the first streamed chunk contains a NUL byte (see the `AppEvent::PagerChunk` handler).
+fn open_pager_for_view(state: &mut AppState) -> Vec<AppEffect> {
+    let pane = state.active();
+    let Some(entry) = pane.current() else {
+        state.status = Some("Nothing selected".to_owned());
+        return Vec::new();
+    };
+    if entry.is_dotdot_sentinel() || entry.is_dir() {
+        state.status = Some("Cannot view a directory".to_owned());
+        return Vec::new();
+    }
+    // Restrict to the same kinds the Enter sniff accepts (`File`/`Symlink`). Opening a `Special`
+    // node (FIFO, device, socket) for read on the local backend blocks indefinitely until a writer
+    // connects, and that `open_read().await` runs before the pager's cancellation token is polled —
+    // so without this guard, F3 on a named pipe spawns an unkillable, forever-hung stream. `Stream`
+    // entries (container/pod logs) have their own live-tail flow and aren't byte-pager content.
+    if !matches!(entry.kind, EntryKind::File | EntryKind::Symlink) {
+        state.status = Some("Cannot view this entry".to_owned());
+        return Vec::new();
+    }
+    let Ok(path) = pane.cwd.join(entry.name.as_ref()) else {
+        state.status = Some("Cannot open this entry".to_owned());
+        return Vec::new();
+    };
+    let conn = pane.conn;
+    let title = format!("{} — view", entry.name);
+    let total_size = entry.size;
+    open_pager(
+        state,
+        conn,
+        path,
+        title,
+        PagerMode::Text,
+        total_size,
+        Bytes::new(),
+    )
+}
+
+/// Mint a fresh pager id, install [`Overlay::Pager`] in `mode` (seeded with `prefetch`, if any, so
+/// the first frame renders instantly), and emit [`AppEffect::OpenPager`] to stream the rest.
+///
+/// The effect's `skip` is derived from `prefetch.len()` directly — not from the post-decode
+/// `byte_size` the seeding leaves behind, which can differ from the raw input length (`Text`
+/// mode's lossy UTF-8 decoding can replace invalid sequences with a wider placeholder; `Hex`
+/// mode's byte↔char encoding can take 1–2 UTF-8 bytes per raw byte). Using the raw length keeps
+/// the "how many bytes has the runner already shown" accounting exact regardless of how the
+/// reducer chooses to store them.
+fn open_pager(
+    state: &mut AppState,
+    conn: ConnectionId,
+    path: VfsPath,
+    title: String,
+    mode: PagerMode,
+    total_size: Option<u64>,
+    prefetch: Bytes,
+) -> Vec<AppEffect> {
+    let id = state.next_pager_id;
+    state.next_pager_id += 1;
+
+    // If a pager is already open (e.g. F3 opened one, then an in-flight Enter sniff resolves, or
+    // two quick Enters both resolve), its stream must be cancelled before we replace the overlay —
+    // otherwise its `PagerId` becomes unreachable: no `ClosePager` would ever be emitted for it, so
+    // its runner keeps reading the whole file to EOF (uncapped, uncancellable) with every chunk
+    // silently dropped by the id guard. Capture the old id here and close it alongside the open.
+    let superseded = match &state.overlay {
+        Some(Overlay::Pager { id: old, .. }) => Some(*old),
+        _ => None,
+    };
+
+    let mut lines = VecDeque::new();
+    let mut partial = String::new();
+    let mut byte_size = 0usize;
+    if !prefetch.is_empty() {
+        append_pager_bytes(mode, &mut lines, &mut partial, &mut byte_size, &prefetch);
+    }
+    let skip = prefetch.len() as u64;
+
+    state.overlay = Some(Overlay::Pager {
+        id,
+        title,
+        mode,
+        lines,
+        partial,
+        byte_size,
+        total_size,
+        scroll: 0,
+        status: PagerStatus::Loading,
+        wrap: true,
+    });
+
+    let mut effects = Vec::with_capacity(2);
+    if let Some(old) = superseded {
+        effects.push(AppEffect::ClosePager { id: old });
+    }
+    effects.push(AppEffect::OpenPager {
+        id,
+        conn,
+        path,
+        skip,
+    });
+    effects
+}
+
+/// Accumulate raw bytes into the pager's stored lines/rows, dispatching on `mode`. Returns `true`
+/// once [`PAGER_MAX_BYTES`] is reached — the caller stops accepting further bytes for this stream.
+fn append_pager_bytes(
+    mode: PagerMode,
+    lines: &mut VecDeque<String>,
+    partial: &mut String,
+    byte_size: &mut usize,
+    chunk: &[u8],
+) -> bool {
+    match mode {
+        PagerMode::Text => append_pager_text(lines, partial, byte_size, chunk),
+        PagerMode::Hex => append_pager_hex(lines, partial, byte_size, chunk),
+    }
+}
+
+/// Split raw bytes into decoded text lines for the pager (mirrors the log viewer's line-splitting
+/// convention, decoding each chunk lossily) — but, unlike the log viewer's live-tail ring buffer,
+/// never evicts from the front: a file pager shows the *first* N bytes up to the cap, not the most
+/// recent ones. Returns `true` once [`PAGER_MAX_BYTES`] is reached.
+fn append_pager_text(
+    lines: &mut VecDeque<String>,
+    partial: &mut String,
+    byte_size: &mut usize,
+    chunk: &[u8],
+) -> bool {
+    if *byte_size >= PAGER_MAX_BYTES {
+        return true;
+    }
+    let text = String::from_utf8_lossy(chunk);
+    let mut segments = text.split('\n');
+    if let Some(first) = segments.next() {
+        if !push_within_pager_budget(partial, byte_size, first) {
+            return true;
+        }
+    }
+    for seg in segments {
+        let complete = std::mem::take(partial);
+        lines.push_back(complete);
+        *byte_size += 1; // the '\n' itself
+        if *byte_size >= PAGER_MAX_BYTES {
+            return true;
+        }
+        if !push_within_pager_budget(partial, byte_size, seg) {
+            return true;
+        }
+    }
+    *byte_size >= PAGER_MAX_BYTES
+}
+
+/// Append as much of `s` as fits within the remaining [`PAGER_MAX_BYTES`] budget onto `partial`,
+/// updating `byte_size`. Returns `false` once the budget is exhausted (the caller stops after this
+/// call either way, so the exhausted-write is the last thing appended).
+///
+/// Lossy UTF-8 decoding can *expand* a chunk (an invalid byte becomes the 3-byte replacement
+/// character `U+FFFD`), so clamping the raw input bytes before decoding would not be sufficient to
+/// bound the decoded string — this truncates the already-decoded `&str` instead, backing off to a
+/// `str::is_char_boundary` so a multi-byte character is never split (which would panic on
+/// indexing) even for maliciously or incidentally malformed input.
+fn push_within_pager_budget(partial: &mut String, byte_size: &mut usize, s: &str) -> bool {
+    let remaining = PAGER_MAX_BYTES.saturating_sub(*byte_size);
+    if s.len() <= remaining {
+        *byte_size += s.len();
+        partial.push_str(s);
+        true
+    } else {
+        let mut cut = remaining;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        *byte_size += cut;
+        partial.push_str(&s[..cut]);
+        false
+    }
+}
+
+/// Accumulate raw bytes into fixed [`PAGER_HEX_ROW_BYTES`]-byte "rows" for the hex-mode pager.
+/// Each row is encoded as a `String` via a lossless byte↔char mapping (`char::from(byte)`, always
+/// a valid Unicode scalar value for `0..=255`) so the raw bytes round-trip exactly — unlike `Text`
+/// mode, hex content must never be corrupted by lossy UTF-8 decoding. The render layer decodes
+/// each row back to bytes and formats the `offset | hex | ascii` display row; storage stays raw
+/// here. Like [`append_pager_text`], never evicts — returns `true` once [`PAGER_MAX_BYTES`] bytes
+/// have been retained.
+fn append_pager_hex(
+    lines: &mut VecDeque<String>,
+    partial: &mut String,
+    byte_size: &mut usize,
+    chunk: &[u8],
+) -> bool {
+    if *byte_size >= PAGER_MAX_BYTES {
+        return true;
+    }
+    for &b in chunk {
+        partial.push(char::from(b));
+        *byte_size += 1;
+        if partial.chars().count() == PAGER_HEX_ROW_BYTES {
+            lines.push_back(std::mem::take(partial));
+        }
+        if *byte_size >= PAGER_MAX_BYTES {
+            return true;
+        }
+    }
+    false
+}
+
+/// Page size for the pager's scroll actions (mirrors the log viewer's `LOG_VIEWER_PAGE`).
+const PAGER_PAGE: usize = 20;
+
+/// Handle actions while the pager overlay is open. Unlike the log viewer there is no `follow`
+/// state — a static file pager doesn't auto-tail — so this is a simpler, symmetric set of
+/// cursor/page moves over whatever has streamed in so far.
+fn apply_pager_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    let Some(Overlay::Pager {
+        id, lines, scroll, ..
+    }) = &mut state.overlay
+    else {
+        return Vec::new();
+    };
+    let total = lines.len();
+    match action {
+        Action::CursorUp => {
+            *scroll = scroll.saturating_sub(1);
+            Vec::new()
+        }
+        Action::PageUp => {
+            *scroll = scroll.saturating_sub(PAGER_PAGE);
+            Vec::new()
+        }
+        Action::CursorDown => {
+            if *scroll + 1 < total {
+                *scroll += 1;
+            }
+            Vec::new()
+        }
+        Action::PageDown => {
+            *scroll = (*scroll + PAGER_PAGE).min(total.saturating_sub(1));
+            Vec::new()
+        }
+        Action::CursorTop => {
+            *scroll = 0;
+            Vec::new()
+        }
+        Action::CursorBottom => {
+            *scroll = total.saturating_sub(1);
+            Vec::new()
+        }
+        Action::Cancel => {
+            let pager_id = *id;
+            state.overlay = None;
+            vec![AppEffect::ClosePager { id: pager_id }]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -3013,6 +3309,116 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                     *status = match error {
                         Some(msg) => LogViewerStatus::Error(msg),
                         None => LogViewerStatus::Done,
+                    };
+                }
+            }
+            Vec::new()
+        }
+        AppEvent::FileSniffed {
+            pane,
+            conn,
+            path,
+            kind,
+            prefetch,
+        } => {
+            // Guard against a stale result: the user may have navigated away, or pressed
+            // Enter/F3 on a different entry, while the classification was in flight. Only open
+            // the pager if the *issuing* pane is still positioned on exactly this file (the same
+            // pane-scoped staleness convention as the guard on `AppEvent::Listed`).
+            let still_current = {
+                let p = state.pane(pane);
+                p.conn == conn
+                    && p.current()
+                        .and_then(|e| p.cwd.join(&e.name).ok())
+                        .is_some_and(|joined| joined == path)
+            };
+            if !still_current {
+                return Vec::new();
+            }
+            // Re-fetch rather than holding the borrow above across the mutation below; guarded
+            // by `still_current`, so this is expected to be `Some`, but we still pattern-match
+            // instead of `.expect()`ing (no panics on a backend/user-reachable path).
+            let Some(entry) = state.pane(pane).current() else {
+                return Vec::new();
+            };
+            let title = format!("{} — view", entry.name);
+            let total_size = entry.size;
+            let mode = match kind {
+                // P2: once the editor lands, `Text` should route to `Action::Edit` instead of
+                // (or in addition to) this read-only pager.
+                FileKind::Text => PagerMode::Text,
+                FileKind::Binary => PagerMode::Hex,
+            };
+            open_pager(state, conn, path, title, mode, total_size, prefetch)
+        }
+        AppEvent::SniffFailed { message } => {
+            state.status = Some(format!("error: {message}"));
+            Vec::new()
+        }
+        AppEvent::PagerChunk { id, bytes } => {
+            if let Some(Overlay::Pager {
+                id: ov_id,
+                mode,
+                lines,
+                partial,
+                byte_size,
+                status,
+                ..
+            }) = &mut state.overlay
+            {
+                if *ov_id == id && *status == PagerStatus::Loading {
+                    // F3 opens in `Text` optimistically; flip to `Hex` if the *first* chunk of a
+                    // directly-viewed file contains a NUL byte (the same binary heuristic the Enter
+                    // sniff uses). Gate on `byte_size == 0` so a NUL appearing only in a later chunk
+                    // of an otherwise-text file can't reshuffle already-displayed content.
+                    if *byte_size == 0 && *mode == PagerMode::Text && bytes.contains(&0) {
+                        *mode = PagerMode::Hex;
+                    }
+                    let cap_hit = append_pager_bytes(*mode, lines, partial, byte_size, &bytes);
+                    if cap_hit {
+                        // Flush the trailing incomplete line/row so the last (partial) content at
+                        // the cap boundary is still shown — the runner is about to be cancelled, so
+                        // the `PagerDone` flush would otherwise never run for a truncated view.
+                        if !partial.is_empty() {
+                            lines.push_back(std::mem::take(partial));
+                        }
+                        *status = PagerStatus::Truncated;
+                        // Tell the runner to stop reading — the reducer already has all the
+                        // bytes it will ever show for this session.
+                        return vec![AppEffect::ClosePager { id }];
+                    }
+                }
+            }
+            Vec::new()
+        }
+        AppEvent::PagerDone {
+            id,
+            error,
+            truncated,
+        } => {
+            if let Some(Overlay::Pager {
+                id: ov_id,
+                lines,
+                partial,
+                status,
+                ..
+            }) = &mut state.overlay
+            {
+                // Only act while still `Loading`: the cap path (`PagerChunk`) may already have set
+                // `Truncated` and cancelled the runner, but for a file sized exactly at the cap the
+                // runner can still have observed EOF and enqueued a `PagerDone` first — without this
+                // guard that stray event would clobber `Truncated` back to `Ready`.
+                if *ov_id == id && *status == PagerStatus::Loading {
+                    // Flush any incomplete trailing line/row so it is visible without the
+                    // renderer having to special-case `partial` (unlike the log viewer's
+                    // live-tail convention, where a growing partial is expected mid-stream).
+                    if !partial.is_empty() {
+                        lines.push_back(std::mem::take(partial));
+                    }
+                    *status = match error {
+                        Some(msg) => PagerStatus::Error(msg),
+                        None if truncated => PagerStatus::Truncated,
+                        None => PagerStatus::Ready,
                     };
                 }
             }
@@ -4758,7 +5164,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_file_does_nothing() {
+    fn enter_file_emits_sniff_effect() {
+        // RFC-0012 P1: `Enter` on a file no longer no-ops — it kicks off the async sniff so the
+        // pager can open in the right mode. The cwd doesn't change (only a directory navigates).
         let mut s = state();
         deliver(
             &mut s,
@@ -4766,8 +5174,29 @@ mod tests {
             vec![Entry::new("file", EntryKind::File)],
         );
         let fx = update(&mut s, Msg::Action(Action::Enter));
-        assert!(fx.is_empty());
+        assert_eq!(fx.len(), 1);
+        assert!(matches!(
+            fx[0],
+            AppEffect::SniffFile {
+                conn: ConnectionId(1),
+                ..
+            }
+        ));
         assert_eq!(s.active().cwd.as_str(), "/");
+    }
+
+    #[test]
+    fn enter_on_stream_entry_does_nothing() {
+        // Stream entries (container/pod logs) have their own dedicated flow
+        // (`Action::OpenLogViewer`) — `Enter` must not try to sniff/page them.
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("web-1", EntryKind::Stream)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Enter));
+        assert!(fx.is_empty());
     }
 
     #[test]
@@ -6305,6 +6734,542 @@ mod tests {
             panic!("overlay gone");
         };
         assert_eq!(*status, crate::state::LogViewerStatus::Done);
+    }
+
+    // ── RFC-0012 P1: read-only file pager ─────────────────────────────────────────────────────
+
+    /// `Action::View` (F3) opens the pager immediately — no sniff — starting `Loading`/`Text`.
+    #[test]
+    fn view_action_opens_pager_immediately_in_text_mode() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::View));
+        assert!(
+            matches!(&fx[..], [AppEffect::OpenPager { skip: 0, .. }]),
+            "F3 must emit OpenPager with no skip (no prefetch), got {fx:?}"
+        );
+        let Some(Overlay::Pager { mode, status, .. }) = &s.overlay else {
+            panic!("pager overlay must be open");
+        };
+        assert_eq!(*mode, PagerMode::Text);
+        assert_eq!(*status, PagerStatus::Loading);
+    }
+
+    /// F3 on a directory (or `..`) is a no-op — the pager only makes sense on file-like entries.
+    #[test]
+    fn view_action_on_directory_does_nothing() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("dir", EntryKind::Dir)]);
+        let fx = update(&mut s, Msg::Action(Action::View));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+    }
+
+    /// A stale `FileSniffed` for a file the cursor has since moved away from must not pop open a
+    /// pager the user didn't ask to see anymore.
+    #[test]
+    fn stale_file_sniffed_is_ignored() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a.txt", EntryKind::File),
+                Entry::new("b.txt", EntryKind::File),
+            ],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Enter)); // sniffs a.txt
+        let AppEffect::SniffFile { pane, conn, path } = fx.into_iter().next().unwrap() else {
+            panic!("expected SniffFile");
+        };
+        // The user moves on to b.txt before a.txt's sniff result arrives.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::FileSniffed {
+                pane,
+                conn,
+                path,
+                kind: FileKind::Text,
+                prefetch: Bytes::from_static(b"hello"),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none(), "stale sniff must not open the pager");
+    }
+
+    /// A matching `FileSniffed` opens the pager, seeded with the prefetch bytes, in the mode the
+    /// classification picked.
+    #[test]
+    fn file_sniffed_opens_pager_seeded_with_prefetch() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Enter));
+        let AppEffect::SniffFile { pane, conn, path } = fx.into_iter().next().unwrap() else {
+            panic!("expected SniffFile");
+        };
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::FileSniffed {
+                pane,
+                conn,
+                path,
+                kind: FileKind::Text,
+                prefetch: Bytes::from_static(b"line one\nline two"),
+            }),
+        );
+        assert!(
+            matches!(&fx[..], [AppEffect::OpenPager { skip: 17, .. }]),
+            "skip must equal the raw prefetch length, got {fx:?}"
+        );
+        let Some(Overlay::Pager {
+            mode,
+            lines,
+            status,
+            ..
+        }) = &s.overlay
+        else {
+            panic!("pager overlay must be open");
+        };
+        assert_eq!(*mode, PagerMode::Text);
+        assert_eq!(*status, PagerStatus::Loading);
+        // "line one" is a complete line (flushed on the '\n'); "line two" is still `partial`.
+        assert_eq!(lines.iter().next().map(String::as_str), Some("line one"));
+    }
+
+    /// A `Binary` classification opens the pager in `Hex` mode.
+    #[test]
+    fn file_sniffed_binary_opens_hex_mode() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.bin", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Enter));
+        let AppEffect::SniffFile { pane, conn, path } = fx.into_iter().next().unwrap() else {
+            panic!("expected SniffFile");
+        };
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::FileSniffed {
+                pane,
+                conn,
+                path,
+                kind: FileKind::Binary,
+                prefetch: Bytes::from_static(b"\x89PNG\x00\x00"),
+            }),
+        );
+        let Some(Overlay::Pager { mode, .. }) = &s.overlay else {
+            panic!("pager overlay must be open");
+        };
+        assert_eq!(*mode, PagerMode::Hex);
+    }
+
+    /// `SniffFailed` shows a redacted status message and opens no overlay.
+    #[test]
+    fn sniff_failed_sets_status_without_opening_overlay() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::SniffFailed {
+                message: "permission denied".to_owned(),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        assert_eq!(s.status.as_deref(), Some("error: permission denied"));
+    }
+
+    fn state_with_pager(id: crate::state::PagerId, mode: PagerMode) -> AppState {
+        let mut s = state();
+        s.overlay = Some(Overlay::Pager {
+            id,
+            title: "f.txt — view".to_owned(),
+            mode,
+            lines: std::collections::VecDeque::new(),
+            partial: String::new(),
+            byte_size: 0,
+            total_size: None,
+            scroll: 0,
+            status: PagerStatus::Loading,
+            wrap: true,
+        });
+        s
+    }
+
+    #[test]
+    fn pager_chunk_appends_text_lines() {
+        let mut s = state_with_pager(1, PagerMode::Text);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 1,
+                bytes: Bytes::from_static(b"alpha\nbeta\ngam"),
+            }),
+        );
+        let Some(Overlay::Pager { lines, partial, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(
+            lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(partial, "gam");
+    }
+
+    /// A chunk for a different (stale) pager id is ignored.
+    #[test]
+    fn pager_chunk_with_mismatched_id_is_ignored() {
+        let mut s = state_with_pager(1, PagerMode::Text);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 99,
+                bytes: Bytes::from_static(b"nope"),
+            }),
+        );
+        let Some(Overlay::Pager { lines, partial, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert!(lines.is_empty());
+        assert!(partial.is_empty());
+    }
+
+    /// Hitting `PAGER_MAX_BYTES` marks the view `Truncated` and emits `ClosePager` to stop the
+    /// stream — no more bytes will ever be shown for this session.
+    #[test]
+    fn pager_chunk_hitting_cap_truncates_and_closes() {
+        let mut s = state_with_pager(3, PagerMode::Text);
+        let big = vec![b'x'; PAGER_MAX_BYTES + 10];
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 3,
+                bytes: Bytes::from(big),
+            }),
+        );
+        assert!(matches!(&fx[..], [AppEffect::ClosePager { id: 3 }]));
+        let Some(Overlay::Pager {
+            status, byte_size, ..
+        }) = &s.overlay
+        else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*status, PagerStatus::Truncated);
+        assert_eq!(
+            *byte_size, PAGER_MAX_BYTES,
+            "a single newline-free chunk must be clamped exactly to the cap, not overshoot it"
+        );
+    }
+
+    /// A single chunk whose cap-crossing point lands in the middle of a multi-byte UTF-8
+    /// character must truncate at the preceding char boundary rather than panicking (slicing a
+    /// `&str` at a non-boundary index panics) or producing invalid UTF-8.
+    #[test]
+    fn pager_chunk_cap_truncation_backs_off_to_char_boundary() {
+        let mut s = state_with_pager(11, PagerMode::Text);
+        // Fill to exactly one byte short of the cap, then send a chunk starting with a 3-byte
+        // character ('€', U+20AC) — the cap lands inside its second byte.
+        if let Some(Overlay::Pager { byte_size, .. }) = &mut s.overlay {
+            *byte_size = PAGER_MAX_BYTES - 1;
+        }
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 11,
+                bytes: Bytes::from_static("€uro".as_bytes()),
+            }),
+        );
+        assert!(matches!(&fx[..], [AppEffect::ClosePager { id: 11 }]));
+        let Some(Overlay::Pager { byte_size, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        // Only 1 byte of budget remained, and '€' needs 3 — the whole character must be dropped
+        // rather than splitting it, so byte_size stays at the pre-chunk value.
+        assert_eq!(*byte_size, PAGER_MAX_BYTES - 1);
+    }
+
+    /// Truncating on the cap must still flush the trailing (newline-free) partial into `lines` —
+    /// the runner is cancelled by the `ClosePager`, so the `PagerDone` flush never runs and the
+    /// renderer only shows `lines`. Regression: the last screenful of a truncated file was dropped.
+    #[test]
+    fn pager_chunk_cap_truncation_flushes_partial_line() {
+        let mut s = state_with_pager(21, PagerMode::Text);
+        let big = vec![b'x'; PAGER_MAX_BYTES + 10];
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 21,
+                bytes: Bytes::from(big),
+            }),
+        );
+        assert!(matches!(&fx[..], [AppEffect::ClosePager { id: 21 }]));
+        let Some(Overlay::Pager {
+            lines,
+            partial,
+            status,
+            ..
+        }) = &s.overlay
+        else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*status, PagerStatus::Truncated);
+        assert!(partial.is_empty(), "partial must be flushed on truncation");
+        assert_eq!(
+            lines.back().map(String::len),
+            Some(PAGER_MAX_BYTES),
+            "the truncated (newline-free) content must be visible as a flushed line"
+        );
+    }
+
+    /// F3 opens optimistically in `Text`; a NUL byte in the *first* streamed chunk flips it to
+    /// `Hex` so a binary file directly viewed with F3 renders as a hex dump, not garbled `U+FFFD`
+    /// text. Documented in the `AppEvent::PagerChunk` contract; regression: the flip was missing.
+    #[test]
+    fn view_first_chunk_with_nul_flips_text_to_hex() {
+        let mut s = state_with_pager(31, PagerMode::Text);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 31,
+                bytes: Bytes::from_static(b"\x89PNG\x00\x0d"),
+            }),
+        );
+        let Some(Overlay::Pager { mode, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*mode, PagerMode::Hex, "first-chunk NUL must flip to Hex");
+    }
+
+    /// A NUL appearing only in a *later* chunk of an otherwise-text file must NOT flip the mode —
+    /// that would reshuffle already-displayed content. The flip is gated on `byte_size == 0`.
+    #[test]
+    fn view_later_chunk_nul_does_not_flip_mode() {
+        let mut s = state_with_pager(32, PagerMode::Text);
+        // First chunk: plain text (advances byte_size past 0).
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 32,
+                bytes: Bytes::from_static(b"hello world\n"),
+            }),
+        );
+        // Second chunk carries a NUL — too late to flip.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 32,
+                bytes: Bytes::from_static(b"tail\x00"),
+            }),
+        );
+        let Some(Overlay::Pager { mode, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*mode, PagerMode::Text, "a late NUL must not flip the mode");
+    }
+
+    /// A late `PagerDone` (clean EOF for a file sized exactly at the cap) must not clobber a
+    /// `Truncated` status already set by the cap path back to `Ready`.
+    #[test]
+    fn pager_done_does_not_clobber_truncated() {
+        let mut s = state_with_pager(33, PagerMode::Text);
+        // Drive it to `Truncated` via the cap path.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 33,
+                bytes: Bytes::from(vec![b'x'; PAGER_MAX_BYTES + 1]),
+            }),
+        );
+        // A stray clean-EOF PagerDone arrives afterwards.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerDone {
+                id: 33,
+                error: None,
+                truncated: false,
+            }),
+        );
+        let Some(Overlay::Pager { status, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*status, PagerStatus::Truncated, "Truncated must stick");
+    }
+
+    /// Opening a pager while one is already open (e.g. F3 opened one, then an in-flight Enter sniff
+    /// resolves) must emit `ClosePager` for the superseded id so its stream can't be orphaned into
+    /// an uncapped, uncancellable read.
+    #[test]
+    fn opening_pager_over_existing_closes_the_old() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Enter));
+        let AppEffect::SniffFile { pane, conn, path } = fx.into_iter().next().unwrap() else {
+            panic!("expected SniffFile");
+        };
+        // Simulate a pager already open (id 7) — e.g. the user pressed F3 first.
+        s.overlay = Some(Overlay::Pager {
+            id: 7,
+            title: "f.txt — view".to_owned(),
+            mode: PagerMode::Text,
+            lines: std::collections::VecDeque::new(),
+            partial: String::new(),
+            byte_size: 0,
+            total_size: None,
+            scroll: 0,
+            status: PagerStatus::Loading,
+            wrap: true,
+        });
+        s.next_pager_id = 8;
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::FileSniffed {
+                pane,
+                conn,
+                path,
+                kind: FileKind::Text,
+                prefetch: Bytes::new(),
+            }),
+        );
+        assert!(
+            matches!(
+                &fx[..],
+                [
+                    AppEffect::ClosePager { id: 7 },
+                    AppEffect::OpenPager { id: 8, .. }
+                ]
+            ),
+            "superseding a pager must close the old stream, got {fx:?}"
+        );
+        let Some(Overlay::Pager { id, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*id, 8, "overlay must be the new pager");
+    }
+
+    /// F3 on a `Special` entry (FIFO/device/socket) must not open a pager — reading it can block
+    /// forever before the cancellation token is polled. Mirrors the Enter sniff's kind guard.
+    #[test]
+    fn view_action_on_special_entry_does_nothing() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("pipe", EntryKind::Special)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::View));
+        assert!(fx.is_empty());
+        assert!(
+            s.overlay.is_none(),
+            "F3 on a special node must not open a pager"
+        );
+    }
+
+    /// `PagerDone` flushes a trailing (incomplete) line into `lines` and sets `Ready`.
+    #[test]
+    fn pager_done_flushes_partial_and_sets_ready() {
+        let mut s = state_with_pager(2, PagerMode::Text);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerChunk {
+                id: 2,
+                bytes: Bytes::from_static(b"only line, no trailing newline"),
+            }),
+        );
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerDone {
+                id: 2,
+                error: None,
+                truncated: false,
+            }),
+        );
+        assert!(fx.is_empty());
+        let Some(Overlay::Pager {
+            lines,
+            partial,
+            status,
+            ..
+        }) = &s.overlay
+        else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*status, PagerStatus::Ready);
+        assert!(partial.is_empty(), "partial must be flushed into lines");
+        assert_eq!(
+            lines.back().map(String::as_str),
+            Some("only line, no trailing newline")
+        );
+    }
+
+    /// `PagerDone` with an error sets `PagerStatus::Error` with the redacted message.
+    #[test]
+    fn pager_done_with_error_sets_error_status() {
+        let mut s = state_with_pager(4, PagerMode::Text);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::PagerDone {
+                id: 4,
+                error: Some("connection reset".to_owned()),
+                truncated: false,
+            }),
+        );
+        let Some(Overlay::Pager { status, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*status, PagerStatus::Error("connection reset".to_owned()));
+    }
+
+    /// Cursor/page scroll actions move `scroll` within `[0, lines.len())`, and `Cancel` closes the
+    /// overlay while emitting `ClosePager` to stop the stream.
+    #[test]
+    fn pager_scroll_and_cancel() {
+        let mut s = state_with_pager(9, PagerMode::Text);
+        if let Some(Overlay::Pager { lines, .. }) = &mut s.overlay {
+            for i in 0..50 {
+                lines.push_back(format!("line {i}"));
+            }
+        }
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let Some(Overlay::Pager { scroll, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*scroll, 1);
+
+        let _ = update(&mut s, Msg::Action(Action::PageDown));
+        let Some(Overlay::Pager { scroll, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*scroll, 21);
+
+        let _ = update(&mut s, Msg::Action(Action::CursorTop));
+        let Some(Overlay::Pager { scroll, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*scroll, 0);
+
+        let _ = update(&mut s, Msg::Action(Action::CursorBottom));
+        let Some(Overlay::Pager { scroll, .. }) = &s.overlay else {
+            panic!("pager overlay gone");
+        };
+        assert_eq!(*scroll, 49);
+
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(matches!(&fx[..], [AppEffect::ClosePager { id: 9 }]));
+        assert!(s.overlay.is_none());
     }
 
     // ── P2: lazy connection-open routing ──────────────────────────────────────────────────────

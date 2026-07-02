@@ -608,6 +608,47 @@ pub enum Overlay {
         /// Current stream status.
         status: LogViewerStatus,
     },
+    /// A read-only pager over a file's contents (`F3` / `Enter` on a non-directory entry —
+    /// RFC-0012 P1). Modeled closely on [`Overlay::LogViewer`]: a capped, `byte_size`-tracked
+    /// buffer fed by a streaming effect, except the pager never evicts from the front — a static
+    /// file shows its *first* N bytes up to the cap, not a live tail's most recent N (see
+    /// [`PagerStatus::Truncated`]).
+    ///
+    /// `lines` holds one stored entry per display row regardless of mode: complete
+    /// `\n`-terminated text lines in [`PagerMode::Text`] (decoded lossily, like the log viewer),
+    /// or raw [`PAGER_HEX_ROW_BYTES`]-byte rows (preserved exactly via a lossless byte↔char
+    /// mapping, so a stray byte can never corrupt the hex dump the way lossy UTF-8 decoding
+    /// would) in [`PagerMode::Hex`]. `partial` holds the not-yet-flushed tail of the current
+    /// line/row; it is flushed into `lines` when the stream ends so the last (possibly
+    /// incomplete) line/row is always visible without special-casing it in the renderer.
+    ///
+    /// `total_size` is the entry's size from the directory listing, if known — used only to
+    /// render a percentage position; the pager works fine without it (backends that don't report
+    /// size, or a size unknown at listing time).
+    Pager {
+        /// Session id — matches `AppEvent::PagerChunk`/`AppEvent::PagerDone`.
+        id: PagerId,
+        /// Display title (filename + a short suffix, e.g. `"README.md — view"`).
+        title: String,
+        /// Text or hex display mode.
+        mode: PagerMode,
+        /// Accumulated complete lines/rows, oldest-first (see the mode-dependent contract above).
+        lines: VecDeque<String>,
+        /// Incomplete last line/row (no trailing `'\n'` yet in `Text` mode; fewer than
+        /// [`PAGER_HEX_ROW_BYTES`] bytes in `Hex` mode). Flushed into `lines` on stream end.
+        partial: String,
+        /// Total bytes represented by `lines` + `partial` (for the [`PAGER_MAX_BYTES`] cap check).
+        byte_size: usize,
+        /// The entry's size from the directory listing, if the backend reports one.
+        total_size: Option<u64>,
+        /// Index of the first visible line/row.
+        scroll: usize,
+        /// Current stream status.
+        status: PagerStatus,
+        /// Whether `Text`-mode content soft-wraps to the pane width (`Hex` rows never wrap).
+        /// No keybinding toggles this in P1 (`// v2`: a toggle action is future work).
+        wrap: bool,
+    },
     /// An interactive cooked-mode exec session (v1: line-oriented, no TTY emulation, `tty: false`).
     ///
     /// Renders `SessionRecord.output_lines` as scrollable text (like [`Overlay::LogViewer`]) plus a
@@ -940,6 +981,8 @@ pub struct AppState {
     pub pending_conn_open: [Option<ConnectionId>; 2],
     /// Monotonic id counter for log-viewer sessions (like `next_transfer_id`). Starts at 1.
     pub next_log_viewer_id: LogViewerId,
+    /// Monotonic id counter for pager sessions (like `next_log_viewer_id`). Starts at 1.
+    pub next_pager_id: PagerId,
     /// Active exec and port-forward sessions, keyed by stable [`SessionId`].
     ///
     /// A record is inserted when `OpenExecSession`/`OpenPortForward` is emitted by the reducer and
@@ -975,6 +1018,71 @@ pub type LogViewerId = u64;
 pub const LOG_VIEWER_MAX_LINES: usize = 100_000;
 /// Max decoded bytes the log viewer keeps in memory (~4 MiB).
 pub const LOG_VIEWER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// A stable identifier for a pager session (`F3` / `Enter`-to-view — RFC-0012 P1).
+pub type PagerId = u64;
+
+/// Max bytes the pager retains before it stops streaming and marks the view
+/// [`Truncated`](PagerStatus::Truncated). Unlike the log viewer's live-tail ring buffer (which
+/// evicts the *oldest* lines to keep the most recent ones), the pager never evicts: once the cap
+/// is hit it simply stops accepting more bytes and shows "truncated — showing first N", which is
+/// the correct behaviour for viewing a static file from the start (not a live tail).
+pub const PAGER_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes per row in [`PagerMode::Hex`] display (`offset | hex | ascii`). Shared between the
+/// reducer's row assembly (`crate::update::append_pager_hex`) and the renderer's row decoding so
+/// the two can never drift apart.
+pub const PAGER_HEX_ROW_BYTES: usize = 16;
+
+/// Text vs binary classification of a file, produced by [`detect_file_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    /// No NUL byte found in the sampled prefix — treated as text.
+    Text,
+    /// A NUL byte was found in the sampled prefix — treated as binary.
+    Binary,
+}
+
+/// Classify a byte sample as text or binary using a NUL-byte heuristic: any `0x00` byte in
+/// `sample` means binary. Legitimate text (UTF-8, Latin-1, ASCII, …) never legally contains a NUL
+/// byte, while binary formats (images, archives, executables) commonly do within their first few
+/// KiB — the same heuristic `file(1)`, git, and most pagers use to decide binary handling.
+///
+/// Pure and I/O-free: the effect runner reads the bounded sample
+/// ([`crate::AppEffect::SniffFile`]); this function only inspects the bytes already in hand.
+#[must_use]
+pub fn detect_file_kind(sample: &[u8]) -> FileKind {
+    if sample.contains(&0) {
+        FileKind::Binary
+    } else {
+        FileKind::Text
+    }
+}
+
+/// Which representation the pager overlay is currently rendering in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagerMode {
+    /// Decoded (lossy UTF-8) text, one stored line per `\n`.
+    Text,
+    /// Raw bytes stored [`PAGER_HEX_ROW_BYTES`] at a time, preserved exactly via a lossless
+    /// byte↔char mapping. The render layer formats each stored row into an
+    /// `offset | hex | ascii` display line — kept out of the reducer so `Overlay::Pager::lines`
+    /// stays the same shape (a plain `String` per entry) in both modes.
+    Hex,
+}
+
+/// Status of an [`Overlay::Pager`] stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagerStatus {
+    /// Still reading from the backend.
+    Loading,
+    /// The file was read to completion within [`PAGER_MAX_BYTES`].
+    Ready,
+    /// [`PAGER_MAX_BYTES`] was reached before EOF; only the first N bytes are shown.
+    Truncated,
+    /// The stream ended with a (redacted, non-secret) error.
+    Error(String),
+}
 
 /// The recorded end-state of a session (exec or port-forward).
 #[derive(Debug, Clone)]
@@ -1076,6 +1184,7 @@ impl AppState {
             vault_file_exists: false,
             pending_conn_open: [None; 2],
             next_log_viewer_id: 1,
+            next_pager_id: 1,
             sessions: HashMap::new(),
             next_session_id: SessionId(1),
             connection_saving: false,
@@ -1190,5 +1299,36 @@ mod tests {
         let secret = m.take_secret();
         assert_eq!(secret.expose_secret(), "open-sesame");
         assert!(m.is_empty(), "the field is wiped after taking the secret");
+    }
+
+    #[test]
+    fn detect_file_kind_treats_plain_text_as_text() {
+        assert_eq!(
+            detect_file_kind(b"hello, world\nsecond line\n"),
+            FileKind::Text
+        );
+    }
+
+    #[test]
+    fn detect_file_kind_treats_nul_byte_as_binary() {
+        // A PNG-like header with an embedded NUL.
+        assert_eq!(
+            detect_file_kind(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"),
+            FileKind::Binary
+        );
+    }
+
+    #[test]
+    fn detect_file_kind_empty_sample_is_text() {
+        assert_eq!(detect_file_kind(b""), FileKind::Text);
+    }
+
+    #[test]
+    fn detect_file_kind_nul_anywhere_in_sample_is_binary() {
+        // A NUL byte deep in the sample (not just at the front) must still be caught.
+        let mut sample = vec![b'a'; 100];
+        sample.push(0);
+        sample.extend_from_slice(b"more text after the nul");
+        assert_eq!(detect_file_kind(&sample), FileKind::Binary);
     }
 }
