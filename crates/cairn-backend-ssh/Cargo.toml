@@ -18,7 +18,7 @@ default = []
 # default so the lean, cross-platform build builds only the `SftpOps` seam + the russh-sftp adapter
 # (TLS-free); the full build (Linux) and the sshd integration job enable it. See ADR-0006 / RFC-0003.
 # `tokio/time` is only used by the gated connector, so keep it out of the lean build.
-ssh = ["dep:russh", "dep:cairn-vault", "tokio/time"]
+ssh = ["dep:russh", "dep:cairn-vault", "tokio/time", "tokio/fs"]
 
 [dependencies]
 cairn-types = { workspace = true }
@@ -32,6 +32,11 @@ futures = "0.3"
 russh = { version = "0.61", optional = true }
 russh-sftp = "2"
 tokio = { version = "1", features = ["io-util"] }
+# zeroize: wipe the PEM bytes read from a PrivateKeyFile after decode_secret_key has
+# parsed them. Without it, the String sits on the heap until freed (without overwrite),
+# leaving key material potentially visible in a process-memory dump. Already a transitive
+# dep via russh; making it direct gives explicit version control and clear intent.
+zeroize = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net", "time"] }

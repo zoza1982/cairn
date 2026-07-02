@@ -37,6 +37,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC-0011 Phase P5 — reference-first credential provisioning** (branch
+  `feat/conn-p5-credentials`): users can now configure SSH/S3/GCS/Azure credentials through the
+  connection form. Key details:
+  - The connection form gains two new stages: **CredentialMethodPicker** (choose SSH agent / key
+    file / inline PEM / password, or the AWS/GCP/Azure equivalent) and **CredentialFields**
+    (fill required fields for secret-bearing methods).
+  - **Delegation sources** (SSH agent, AWS default chain / named profile, GCP ADC, Azure AD) are
+    preferred — no key material is stored in the vault. Picking a delegation method saves the
+    profile immediately with a delegation marker.
+  - **`SshPrivateKeyFile`** stores only the path (non-secret) and optional passphrase; the key
+    bytes are read from disk at connect time so key rotation is reflected immediately.
+  - **Vault gating:** non-delegation methods gate on vault availability. If the vault is locked
+    or absent, the credential draft is held in `pending_save` on the `VaultUnlock` / `VaultCreate`
+    overlay and completes automatically after unlock/create.
+  - **OS-source detection** (`AppEffect::DetectOsSources`) runs at startup to default the
+    credential picker to the most-likely-working option (SSH agent if `SSH_AUTH_SOCK` is set,
+    named AWS profile if `~/.aws/credentials` has entries, etc.).
+  - **Edit mode** shows "Keep existing credential" at the top of the picker so re-editing
+    endpoint fields does not inadvertently clear a configured vault secret.
+  - **`cairn-core` isolation** is preserved: `CredentialDraft` (not `CredentialSecret`) travels
+    through `AppEffect`; the fully-typed `CredentialSecret` is assembled only at the binary edge
+    in `cairn/src/app.rs` where `cairn-vault` is available.
+  - GCS service-account JSON and Azure shared-key / SAS / connection-string are present in the
+    picker but field-capture is deferred to a future update (the profile saves without vault
+    credentials; the backend will prompt on first open).
+  - Added ADR-0009 documenting the reference-first design decision.
+  - **Post-review fixes** (quality gate findings addressed in the same PR): `AwsProfile`
+    removed from `is_delegation()` — it now correctly requires field entry for the profile name
+    and stores it in the vault; deferred methods (`GcpServiceAccountJson`, `AzureSharedKey`,
+    `AzureSasToken`, `AzureConnectionString`) now emit their correct `CredentialDraft` variants
+    instead of misidentified placeholders; vault gate applies to all methods including delegation
+    (which store a non-secret marker); `debug_assert!` in `initial_effects` extended to allow
+    `AppEffect::DetectOsSources`; `PrivateKeyFile` PEM bytes now wrapped in `zeroize::Zeroizing`
+    to wipe key material after decode; `detect_aws_profiles` streams line-by-line via `BufReader`
+    so secret access-key values never accumulate in a heap `String`; cross-platform home-dir
+    fallback (`USERPROFILE` on Windows, `APPDATA` for GCP ADC path); `spawn_blocking` panic in
+    OS-source detection now logged at `warn` rather than silently swallowed.
+
 - **RFC-0011 Phase P4.5 — vault-create-from-UI** (branch `feat/conn-p45-vault-create`): closes
   the security gate that allows a first-run user to create the encrypted vault from inside Cairn,
   unblocking the credential-provisioning phase (P5). Key details: `Overlay::VaultCreate` with

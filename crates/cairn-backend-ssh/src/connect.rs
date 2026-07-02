@@ -253,6 +253,31 @@ async fn authenticate(
                 .map_err(connection_error)?
                 .success())
         }
+        SshCredential::PrivateKeyFile { path, passphrase } => {
+            // Read the key file at connect time. The path is non-secret (stored in the vault
+            // as a reference); the bytes are transient — never stored in Cairn's vault.
+            // Reading at connect time means key rotation on disk is reflected immediately.
+            //
+            // Wrap in `Zeroizing` so the PEM bytes are wiped on drop — CLAUDE.md §9 requires
+            // secrets to be zeroized after use. A plain `String` would leave key material on
+            // the heap until the allocator reuses that memory (without overwrite).
+            let pem: zeroize::Zeroizing<String> = tokio::fs::read_to_string(path)
+                .await
+                // Discard the I/O error detail: path names must not appear in error messages.
+                .map(zeroize::Zeroizing::new)
+                .map_err(|_| VfsError::Auth)?;
+            // Same oracle-avoidance as PrivateKey: discard decode error detail so we can't
+            // distinguish "bad passphrase" from "bad key format".
+            let key = decode_secret_key(&pem, passphrase.as_ref().map(ExposeSecret::expose_secret))
+                .map_err(|_| VfsError::Auth)?;
+            let hash = rsa_hash(handle, key.algorithm()).await;
+            let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
+            Ok(handle
+                .authenticate_publickey(user, key)
+                .await
+                .map_err(connection_error)?
+                .success())
+        }
         SshCredential::Agent => authenticate_agent(handle, user).await,
         // A future SSH auth variant this build doesn't yet handle.
         _ => Err(VfsError::Auth),

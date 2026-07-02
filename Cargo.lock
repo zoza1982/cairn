@@ -1239,6 +1239,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1338,6 +1339,7 @@ dependencies = [
  "russh-sftp",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
