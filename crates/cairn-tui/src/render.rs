@@ -3,9 +3,9 @@
 use crate::theme::Theme;
 use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{
-    forms::{scheme_fields, KNOWN_SCHEMES},
-    AppState, ChoiceProvenance, ConnectionFormStage, ConnectionKind, Listing, LogViewerStatus,
-    MaskedInput, Overlay, PaneState, PromptKind, SessionEnd, SessionRecord, Side,
+    credential_method_fields, credential_methods, scheme_fields, AppState, ChoiceProvenance,
+    ConnectionFormStage, ConnectionKind, CredentialMethod, FieldValue, Listing, LogViewerStatus,
+    MaskedInput, Overlay, PaneState, PromptKind, SessionEnd, SessionRecord, Side, KNOWN_SCHEMES,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -215,7 +215,11 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             focus,
             field_errors,
             editing_id,
-            ..
+            existing_secret_ref: _,
+            cred_method_cursor,
+            cred_method,
+            cred_fields,
+            cred_focus,
         } => render_connection_form(
             frame,
             stage,
@@ -224,6 +228,10 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             *focus,
             field_errors,
             editing_id.is_some(),
+            *cred_method_cursor,
+            cred_method.as_ref(),
+            cred_fields,
+            *cred_focus,
         ),
     }
 }
@@ -394,6 +402,7 @@ fn render_vault_create(
 ///
 /// Delegates to [`render_scheme_picker`] in the `SchemePicker` stage and [`render_form_fields`]
 /// in the `Fields` stage.
+#[allow(clippy::too_many_arguments)]
 fn render_connection_form(
     frame: &mut Frame,
     stage: &ConnectionFormStage,
@@ -402,11 +411,21 @@ fn render_connection_form(
     focus: usize,
     field_errors: &std::collections::HashMap<String, String>,
     is_edit: bool,
+    cred_method_cursor: usize,
+    cred_method: Option<&CredentialMethod>,
+    cred_fields: &std::collections::HashMap<String, FieldValue>,
+    cred_focus: usize,
 ) {
     match stage {
         ConnectionFormStage::SchemePicker => render_scheme_picker(frame, focus),
         ConnectionFormStage::Fields => {
             render_form_fields(frame, scheme, values, focus, field_errors, is_edit)
+        }
+        ConnectionFormStage::CredentialMethodPicker => {
+            render_credential_method_picker(frame, scheme, is_edit, cred_method_cursor)
+        }
+        ConnectionFormStage::CredentialFields => {
+            render_credential_fields(frame, cred_method, cred_fields, cred_focus)
         }
     }
 }
@@ -532,13 +551,15 @@ fn render_form_fields(
         }
     }
 
-    // Credential hint (always shown; P5 will replace this with credential fields).
+    // Credential hint: P5 — indicates next step is credential picker.
     if let Some(hint_area) = areas.get(n_fields) {
+        let hint = if cairn_core::forms::scheme_needs_credentials(scheme) {
+            "  Next: choose authentication method →"
+        } else {
+            "  No credentials required for this backend."
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(
-                "  Credentials are set up when the connection is first used (coming in next update).",
-            ))
-            .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(Line::from(hint)).style(Style::default().fg(Color::DarkGray)),
             *hint_area,
         );
     }
@@ -549,10 +570,187 @@ fn render_form_fields(
     } else {
         "  [Esc] Back"
     };
-    let action_hint = format!("[Tab/↑↓] Navigate fields  [Enter] Save{back_hint}");
+    let action_hint = format!("[Tab/↑↓] Navigate fields  [Enter] Next{back_hint}");
     if let Some(ahint_area) = areas.last() {
         frame.render_widget(
             Paragraph::new(Line::from(action_hint)).style(Style::default().fg(Color::Gray)),
+            *ahint_area,
+        );
+    }
+}
+
+/// Draw the credential method picker stage: a list of auth methods for the chosen scheme.
+fn render_credential_method_picker(frame: &mut Frame, scheme: &str, is_edit: bool, cursor: usize) {
+    let methods = credential_methods(scheme, is_edit);
+    let n = methods.len();
+    if n == 0 {
+        return; // No-credential schemes skip this stage entirely.
+    }
+    let h = u16::try_from(n)
+        .unwrap_or(u16::MAX)
+        .saturating_add(5) // 2 borders + 1 blank + 1 hint + 1 breathing room
+        .min(frame.area().height);
+    let area = centered(frame.area(), 60, h.max(5));
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Choose authentication method ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let items: Vec<ListItem> = methods
+        .iter()
+        .map(|m| {
+            let suffix = if m.is_deferred_p5() {
+                " (coming soon)"
+            } else {
+                ""
+            };
+            ListItem::new(format!("{}{suffix}", m.label()))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
+        .highlight_symbol("> ");
+    let mut st = ListState::default();
+    if !methods.is_empty() {
+        st.select(Some(cursor.min(n - 1)));
+    }
+    frame.render_stateful_widget(list, list_area, &mut st);
+    frame.render_widget(
+        Paragraph::new(Line::from("[Enter] Select  [↑↓] Navigate  [Esc] Back"))
+            .style(Style::default().fg(Color::Gray)),
+        hint_area,
+    );
+}
+
+/// Draw the credential fields stage: labelled inputs for the chosen auth method.
+///
+/// Secret fields show bullet characters; plain fields show the typed text. Deferred and
+/// delegation methods should not reach this stage (the picker auto-advances past them).
+fn render_credential_fields(
+    frame: &mut Frame,
+    cred_method: Option<&CredentialMethod>,
+    cred_fields: &std::collections::HashMap<String, FieldValue>,
+    cred_focus: usize,
+) {
+    let Some(method) = cred_method else {
+        return;
+    };
+    let fields = credential_method_fields(method);
+
+    if method.is_deferred_p5() {
+        // Deferred method: show a placeholder message.
+        let area = centered(frame.area(), 60, 5);
+        frame.render_widget(Clear, area);
+        let block = Block::bordered()
+            .title(" Credentials ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("  {}: coming in a future update.", method.label())),
+                Line::from(""),
+                Line::from("  [Enter] Save without credentials  [Esc] Back")
+                    .style(Style::default().fg(Color::Gray)),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    if fields.is_empty() {
+        // Delegation method: no fields, auto-advances. Show nothing (shouldn't be reached
+        // normally but guard for safety).
+        return;
+    }
+
+    let h = u16::try_from(fields.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(4) // 2 borders + 1 blank + 1 hint
+        .min(frame.area().height);
+    let area = centered(frame.area(), 60, h.max(5));
+    frame.render_widget(Clear, area);
+    let title = format!(" Credentials — {} ", method.label());
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let n_fields = fields.len();
+    let mut constraints: Vec<Constraint> = (0..n_fields).map(|_| Constraint::Length(1)).collect();
+    constraints.push(Constraint::Min(0)); // spacer
+    constraints.push(Constraint::Length(1)); // hint
+    let areas = Layout::vertical(constraints).split(inner);
+
+    for (i, spec) in fields.iter().enumerate() {
+        let is_focused = i == cred_focus;
+        let label_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let (display_text, value_style) = match cred_fields.get(spec.key) {
+            None => {
+                // No value entered yet — show placeholder.
+                (
+                    format!("{}: {}", spec.label, spec.placeholder),
+                    Style::default().fg(Color::DarkGray),
+                )
+            }
+            Some(fv) if fv.is_empty() => {
+                // Entered but empty (e.g. just cleared) — show placeholder.
+                (
+                    format!("{}: {}", spec.label, spec.placeholder),
+                    Style::default().fg(Color::DarkGray),
+                )
+            }
+            Some(FieldValue::Plain(s)) => {
+                let cursor = if is_focused { "\u{258f}" } else { "" };
+                (
+                    format!("{}: {}{cursor}", spec.label, s),
+                    if is_focused {
+                        Style::default().fg(Color::White)
+                    } else {
+                        Style::default()
+                    },
+                )
+            }
+            Some(FieldValue::Secret(m)) => {
+                let cursor = if is_focused { "\u{258f}" } else { "" };
+                let masked = "\u{2022}".repeat(m.len());
+                (
+                    format!("{}: {}{cursor}", spec.label, masked),
+                    if is_focused {
+                        Style::default().fg(Color::White)
+                    } else {
+                        Style::default()
+                    },
+                )
+            }
+        };
+
+        let spans = vec![
+            ratatui::text::Span::styled(if is_focused { "> " } else { "  " }, label_style),
+            ratatui::text::Span::styled(display_text, value_style),
+        ];
+        if let Some(row_area) = areas.get(i) {
+            frame.render_widget(Paragraph::new(Line::from(spans)), *row_area);
+        }
+    }
+
+    if let Some(ahint_area) = areas.last() {
+        frame.render_widget(
+            Paragraph::new(Line::from("[Tab/↑↓] Navigate  [Enter] Save  [Esc] Back"))
+                .style(Style::default().fg(Color::Gray)),
             *ahint_area,
         );
     }
@@ -1515,6 +1713,7 @@ mod tests {
             input,
             error: Some("decryption failed (wrong passphrase or corrupt vault)".to_owned()),
             pending_conn: None,
+            pending_save: None,
         });
         let text = render_text(&s, 80, 24);
         assert!(text.contains("Unlock vault"), "dialog title: {text}");

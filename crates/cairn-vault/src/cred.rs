@@ -84,6 +84,18 @@ pub enum SshCredential {
         /// Passphrase, if the key is encrypted.
         passphrase: Option<SecretString>,
     },
+    /// Reference an on-disk private-key file. The private-key *bytes* are read from disk at
+    /// connect time and never stored in the vault — only the file path (non-secret) and the
+    /// optional decryption passphrase are kept in the vault entry.
+    ///
+    /// This is the preferred form for locally-managed keys: the vault holds a *reference*, not
+    /// a copy, so key rotation on disk is reflected immediately at next connect.
+    PrivateKeyFile {
+        /// Path to the private key file (non-secret; stored in clear in the vault entry).
+        path: std::path::PathBuf,
+        /// Passphrase for an encrypted key file, if any.
+        passphrase: Option<SecretString>,
+    },
     /// Delegate to the running SSH agent — no key material is stored in the vault.
     Agent,
 }
@@ -93,11 +105,15 @@ impl SshCredential {
         match self {
             Self::Password(_) => "password",
             Self::PrivateKey { .. } => "private-key",
+            Self::PrivateKeyFile { .. } => "private-key-file",
             Self::Agent => "agent",
         }
     }
 
     fn is_delegation(&self) -> bool {
+        // `Agent` delegates to the running SSH agent — no key material in the vault.
+        // `PrivateKeyFile` stores an optional passphrase in the vault (not a pure delegation),
+        // but keeps the key bytes on disk; classified as non-delegation for the shape descriptor.
         matches!(self, Self::Agent)
     }
 }
@@ -218,6 +234,13 @@ pub(crate) enum SshWire {
         key_pem: String,
         passphrase: Option<String>,
     },
+    /// Wire-mirror of [`SshCredential::PrivateKeyFile`]. The path is stored as a UTF-8 string;
+    /// non-UTF-8 paths are lossy-converted on seal and round-trip cleanly because the form only
+    /// accepts user-typed paths (always valid UTF-8).
+    PrivateKeyFile {
+        path: String,
+        passphrase: Option<String>,
+    },
     Agent,
 }
 
@@ -303,6 +326,8 @@ impl From<&AwsCredential> for AwsWire {
 
 impl From<&SshCredential> for SshWire {
     fn from(s: &SshCredential) -> Self {
+        // Exhaustive match: adding a new `SshCredential` variant without its wire counterpart is
+        // a compile error — keeping the two types in sync at compile time.
         match s {
             SshCredential::Password(p) => SshWire::Password(p.expose_secret().to_owned()),
             SshCredential::PrivateKey {
@@ -310,6 +335,12 @@ impl From<&SshCredential> for SshWire {
                 passphrase,
             } => SshWire::PrivateKey {
                 key_pem: key_pem.expose_secret().to_owned(),
+                passphrase: passphrase.as_ref().map(|p| p.expose_secret().to_owned()),
+            },
+            SshCredential::PrivateKeyFile { path, passphrase } => SshWire::PrivateKeyFile {
+                // to_string_lossy is lossless for paths entered through the form (always UTF-8);
+                // non-UTF-8 OS paths are an accepted known gap for future improvement.
+                path: path.to_string_lossy().into_owned(),
                 passphrase: passphrase.as_ref().map(|p| p.expose_secret().to_owned()),
             },
             SshCredential::Agent => SshWire::Agent,
@@ -374,6 +405,8 @@ impl From<&AwsWire> for AwsCredential {
 
 impl From<&SshWire> for SshCredential {
     fn from(w: &SshWire) -> Self {
+        // Exhaustive match: adding a new `SshWire` variant without its credential counterpart is
+        // a compile error — keeping the two types in sync at compile time.
         match w {
             SshWire::Password(p) => SshCredential::Password(SecretString::from(p.clone())),
             SshWire::PrivateKey {
@@ -381,6 +414,10 @@ impl From<&SshWire> for SshCredential {
                 passphrase,
             } => SshCredential::PrivateKey {
                 key_pem: SecretString::from(key_pem.clone()),
+                passphrase: passphrase.as_ref().map(|p| SecretString::from(p.clone())),
+            },
+            SshWire::PrivateKeyFile { path, passphrase } => SshCredential::PrivateKeyFile {
+                path: std::path::PathBuf::from(path),
                 passphrase: passphrase.as_ref().map(|p| SecretString::from(p.clone())),
             },
             SshWire::Agent => SshCredential::Agent,

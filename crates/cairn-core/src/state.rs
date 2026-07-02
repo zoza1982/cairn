@@ -349,16 +349,153 @@ impl PaneState {
     }
 }
 
-/// The two stages of the connection form overlay.
+/// A connection-form field value: either a plain (non-secret) string or a secret held in a
+/// [`MaskedInput`].
 ///
-/// `SchemePicker` shows a scrollable list of known backends; once the user selects one the form
-/// advances to `Fields` where they fill in the scheme-specific endpoint parameters.
+/// Endpoint fields (host, port, bucket, …) are always [`Plain`](FieldValue::Plain) — they are
+/// stored in `ProfileData::endpoint` and written to the config file in clear text. Credential
+/// fields whose `FieldSpec.secret` flag is `true` are [`Secret`](FieldValue::Secret) — they
+/// exist only in this buffer until the form submits, at which point they are moved into a
+/// [`CredentialDraft`] and then zeroized by the [`MaskedInput::take_secret`] call.
+///
+/// ## Clone contract
+///
+/// Cloning a [`Secret`](FieldValue::Secret) variant returns an **empty** [`MaskedInput`] to
+/// prevent silent duplication of live key material (mirrors [`MaskedInput`]'s own clone contract
+/// and `secrecy`'s design rationale for not implementing `Clone` on `Secret<S>` in older versions).
+/// Cloning a [`Plain`](FieldValue::Plain) variant clones the string normally.
+///
+/// ## Debug contract
+///
+/// [`Secret`](FieldValue::Secret) variants always print `Secret(<redacted>)`.
+/// [`Plain`](FieldValue::Plain) variants print the value (endpoint data is not secret).
+///
+/// [`CredentialDraft`]: crate::forms::CredentialDraft
+pub enum FieldValue {
+    /// A plain text value (non-secret endpoint fields).
+    Plain(String),
+    /// A secret value held in a masked, zeroizing buffer.
+    Secret(MaskedInput),
+}
+
+impl Default for FieldValue {
+    fn default() -> Self {
+        Self::Plain(String::new())
+    }
+}
+
+impl Clone for FieldValue {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Plain(s) => Self::Plain(s.clone()),
+            // Never silently copy a live secret — return an empty field instead.
+            // This mirrors MaskedInput's own Clone contract.
+            Self::Secret(_) => Self::Secret(MaskedInput::new()),
+        }
+    }
+}
+
+impl fmt::Debug for FieldValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain(s) => write!(f, "Plain({s:?})"),
+            Self::Secret(_) => f.write_str("Secret(<redacted>)"),
+        }
+    }
+}
+
+impl FieldValue {
+    /// The plain text value for non-secret fields, or `""` for secret fields (use the
+    /// [`Secret`](FieldValue::Secret) variant's [`MaskedInput`] directly when rendering).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Plain(s) => s.as_str(),
+            Self::Secret(_) => "",
+        }
+    }
+
+    /// Append a character to the field value.
+    pub fn push_char(&mut self, c: char) {
+        match self {
+            Self::Plain(s) => s.push(c),
+            Self::Secret(m) => m.push(c),
+        }
+    }
+
+    /// Remove the last character from the field value.
+    pub fn backspace(&mut self) {
+        match self {
+            Self::Plain(s) => {
+                s.pop();
+            }
+            Self::Secret(m) => m.backspace(),
+        }
+    }
+
+    /// Whether the field is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Plain(s) => s.is_empty(),
+            Self::Secret(m) => m.is_empty(),
+        }
+    }
+
+    /// The trimmed plain text, or `""` for secret fields.
+    #[must_use]
+    pub fn as_str_trimmed(&self) -> &str {
+        match self {
+            Self::Plain(s) => s.trim(),
+            Self::Secret(_) => "",
+        }
+    }
+
+    /// Length of the value (character count), for masking secret fields in the renderer.
+    ///
+    /// For [`Secret`](FieldValue::Secret) this is the only safe way to know how many bullets
+    /// to draw. For [`Plain`](FieldValue::Plain) it returns the character count of the string.
+    #[must_use]
+    pub fn display_len(&self) -> usize {
+        match self {
+            Self::Plain(s) => s.chars().count(),
+            Self::Secret(m) => m.len(),
+        }
+    }
+}
+
+/// The stages of the connection form overlay (P5 adds the credential-picker stages).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionFormStage {
-    /// Step 1: choose a backend scheme from the list.
+    /// Step 1: choose a backend scheme from the list (cursor-based, not capturing text).
     SchemePicker,
-    /// Step 2: fill in the endpoint fields for the chosen scheme.
+    /// Step 2: fill in the endpoint fields for the chosen scheme (captures text as `TextEdit`).
     Fields,
+    /// Step 3 (P5): choose an authentication method from the list (cursor-based, not capturing
+    /// text). Skipped for schemes that need no credentials (e.g. `"local"`).
+    CredentialMethodPicker,
+    /// Step 4 (P5): fill in credential fields for the chosen method (captures text as `TextEdit`).
+    /// Skipped for delegation methods (no fields required) and deferred methods.
+    CredentialFields,
+}
+
+/// A credential-provisioning task deferred until the vault is unlocked or created.
+///
+/// Carried in `pending_save` by [`Overlay::VaultUnlock`] and [`Overlay::VaultCreate`]. After a
+/// successful vault unlock or creation, the reducer emits
+/// [`AppEffect::ProvisionAndSaveConnection`](crate::AppEffect::ProvisionAndSaveConnection) using
+/// the data here — so the user does not need to re-fill the connection form.
+///
+/// `Clone` is implemented because vault overlays derive `Clone` (as part of `Overlay`), and the
+/// nested `CredentialDraft` is cloneable (its `SecretString` fields are cloned, not moved).
+#[derive(Debug, Clone)]
+pub struct PendingSave {
+    /// The profile to save once the vault is available.
+    pub profile: crate::forms::ProfileData,
+    /// The credential to provision into the vault.
+    pub draft: crate::forms::CredentialDraft,
+    /// Whether this is an update to an existing profile.
+    pub is_edit: bool,
 }
 
 /// A modal overlay awaiting user input.
@@ -419,6 +556,10 @@ pub enum Overlay {
     /// user selects a [`NeedsVault`](crate::ChoiceStatus::NeedsVault) entry, that connection's id is
     /// stored here so the runtime can auto-open it immediately after a successful unlock. `None`
     /// when the user explicitly pressed `Ctrl-U` rather than selecting a locked connection.
+    ///
+    /// `pending_save` (added in Phase P5) carries a credential + profile that need to be stored
+    /// and saved once the vault is unlocked. Set when the user submits the credential form while
+    /// the vault is locked; the reducer emits `ProvisionAndSaveConnection` after a successful unlock.
     VaultUnlock {
         /// The passphrase entered so far — masked on screen, redacted in `Debug`, zeroized on drop.
         input: MaskedInput,
@@ -426,6 +567,9 @@ pub enum Overlay {
         error: Option<String>,
         /// The connection that triggered this unlock, if any (Phase P2+).
         pending_conn: Option<ConnectionId>,
+        /// A deferred credential-provisioning task to complete after vault unlock (Phase P5).
+        /// Boxed to keep the `Overlay` enum variant size reasonable (CredentialDraft is larger).
+        pending_save: Option<Box<PendingSave>>,
     },
     /// Confirm running a user-defined shell action before it executes (security gate — shell actions
     /// run a local program). Holds what's needed to dispatch on confirm.
@@ -505,6 +649,9 @@ pub enum Overlay {
     /// `pending_conn` carries the connection that triggered this overlay via a
     /// [`NeedsVault`](ChoiceStatus::NeedsVault) selection, so it can be auto-opened after
     /// the vault is created and unlocked. `None` when the user pressed `Ctrl-U` explicitly.
+    ///
+    /// `pending_save` (added in Phase P5) carries a deferred credential-provisioning task,
+    /// parallel to `Overlay::VaultUnlock::pending_save`.
     VaultCreate {
         /// The new passphrase being typed (focus 0).
         passphrase: MaskedInput,
@@ -524,6 +671,8 @@ pub enum Overlay {
         creating: bool,
         /// The connection that triggered this overlay (auto-opened after vault creation).
         pending_conn: Option<ConnectionId>,
+        /// A deferred credential-provisioning task to complete after vault creation (Phase P5).
+        pending_save: Option<Box<PendingSave>>,
     },
     /// Confirm deletion of a saved connection profile. The user sees the profile name and must
     /// press `[Enter]` to confirm or `[Esc]`/`[q]` to cancel. Destructive: removes the entry from
@@ -534,12 +683,16 @@ pub enum Overlay {
         /// Display name shown in the confirmation prompt.
         display_name: String,
     },
-    /// The add-/edit-connection form (Phase P4 of RFC-0011).
+    /// The add-/edit-connection form (Phases P4 + P5 of RFC-0011).
     ///
-    /// A two-stage overlay: `SchemePicker` presents a scrollable list of backends; once the user
-    /// selects one the form advances to `Fields` for the scheme-specific endpoint parameters.
-    /// Credential capture is deferred to P5 — the form collects endpoint data only and shows a
-    /// one-line hint about upcoming credential support.
+    /// The form progresses through up to four stages:
+    ///
+    /// 1. [`SchemePicker`](ConnectionFormStage::SchemePicker) — choose a backend type.
+    /// 2. [`Fields`](ConnectionFormStage::Fields) — fill in endpoint parameters.
+    /// 3. [`CredentialMethodPicker`](ConnectionFormStage::CredentialMethodPicker) — choose an
+    ///    authentication method (P5; skipped for `"local"` and other no-credential schemes).
+    /// 4. [`CredentialFields`](ConnectionFormStage::CredentialFields) — fill in credential
+    ///    fields for the chosen method (P5; skipped for delegation and deferred methods).
     ///
     /// `editing_id` is `None` for a new connection and `Some(id)` when editing an existing profile.
     /// `existing_secret_ref` carries the `secret_ref` from the live profile so it is not silently
@@ -547,19 +700,31 @@ pub enum Overlay {
     ConnectionForm {
         /// Current stage.
         stage: ConnectionFormStage,
-        /// The chosen scheme id (e.g. `"ssh"`), populated when advancing to `Fields`.
+        /// The chosen scheme id (e.g. `"ssh"`), populated when advancing past `SchemePicker`.
         scheme: String,
-        /// Live field values keyed by [`crate::forms::FieldSpec::key`].
+        /// Live endpoint field values keyed by [`crate::forms::FieldSpec::key`] (plain strings).
         values: HashMap<String, String>,
-        /// Which field (by index into the scheme's field list) currently has focus.
+        /// Which endpoint field (index into the scheme's field list) currently has focus.
         focus: usize,
-        /// Per-field validation errors, shown inline. Cleared when the user edits the field.
+        /// Per-endpoint-field validation errors, shown inline. Cleared when the field is edited.
         field_errors: HashMap<String, String>,
         /// `None` = new connection; `Some(id)` = editing an existing profile.
         editing_id: Option<uuid::Uuid>,
         /// The existing `secret_ref` from the profile being edited, preserved on save. `None`
-        /// for new connections (credentials are configured in P5).
+        /// for new connections.
         existing_secret_ref: Option<uuid::Uuid>,
+
+        // ── P5 credential stage ──────────────────────────────────────────────────────────
+        /// Cursor position in the credential method picker (index into
+        /// `credential_methods(scheme, editing_id.is_some())`).
+        cred_method_cursor: usize,
+        /// The chosen credential method; `None` until the user selects one in the picker.
+        cred_method: Option<crate::forms::CredentialMethod>,
+        /// Live credential field values, keyed by [`crate::forms::FieldSpec::key`].
+        /// Plain fields are [`FieldValue::Plain`]; masked fields are [`FieldValue::Secret`].
+        cred_fields: HashMap<String, FieldValue>,
+        /// Which credential field currently has focus (index into the method's field list).
+        cred_focus: usize,
     },
 }
 
@@ -791,6 +956,12 @@ pub struct AppState {
     /// and kept in sync by `ConnectionSaved`/`ConnectionDeleted` events. The connection form reads
     /// this to pre-populate fields when editing an existing profile.
     pub saved_profiles: HashMap<uuid::Uuid, crate::forms::ProfileData>,
+    /// Detected OS credential sources, populated by [`AppEffect::DetectOsSources`](crate::AppEffect::DetectOsSources)
+    /// at startup and stored in [`AppEvent::OsSourcesDetected`](crate::AppEvent::OsSourcesDetected).
+    /// Used by the credential method picker to default to the best available method per scheme.
+    ///
+    /// **Security invariant:** contains presence/name information only — never secret bytes.
+    pub os_sources: crate::forms::OsSources,
 }
 
 /// A stable identifier for an in-flight transfer, used to address progress/done events and the
@@ -909,6 +1080,7 @@ impl AppState {
             next_session_id: SessionId(1),
             connection_saving: false,
             saved_profiles: HashMap::new(),
+            os_sources: crate::forms::OsSources::default(),
         }
     }
 
@@ -958,9 +1130,10 @@ impl AppState {
                 | Overlay::VaultCreate { .. }
                 | Overlay::ExecPane { .. },
             ) => true,
-            // The connection form captures text only while the user is filling in fields.
+            // The connection form captures text only while the user is filling in endpoint or
+            // credential fields. The scheme picker and method picker are cursor-based.
             Some(Overlay::ConnectionForm {
-                stage: ConnectionFormStage::Fields,
+                stage: ConnectionFormStage::Fields | ConnectionFormStage::CredentialFields,
                 ..
             }) => true,
             Some(_) => false,
@@ -1003,6 +1176,7 @@ mod tests {
             input: m,
             error: None,
             pending_conn: None,
+            pending_save: None,
         };
         assert!(!format!("{overlay:?}").contains("hunter2"));
     }

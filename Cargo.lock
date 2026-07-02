@@ -1338,6 +1338,7 @@ dependencies = [
  "russh-sftp",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

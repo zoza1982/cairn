@@ -315,6 +315,17 @@ pub enum AppEvent {
         /// Secret-free error message to display in the status line.
         message: String,
     },
+    /// OS credential source detection (from [`AppEffect::DetectOsSources`]) completed.
+    ///
+    /// The reducer stores the result in [`AppState::os_sources`](crate::AppState::os_sources)
+    /// and, if the connection form's credential method picker is open, updates the cursor to
+    /// the recommended default for the current scheme.
+    ///
+    /// **Security invariant:** carries presence/name information only — never secret bytes.
+    OsSourcesDetected {
+        /// The detected OS credential source availability.
+        os_sources: crate::forms::OsSources,
+    },
     /// The [`AppEffect::CreateVault`] task completed.
     ///
     /// On success: the new vault is installed in the broker; the reducer closes the overlay, sets
@@ -553,6 +564,46 @@ pub enum AppEffect {
         /// The profile to remove.
         id: uuid::Uuid,
     },
+    /// Provision a credential in the vault and save the connection profile.
+    ///
+    /// The effect runner (binary edge) assembles a typed `CredentialSecret` from the
+    /// [`CredentialDraft`](crate::forms::CredentialDraft), calls `Broker::store` to add it to the
+    /// vault and persist to disk, sets `profile.secret_ref` to the new id, and then saves the
+    /// config (same as `SaveConnection`). The `ConnectionSaved` event is returned on success.
+    ///
+    /// When `draft` is [`KeepExisting`](crate::forms::CredentialDraft::KeepExisting) (edit mode),
+    /// no vault operation is performed and the profile is saved with its existing `secret_ref`.
+    ///
+    /// When `draft` is a deferred-P5 method (e.g. `GcpServiceAccountJson`), the profile is saved
+    /// without a vault credential (`secret_ref = None`) and a status note is shown.
+    ///
+    /// ## Security invariant
+    ///
+    /// The `CredentialSecret` assembly lives exclusively in `crates/cairn/src/app.rs`
+    /// (the binary edge). `cairn-core` emits only the `CredentialDraft` in this effect;
+    /// `cairn-vault` is never in `cairn-core`'s dependency graph. The `Debug` of this variant
+    /// is safe to log: `SecretString`'s `Debug` always prints `Secret([REDACTED])`.
+    ProvisionAndSaveConnection {
+        /// Profile data (endpoint fields + display name). `secret_ref` will be set by the runner.
+        profile: crate::forms::ProfileData,
+        /// The credential intent; assembled into a `CredentialSecret` at the binary edge.
+        draft: crate::forms::CredentialDraft,
+        /// `true` when updating an existing profile, `false` when creating a new one.
+        is_edit: bool,
+    },
+    /// Detect which OS credential sources are present (names / existence only — no secret bytes).
+    ///
+    /// Emitted once at startup by [`initial_effects`](crate::initial_effects). The effect runner
+    /// checks environment variables and file existence (not content) for:
+    ///
+    /// - SSH: `SSH_AUTH_SOCK` presence.
+    /// - AWS: profile section names in `~/.aws/credentials`.
+    /// - GCP: `GOOGLE_APPLICATION_CREDENTIALS` or the ADC JSON file existence.
+    /// - Azure: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, or `AZURE_CLIENT_SECRET` presence.
+    ///
+    /// The result arrives as [`AppEvent::OsSourcesDetected`] and is stored in
+    /// [`AppState::os_sources`](crate::AppState::os_sources) for use by the credential picker.
+    DetectOsSources,
     /// Create a new vault at the configured path (first-run setup). Argon2id key derivation is
     /// CPU-bound; the effect runner executes this under `spawn_blocking` to keep the render path
     /// responsive. The passphrase is consumed within the blocking task and zeroized on drop; it

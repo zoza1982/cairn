@@ -47,12 +47,17 @@ pub struct JournalEntry {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BrokerError {
-    /// The vault is locked; no credentials can be resolved.
+    /// The vault is locked; no credentials can be resolved or stored.
     #[error("vault is locked")]
     Locked,
     /// No credential with the given id exists.
     #[error("credential not found")]
     NotFound,
+    /// A vault I/O or serialization error occurred while storing a credential.
+    ///
+    /// Only produced by [`Broker::store`]; resolution errors are always `Locked` or `NotFound`.
+    #[error("vault error while storing credential")]
+    Vault(#[source] cairn_vault::VaultError),
 }
 
 /// Mediates access to the vault. Cheap to share behind an `Arc`.
@@ -109,6 +114,44 @@ impl Broker {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Store a new credential in the vault, persist to disk, and record the operation in the
+    /// audit journal.
+    ///
+    /// Returns the stable [`CredentialId`] assigned to the new credential.
+    ///
+    /// **Security invariant:** the journal entry records only the actor, the credential kind, and
+    /// the human-readable `label` — never key material. The kind string comes from the credential's
+    /// [`shape`](cairn_vault::CredentialSecret::shape), which is always a static category name
+    /// (`"ssh"`, `"aws"`, …).
+    ///
+    /// # Errors
+    /// - [`BrokerError::Locked`] if the vault is not installed.
+    /// - [`BrokerError::Vault`] if the vault save fails (I/O or serialization error).
+    pub fn store(
+        &self,
+        actor: Actor,
+        label: &str,
+        secret: CredentialSecret,
+    ) -> Result<CredentialId, BrokerError> {
+        let mut guard = self.vault.lock().expect("broker mutex");
+        let vault = guard.as_mut().ok_or(BrokerError::Locked)?;
+        // Capture kind before `add` consumes `secret`.
+        let kind_str = secret.shape().kind.as_str().to_owned();
+        let id = vault.add(label, secret);
+        // Save after add: if save fails the credential is NOT persisted to disk (the in-memory
+        // vault has it, but a process restart would lose it). Returning Err here gives the caller
+        // a chance to retry or surface the error; the in-memory add is idempotent on retry since
+        // `add` assigns a fresh UUID each time.
+        vault.save().map_err(BrokerError::Vault)?;
+        // Release the lock before journaling so journal contention never stalls the vault lock.
+        drop(guard);
+        self.record(JournalEntry {
+            actor,
+            action: format!("store {kind_str} as '{label}' → {id}"),
+        });
+        Ok(id)
     }
 
     /// Resolve a credential reference to its secret value, recording the request in the journal.
@@ -201,6 +244,9 @@ impl CredentialBroker for BrokerCredentialAdapter {
             .map_err(|e| match e {
                 BrokerError::Locked => CredentialBrokerError::Locked,
                 BrokerError::NotFound => CredentialBrokerError::NotFound,
+                // Vault I/O error during resolve is not currently part of the broker-api contract;
+                // treat it as a transient locked state so the plugin receives a retriable error.
+                BrokerError::Vault(_) => CredentialBrokerError::Locked,
             })?;
 
         // Perform the closed-vocabulary action. Any zeroizing `SecretString` fields inside
