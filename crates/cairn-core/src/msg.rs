@@ -561,7 +561,7 @@ pub enum AppEffect {
     /// Delete a connection profile by its stable UUID. The runtime removes it from `cairn.toml`
     /// and rebuilds the switcher list, then reports back via [`AppEvent::ConnectionDeleted`].
     /// If the profile had a vault credential, `secret_ref` carries the id so the effect runner
-    /// can call [`Broker::remove`](cairn_broker::Broker::remove) to avoid orphaning vault entries.
+    /// can call the broker's `remove` to avoid orphaning vault entries.
     DeleteConnection {
         /// The profile to remove.
         id: uuid::Uuid,
