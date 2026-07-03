@@ -3,9 +3,9 @@
 //! An archive is arbitrary, attacker-influenceable input (it may be downloaded, received as an
 //! attachment, or copied from anywhere) — unlike the local filesystem it is browsed *through*,
 //! every byte of its structure (paths, sizes, ratios, link targets) must be treated as hostile.
-//! This module centralizes the caps and validation helpers both [`crate::tar_backend::TarOps`] and
-//! [`crate::zip_backend::ZipOps`] apply during indexing and reads, so the two format-specific
-//! scanners can't independently drift on policy.
+//! This module centralizes the caps and validation helpers [`crate::tar_backend::TarOps`],
+//! [`crate::zip_backend::ZipOps`], and `compressed_tar` all apply during indexing/decoding and
+//! reads, so the format-specific scanners can't independently drift on policy.
 
 use cairn_types::VfsPath;
 use cairn_vfs::VfsError;
@@ -27,18 +27,37 @@ pub(crate) const ARCHIVE_PER_MEMBER_CAP: u64 = 64 * 1024 * 1024;
 /// archive whose members are individually under [`ARCHIVE_PER_MEMBER_CAP`] but whose sum is not.
 pub(crate) const ARCHIVE_SESSION_BYTE_CAP: u64 = 512 * 1024 * 1024;
 
-/// Maximum tolerated uncompressed:compressed ratio for a zip member, checked from central-directory
-/// metadata *before* any decompression is attempted. Ordinary text/data compresses well short of
-/// this; a ratio beyond it is characteristic of a deliberately crafted decompression bomb (e.g. a
-/// few KiB of repeated zeros expanding to gigabytes).
-pub(crate) const ZIP_MAX_COMPRESSION_RATIO: u64 = 100;
+/// Maximum tolerated uncompressed:compressed ratio, checked *before* (zip: from central-directory
+/// metadata) or incrementally *during* (compressed tar: from the running decoded-byte count vs. the
+/// whole compressed file's size) decompression. Ordinary text/data compresses well short of this; a
+/// ratio beyond it is characteristic of a deliberately crafted decompression bomb (e.g. a few KiB of
+/// repeated zeros expanding to gigabytes). Shared by the zip member guard
+/// (`zip_backend::ZipOps::build`) and the compressed-tar guard (`compressed_tar::decompress_to_temp`)
+/// so the two can't independently drift on where the line is drawn.
+pub(crate) const MAX_COMPRESSION_RATIO: u64 = 100;
 
-/// Ratio-guard floor: members whose *uncompressed* size is below this are exempt from the ratio
-/// check. A handful of bytes can legitimately compress at a huge ratio (e.g. an empty-ish file) and
-/// numerically none of that is dangerous — the ratio only matters once the absolute size is large
-/// enough to matter, and [`ARCHIVE_PER_MEMBER_CAP`]/[`ARCHIVE_SESSION_BYTE_CAP`] independently bound
-/// the actual decode regardless.
-pub(crate) const ZIP_RATIO_FLOOR_BYTES: u64 = 1024 * 1024;
+/// Ratio-guard floor: below this absolute (uncompressed/decoded) size, the ratio check is skipped
+/// entirely. A handful of bytes can legitimately compress at a huge ratio (e.g. an empty-ish file)
+/// and numerically none of that is dangerous — the ratio only matters once the absolute size is
+/// large enough to matter, and [`ARCHIVE_PER_MEMBER_CAP`]/[`ARCHIVE_SESSION_BYTE_CAP`]/
+/// [`ARCHIVE_MAX_DECOMPRESSED_BYTES`] independently bound the actual decode regardless.
+pub(crate) const COMPRESSION_RATIO_FLOOR_BYTES: u64 = 1024 * 1024;
+
+/// Hard cap on total decompressed output for one compressed-tar decode pass (RFC-0013 P5): the whole
+/// compressed file (`.tgz`/`.tbz2`/`.tzst` — `.txz` is not decoded at all, see `compressed_tar`) is
+/// decoded exactly once, up front, into a private temp file before any tar indexing happens
+/// (`compressed_tar::decompress_to_temp`) — this is the backstop that aborts that decode the instant
+/// it would exceed the cap, regardless of what the container's own (untrusted) size hints claim.
+///
+/// This value is numerically equal to [`ARCHIVE_SESSION_BYTE_CAP`] but the two are **independent
+/// budgets that happen to share a number**, not one shared pool: this cap bounds the one-time
+/// *temp-disk* footprint of decompressing a compressed-tar mount, while `ARCHIVE_SESSION_BYTE_CAP`
+/// separately bounds cumulative *read* traffic back out through `Vfs::open_read` over the life of
+/// the mount. A single compressed-tar mount can therefore use up to ~1 GiB combined in the
+/// worst case (up to this cap on temp disk at mount time, plus up to `ARCHIVE_SESSION_BYTE_CAP` of
+/// reads afterward) — not ~512 MiB total. Kept numerically equal only because there was no reason to
+/// pick two different round numbers, not because they are the same budget.
+pub(crate) const ARCHIVE_MAX_DECOMPRESSED_BYTES: u64 = ARCHIVE_SESSION_BYTE_CAP;
 
 /// Cap on a single path segment's length. Guards against a pathological name (megabytes of a single
 /// "file name") reaching the TUI's listing renderer or a terminal-width calculation.
@@ -97,18 +116,23 @@ pub(crate) fn check_entry_count(scanned: usize) -> Result<(), VfsError> {
     Ok(())
 }
 
-/// Whether a zip member's declared compressed/uncompressed sizes look like a decompression bomb,
-/// checked from central-directory metadata alone (before any bytes are decoded). `uncompressed`
-/// below [`ZIP_RATIO_FLOOR_BYTES`] is always accepted regardless of ratio.
+/// Whether a compressed/decoded size pair looks like a decompression bomb. Used two ways:
+/// - **zip** (`zip_backend::ZipOps::build`): both sizes come from central-directory metadata,
+///   checked once, before any bytes are decoded.
+/// - **compressed tar** (`compressed_tar::decompress_to_temp`): `compressed` is the whole input
+///   file's size and `uncompressed` is the running decoded-byte count so far, checked incrementally
+///   after every write during the single decode pass.
+///
+/// `uncompressed` below [`COMPRESSION_RATIO_FLOOR_BYTES`] is always accepted regardless of ratio.
 #[must_use]
-pub(crate) fn zip_ratio_is_bomb(compressed: u64, uncompressed: u64) -> bool {
-    if uncompressed < ZIP_RATIO_FLOOR_BYTES {
+pub(crate) fn compression_ratio_is_bomb(compressed: u64, uncompressed: u64) -> bool {
+    if uncompressed < COMPRESSION_RATIO_FLOOR_BYTES {
         return false;
     }
     // A declared-zero (or tiny) compressed size for a large uncompressed size is the degenerate
     // case of an absurd ratio; treat it as a bomb rather than divide-by-near-zero.
     let divisor = compressed.max(1);
-    uncompressed / divisor > ZIP_MAX_COMPRESSION_RATIO
+    uncompressed / divisor > MAX_COMPRESSION_RATIO
 }
 
 #[cfg(test)]
@@ -162,14 +186,17 @@ mod tests {
     #[test]
     fn ratio_guard_floor_exempts_small_members() {
         // Absurd ratio, but tiny absolute size -> not flagged.
-        assert!(!zip_ratio_is_bomb(1, 10_000));
+        assert!(!compression_ratio_is_bomb(1, 10_000));
     }
 
     #[test]
     fn ratio_guard_flags_large_absurd_ratios() {
         // 1 byte compressed expanding to 200 MiB uncompressed.
-        assert!(zip_ratio_is_bomb(1, 200 * 1024 * 1024));
+        assert!(compression_ratio_is_bomb(1, 200 * 1024 * 1024));
         // A realistic compression ratio for compressible text is not flagged.
-        assert!(!zip_ratio_is_bomb(2 * 1024 * 1024, 10 * 1024 * 1024));
+        assert!(!compression_ratio_is_bomb(
+            2 * 1024 * 1024,
+            10 * 1024 * 1024
+        ));
     }
 }

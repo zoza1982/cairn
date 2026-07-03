@@ -24,8 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `archive` Cargo feature (included in `all-backends`). Hardened against untrusted archive bytes:
   bounded per-member and per-session decode caps, a zip compression-ratio (bomb) guard, an
   entry-count cap, path-traversal/absolute-path/UNC/drive-letter rejection, and inert (never
-  followed) symlink/hardlink members. Compressed tar (`.tgz`/`.txz`/`.tbz2`/`.tzst`) is a follow-up
-  (RFC-0013 P5). See RFC-0013 and ADR-0012.
+  followed) symlink/hardlink members. See RFC-0013 and ADR-0012.
+
+- **Browse compressed tar archives** (RFC-0013 P5): `.tgz`/`.tar.gz`, `.tbz2`/`.tar.bz2`, and
+  `.tzst`/`.tar.zst` now mount and browse exactly like a plain `.tar` — the whole file is
+  decompressed once, up front, into a private (owner-only, RAII-deleted, preferring
+  `$XDG_RUNTIME_DIR` when available) temp file, then indexed by the same tar indexer P4 already
+  ships, so every existing tar guard applies unchanged. New decompression-bomb defenses: an
+  incrementally-enforced absolute decoded-byte cap and a compression-ratio guard (generalized from
+  P4's zip-only check), both aborting mid-decode the instant they trip rather than after the fact.
+  A separate guard refuses (rather than silently truncates) concatenated multi-stream/multi-frame
+  bzip2/zstd input that only partially decodes. All three decoders (gzip via `flate2`'s
+  `MultiGzDecoder`, zstd via `ruzstd`, bzip2 via `bzip2-rs`) are pure-Rust — no C/FFI parsing
+  untrusted compressed bytes; see ADR-0013 for the per-codec selection rationale and disclosed
+  trade-offs. `.txz`/`.tar.xz` is recognized (magic-sniffed) but **not decoded** in this release —
+  refused with a clear, typed error — because the only pure-Rust xz decoder evaluated is not
+  memory-bounded against a decompression bomb; tracked as a follow-up.
 
 - **Deterministic TUI snapshot testing.** A `scenarios` catalog in `cairn-tui` renders every screen
   (dual-pane, pager text/hex, log/AI-plan/transfer/connection/vault overlays, …) to a plain-text

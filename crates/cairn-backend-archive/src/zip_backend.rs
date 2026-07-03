@@ -6,7 +6,7 @@
 
 use crate::index::{ArchiveIndex, IndexBuilder, StoredEntry};
 use crate::security::{
-    check_entry_count, validate_member_name, zip_ratio_is_bomb, ARCHIVE_SYMLINK_TARGET_CAP,
+    check_entry_count, compression_ratio_is_bomb, validate_member_name, ARCHIVE_SYMLINK_TARGET_CAP,
 };
 use crate::ArchiveOps;
 use cairn_types::VfsPath;
@@ -69,7 +69,7 @@ impl ZipOps {
             };
             let compressed = zf.compressed_size();
             let uncompressed = zf.size();
-            if zip_ratio_is_bomb(compressed, uncompressed) {
+            if compression_ratio_is_bomb(compressed, uncompressed) {
                 tracing::warn!(
                     name = %name,
                     compressed,
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn absurd_ratio_member_is_rejected_before_decompression() {
         // A real (if modest) decompression bomb: a run of zeros deflates at a ratio far beyond
-        // `ZIP_MAX_COMPRESSION_RATIO`. `ZipOps::build` must reject it purely from the central
+        // `MAX_COMPRESSION_RATIO`. `ZipOps::build` must reject it purely from the central
         // directory's compressed/uncompressed sizes — the member never appears in the listing, and
         // building the index must not itself decompress the payload to notice.
         let tmp = tempfile::NamedTempFile::new().unwrap();
