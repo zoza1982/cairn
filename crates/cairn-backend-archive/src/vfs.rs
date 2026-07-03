@@ -1,4 +1,4 @@
-//! [`ArchiveVfs`]: maps an [`ArchiveOps`] onto the [`Vfs`] trait, plus the magic-byte format sniff
+//! [`ArchiveVfs`]: maps an `ArchiveOps` onto the [`Vfs`] trait, plus the magic-byte format sniff
 //! that picks tar vs zip at [`ArchiveVfs::open`] time.
 
 use crate::security::{ARCHIVE_PER_MEMBER_CAP, ARCHIVE_SESSION_BYTE_CAP};

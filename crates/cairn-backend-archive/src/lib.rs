@@ -1,12 +1,12 @@
 //! Read-only archive backend for Cairn: browse a local `.tar` or `.zip` file as a directory tree
 //! (RFC-0013 P4, `docs/adr/0012-archive-mount-model.md`).
 //!
-//! [`ArchiveVfs`] implements [`Vfs`](cairn_vfs::Vfs) over an [`ArchiveOps`] built by
+//! [`ArchiveVfs`] implements [`Vfs`](cairn_vfs::Vfs) over an `ArchiveOps` built by
 //! [`ArchiveVfs::open`], which sniffs the file's magic bytes (never its extension) to pick the tar
-//! or zip indexer. Both indexers ([`tar_backend::TarOps`], [`zip_backend::ZipOps`]) build their
+//! or zip indexer. Both indexers (`tar_backend::TarOps`, `zip_backend::ZipOps`) build their
 //! whole directory tree once, up front, inside `tokio::task::spawn_blocking` (the `tar`/`zip`
 //! crates are sync-only — there is no maintained async fork; `tokio-tar` is abandoned and is
-//! deliberately not used here) — see the crate-level rustdoc on [`ArchiveOps`] for why the trait is
+//! deliberately not used here) — see the crate-level rustdoc on `ArchiveOps` for why the trait is
 //! object-safe (`dyn`) rather than generic like `cairn-backend-ssh`'s `SftpOps`.
 //!
 //! **Scope (P4):** local archives only (an archive on a remote backend must be copied to a local
@@ -32,7 +32,7 @@ use cairn_types::{Entry, VfsPath};
 use cairn_vfs::VfsError;
 
 /// The subset of tar/zip-specific indexing and reading behavior [`ArchiveVfs`] needs, implemented
-/// once for tar ([`tar_backend::TarOps`]) and once for zip ([`zip_backend::ZipOps`]) so
+/// once for tar (`tar_backend::TarOps`) and once for zip (`zip_backend::ZipOps`) so
 /// `impl Vfs for ArchiveVfs` (in `vfs.rs`) is written exactly once.
 ///
 /// Object-safe (`dyn ArchiveOps`) rather than a generic type parameter (contrast

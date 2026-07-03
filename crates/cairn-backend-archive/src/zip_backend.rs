@@ -1,4 +1,4 @@
-//! [`ZipOps`]: indexes and reads a `.zip` file (RFC-0013 P4).
+//! `ZipOps`: indexes and reads a `.zip` file (RFC-0013 P4).
 //!
 //! Zip carries a central directory, so — unlike tar — the whole member list (names, compressed and
 //! uncompressed sizes, unix mode) is available from a single parse (`zip::ZipArchive::new`) without

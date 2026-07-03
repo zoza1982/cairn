@@ -1,4 +1,4 @@
-//! [`TarOps`]: indexes and reads an **uncompressed** `.tar` file (RFC-0013 P4).
+//! `TarOps`: indexes and reads an **uncompressed** `.tar` file (RFC-0013 P4).
 //!
 //! `tar` is a sequential format with no central directory, so unlike zip we can't jump straight to
 //! an index — we do one initial sequential scan (`tar::Archive::entries_with_seek`, which uses
