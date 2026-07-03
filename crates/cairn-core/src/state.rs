@@ -3,10 +3,12 @@
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
 use cairn_types::SessionId;
-use cairn_types::{ConnectionId, Entry, VfsPath};
+use cairn_types::{ConnectionId, Entry, UnixPerms, VfsPath};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use zeroize::Zeroize;
 
 /// A text field whose contents are a **secret** (the vault passphrase).
@@ -786,6 +788,199 @@ pub enum Overlay {
         /// Which credential field currently has focus (index into the method's field list).
         cred_focus: usize,
     },
+    /// Confirm what to do with a remote edit whose write-back cannot proceed silently (RFC-0012
+    /// P3): either the remote file changed underneath the editor (re-`stat` disagrees with the
+    /// snapshot taken before download — [`WritebackConflictReason::RemoteChanged`]), or the edited
+    /// temp file is now zero bytes while the original was not
+    /// ([`WritebackConflictReason::ZeroLengthGuard`], a crashed-editor/truncated-save guard).
+    ///
+    /// Offers four choices (see [`WritebackChoice`]), cursor-selected like [`Overlay::Connections`]:
+    /// overwrite the original anyway, save to a fresh sibling path instead, resume editing the same
+    /// temp file, or discard the edit entirely. The temp file is **not** deleted while this overlay
+    /// is open — see `crates/cairn/src/app.rs`'s `remote_edit_temps` map, which owns the RAII
+    /// cleanup and is only dropped when the flow reaches a terminal outcome.
+    ConfirmWriteback {
+        /// Correlates this overlay's choice back to the runtime's held temp-file resources.
+        id: RemoteEditId,
+        /// The connection the remote file lives on.
+        conn: ConnectionId,
+        /// The remote file's path (the original write-back target).
+        path: VfsPath,
+        /// The local temp file's real OS path (still present on disk).
+        temp_path: PathBuf,
+        /// The remote version observed just before the file was downloaded for editing — the
+        /// baseline `confirmed_equal` compares against on every write-back attempt, including a
+        /// subsequent one after `KeepEditing` is chosen here.
+        v0: RemoteVersion,
+        /// The remote file's size at download time (drives the zero-length guard).
+        orig_size: u64,
+        /// The remote file's Unix permissions at download time, if reported — restored on the
+        /// target after a staging-rename write-back (see `crate::AppEffect::WriteBack`'s doc).
+        orig_perms: Option<UnixPerms>,
+        /// The content hash captured right after the original download. **Stable for the whole
+        /// session** — carried forward unchanged into a subsequent `EditRemoteTemp` if
+        /// `KeepEditing` is chosen; this is the only value the no-op-edit decision ever compares
+        /// against (see `crate::AppEffect::EditRemoteTemp`'s doc for why that distinction matters).
+        download_hash: ContentHash,
+        /// The most recently observed content hash of the temp file (the pre-round baseline for a
+        /// further edit session if `KeepEditing` is chosen — informational only, not used for the
+        /// no-op decision).
+        hash: ContentHash,
+        /// Why this overlay opened — display-only, doesn't change the four choices offered.
+        reason: WritebackConflictReason,
+        /// Selection cursor into [`WritebackChoice::ALL`].
+        cursor: usize,
+    },
+}
+
+/// A stable identifier for an in-flight remote-edit session (RFC-0012 P3): download → edit →
+/// conflict-check → write-back. Minted monotonically by the reducer (like [`TransferId`]/
+/// [`PagerId`]) the moment a remote edit is confirmed underway (`AppEvent::RemoteEditNeedsDownload`
+/// handler), and threaded through every subsequent effect/event so the runtime's held temp-file
+/// resources (never visible to the reducer) can be found and cleaned up by id.
+pub type RemoteEditId = u64;
+
+/// The largest remote file RFC-0012 P3 will download-and-edit. Editing a multi-GB file by
+/// round-tripping it through `$EDITOR` is the wrong workflow regardless of available disk/memory —
+/// this is a deliberate UX guardrail, not a technical ceiling. Enforced by the runtime (which holds
+/// the `Entry.size` needed to check it) before any download begins.
+pub const REMOTE_EDIT_MAX_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+
+/// A SHA-256 digest of a temp file's content, used purely as a local before/after diff to detect a
+/// no-op edit (the editor was opened and closed without changing the bytes) — never a cross-system
+/// integrity check, so the choice of hash function has no interop constraint.
+pub type ContentHash = [u8; 32];
+
+/// A backend's reported "version" of a remote object at a point in time, used to detect whether it
+/// changed underneath an in-progress edit (RFC-0012 P3).
+///
+/// Built once from the [`Entry`] returned by `stat` just before download (`v0`, the baseline) and
+/// again immediately before write-back (`v1`); [`confirmed_equal`](Self::confirmed_equal) decides
+/// whether it is safe to overwrite silently. Per-backend signal availability (documented in
+/// `docs/rfcs/0012-file-open-view-edit.md`): S3/GCS/Azure report an `etag`; SFTP/local report
+/// `modified`+`size` but no `etag`; **Docker/K8s currently report neither** (their `Entry` never
+/// populates `modified`), so they degrade to `Unknown` today — moot in practice since neither
+/// advertises `Caps::WRITE` yet, so remote-edit write-back is refused before `RemoteVersion` is
+/// ever consulted for them; if/when they gain write support, they will always prompt on conflict
+/// until `modified` is plumbed through. Anything reporting neither `etag` nor `modified`+`size`
+/// degrades to `Unknown`, which is deliberately **never** treated as a match — an unverifiable
+/// version must always prompt rather than risk a silent clobber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteVersion {
+    /// The backend reports a content/version tag (object stores). Compared for exact equality.
+    ETag(String),
+    /// The backend reports modification time and size but no tag (SFTP, local, container/pod
+    /// filesystems). Compared as a pair — either differing is a change.
+    MTimeSize {
+        /// Last-modified time reported by the backend.
+        modified: SystemTime,
+        /// Size in bytes reported by the backend.
+        size: u64,
+    },
+    /// Neither an `etag` nor both `modified`+`size` were available (or the entry vanished — see
+    /// callers that map a `NotFound` re-`stat` to this variant). Never `confirmed_equal` to
+    /// anything, including another `Unknown` — an unverifiable version can never be "confirmed
+    /// unchanged".
+    Unknown,
+}
+
+impl RemoteVersion {
+    /// Build a version snapshot from a `stat` result: prefers `etag` (exact, cheap to compare),
+    /// falls back to `modified`+`size` when both are present, else [`RemoteVersion::Unknown`].
+    #[must_use]
+    pub fn from_entry(entry: &Entry) -> Self {
+        if let Some(etag) = &entry.etag {
+            return Self::ETag(etag.to_string());
+        }
+        if let (Some(modified), Some(size)) = (entry.modified, entry.size) {
+            return Self::MTimeSize { modified, size };
+        }
+        Self::Unknown
+    }
+
+    /// Whether `self` and `other` are confirmed to describe the same object state.
+    ///
+    /// `false` whenever either side is [`RemoteVersion::Unknown`] (including two `Unknown`s
+    /// compared against each other) or the two sides are different variants (a backend should never
+    /// switch signal kind for the same path mid-session, but a mismatch is treated the same as "not
+    /// confirmed" rather than assumed benign) — an unconfirmed version must always prompt rather
+    /// than risk silently overwriting a concurrent change.
+    #[must_use]
+    pub fn confirmed_equal(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ETag(a), Self::ETag(b)) => a == b,
+            (
+                Self::MTimeSize {
+                    modified: m1,
+                    size: s1,
+                },
+                Self::MTimeSize {
+                    modified: m2,
+                    size: s2,
+                },
+            ) => m1 == m2 && s1 == s2,
+            _ => false,
+        }
+    }
+}
+
+/// The four resolutions offered by [`Overlay::ConfirmWriteback`] when a remote edit's write-back
+/// cannot proceed silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritebackChoice {
+    /// Write the edited content over the original path anyway (accepting the loss of whatever
+    /// changed remotely, or the truncation, since the last known-good snapshot).
+    Overwrite,
+    /// Write the edited content to a fresh sibling path instead, leaving the original untouched.
+    SaveAs,
+    /// Dismiss the overlay and resume editing the same temp file (e.g. to reconcile changes by
+    /// hand before deciding) — re-runs `$EDITOR` on the same local copy.
+    KeepEditing,
+    /// Abandon the edit: delete the temp file, write nothing back.
+    Discard,
+}
+
+impl WritebackChoice {
+    /// Every choice, in the order the overlay lists and cursor-selects them.
+    pub const ALL: [Self; 4] = [
+        Self::Overwrite,
+        Self::SaveAs,
+        Self::KeepEditing,
+        Self::Discard,
+    ];
+
+    /// A short label for the overlay's choice list.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overwrite => "Overwrite",
+            Self::SaveAs => "Save as a new file",
+            Self::KeepEditing => "Keep editing",
+            Self::Discard => "Discard my changes",
+        }
+    }
+}
+
+/// Why [`Overlay::ConfirmWriteback`] opened — display-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritebackConflictReason {
+    /// The remote file's version at write-back time no longer [`RemoteVersion::confirmed_equal`]s
+    /// the baseline observed before download (including the remote path having been deleted).
+    RemoteChanged,
+    /// The temp file is now zero bytes but the original remote file was not — most likely a crashed
+    /// or misbehaving editor, not a deliberate "empty this file" edit.
+    ZeroLengthGuard,
+}
+
+impl WritebackConflictReason {
+    /// A short, user-facing explanation shown in the overlay title/status.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::RemoteChanged => "the remote file changed since you started editing",
+            Self::ZeroLengthGuard => "the edited file is now empty, but the original was not",
+        }
+    }
 }
 
 /// What submitting a [`Overlay::Prompt`] text field will do.
@@ -1002,6 +1197,10 @@ pub struct AppState {
     pub next_log_viewer_id: LogViewerId,
     /// Monotonic id counter for pager sessions (like `next_log_viewer_id`). Starts at 1.
     pub next_pager_id: PagerId,
+    /// Monotonic id counter for remote-edit sessions (RFC-0012 P3, like `next_pager_id`). Starts at
+    /// 1; minted the moment a remote edit is confirmed underway
+    /// (`AppEvent::RemoteEditNeedsDownload`'s handler).
+    pub next_remote_edit_id: RemoteEditId,
     /// Active exec and port-forward sessions, keyed by stable [`SessionId`].
     ///
     /// A record is inserted when `OpenExecSession`/`OpenPortForward` is emitted by the reducer and
@@ -1237,6 +1436,7 @@ impl AppState {
             pending_conn_open: [None; 2],
             next_log_viewer_id: 1,
             next_pager_id: 1,
+            next_remote_edit_id: 1,
             sessions: HashMap::new(),
             next_session_id: SessionId(1),
             connection_saving: false,
@@ -1422,5 +1622,116 @@ mod tests {
         // Shorter than the tar magic's offset+len: must not panic (slice indexing) or misclassify.
         assert_eq!(detect_file_kind(b"PK"), FileKind::Text);
         assert_eq!(detect_file_kind(&[0u8; 10]), FileKind::Binary);
+    }
+
+    // --- RemoteVersion (RFC-0012 P3) ---
+
+    fn entry_with_etag(tag: &str) -> Entry {
+        let mut e = Entry::new("f", cairn_types::EntryKind::File);
+        e.etag = Some(tag.into());
+        e
+    }
+
+    fn entry_with_mtime_size(secs: u64, size: u64) -> Entry {
+        let mut e = Entry::new("f", cairn_types::EntryKind::File);
+        e.modified = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        e.size = Some(size);
+        e
+    }
+
+    #[test]
+    fn remote_version_prefers_etag_over_mtime_size() {
+        let mut e = entry_with_etag("abc123");
+        e.modified = Some(SystemTime::UNIX_EPOCH);
+        e.size = Some(10);
+        assert_eq!(
+            RemoteVersion::from_entry(&e),
+            RemoteVersion::ETag("abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn remote_version_falls_back_to_mtime_size() {
+        let e = entry_with_mtime_size(1000, 42);
+        assert_eq!(
+            RemoteVersion::from_entry(&e),
+            RemoteVersion::MTimeSize {
+                modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000),
+                size: 42
+            }
+        );
+    }
+
+    #[test]
+    fn remote_version_unknown_when_neither_signal_present() {
+        let e = Entry::new("f", cairn_types::EntryKind::File);
+        assert_eq!(RemoteVersion::from_entry(&e), RemoteVersion::Unknown);
+        // Only one of modified/size present is still Unknown — both are required for the pair signal.
+        let mut e2 = Entry::new("f", cairn_types::EntryKind::File);
+        e2.size = Some(5);
+        assert_eq!(RemoteVersion::from_entry(&e2), RemoteVersion::Unknown);
+    }
+
+    #[test]
+    fn remote_version_etag_equality() {
+        let a = RemoteVersion::ETag("v1".to_owned());
+        let b = RemoteVersion::ETag("v1".to_owned());
+        let c = RemoteVersion::ETag("v2".to_owned());
+        assert!(a.confirmed_equal(&b));
+        assert!(!a.confirmed_equal(&c));
+    }
+
+    #[test]
+    fn remote_version_mtime_size_equality() {
+        let m = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(500);
+        let a = RemoteVersion::MTimeSize {
+            modified: m,
+            size: 10,
+        };
+        let b = RemoteVersion::MTimeSize {
+            modified: m,
+            size: 10,
+        };
+        let different_size = RemoteVersion::MTimeSize {
+            modified: m,
+            size: 11,
+        };
+        let different_time = RemoteVersion::MTimeSize {
+            modified: m + std::time::Duration::from_secs(1),
+            size: 10,
+        };
+        assert!(a.confirmed_equal(&b));
+        assert!(!a.confirmed_equal(&different_size));
+        assert!(!a.confirmed_equal(&different_time));
+    }
+
+    #[test]
+    fn remote_version_unknown_is_never_confirmed_equal() {
+        // Not even to itself — an unverifiable version can never be treated as "unchanged".
+        assert!(!RemoteVersion::Unknown.confirmed_equal(&RemoteVersion::Unknown));
+        let known = RemoteVersion::ETag("v1".to_owned());
+        assert!(!RemoteVersion::Unknown.confirmed_equal(&known));
+        assert!(!known.confirmed_equal(&RemoteVersion::Unknown));
+    }
+
+    #[test]
+    fn remote_version_mismatched_variants_are_never_confirmed_equal() {
+        let etag = RemoteVersion::ETag("v1".to_owned());
+        let mtime = RemoteVersion::MTimeSize {
+            modified: SystemTime::UNIX_EPOCH,
+            size: 1,
+        };
+        assert!(!etag.confirmed_equal(&mtime));
+        assert!(!mtime.confirmed_equal(&etag));
+    }
+
+    #[test]
+    fn writeback_choice_labels_and_order() {
+        assert_eq!(WritebackChoice::ALL.len(), 4);
+        assert_eq!(WritebackChoice::ALL[0], WritebackChoice::Overwrite);
+        assert_eq!(WritebackChoice::ALL[3], WritebackChoice::Discard);
+        for c in WritebackChoice::ALL {
+            assert!(!c.label().is_empty());
+        }
     }
 }

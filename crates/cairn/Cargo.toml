@@ -106,12 +106,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # tiny and stable API (`shlex::split`) — a natural fit versus hand-rolling a shell-word splitter.
 shlex = "2"
 
+# RFC-0012 P3 (remote file edit): a private local temp file for the download-edit-writeback
+# round-trip. Already a normal dependency of `cairn-backend-archive` (same "0600/O_EXCL,
+# non-predictable name, prefer $XDG_RUNTIME_DIR" pattern reused here for consistency — see
+# `new_remote_edit_dir`/`create_temp_edit_file`); promoted here from dev-only to a real
+# dependency since P2's local-only edit never needed a temp file of its own.
+tempfile = "3"
+# RFC-0012 P3: a local content hash of the temp file before/after editing, to detect a no-op edit
+# without writing anything back. Purely a local before/after diff (never a cross-system integrity
+# check), so no interop constraint drove the choice — `sha2` is already resolved in the workspace
+# dependency tree (pulled transitively by `wasmtime`/`cranelift` for `cairn-plugin`), so naming it
+# directly here adds no new crate, just a new consumer of one already being built.
+sha2 = "0.10"
+
 # Safe process-group kill for shell-action timeouts (no `unsafe`). Already in the dependency tree.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # The connection-opener / vault-unlock tests build a vault + typed credentials to exercise the
 # resolve → dispatch path hermetically (no live servers). Both `cairn-vault` and `cairn-secrets` are

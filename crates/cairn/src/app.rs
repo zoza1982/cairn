@@ -18,12 +18,13 @@ use cairn_broker::{Actor, Broker};
 use cairn_config::Config;
 use cairn_core::{
     initial_effects, update, Action, AppEffect, AppEvent, AppState, ChoiceStatus, ConnectionChoice,
-    LogViewerId, Msg, Overlay, PagerId, ShellActionMeta, Side, TransferId,
+    ContentHash, LogViewerId, Msg, Overlay, PagerId, RemoteEditId, RemoteVersion, ShellActionMeta,
+    Side, TransferId, WriteBackMode, REMOTE_EDIT_MAX_BYTES,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
 use cairn_types::SessionId;
-use cairn_types::{ConnectionId, VfsPath};
+use cairn_types::{Caps, ConnectionId, UnixPerms, VfsPath};
 use cairn_vault::Vault;
 use cairn_vfs::{ByteRange, ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
@@ -43,6 +44,16 @@ const RIGHT: ConnectionId = ConnectionId(2);
 /// increasing id space of their own for the process lifetime, so the two counters can never
 /// collide without needing to consult each other's claimed-id sets.
 const ARCHIVE_CONN_ID_BASE: u64 = 1_000_000_000;
+
+/// A private sentinel [`ConnectionId`] for the ephemeral [`LocalVfs`] the RFC-0012 P3 remote-edit
+/// download/write-back effects build over a temp file. Never inserted into the [`VfsRegistry`] and
+/// never compared against a real connection's id for anything other than the transfer engine's
+/// same-connection fast-path check (`src.connection() == dst.connection()`), which must be
+/// `false` here so a remote→temp / temp→remote copy always takes the stream-through path rather
+/// than the same-backend rename fast-path. `u64::MAX` can never collide with a real connection id
+/// (assigned sequentially from 1) or an archive-mount id (assigned sequentially from
+/// [`ARCHIVE_CONN_ID_BASE`]).
+const REMOTE_EDIT_TEMP_CONN_ID: ConnectionId = ConnectionId(u64::MAX);
 
 /// UI progress granularity: the transfer callback notifies the status bar at most every this many
 /// bytes. 256 KiB balances update frequency against channel pressure; progress is sent best-effort
@@ -301,6 +312,7 @@ async fn run_async() -> anyhow::Result<()> {
     let empty_descriptors: HashMap<ConnectionId, ConnectionDescriptor> = HashMap::new();
     let mut startup_in_flight: HashSet<ConnectionId> = HashSet::new();
     let mut startup_next_archive_conn_id: u64 = ARCHIVE_CONN_ID_BASE;
+    let mut startup_remote_edit_temps: HashMap<RemoteEditId, tempfile::TempDir> = HashMap::new();
     for effect in initial {
         dispatch(
             effect,
@@ -316,6 +328,7 @@ async fn run_async() -> anyhow::Result<()> {
             &empty_descriptors,
             &mut startup_in_flight,
             &mut startup_next_archive_conn_id,
+            &mut startup_remote_edit_temps,
         );
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
@@ -811,6 +824,12 @@ async fn event_loop(
     // is no "done" event that could reclaim an id for reuse — each mount is a genuinely new,
     // permanently-registered (for the session) connection. See `ARCHIVE_CONN_ID_BASE`.
     let mut next_archive_conn_id: u64 = ARCHIVE_CONN_ID_BASE;
+    // Owns the RAII temp directory for each in-flight remote-edit session (RFC-0012 P3), keyed by
+    // `RemoteEditId`. Created in `dispatch`'s `DownloadForEdit` arm; removed (deleting the temp
+    // file) on every terminal outcome below, on an explicit `CancelRemoteEdit` (`dispatch`), and —
+    // as a last-resort safety net — when the whole event loop exits (dropping this map along with
+    // every other local here), so a session left open when the app quits is still cleaned up.
+    let mut remote_edit_temps: HashMap<RemoteEditId, tempfile::TempDir> = HashMap::new();
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -851,6 +870,18 @@ async fn event_loop(
         if let Msg::Event(AppEvent::ConnectionOpened { conn, .. }) = &msg {
             open_connection_in_flight.remove(conn);
         }
+        // RFC-0012 P3: every terminal outcome of a remote-edit session drops (and thus deletes)
+        // its held temp directory. `WriteBackConflict` is deliberately excluded — the flow
+        // continues (the overlay is open, or `KeepEditing`/`SaveAs` will re-use the same temp
+        // file), so cleanup must not run yet.
+        if let Msg::Event(
+            AppEvent::RemoteEditNoChange { id, .. }
+            | AppEvent::RemoteEditFailed { id, .. }
+            | AppEvent::WriteBackDone { id, .. },
+        ) = &msg
+        {
+            remote_edit_temps.remove(id);
+        }
         let effects = update(state, msg);
         if state.should_quit {
             break;
@@ -864,6 +895,37 @@ async fn event_loop(
             // `docs/adr/0011-terminal-suspend-and-editor-launch.md`.
             if let AppEffect::SuspendAndEdit { conn, path } = effect {
                 run_editor_suspend(terminal, input_gate, registry, event_tx, conn, path).await;
+                continue;
+            }
+            // `EditRemoteTemp` (RFC-0012 P3) needs the same exclusive terminal/stdin ownership as
+            // `SuspendAndEdit` — see `run_remote_edit_temp`.
+            if let AppEffect::EditRemoteTemp {
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                orig_perms,
+                download_hash,
+                hash,
+            } = effect
+            {
+                run_remote_edit_temp(
+                    terminal,
+                    input_gate,
+                    event_tx,
+                    id,
+                    conn,
+                    path,
+                    temp_path,
+                    v0,
+                    orig_size,
+                    orig_perms,
+                    download_hash,
+                    hash,
+                )
+                .await;
                 continue;
             }
             dispatch(
@@ -880,6 +942,7 @@ async fn event_loop(
                 &descriptor_map,
                 &mut open_connection_in_flight,
                 &mut next_archive_conn_id,
+                &mut remote_edit_temps,
             );
         }
     }
@@ -1077,6 +1140,7 @@ fn dispatch(
     descriptor_map: &HashMap<ConnectionId, ConnectionDescriptor>,
     open_connection_in_flight: &mut HashSet<ConnectionId>,
     next_archive_conn_id: &mut u64,
+    remote_edit_temps: &mut HashMap<RemoteEditId, tempfile::TempDir>,
 ) {
     match effect {
         AppEffect::List {
@@ -1543,6 +1607,85 @@ fn dispatch(
                     .send(AppEvent::OsSourcesDetected { os_sources })
                     .await;
             });
+        }
+        AppEffect::DownloadForEdit {
+            id,
+            conn,
+            path,
+            v0,
+            size,
+            orig_perms,
+        } => {
+            // The temp dir + file are created here, synchronously (a handful of fast std::fs
+            // calls — no different in cost from the `cancel`/`pause_tx` setup `AppEffect::Transfer`
+            // does inline above), so this map — the sole owner of the RAII `TempDir` value for the
+            // whole remote-edit session — always has an entry before any event referencing `id`
+            // can arrive, no matter how the spawned download task below finishes.
+            let leaf = path.file_name().unwrap_or("edited-file").to_owned();
+            let outcome = new_remote_edit_dir().and_then(|dir| {
+                let file = create_temp_edit_file(dir.path(), &leaf)?;
+                Ok((dir, file))
+            });
+            let (dir, temp_path) = match outcome {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = event_tx
+                            .send(AppEvent::RemoteEditFailed {
+                                id,
+                                status: format!("could not create a temp file: {e}"),
+                            })
+                            .await;
+                    });
+                    return;
+                }
+            };
+            remote_edit_temps.insert(id, dir);
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_download_for_edit(
+                    &registry, id, conn, path, v0, size, orig_perms, temp_path,
+                )
+                .await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::WriteBack {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size,
+            orig_perms,
+            download_hash,
+            mode,
+        } => {
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_writeback(
+                    &registry,
+                    id,
+                    conn,
+                    path,
+                    temp_path,
+                    v0,
+                    orig_size,
+                    orig_perms,
+                    download_hash,
+                    mode,
+                )
+                .await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::CancelRemoteEdit { id } => {
+            // Synchronous, like `CancelTransfer`: dropping the map entry deletes the temp
+            // directory (and the file within it) via `tempfile::TempDir`'s `Drop` impl.
+            remote_edit_temps.remove(&id);
         }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
         other => tracing::warn!(effect = ?other, "unhandled effect"),
@@ -3066,13 +3209,78 @@ fn send_event_detached(event_tx: &mpsc::Sender<AppEvent>, ev: AppEvent) {
     });
 }
 
+/// Pause the input reader, suspend the terminal, run the already-resolved editor on `target` (with
+/// `cwd` as its working directory), then resume the terminal and un-pause input.
+///
+/// Shared by [`run_editor_suspend`] (RFC-0012 P2: `target` is a resolved local path) and
+/// [`run_remote_edit_temp`] (RFC-0012 P3: `target` is an already-local temp file) — the two differ
+/// only in how `target`/`cwd` were obtained and in what the caller does with the outcome
+/// afterward. Steps and rationale are unchanged from the original P2 implementation; see
+/// `docs/adr/0011-terminal-suspend-and-editor-launch.md`.
+async fn suspend_and_run_editor(
+    terminal: &mut ratatui::DefaultTerminal,
+    input_gate: &Arc<InputGate>,
+    program: &str,
+    fixed_args: &[String],
+    target: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Result<std::process::ExitStatus, String> {
+    // 1. Pause the blocking input-reader thread and wait for its ack. `request_pause` performs a
+    // real OS-level `Condvar::wait`, so it must run inside `spawn_blocking`, not directly `.await`ed.
+    {
+        let gate = input_gate.clone();
+        let paused = tokio::task::spawn_blocking(move || gate.request_pause()).await;
+        // `Ok(Ok(()))` = the reader acknowledged the pause. `Ok(Err(()))` = the reader thread has
+        // died (e.g. the controlling terminal dropped), so it will never ack — bail rather than
+        // wait forever. `Err(_)` = the blocking task panicked (has no panicking path, but handle it).
+        // In every non-ack case we have NOT touched the terminal yet, so fail cleanly.
+        if !matches!(paused, Ok(Ok(()))) {
+            return Err("cannot edit: input is unavailable".to_owned());
+        }
+    }
+
+    // 2. Suspend: leave raw mode + the alternate screen. Deliberately NOT `ratatui::init()` again
+    // on resume (see the ADR) — `init()` re-installs a panic hook and stacks a new closure on
+    // every call; `restore()` here is the suspend half, the manual re-init below is the resume half.
+    ratatui::restore();
+
+    // RAII guard: if anything below panics or returns early before the explicit resume, this
+    // still re-enters raw mode/alt-screen and unpauses the reader rather than leaving the app
+    // permanently deaf to input.
+    let mut guard = EditorRestoreGuard {
+        input_gate,
+        armed: true,
+    };
+
+    // 3. Spawn the editor and await it in the foreground — the documented exception to "the
+    // render path never blocks": this specific await is the entire point of suspending.
+    let outcome = spawn_editor_hardened(program, fixed_args, target, cwd).await;
+
+    // 4. Resume: manual re-init (not `ratatui::init()`) + a full non-diffed repaint, since the
+    // terminal size may have changed and the editor's own screen is sitting in ratatui's diff
+    // buffer's blind spot.
+    if let Err(e) = enable_raw_mode() {
+        tracing::error!(error = %e, "failed to re-enable raw mode after editor exit");
+    }
+    if let Err(e) = execute!(std::io::stdout(), EnterAlternateScreen) {
+        tracing::error!(error = %e, "failed to re-enter the alternate screen after editor exit");
+    }
+    if let Err(e) = terminal.clear() {
+        tracing::error!(error = %e, "failed to repaint the terminal after editor exit");
+    }
+    input_gate.resume();
+    guard.armed = false; // resume already performed above; disarm so Drop is a no-op
+
+    outcome
+}
+
 /// Handle [`AppEffect::SuspendAndEdit`] — the one effect not routed through [`dispatch`] because it
 /// needs exclusive terminal + stdin ownership. Resolves the local path *before* touching the
-/// terminal (so a remote-backend refusal never disturbs the TUI), pauses the blocking input reader
-/// and waits for its ack, suspends the terminal, spawns the hardened editor and awaits it
-/// (foreground — the deliberate, documented exception to "the render path never blocks": the whole
-/// point is that the editor exclusively owns the TTY while it runs), manually resumes the terminal
-/// with a full non-diffed repaint, resumes the reader, and reports the outcome.
+/// terminal (so a refusal or a hand-off to the RFC-0012 P3 remote-edit flow never disturbs the
+/// TUI), then suspends the terminal, spawns the hardened editor and awaits it (foreground — the
+/// deliberate, documented exception to "the render path never blocks": the whole point is that the
+/// editor exclusively owns the TTY while it runs), manually resumes the terminal with a full
+/// non-diffed repaint, and reports the outcome.
 async fn run_editor_suspend(
     terminal: &mut ratatui::DefaultTerminal,
     input_gate: &Arc<InputGate>,
@@ -3094,23 +3302,18 @@ async fn run_editor_suspend(
         return;
     };
     let real = {
-        let (vfs, path) = (vfs.clone(), path.clone());
-        match tokio::task::spawn_blocking(move || vfs.local_path(&path)).await {
+        let (vfs2, path2) = (vfs.clone(), path.clone());
+        match tokio::task::spawn_blocking(move || vfs2.local_path(&path2)).await {
             Ok(Some(p)) => p,
+            // `None` covers "remote backend" *and* a local path that won't resolve (a dangling
+            // symlink, or one that escapes the confined root) — see `Vfs::local_path`'s doc. Both
+            // cases are handed to the RFC-0012 P3 remote-edit flow (download to a temp file, edit
+            // that, write back) rather than refused outright: it works correctly for a genuinely
+            // remote backend, and also gracefully covers the local-but-unresolvable-symlink case P2
+            // used to refuse, since the P3 path never needs `local_path` to succeed — only
+            // `stat`/`open_read`/`open_write`. Neither case has touched the terminal.
             _ => {
-                // `None` covers "remote backend" *and* a local path that won't resolve (a dangling
-                // symlink, or one that escapes the confined root) — all mean "do not proceed" (see
-                // `Vfs::local_path`'s doc). The message avoids claiming "remote" for what may be a
-                // broken local link. Neither case has touched the terminal.
-                send_event_detached(
-                    event_tx,
-                    AppEvent::EditFinished {
-                        status: "Cannot edit this file — only local, resolvable files are \
-                                 editable (remote editing lands in P3)"
-                            .to_owned(),
-                        error: true,
-                    },
-                );
+                begin_remote_edit(&vfs, conn, path, event_tx).await;
                 return;
             }
         }
@@ -3140,58 +3343,8 @@ async fn run_editor_suspend(
         }
     };
 
-    // 2. Pause the blocking input-reader thread and wait for its ack. `request_pause` performs a
-    // real OS-level `Condvar::wait`, so it must run inside `spawn_blocking`, not directly `.await`ed.
-    {
-        let gate = input_gate.clone();
-        let paused = tokio::task::spawn_blocking(move || gate.request_pause()).await;
-        // `Ok(Ok(()))` = the reader acknowledged the pause. `Ok(Err(()))` = the reader thread has
-        // died (e.g. the controlling terminal dropped), so it will never ack — bail rather than
-        // wait forever. `Err(_)` = the blocking task panicked (has no panicking path, but handle it).
-        // In every non-ack case we have NOT touched the terminal yet, so fail cleanly.
-        if !matches!(paused, Ok(Ok(()))) {
-            send_event_detached(
-                event_tx,
-                AppEvent::EditFinished {
-                    status: "cannot edit: input is unavailable".to_owned(),
-                    error: true,
-                },
-            );
-            return;
-        }
-    }
-
-    // 3. Suspend: leave raw mode + the alternate screen. Deliberately NOT `ratatui::init()` again
-    // on resume (see the ADR) — `init()` re-installs a panic hook and stacks a new closure on
-    // every call; `restore()` here is the suspend half, the manual re-init below is the resume half.
-    ratatui::restore();
-
-    // RAII guard: if anything below panics or returns early before the explicit resume, this
-    // still re-enters raw mode/alt-screen and unpauses the reader rather than leaving the app
-    // permanently deaf to input.
-    let mut guard = EditorRestoreGuard {
-        input_gate,
-        armed: true,
-    };
-
-    // 4. Spawn the editor and await it in the foreground — the documented exception to "the
-    // render path never blocks": this specific await is the entire point of suspending.
-    let outcome = spawn_editor_hardened(&program, &fixed_args, &real, &cwd).await;
-
-    // 5. Resume: manual re-init (not `ratatui::init()`) + a full non-diffed repaint, since the
-    // terminal size may have changed and the editor's own screen is sitting in ratatui's diff
-    // buffer's blind spot.
-    if let Err(e) = enable_raw_mode() {
-        tracing::error!(error = %e, "failed to re-enable raw mode after editor exit");
-    }
-    if let Err(e) = execute!(std::io::stdout(), EnterAlternateScreen) {
-        tracing::error!(error = %e, "failed to re-enter the alternate screen after editor exit");
-    }
-    if let Err(e) = terminal.clear() {
-        tracing::error!(error = %e, "failed to repaint the terminal after editor exit");
-    }
-    input_gate.resume();
-    guard.armed = false; // resume already performed above; disarm so Drop is a no-op
+    let outcome =
+        suspend_and_run_editor(terminal, input_gate, &program, &fixed_args, &real, &cwd).await;
 
     let (status, error) = match outcome {
         Ok(status) if status.success() => (format!("edited {name}"), false),
@@ -3202,6 +3355,722 @@ async fn run_editor_suspend(
         Err(message) => (message, true),
     };
     send_event_detached(event_tx, AppEvent::EditFinished { status, error });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// RFC-0012 P3: remote file edit — download / conflict-check / write-back
+//
+// Extends P2's local-only `$EDITOR` shell-out to any backend whose `Vfs::local_path` is `None`:
+// download the remote file to a private local temp copy, edit that copy through the exact same
+// terminal-suspend machinery P2 uses, then (if it changed) re-check the remote version and write
+// the edited copy back. See `docs/rfcs/0012-file-open-view-edit.md`'s P3 section for the full
+// design and `docs/adr/0011-terminal-suspend-and-editor-launch.md` for the terminal model this
+// reuses. Security review: temp files hold plaintext remote content (see `new_remote_edit_dir`).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Called from [`run_editor_suspend`] before the terminal is touched, once `Vfs::local_path` has
+/// resolved to `None`. Performs every cheap, pre-flight check that can fail *before* committing to
+/// a download: the backend must be writable (no point downloading from a read-only mount like a
+/// mounted archive), `stat` must succeed and report a size within [`REMOTE_EDIT_MAX_BYTES`], and
+/// `$VISUAL`/`$EDITOR`/`vi` must resolve. Any failure here reports the existing
+/// [`AppEvent::EditFinished`] (mirrors P2's pre-terminal refusal path) — no [`RemoteEditId`] has
+/// been minted yet, so there is nothing for the runtime to track or clean up.
+///
+/// On success, emits [`AppEvent::RemoteEditNeedsDownload`] so the reducer mints a
+/// [`RemoteEditId`] and kicks off the download as a normal (spawned, non-blocking) effect.
+async fn begin_remote_edit(
+    vfs: &Arc<dyn Vfs>,
+    conn: ConnectionId,
+    path: VfsPath,
+    event_tx: &mpsc::Sender<AppEvent>,
+) {
+    // `caps_at`, not the backend-wide `caps()`: some backends (Docker/K8s) refine capabilities per
+    // path/depth, so the write-check must be scoped to the file actually being edited.
+    if !vfs.caps_at(&path).contains(Caps::WRITE) {
+        send_event_detached(
+            event_tx,
+            AppEvent::EditFinished {
+                status: "This location is read-only — cannot edit".to_owned(),
+                error: true,
+            },
+        );
+        return;
+    }
+    let entry = match vfs.stat(&path).await {
+        Ok(e) => e,
+        Err(e) => {
+            send_event_detached(
+                event_tx,
+                AppEvent::EditFinished {
+                    status: format!("Cannot edit: {}", e.redacted()),
+                    error: true,
+                },
+            );
+            return;
+        }
+    };
+    let Some(size) = entry.size else {
+        send_event_detached(
+            event_tx,
+            AppEvent::EditFinished {
+                status: "Cannot edit: this backend does not report a size for this file".to_owned(),
+                error: true,
+            },
+        );
+        return;
+    };
+    if size > REMOTE_EDIT_MAX_BYTES {
+        send_event_detached(
+            event_tx,
+            AppEvent::EditFinished {
+                status: format!(
+                    "Cannot edit: {size} bytes exceeds the {REMOTE_EDIT_MAX_BYTES}-byte edit cap \
+                     — copy it to a local pane to edit a file this large"
+                ),
+                error: true,
+            },
+        );
+        return;
+    }
+    // Fail fast on a misconfigured editor before spending a (potentially large) download on it —
+    // re-checked again in `run_remote_edit_temp` immediately before the editor actually launches
+    // (cheap, deterministic, and consistent with `run_shell_action_effect`'s "defensive
+    // re-validation" convention elsewhere in this file).
+    if let Err(message) = resolve_editor_argv() {
+        send_event_detached(
+            event_tx,
+            AppEvent::EditFinished {
+                status: message,
+                error: true,
+            },
+        );
+        return;
+    }
+    let v0 = RemoteVersion::from_entry(&entry);
+    let orig_perms = entry.perms;
+    send_event_detached(
+        event_tx,
+        AppEvent::RemoteEditNeedsDownload {
+            conn,
+            path,
+            v0,
+            size,
+            orig_perms,
+        },
+    );
+}
+
+/// Pick the private, per-user base directory for a remote-edit temp file: `$XDG_RUNTIME_DIR`
+/// (per-user, usually tmpfs, torn down at logout) when it's set and really is a directory, else
+/// `None` (the caller falls back to the OS temp dir). Mirrors
+/// `cairn_backend_archive::compressed_tar::preferred_temp_dir` — kept as an independent copy here
+/// (rather than a shared crate) since `cairn` does not otherwise depend on `cairn-backend-archive`
+/// and this is a two-line, dependency-free check.
+fn preferred_temp_base_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let path = PathBuf::from(dir);
+    path.is_dir().then_some(path)
+}
+
+/// Create a fresh, private, per-edit temp directory: a non-predictable subdirectory (`tempfile`'s
+/// own randomized naming) under [`preferred_temp_base_dir`] or the OS temp dir, forced to `0700` on
+/// Unix regardless of the process umask. Scoping the whole remote-edit download to its own
+/// directory (rather than dropping a single temp file directly into a shared, multi-tenant
+/// `$XDG_RUNTIME_DIR`/`/tmp`) means the [`LocalVfs`] built over it in [`run_download_for_edit`] can
+/// only ever address the one file this session creates — no sibling in that shared directory is
+/// reachable through it.
+fn new_remote_edit_dir() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".cairn-edit-");
+    let dir = match preferred_temp_base_dir() {
+        Some(base) => builder.tempdir_in(base)?,
+        None => builder.tempdir()?,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+/// Create the temp file itself inside `dir`, preserving the original leaf name (so `$EDITOR` still
+/// sees the right extension for syntax highlighting) — safe here specifically because `dir` is
+/// already a freshly-minted, non-predictable, private (`0700`) directory containing nothing else
+/// (see [`new_remote_edit_dir`]), so a predictable *filename* within it is not a predictable *path*.
+/// `create_new` (⇒ `O_EXCL` on Unix) still guards against a same-name collision; mode `0600` is set
+/// explicitly rather than relying on umask.
+fn create_temp_edit_file(dir: &std::path::Path, leaf: &str) -> std::io::Result<PathBuf> {
+    // Defensive: `leaf` comes from `VfsPath::file_name()`, which is already a single path segment
+    // with no separators, but this keeps the guarantee local rather than trusting a caller forever.
+    let safe_leaf = leaf.rsplit(['/', '\\']).next().filter(|s| !s.is_empty());
+    let path = dir.join(safe_leaf.unwrap_or("edited-file"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).read(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&path)?;
+    Ok(path)
+}
+
+/// SHA-256 of `path`'s current content, computed off the async runtime (`spawn_blocking`) since
+/// hashing is CPU/IO-bound sync work. Used purely as a local before/after diff to detect a no-op
+/// edit — never a cross-system integrity check.
+async fn hash_file(path: &std::path::Path) -> std::io::Result<ContentHash> {
+    use sha2::{Digest, Sha256};
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<ContentHash> {
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(hasher.finalize().into())
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+/// The runtime task body for [`AppEffect::DownloadForEdit`]. `temp_path` was already created (empty,
+/// `0600`) synchronously in `dispatch` before this was spawned. Downloads `path` into it via the
+/// transfer engine (remote `Vfs` → a [`LocalVfs`] rooted at the temp file's parent directory),
+/// preserving the pre-created file's permissions (the write opens with `overwrite: true`, which
+/// truncates the existing inode rather than recreating it). On success, hashes the result and
+/// reports [`AppEvent::RemoteEditDownloaded`]; on any failure, reports
+/// [`AppEvent::RemoteEditFailed`] (the caller in `dispatch` cleans up the temp directory for `id`
+/// when that event arrives).
+#[allow(clippy::too_many_arguments)]
+async fn run_download_for_edit(
+    registry: &VfsRegistry,
+    id: RemoteEditId,
+    conn: ConnectionId,
+    path: VfsPath,
+    v0: RemoteVersion,
+    size: u64,
+    orig_perms: Option<UnixPerms>,
+    temp_path: PathBuf,
+) -> AppEvent {
+    let Some(src) = registry.get(conn).await else {
+        return AppEvent::RemoteEditFailed {
+            id,
+            status: "connection unavailable".to_owned(),
+        };
+    };
+    let Some(temp_dir) = temp_path.parent() else {
+        return AppEvent::RemoteEditFailed {
+            id,
+            status: "internal error: temp file has no parent directory".to_owned(),
+        };
+    };
+    let dst: Arc<dyn Vfs> = Arc::new(LocalVfs::new(REMOTE_EDIT_TEMP_CONN_ID, temp_dir));
+    let leaf = match temp_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => {
+            return AppEvent::RemoteEditFailed {
+                id,
+                status: "internal error: temp file name is not valid UTF-8".to_owned(),
+            };
+        }
+    };
+    let dst_path = match VfsPath::root().join(leaf) {
+        Ok(p) => p,
+        Err(_) => {
+            return AppEvent::RemoteEditFailed {
+                id,
+                status: "internal error: temp file name is not a valid path segment".to_owned(),
+            };
+        }
+    };
+    let spec = TransferSpec {
+        op: TransferOp::Copy,
+        conflict: ConflictPolicy::Overwrite,
+        verify: VerifyPolicy::Size,
+    };
+    let cancel = CancellationToken::new();
+    let paused = watch::channel(false).1;
+    let result = cairn_transfer::run_transfer(
+        &src,
+        &dst,
+        &[(path.clone(), dst_path)],
+        spec,
+        &cancel,
+        &paused,
+        &mut |_bytes| {},
+    )
+    .await;
+    if let Err(e) = result {
+        return AppEvent::RemoteEditFailed {
+            id,
+            status: format!("download failed: {}", e.redacted()),
+        };
+    }
+    match hash_file(&temp_path).await {
+        Ok(download_hash) => AppEvent::RemoteEditDownloaded {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size: size,
+            orig_perms,
+            download_hash,
+        },
+        Err(e) => AppEvent::RemoteEditFailed {
+            id,
+            status: format!("could not hash downloaded file: {e}"),
+        },
+    }
+}
+
+/// Handle [`AppEffect::EditRemoteTemp`] — the RFC-0012 P3 analogue of
+/// [`run_editor_suspend`]/`AppEffect::SuspendAndEdit` once a remote file is already a local temp
+/// copy (or the user chose [`cairn_core::WritebackChoice::KeepEditing`] and we're re-entering the
+/// editor on the same copy). Special-cased inline in `event_loop` for the same reason
+/// `SuspendAndEdit` is: exclusive terminal/stdin ownership.
+///
+/// After the editor exits, re-hashes `temp_path` and compares it against **`download_hash`** — the
+/// hash captured right after the *original* download, stable for the whole session — never against
+/// `hash` (the pre-round baseline for *this* invocation only). Comparing against `hash` instead was
+/// a real bug: after a `KeepEditing` re-open, `hash` is the conflict-time content, so an editor exit
+/// with no further changes would compare equal to it and report a false no-op — silently discarding
+/// an edit that still differs from the remote and was never written back. Comparing against the
+/// stable `download_hash` instead means *any* content that differs from the original download
+/// always reports [`AppEvent::RemoteEditModified`] (routing to [`AppEffect::WriteBack`]), no matter
+/// how many `KeepEditing` rounds it took to get there. Only a match against `download_hash` reports
+/// [`AppEvent::RemoteEditNoChange`] (truly nothing to write back). A launch failure or non-zero
+/// exit reports [`AppEvent::RemoteEditFailed`].
+#[allow(clippy::too_many_arguments)]
+async fn run_remote_edit_temp(
+    terminal: &mut ratatui::DefaultTerminal,
+    input_gate: &Arc<InputGate>,
+    event_tx: &mpsc::Sender<AppEvent>,
+    id: RemoteEditId,
+    conn: ConnectionId,
+    path: VfsPath,
+    temp_path: PathBuf,
+    v0: RemoteVersion,
+    orig_size: u64,
+    orig_perms: Option<UnixPerms>,
+    download_hash: ContentHash,
+    hash: ContentHash,
+) {
+    let (program, fixed_args) = match resolve_editor_argv() {
+        Ok(pair) => pair,
+        Err(message) => {
+            send_event_detached(
+                event_tx,
+                AppEvent::RemoteEditFailed {
+                    id,
+                    status: message,
+                },
+            );
+            return;
+        }
+    };
+    let cwd = temp_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| temp_path.clone());
+    let name = temp_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let outcome = suspend_and_run_editor(
+        terminal,
+        input_gate,
+        &program,
+        &fixed_args,
+        &temp_path,
+        &cwd,
+    )
+    .await;
+
+    let status = match outcome {
+        Ok(s) if s.success() => None,
+        Ok(s) => Some(format!("editor exited: {}", describe_exit_status(&s))),
+        Err(message) => Some(message),
+    };
+    if let Some(status) = status {
+        send_event_detached(event_tx, AppEvent::RemoteEditFailed { id, status });
+        return;
+    }
+
+    let new_hash = match hash_file(&temp_path).await {
+        Ok(h) => h,
+        Err(e) => {
+            send_event_detached(
+                event_tx,
+                AppEvent::RemoteEditFailed {
+                    id,
+                    status: format!("could not hash edited file: {e}"),
+                },
+            );
+            return;
+        }
+    };
+    match decide_remote_edit_outcome(new_hash, download_hash, hash) {
+        RemoteEditOutcome::NoChange => {
+            send_event_detached(event_tx, AppEvent::RemoteEditNoChange { id, name });
+        }
+        RemoteEditOutcome::Modified {
+            unchanged_since_reopen,
+        } => {
+            if unchanged_since_reopen {
+                // Nothing changed in *this* invocation, but the content still differs from the
+                // original download (a prior round already diverged) — still must be written back.
+                tracing::debug!(
+                    remote_edit_id = id,
+                    "content unchanged since reopen but still differs from the original download; \
+                     writing back"
+                );
+            }
+            send_event_detached(
+                event_tx,
+                AppEvent::RemoteEditModified {
+                    id,
+                    conn,
+                    path,
+                    temp_path,
+                    v0,
+                    orig_size,
+                    orig_perms,
+                    download_hash,
+                    hash: new_hash,
+                },
+            );
+        }
+    }
+}
+
+/// The outcome of [`decide_remote_edit_outcome`] — whether a completed edit round leaves anything
+/// to write back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteEditOutcome {
+    /// `new_hash` matches `download_hash` — truly nothing to write back for the whole session.
+    NoChange,
+    /// `new_hash` differs from `download_hash` — something must be written back.
+    Modified {
+        /// Whether `new_hash` also matches `hash` (the pre-round baseline for *this* invocation
+        /// only) — i.e. this particular editor invocation changed nothing further, but an earlier
+        /// round already diverged from the original download and that edit still needs writing
+        /// back. Purely informational (used for a debug-level log), never gates the outcome.
+        unchanged_since_reopen: bool,
+    },
+}
+
+/// Pure decision made after an edit round completes (the editor has already run and `new_hash` is
+/// the temp file's freshly-observed content hash): compares `new_hash` against **`download_hash`**
+/// — the hash captured once, right after the original download, stable for the whole remote-edit
+/// session — never against `hash` (the pre-round baseline for only this invocation).
+///
+/// This split exists to fix a real bug: an earlier implementation compared `new_hash` against
+/// `hash` (which is *updated* to the latest content after every edit round, including a
+/// `KeepEditing` re-open). After a conflict, `KeepEditing` re-opens the temp file with `hash` set to
+/// the conflict-time content; if the user then quit the editor **without making any further
+/// changes**, `new_hash == hash` was true, and the old code reported [`RemoteEditOutcome::NoChange`]
+/// — silently discarding an edit that had never been written back (it still differed from the
+/// remote, which is exactly why the conflict/`KeepEditing` cycle happened in the first place).
+/// Comparing against the *stable* `download_hash` instead means the only way to reach `NoChange` is
+/// for the content to be genuinely, literally identical to what was downloaded — regardless of how
+/// many edit/conflict/`KeepEditing` rounds it took to get there.
+#[must_use]
+fn decide_remote_edit_outcome(
+    new_hash: ContentHash,
+    download_hash: ContentHash,
+    hash: ContentHash,
+) -> RemoteEditOutcome {
+    if new_hash == download_hash {
+        RemoteEditOutcome::NoChange
+    } else {
+        RemoteEditOutcome::Modified {
+            unchanged_since_reopen: new_hash == hash,
+        }
+    }
+}
+
+/// Find a sibling path that does not currently exist on `vfs`, for the `SaveAs` write-back choice:
+/// `"<stem> (edited)<ext>"`, then `"<stem> (edited) (2)<ext>"`, etc. Small, local re-implementation
+/// of the same idea as `cairn_transfer`'s private `unique_name` (not reusable directly — it's a
+/// module-private helper of that crate) — bounded the same way (gives up after a fixed number of
+/// attempts rather than looping forever against a pathological or adversarial listing).
+async fn unique_sibling_path(vfs: &Arc<dyn Vfs>, original: &VfsPath) -> Result<VfsPath, VfsError> {
+    let parent = original.parent().unwrap_or_else(VfsPath::root);
+    let base = original.file_name().unwrap_or("file");
+    let (stem, ext) = match base.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (base, String::new()),
+    };
+    for n in 0..1000 {
+        let candidate_name = if n == 0 {
+            format!("{stem} (edited){ext}")
+        } else {
+            format!("{stem} (edited) ({n}){ext}")
+        };
+        // `candidate_name` is built from `stem`/`ext` (already a valid path segment, since it came
+        // from `VfsPath::file_name()`) plus a literal `" (edited)"`/`" (N)"` suffix — never a `/`
+        // or control character — so this can't actually fail; mapped rather than `?` only because
+        // `PathError` has no `From` conversion into `VfsError`.
+        let candidate = parent
+            .join(&candidate_name)
+            .map_err(|_| VfsError::Backend {
+                code: "remote_edit_invalid_sibling_name".to_owned(),
+                msg: "could not build a sibling path".to_owned(),
+                retryable: false,
+            })?;
+        match vfs.stat(&candidate).await {
+            Err(VfsError::NotFound(_)) => return Ok(candidate),
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(VfsError::Backend {
+        code: "remote_edit_no_unique_sibling".to_owned(),
+        msg: "could not find a free sibling name".to_owned(),
+        retryable: false,
+    })
+}
+
+/// Write `temp_path`'s content to `target` on `vfs`. Where the backend advertises `Caps::RENAME` at
+/// `target`, this stages the content at a sibling name first and renames it over `target` (an
+/// atomic-ish replace on backends with atomic rename; best-effort ordering otherwise) — cleaning up
+/// the staged sibling on a failed staging write *or* a failed rename. Where it does not (Docker/K8s:
+/// no atomic rename), this writes directly to `target`, which has a real (documented) non-atomic
+/// window: a reader could see a partially-written file mid-copy. Either way conflicts are resolved
+/// by direct overwrite here — the caller (`run_writeback`) has already decided writing is safe.
+///
+/// **Mode preservation on the RENAME path:** staging writes to a brand-new inode, so after a
+/// successful rename the target's mode is whatever the staged file happened to get (umask-default),
+/// not the original's — silently loosening (or tightening) permissions on every remote edit. When
+/// `orig_perms` is `Some` and the backend advertises `Caps::CHMOD`, this restores the original mode
+/// on `target` afterward, best-effort (a failure here does **not** fail an otherwise-successful
+/// write-back — the content landed correctly; only the mode restoration is advisory). The
+/// direct-overwrite path needs no such fix-up: it truncates the existing inode in place, so the
+/// mode was never touched.
+async fn write_temp_to_remote(
+    vfs: &Arc<dyn Vfs>,
+    temp_dir_vfs: &Arc<dyn Vfs>,
+    temp_dst_path: &VfsPath,
+    target: &VfsPath,
+    orig_perms: Option<UnixPerms>,
+) -> Result<(), cairn_transfer::TransferError> {
+    let spec = TransferSpec {
+        op: TransferOp::Copy,
+        conflict: ConflictPolicy::Overwrite,
+        verify: VerifyPolicy::Size,
+    };
+    let cancel = CancellationToken::new();
+    let paused = watch::channel(false).1;
+
+    if vfs.caps_at(target).contains(Caps::RENAME) {
+        let staging_name = format!(".cairn-edit-tmp-{}", target.file_name().unwrap_or("file"));
+        let staging = target
+            .parent()
+            .unwrap_or_else(VfsPath::root)
+            .join(&staging_name)?;
+        if let Err(e) = cairn_transfer::run_transfer(
+            temp_dir_vfs,
+            vfs,
+            &[(temp_dst_path.clone(), staging.clone())],
+            spec,
+            &cancel,
+            &paused,
+            &mut |_| {},
+        )
+        .await
+        {
+            // Best-effort cleanup: a failed staging write can still have left a partial object at
+            // `staging` (e.g. a one-off network failure mid-copy) — don't leave debris on the remote.
+            let _ = vfs.remove(&staging, Recurse::No).await;
+            return Err(e);
+        }
+        if let Err(e) = vfs.rename(&staging, target).await {
+            // Best-effort cleanup of the staged copy so a failed rename doesn't leave debris.
+            let _ = vfs.remove(&staging, Recurse::No).await;
+            return Err(e.into());
+        }
+        if let Some(perms) = orig_perms {
+            if vfs.caps_at(target).contains(Caps::CHMOD) {
+                if let Err(e) = vfs
+                    .set_perms(target, UnixPerms::from_mode(perms.mode))
+                    .await
+                {
+                    // Advisory only: the content write-back already succeeded; losing the original
+                    // mode is a (logged, redacted) degradation, not a failed write-back.
+                    tracing::warn!(
+                        error = %e.redacted(),
+                        "could not restore original file permissions after remote edit write-back"
+                    );
+                }
+            }
+        }
+        Ok(())
+    } else {
+        cairn_transfer::run_transfer(
+            temp_dir_vfs,
+            vfs,
+            &[(temp_dst_path.clone(), target.clone())],
+            spec,
+            &cancel,
+            &paused,
+            &mut |_| {},
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+/// The runtime task body for [`AppEffect::WriteBack`]. See [`WriteBackMode`] for what each mode
+/// does; `CheckThenWrite` performs both safety guards (remote-version re-check, zero-length guard)
+/// before writing, `ForceOverwrite`/`SaveAsSibling` skip them (the user already confirmed via
+/// [`Overlay::ConfirmWriteback`]).
+#[allow(clippy::too_many_arguments)]
+async fn run_writeback(
+    registry: &VfsRegistry,
+    id: RemoteEditId,
+    conn: ConnectionId,
+    path: VfsPath,
+    temp_path: PathBuf,
+    v0: RemoteVersion,
+    orig_size: u64,
+    orig_perms: Option<UnixPerms>,
+    download_hash: ContentHash,
+    mode: WriteBackMode,
+) -> AppEvent {
+    let Some(vfs) = registry.get(conn).await else {
+        return AppEvent::RemoteEditFailed {
+            id,
+            status: "connection unavailable".to_owned(),
+        };
+    };
+    let Some(temp_dir) = temp_path.parent() else {
+        return AppEvent::RemoteEditFailed {
+            id,
+            status: "internal error: temp file has no parent directory".to_owned(),
+        };
+    };
+    let temp_dir_vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new(REMOTE_EDIT_TEMP_CONN_ID, temp_dir));
+    let Some(leaf) = temp_path.file_name().and_then(|n| n.to_str()) else {
+        return AppEvent::RemoteEditFailed {
+            id,
+            status: "internal error: temp file name is not valid UTF-8".to_owned(),
+        };
+    };
+    let Ok(temp_dst_path) = VfsPath::root().join(leaf) else {
+        return AppEvent::RemoteEditFailed {
+            id,
+            status: "internal error: temp file name is not a valid path segment".to_owned(),
+        };
+    };
+
+    if mode == WriteBackMode::CheckThenWrite {
+        // Zero-length guard: a crashed/misbehaving editor truncating a previously non-empty file.
+        // Local-only, cheap — checked before bothering with a remote round trip.
+        let current_size = match tokio::fs::metadata(&temp_path).await {
+            Ok(m) => m.len(),
+            Err(e) => {
+                return AppEvent::RemoteEditFailed {
+                    id,
+                    status: format!("could not stat the edited temp file: {e}"),
+                };
+            }
+        };
+        if orig_size > 0 && current_size == 0 {
+            // Real hash of the (empty) temp file, not a placeholder: if the user picks
+            // `KeepEditing` from the conflict overlay, this becomes the next edit session's
+            // no-op baseline — an all-zero placeholder would never match a real SHA-256 (not even
+            // the well-known empty-input digest), silently defeating the no-op-skip optimization
+            // on the very next round.
+            let hash = match hash_file(&temp_path).await {
+                Ok(h) => h,
+                Err(e) => {
+                    return AppEvent::RemoteEditFailed {
+                        id,
+                        status: format!("could not hash the edited temp file: {e}"),
+                    };
+                }
+            };
+            return AppEvent::WriteBackConflict {
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                orig_perms,
+                download_hash,
+                hash,
+                reason: cairn_core::WritebackConflictReason::ZeroLengthGuard,
+            };
+        }
+
+        // Conflict re-check: this is the TOCTOU-sensitive comparison — `v0` is the snapshot taken
+        // at download time (held since; never recomputed from a re-opened path), `v1` is a fresh
+        // `stat` right now, immediately before the write decision.
+        let v1 = match vfs.stat(&path).await {
+            Ok(entry) => RemoteVersion::from_entry(&entry),
+            Err(VfsError::NotFound(_)) => RemoteVersion::Unknown,
+            Err(e) => {
+                return AppEvent::RemoteEditFailed {
+                    id,
+                    status: format!("write-back aborted: {}", e.redacted()),
+                };
+            }
+        };
+        if !v0.confirmed_equal(&v1) {
+            // See the comment above: this must be the real content hash, not a placeholder, so a
+            // subsequent `KeepEditing` pass has a correct no-op baseline.
+            let hash = match hash_file(&temp_path).await {
+                Ok(h) => h,
+                Err(e) => {
+                    return AppEvent::RemoteEditFailed {
+                        id,
+                        status: format!("could not hash the edited temp file: {e}"),
+                    };
+                }
+            };
+            return AppEvent::WriteBackConflict {
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                orig_perms,
+                download_hash,
+                hash,
+                reason: cairn_core::WritebackConflictReason::RemoteChanged,
+            };
+        }
+    }
+
+    let (target, name) = match mode {
+        WriteBackMode::SaveAsSibling => match unique_sibling_path(&vfs, &path).await {
+            Ok(sibling) => {
+                let n = sibling.file_name().unwrap_or("file").to_owned();
+                (sibling, n)
+            }
+            Err(e) => {
+                return AppEvent::RemoteEditFailed {
+                    id,
+                    status: format!("could not choose a sibling name: {}", e.redacted()),
+                };
+            }
+        },
+        WriteBackMode::CheckThenWrite | WriteBackMode::ForceOverwrite => {
+            let n = path.file_name().unwrap_or("file").to_owned();
+            (path, n)
+        }
+    };
+
+    match write_temp_to_remote(&vfs, &temp_dir_vfs, &temp_dst_path, &target, orig_perms).await {
+        Ok(()) => AppEvent::WriteBackDone { id, name },
+        Err(e) => AppEvent::RemoteEditFailed {
+            id,
+            status: format!("write-back failed: {}", e.redacted()),
+        },
+    }
 }
 
 /// Decode as much valid UTF-8 as possible from `carry ++ bytes`, returning the decoded
@@ -4709,5 +5578,648 @@ mod tests {
             "in-loop early return must normalize empty base to /"
         );
         assert!(vfs.is_root());
+    }
+
+    // ── RFC-0012 P3: remote file edit — download / conflict-check / write-back ───────────────
+
+    /// Wraps a real [`Vfs`] but strips `Caps::RENAME` (mirrors Docker/K8s-style backends with no
+    /// atomic rename), so tests can exercise [`write_temp_to_remote`]'s direct-overwrite branch
+    /// without a real non-local backend. `rename`/`local_path` are deliberately left at their
+    /// trait defaults (`Unsupported`/`None`) — consistent with `caps()` no longer advertising it.
+    struct NoRenameVfs(Arc<dyn Vfs>);
+
+    impl cairn_vfs::CapabilityProvider for NoRenameVfs {
+        fn caps(&self) -> Caps {
+            self.0.caps().difference(Caps::RENAME)
+        }
+        fn caps_at(&self, path: &VfsPath) -> Caps {
+            self.0.caps_at(path).difference(Caps::RENAME)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Vfs for NoRenameVfs {
+        fn scheme(&self) -> cairn_types::Scheme {
+            self.0.scheme()
+        }
+        fn connection(&self) -> ConnectionId {
+            self.0.connection()
+        }
+        fn list<'a>(
+            &'a self,
+            dir: &VfsPath,
+            opts: ListOpts,
+        ) -> futures::stream::BoxStream<'a, Result<ListPage, VfsError>> {
+            self.0.list(dir, opts)
+        }
+        async fn stat(&self, path: &VfsPath) -> Result<cairn_types::Entry, VfsError> {
+            self.0.stat(path).await
+        }
+        async fn open_read(
+            &self,
+            path: &VfsPath,
+            range: Option<ByteRange>,
+        ) -> Result<cairn_vfs::ReadHandle, VfsError> {
+            self.0.open_read(path, range).await
+        }
+        async fn open_write(
+            &self,
+            path: &VfsPath,
+            opts: cairn_vfs::WriteOpts,
+        ) -> Result<cairn_vfs::WriteHandle, VfsError> {
+            self.0.open_write(path, opts).await
+        }
+        async fn remove(&self, path: &VfsPath, recurse: Recurse) -> Result<(), VfsError> {
+            self.0.remove(path, recurse).await
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_remote_edit_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = new_remote_edit_dir().unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "remote-edit temp dir must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_edit_file_is_0600_and_excl() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = new_remote_edit_dir().unwrap();
+        let path = create_temp_edit_file(dir.path(), "notes.txt").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "remote-edit temp file must be owner-only");
+        // O_EXCL: a second attempt at the same name must fail rather than silently truncate.
+        assert!(
+            create_temp_edit_file(dir.path(), "notes.txt").is_err(),
+            "create_new must refuse a colliding name"
+        );
+    }
+
+    #[test]
+    fn create_temp_edit_file_sanitizes_a_path_like_leaf() {
+        let dir = new_remote_edit_dir().unwrap();
+        // Defensive: even though `VfsPath::file_name()` never contains a separator, a
+        // path-shaped leaf must still resolve to a plain filename *inside* `dir`, not escape it.
+        let path = create_temp_edit_file(dir.path(), "../../etc/passwd").unwrap();
+        assert_eq!(path.parent(), Some(dir.path()));
+        assert_eq!(path.file_name().unwrap(), "passwd");
+    }
+
+    #[tokio::test]
+    async fn hash_file_detects_content_change() {
+        let dir = tempfile_dir();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"hello").unwrap();
+        let h1 = hash_file(&path).await.unwrap();
+        let h2 = hash_file(&path).await.unwrap();
+        assert_eq!(h1, h2, "hashing twice with no change must be stable");
+        std::fs::write(&path, b"hello!").unwrap();
+        let h3 = hash_file(&path).await.unwrap();
+        assert_ne!(h1, h3, "a content change must change the hash");
+    }
+
+    // ── `decide_remote_edit_outcome` (RFC-0012 P3 gate-fix regression) ───────────────────────
+
+    const H0: ContentHash = [0u8; 32];
+    const H1: ContentHash = [1u8; 32];
+    const H2: ContentHash = [2u8; 32];
+
+    #[test]
+    fn decide_outcome_true_no_op_first_round() {
+        // First edit round: `hash` and `download_hash` coincide (nothing has diverged yet). The
+        // editor changes nothing at all.
+        assert_eq!(
+            decide_remote_edit_outcome(H0, H0, H0),
+            RemoteEditOutcome::NoChange
+        );
+    }
+
+    #[test]
+    fn decide_outcome_modified_first_round() {
+        // First edit round, content changed: download_hash == hash == H0, new content is H1.
+        assert_eq!(
+            decide_remote_edit_outcome(H1, H0, H0),
+            RemoteEditOutcome::Modified {
+                unchanged_since_reopen: false
+            }
+        );
+    }
+
+    /// Regression for the bug-bot HIGH finding: after a conflict, `KeepEditing` re-opens the temp
+    /// file with `hash` set to the conflict-time content (H1, which already differs from the
+    /// original download H0). If the user quits the editor **without making any further changes**
+    /// (`new_hash` is still H1), the outcome must be `Modified` (so the edit is written back), never
+    /// `NoChange` — the old, buggy comparison (`new_hash == hash`) would have said `NoChange` here
+    /// and silently discarded an edit that was never written back.
+    #[test]
+    fn decide_outcome_keep_editing_unchanged_since_reopen_is_still_modified() {
+        let outcome = decide_remote_edit_outcome(H1, H0, H1);
+        assert_eq!(
+            outcome,
+            RemoteEditOutcome::Modified {
+                unchanged_since_reopen: true
+            },
+            "an edit that stayed unchanged across a KeepEditing reopen, but still differs from the \
+             original download, must be Modified (written back), never silently discarded as NoChange"
+        );
+    }
+
+    /// A `KeepEditing` round where the user edits *further* (new content H2, differing from both
+    /// the original download H0 and the conflict-time reopen baseline H1) must also be `Modified`,
+    /// with `unchanged_since_reopen: false`.
+    #[test]
+    fn decide_outcome_keep_editing_further_change_is_modified() {
+        let outcome = decide_remote_edit_outcome(H2, H0, H1);
+        assert_eq!(
+            outcome,
+            RemoteEditOutcome::Modified {
+                unchanged_since_reopen: false
+            }
+        );
+    }
+
+    /// If, across any number of `KeepEditing` rounds, the content is eventually restored to exactly
+    /// the original download's bytes, that is a genuine (if unusual) no-op — nothing to write back.
+    #[test]
+    fn decide_outcome_restored_to_original_is_no_op() {
+        let outcome = decide_remote_edit_outcome(H0, H0, H1);
+        assert_eq!(outcome, RemoteEditOutcome::NoChange);
+    }
+
+    #[tokio::test]
+    async fn begin_remote_edit_refuses_read_only_backend() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("f.txt"), b"data").unwrap();
+        let inner: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
+        struct ReadOnlyVfs(Arc<dyn Vfs>);
+        impl cairn_vfs::CapabilityProvider for ReadOnlyVfs {
+            fn caps(&self) -> Caps {
+                self.0.caps().difference(Caps::WRITE)
+            }
+        }
+        #[async_trait::async_trait]
+        impl Vfs for ReadOnlyVfs {
+            fn scheme(&self) -> cairn_types::Scheme {
+                self.0.scheme()
+            }
+            fn connection(&self) -> ConnectionId {
+                self.0.connection()
+            }
+            fn list<'a>(
+                &'a self,
+                dir: &VfsPath,
+                opts: ListOpts,
+            ) -> futures::stream::BoxStream<'a, Result<ListPage, VfsError>> {
+                self.0.list(dir, opts)
+            }
+            async fn stat(&self, path: &VfsPath) -> Result<cairn_types::Entry, VfsError> {
+                self.0.stat(path).await
+            }
+            async fn open_read(
+                &self,
+                path: &VfsPath,
+                range: Option<ByteRange>,
+            ) -> Result<cairn_vfs::ReadHandle, VfsError> {
+                self.0.open_read(path, range).await
+            }
+            async fn open_write(
+                &self,
+                path: &VfsPath,
+                opts: cairn_vfs::WriteOpts,
+            ) -> Result<cairn_vfs::WriteHandle, VfsError> {
+                self.0.open_write(path, opts).await
+            }
+        }
+        let ro: Arc<dyn Vfs> = Arc::new(ReadOnlyVfs(inner));
+        let (tx, mut rx) = mpsc::channel(4);
+        begin_remote_edit(&ro, LEFT, VfsPath::parse("/f.txt").unwrap(), &tx).await;
+        let ev = rx.recv().await.unwrap();
+        assert!(
+            matches!(ev, AppEvent::EditFinished { error: true, ref status } if status.contains("read-only")),
+            "unexpected event"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_remote_edit_refuses_oversized_file() {
+        let dir = tempfile_dir();
+        let big = vec![0u8; usize::try_from(REMOTE_EDIT_MAX_BYTES).unwrap() + 1];
+        std::fs::write(dir.path().join("big.bin"), &big).unwrap();
+        let vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
+        let (tx, mut rx) = mpsc::channel(4);
+        begin_remote_edit(&vfs, LEFT, VfsPath::parse("/big.bin").unwrap(), &tx).await;
+        let ev = rx.recv().await.unwrap();
+        assert!(
+            matches!(ev, AppEvent::EditFinished { error: true, ref status } if status.contains("exceeds")),
+            "unexpected event"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_remote_edit_succeeds_within_cap() {
+        // `begin_remote_edit` fails fast if no editor resolves. On Windows `$EDITOR`/`$VISUAL`
+        // unset yields an error (there's no `vi` fallback), so pin a resolvable editor to reach the
+        // success path on every platform. Serialize against the other env-mutating editor tests.
+        let _serialize = env_test_lock().lock().await;
+        let _env = EnvVarGuard::set(&[("VISUAL", ""), ("EDITOR", "vi")]);
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("f.txt"), b"small").unwrap();
+        let vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
+        let (tx, mut rx) = mpsc::channel(4);
+        begin_remote_edit(&vfs, LEFT, VfsPath::parse("/f.txt").unwrap(), &tx).await;
+        let ev = rx.recv().await.unwrap();
+        assert!(
+            matches!(ev, AppEvent::RemoteEditNeedsDownload { size: 5, .. }),
+            "unexpected event"
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_sibling_path_increments_on_collision() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("notes.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("notes (edited).txt"), b"b").unwrap();
+        let vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
+        let sibling = unique_sibling_path(&vfs, &VfsPath::parse("/notes.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(sibling.as_str(), "/notes (edited) (1).txt");
+    }
+
+    #[tokio::test]
+    async fn write_temp_to_remote_stages_and_renames_when_backend_supports_rename() {
+        let temp_dir = tempfile_dir();
+        std::fs::write(temp_dir.path().join("f.txt"), b"edited content").unwrap();
+        let temp_vfs: Arc<dyn Vfs> =
+            Arc::new(LocalVfs::new(REMOTE_EDIT_TEMP_CONN_ID, temp_dir.path()));
+        let remote_dir = tempfile_dir();
+        std::fs::write(remote_dir.path().join("f.txt"), b"original").unwrap();
+        let remote_vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new(RIGHT, remote_dir.path()));
+        write_temp_to_remote(
+            &remote_vfs,
+            &temp_vfs,
+            &VfsPath::parse("/f.txt").unwrap(),
+            &VfsPath::parse("/f.txt").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(remote_dir.path().join("f.txt")).unwrap(),
+            b"edited content"
+        );
+        // No staging file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(remote_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".cairn-edit-tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging file left behind: {leftovers:?}"
+        );
+    }
+
+    /// Regression (bug-bot MEDIUM): the RENAME path stages a *new* inode and renames it over the
+    /// target, which silently loses the original file's mode (umask-default on the staged copy) —
+    /// a 0600 secret would come back world-readable after one remote edit. `orig_perms` must be
+    /// restored on the target after the rename.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_temp_to_remote_restores_original_mode_on_rename_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile_dir();
+        std::fs::write(temp_dir.path().join("f.txt"), b"edited content").unwrap();
+        let temp_vfs: Arc<dyn Vfs> =
+            Arc::new(LocalVfs::new(REMOTE_EDIT_TEMP_CONN_ID, temp_dir.path()));
+        let remote_dir = tempfile_dir();
+        let remote_file = remote_dir.path().join("f.txt");
+        std::fs::write(&remote_file, b"original").unwrap();
+        std::fs::set_permissions(&remote_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let remote_vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new(RIGHT, remote_dir.path()));
+        write_temp_to_remote(
+            &remote_vfs,
+            &temp_vfs,
+            &VfsPath::parse("/f.txt").unwrap(),
+            &VfsPath::parse("/f.txt").unwrap(),
+            Some(UnixPerms::from_mode(0o600)),
+        )
+        .await
+        .unwrap();
+        let mode = std::fs::metadata(&remote_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the original 0600 mode must survive a staging-rename write-back"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_temp_to_remote_direct_overwrite_when_backend_lacks_rename() {
+        let temp_dir = tempfile_dir();
+        std::fs::write(temp_dir.path().join("f.txt"), b"edited content").unwrap();
+        let temp_vfs: Arc<dyn Vfs> =
+            Arc::new(LocalVfs::new(REMOTE_EDIT_TEMP_CONN_ID, temp_dir.path()));
+        let remote_dir = tempfile_dir();
+        std::fs::write(remote_dir.path().join("f.txt"), b"original").unwrap();
+        let remote_vfs: Arc<dyn Vfs> = Arc::new(NoRenameVfs(Arc::new(LocalVfs::new(
+            RIGHT,
+            remote_dir.path(),
+        ))));
+        write_temp_to_remote(
+            &remote_vfs,
+            &temp_vfs,
+            &VfsPath::parse("/f.txt").unwrap(),
+            &VfsPath::parse("/f.txt").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(remote_dir.path().join("f.txt")).unwrap(),
+            b"edited content"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_download_for_edit_downloads_and_hashes() {
+        let remote_dir = tempfile_dir();
+        std::fs::write(remote_dir.path().join("f.txt"), b"remote content").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, remote_dir.path())))
+            .await;
+        let temp_dir = new_remote_edit_dir().unwrap();
+        let temp_path = create_temp_edit_file(temp_dir.path(), "f.txt").unwrap();
+        let ev = run_download_for_edit(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/f.txt").unwrap(),
+            RemoteVersion::Unknown,
+            14,
+            None,
+            temp_path.clone(),
+        )
+        .await;
+        let AppEvent::RemoteEditDownloaded {
+            id,
+            temp_path: tp,
+            orig_size,
+            download_hash,
+            ..
+        } = ev
+        else {
+            panic!("expected RemoteEditDownloaded");
+        };
+        assert_eq!(id, 1);
+        assert_eq!(tp, temp_path);
+        assert_eq!(orig_size, 14);
+        assert_eq!(download_hash, hash_file(&temp_path).await.unwrap());
+        assert_eq!(std::fs::read(&temp_path).unwrap(), b"remote content");
+    }
+
+    /// A fresh registry/temp file pair for the `run_writeback` tests below: a `LocalVfs` "remote"
+    /// with `f.txt` = `orig_content`, and a temp file already containing `temp_content`.
+    ///
+    /// Returns the two `TempDir` RAII guards alongside the registry/path — the caller must bind
+    /// (not `let _ =`) both for the whole test, or the directory they own is deleted the moment
+    /// this function returns, out from under the test that hasn't run yet.
+    async fn writeback_fixture(
+        orig_content: &[u8],
+        temp_content: &[u8],
+    ) -> (
+        VfsRegistry,
+        PathBuf,
+        cairn_types::Entry,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let remote_dir = tempfile_dir();
+        std::fs::write(remote_dir.path().join("f.txt"), orig_content).unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, remote_dir.path())))
+            .await;
+        let entry = registry
+            .get(LEFT)
+            .await
+            .unwrap()
+            .stat(&VfsPath::parse("/f.txt").unwrap())
+            .await
+            .unwrap();
+        let temp_dir = new_remote_edit_dir().unwrap();
+        let temp_path = create_temp_edit_file(temp_dir.path(), "f.txt").unwrap();
+        std::fs::write(&temp_path, temp_content).unwrap();
+        (registry, temp_path, entry, remote_dir, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn run_writeback_check_then_write_succeeds_when_unchanged() {
+        let (registry, temp_path, entry, _remote_dir, _temp_dir) =
+            writeback_fixture(b"original", b"edited").await;
+        let v0 = RemoteVersion::from_entry(&entry);
+        let ev = run_writeback(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/f.txt").unwrap(),
+            temp_path,
+            v0,
+            8,
+            None,
+            [0u8; 32],
+            WriteBackMode::CheckThenWrite,
+        )
+        .await;
+        assert!(
+            matches!(ev, AppEvent::WriteBackDone { id: 1, .. }),
+            "unexpected event"
+        );
+        let vfs = registry.get(LEFT).await.unwrap();
+        let mut reader = vfs
+            .open_read(&VfsPath::parse("/f.txt").unwrap(), None)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"edited");
+    }
+
+    #[tokio::test]
+    async fn run_writeback_check_then_write_detects_remote_drift() {
+        let (registry, temp_path, _entry, _remote_dir, _temp_dir) =
+            writeback_fixture(b"original", b"edited").await;
+        // Deliberately stale baseline: the real remote reports `MTimeSize`, but this `v0` will
+        // never `confirmed_equal` it (mismatched variant) — simulating "the remote changed".
+        let v0 = RemoteVersion::ETag("stale-etag".to_owned());
+        let ev = run_writeback(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/f.txt").unwrap(),
+            temp_path,
+            v0,
+            8,
+            None,
+            [0u8; 32],
+            WriteBackMode::CheckThenWrite,
+        )
+        .await;
+        assert!(
+            matches!(
+                ev,
+                AppEvent::WriteBackConflict {
+                    id: 1,
+                    reason: cairn_core::WritebackConflictReason::RemoteChanged,
+                    ..
+                }
+            ),
+            "unexpected event"
+        );
+        // Nothing was written — the original content is untouched.
+        let vfs = registry.get(LEFT).await.unwrap();
+        let mut reader = vfs
+            .open_read(&VfsPath::parse("/f.txt").unwrap(), None)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"original");
+    }
+
+    #[tokio::test]
+    async fn run_writeback_zero_length_guard_trips() {
+        let (registry, temp_path, entry, _remote_dir, _temp_dir) =
+            writeback_fixture(b"original", b"").await;
+        let v0 = RemoteVersion::from_entry(&entry);
+        let ev = run_writeback(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/f.txt").unwrap(),
+            temp_path,
+            v0,
+            8, // orig_size > 0, current temp content is empty
+            None,
+            [0u8; 32],
+            WriteBackMode::CheckThenWrite,
+        )
+        .await;
+        assert!(
+            matches!(
+                ev,
+                AppEvent::WriteBackConflict {
+                    reason: cairn_core::WritebackConflictReason::ZeroLengthGuard,
+                    ..
+                }
+            ),
+            "unexpected event"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_writeback_force_overwrite_skips_both_guards() {
+        let (registry, temp_path, _entry, _remote_dir, _temp_dir) =
+            writeback_fixture(b"original", b"").await;
+        // A stale/mismatched v0 AND a zero-length temp file — both guards would normally trip,
+        // but `ForceOverwrite` (the user already confirmed) must skip them and just write.
+        let ev = run_writeback(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/f.txt").unwrap(),
+            temp_path,
+            RemoteVersion::Unknown,
+            8,
+            None,
+            [0u8; 32],
+            WriteBackMode::ForceOverwrite,
+        )
+        .await;
+        assert!(
+            matches!(ev, AppEvent::WriteBackDone { .. }),
+            "unexpected event"
+        );
+        let vfs = registry.get(LEFT).await.unwrap();
+        let stat = vfs.stat(&VfsPath::parse("/f.txt").unwrap()).await.unwrap();
+        assert_eq!(stat.size, Some(0));
+    }
+
+    #[tokio::test]
+    async fn run_writeback_save_as_sibling_leaves_original_untouched() {
+        let (registry, temp_path, _entry, _remote_dir, _temp_dir) =
+            writeback_fixture(b"original", b"edited").await;
+        let ev = run_writeback(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/f.txt").unwrap(),
+            temp_path,
+            RemoteVersion::Unknown,
+            8,
+            None,
+            [0u8; 32],
+            WriteBackMode::SaveAsSibling,
+        )
+        .await;
+        let AppEvent::WriteBackDone { name, .. } = ev else {
+            panic!("expected WriteBackDone");
+        };
+        assert_eq!(name, "f (edited).txt");
+        let vfs = registry.get(LEFT).await.unwrap();
+        // Original untouched.
+        let mut reader = vfs
+            .open_read(&VfsPath::parse("/f.txt").unwrap(), None)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"original");
+        // Sibling has the edited content.
+        let mut reader = vfs
+            .open_read(&VfsPath::parse("/f (edited).txt").unwrap(), None)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"edited");
+    }
+
+    #[tokio::test]
+    async fn run_writeback_missing_connection_reports_failure() {
+        let registry = VfsRegistry::new();
+        let ev = run_writeback(
+            &registry,
+            1,
+            ConnectionId(999),
+            VfsPath::parse("/f.txt").unwrap(),
+            PathBuf::from("/tmp/does-not-matter"),
+            RemoteVersion::Unknown,
+            0,
+            None,
+            [0u8; 32],
+            WriteBackMode::ForceOverwrite,
+        )
+        .await;
+        assert!(
+            matches!(ev, AppEvent::RemoteEditFailed { id: 1, ref status } if status.contains("connection")),
+            "unexpected event"
+        );
     }
 }

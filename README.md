@@ -91,8 +91,10 @@ under the cursor, auto-detecting text vs. binary content and switching to a hex 
 latter. `F4` opens the entry under the cursor in an external editor — `$VISUAL`, then `$EDITOR`,
 then `vi` (Unix only; on Windows, set one of the two first); `Enter` on a text file opens the same
 editor, while `Enter` on a binary file still opens the read-only hex pager. Editing works on
-**local files only** for now — a file on a remote connection shows a message pointing at the
-still-designed remote-writeback phase (see [RFC-0012](docs/rfcs/0012-file-open-view-edit.md)).
+**every backend**, local or remote: a remote file is downloaded to a private temp copy, edited
+there, and written back after a conflict check (has the remote file changed since you started
+editing?) — with size limits and a confirm prompt if the remote drifted or the local edit came
+back empty (see [RFC-0012](docs/rfcs/0012-file-open-view-edit.md)).
 `/` filters the listing as you type (`Enter` keeps the filter, `Esc` clears it). During a transfer,
 `p` pauses/resumes and `Esc` cancels (all active transfers); `Ctrl-T` opens the transfer queue. Up
 to two transfers run at once by default — set `[transfers] concurrency = N` in config to change it.

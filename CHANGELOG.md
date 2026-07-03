@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Edit remote files** (RFC-0012 P3, `M4-7`): `F4`/`Enter`-on-text now works on any backend, not
+  just local files — a remote file is downloaded to a private temp copy (0600 permissions, `O_EXCL`,
+  a freshly-minted non-predictable directory preferring `$XDG_RUNTIME_DIR`), edited through the same
+  `$EDITOR` shell-out as local files, and written back once the editor exits (a no-op edit is
+  detected by content hash and skipped — nothing is uploaded). Before writing back, the remote
+  version is re-checked against a snapshot taken at download time (`etag` on S3/GCS/Azure;
+  `modified`+`size` on SFTP/local; Docker/K8s report neither today, so they degrade to `Unknown` —
+  moot for now since neither yet advertises write support; anything reporting neither always
+  prompts); a mismatch — including the remote file having been deleted, or the local edit coming
+  back empty while the original was not — opens a confirm overlay offering Overwrite / Save-as /
+  Keep-editing / Discard, never a silent clobber. The actual write stages to a sibling name and
+  renames it into place when the backend supports atomic rename (restoring the original file's
+  permissions afterward, since staging writes to a new inode), or a direct overwrite otherwise —
+  Docker/K8s (no rename) get a direct overwrite instead (documented non-atomic window). Files above
+  100 MiB are refused up front with a clear message — editing a multi-GB file through `$EDITOR` is
+  the wrong workflow. See RFC-0012's P3 section.
+
 - **tmux end-to-end tests.** `crates/cairn/tests/tmux_e2e.rs` drives the real binary inside a tmux
   pane (`send-keys` / `capture-pane`) to cover the genuine raw-mode / alternate-screen / TTY handoff
   that a headless `TestBackend` can't — startup + clean quit, directory navigation, the F3 pager, and

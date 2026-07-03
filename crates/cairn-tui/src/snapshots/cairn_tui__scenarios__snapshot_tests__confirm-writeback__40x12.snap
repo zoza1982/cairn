@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ Write back? ─────────────────────────┐
+│the remote file changed since you star│
+│remote: /notes.txt                    │
+│local copy kept at: /run/user/1000/.ca│
+│                                      │
+│> Overwrite                           │
+│  Save as a new file                  │
+│  Keep editing                        │
+│  Discard my changes                  │
+│[↑/↓] Select  [Enter] Confirm  [Esc] K│
+│                                      │
+└──────────────────────────────────────┘
