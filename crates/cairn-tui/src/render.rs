@@ -6,24 +6,124 @@ use cairn_core::{
     credential_method_fields, credential_methods, scheme_fields, AppState, ChoiceProvenance,
     ConnectionFormStage, ConnectionKind, CredentialMethod, FieldValue, Listing, LogViewerStatus,
     MaskedInput, Overlay, PagerMode, PagerStatus, PaneState, PromptKind, SessionEnd, SessionRecord,
-    Side, WritebackChoice, WritebackConflictReason, KNOWN_SCHEMES, PAGER_HEX_ROW_BYTES,
+    Side, WritebackChoice, WritebackConflictReason, HELP_SECTIONS, KNOWN_SCHEMES, MENU_SECTIONS,
+    PAGER_HEX_ROW_BYTES,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-/// Render the whole application: two panes over a one-line status bar, themed by `theme`.
+/// Render the whole application: an MC-style function-key bar on row 0, the two panes, and a
+/// one-line status bar, themed by `theme`.
 pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
-    let [body, status] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+    let [funcbar, body, status] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
+    render_function_bar(frame, funcbar, state, theme);
     render_pane(frame, left, state, Side::Left, theme);
     render_pane(frame, right, state, Side::Right, theme);
     render_status(frame, status, state, theme);
     render_overlay(frame, state);
+}
+
+/// The function bar's cells in natural left-to-right display order: `(number, label)`, e.g.
+/// `("1", "Help")` renders as `1Help`. Mirrors the real default bindings in `keymap.rs`.
+const FUNCTION_BAR_ENTRIES: [(&str, &str); 10] = [
+    ("1", "Help"),
+    ("2", "Rename"),
+    ("3", "View"),
+    ("4", "Edit"),
+    ("5", "Copy"),
+    ("6", "Move"),
+    ("7", "MkDir"),
+    ("8", "Delete"),
+    ("9", "Menu"),
+    ("10", "Quit"),
+];
+
+/// Priority order (highest first) used by [`function_bar_cells`] to decide which cells survive at
+/// narrow widths — indices into [`FUNCTION_BAR_ENTRIES`]. Help/View/Edit/Quit (`F1`/`F3`/`F4`/`F10`)
+/// are kept longest: they are the keys most worth being able to discover even at 40 columns. The
+/// rest fill in, in their natural numeric order, until the row runs out of room.
+const FUNCTION_BAR_PRIORITY: [usize; 10] = [0, 2, 3, 9, 1, 4, 5, 6, 7, 8];
+
+/// Build the function bar's cells for the given available `width` (columns), dropping whole cells
+/// — never truncating a label mid-word — when they would not fit.
+///
+/// Cells are tried in [`FUNCTION_BAR_PRIORITY`] order and the first one that would not fit whole
+/// stops the process entirely (mirrors `connections_hint`'s "emit whole tokens, stop at the first
+/// that overflows" rule) — cells are single spaces apart, so the total width needed is order
+/// -independent, and trying a shorter, lower-priority cell after a longer one already failed would
+/// make the result depend on cell order in a way that's harder to reason about and test. Cells that
+/// do fit are always returned in [`FUNCTION_BAR_ENTRIES`]'s natural order, so a dropped cell never
+/// reorders the bar or leaves a gap in the numbering shown.
+#[must_use]
+fn function_bar_cells(width: usize) -> Vec<(&'static str, &'static str)> {
+    let mut included = [false; FUNCTION_BAR_ENTRIES.len()];
+    let mut used = 0usize;
+    for &idx in &FUNCTION_BAR_PRIORITY {
+        let (num, label) = FUNCTION_BAR_ENTRIES[idx];
+        let cell_len = num.len() + label.len();
+        let candidate = if used == 0 {
+            cell_len
+        } else {
+            used + 1 + cell_len
+        };
+        if candidate > width {
+            break;
+        }
+        included[idx] = true;
+        used = candidate;
+    }
+    FUNCTION_BAR_ENTRIES
+        .into_iter()
+        .zip(included)
+        .filter_map(|(cell, keep)| keep.then_some(cell))
+        .collect()
+}
+
+/// Draw the MC-style function-key bar on row 0 (above the panes): `1Help 2Rename 3View …`. Each
+/// cell's number is styled distinctly from its label (the theme's selection colors, i.e. a small
+/// "reverse video" chip, like MC's own function bar) so the numbers stay scannable at a glance.
+///
+/// The label set documents the tool's real default bindings (`crates/cairn-tui/src/keymap.rs`) —
+/// like the bottom status line's hint text, it does not reflect user `[ui.keybindings]` overrides.
+/// At narrow widths the bar drops whole cells rather than truncating a label; see
+/// [`function_bar_cells`] for the rule.
+fn render_function_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let cells = function_bar_cells(area.width as usize);
+    // While a modal overlay owns input, most function keys are inert (only Quit, and the Help/Menu
+    // overlays' own F1/F9 toggle, still act) — dim the whole bar as a lightweight, low-cost cue that
+    // the panes aren't currently reachable, without adding a new theme role for it.
+    let dim = state.overlay.is_some();
+    let num_style = if dim {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+            .fg(theme.selection_fg)
+            .bg(theme.selection_bg)
+    };
+    let label_style = if dim {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(theme.status)
+    };
+    let mut spans = Vec::with_capacity(cells.len() * 3);
+    for (i, (num, label)) in cells.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(num, num_style));
+        spans.push(Span::styled(label, label_style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Compute the display label for a connection choice in the switcher.
@@ -325,7 +425,96 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             cred_fields,
             *cred_focus,
         ),
+        Overlay::Help { scroll } => render_help(frame, *scroll),
+        Overlay::Menu { cursor } => render_menu(frame, *cursor),
     }
+}
+
+/// Draw the `F1` keybinding reference: a scrollable list of section headers and their `(keys,
+/// description)` rows (`cairn_core::HELP_SECTIONS`). Scroll semantics mirror
+/// [`render_log_viewer`]/[`render_pager`] (a `scroll`-managed topmost row), but over static content
+/// rather than a streamed file — there is no status indicator or position counter to show.
+fn render_help(frame: &mut Frame, scroll: usize) {
+    let area = centered(
+        frame.area(),
+        70,
+        frame.area().height.saturating_sub(2).max(3),
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Help — keybindings ")
+        .title_bottom(Line::from(" [Esc/F1] Close  ↑↓ PgUp/PgDn Scroll ").right_aligned())
+        .border_style(Style::default().fg(Color::Cyan));
+
+    // Flatten sections into display rows: a bold section header followed by its entries, so the
+    // scroll window below can treat the whole thing as one flat list (matching `help_line_count`).
+    let rows: Vec<Line> = HELP_SECTIONS
+        .iter()
+        .flat_map(|(section, entries)| {
+            std::iter::once(Line::from(Span::styled(
+                *section,
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+            .chain(
+                entries
+                    .iter()
+                    .map(|(keys, desc)| Line::from(format!("  {keys:<16} {desc}"))),
+            )
+        })
+        .collect();
+
+    let viewport = usize::from(area.height.saturating_sub(2));
+    let top = scroll.min(rows.len().saturating_sub(1));
+    let visible: Vec<Line> = rows.into_iter().skip(top).take(viewport).collect();
+    frame.render_widget(Paragraph::new(visible).block(block), area);
+}
+
+/// Draw the `F9` action menu: a centered, cursor-selectable list of actions grouped by category
+/// (`cairn_core::MENU_SECTIONS`), each row showing its shortcut for discoverability. Cursor-list
+/// styling mirrors [`render_connections`]; category headers are shown but never highlighted.
+fn render_menu(frame: &mut Frame, cursor: usize) {
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut select_row = None;
+    let mut selectable_idx = 0usize;
+    for (section, entries) in MENU_SECTIONS {
+        items.push(ListItem::new(*section).style(Style::default().add_modifier(Modifier::BOLD)));
+        for entry in *entries {
+            if selectable_idx == cursor {
+                select_row = Some(items.len());
+            }
+            items.push(ListItem::new(format!(
+                "  {:<10} {}",
+                entry.label, entry.shortcut
+            )));
+            selectable_idx += 1;
+        }
+    }
+
+    // +3 = 2 borders + 1 hint line at the bottom.
+    let h = u16::try_from(items.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3)
+        .min(frame.area().height);
+    let area = centered(frame.area(), 40, h.max(4));
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Menu ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
+        .highlight_symbol("> ");
+    let mut st = ListState::default();
+    st.select(select_row);
+    frame.render_stateful_widget(list, list_area, &mut st);
+    frame.render_widget(
+        Paragraph::new("[Enter] Run    [Esc] Close").style(Style::default().fg(Color::Gray)),
+        hint_area,
+    );
 }
 
 /// Draw the confirm-delete-connection overlay: a red-bordered prompt asking the user to confirm
@@ -2054,6 +2243,49 @@ mod tests {
             assert!(hint.contains("[P] Pin"));
             assert!(hint.contains("[H] Hide"));
             assert!(hint.contains("[S] Show hidden"));
+        }
+    }
+
+    #[test]
+    fn function_bar_cells_shows_every_cell_when_wide_enough() {
+        let cells = function_bar_cells(80);
+        assert_eq!(cells, FUNCTION_BAR_ENTRIES.to_vec());
+    }
+
+    /// At the 40x12 narrow snapshot width, the four highest-priority cells (`F1`/`F3`/`F4`/`F10`)
+    /// must survive — never truncated mid-label — even though `F10` sorts last in display order.
+    #[test]
+    fn function_bar_cells_keeps_priority_cells_at_narrow_width() {
+        let cells = function_bar_cells(40);
+        let labels: Vec<&str> = cells.iter().map(|(_, label)| *label).collect();
+        for must_have in ["Help", "View", "Edit", "Quit"] {
+            assert!(
+                labels.contains(&must_have),
+                "{must_have} must survive at 40 columns, got {labels:?}"
+            );
+        }
+        // Cells are always in natural (numeric) display order, regardless of priority order.
+        let nums: Vec<&str> = cells.iter().map(|(n, _)| *n).collect();
+        let mut sorted = nums.clone();
+        sorted.sort_by_key(|n| n.parse::<u32>().unwrap_or(u32::MAX));
+        assert_eq!(nums, sorted, "cells must render in natural numeric order");
+        // Never wider than the given width.
+        let rendered_len: usize = cells.iter().map(|(n, l)| n.len() + l.len()).sum::<usize>()
+            + cells.len().saturating_sub(1); // separators
+        assert!(rendered_len <= 40, "rendered width {rendered_len} > 40");
+    }
+
+    #[test]
+    fn function_bar_cells_never_splits_a_label_and_survives_tiny_widths() {
+        for w in 0..80 {
+            let cells = function_bar_cells(w);
+            let rendered_len: usize = cells.iter().map(|(n, l)| n.len() + l.len()).sum::<usize>()
+                + cells.len().saturating_sub(1);
+            assert!(rendered_len <= w, "width {w} produced overflow {cells:?}");
+            // Every emitted cell is a whole, known entry — never a partial label.
+            for cell in &cells {
+                assert!(FUNCTION_BAR_ENTRIES.contains(cell));
+            }
         }
     }
 

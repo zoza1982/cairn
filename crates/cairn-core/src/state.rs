@@ -838,6 +838,23 @@ pub enum Overlay {
         /// Selection cursor into [`WritebackChoice::ALL`].
         cursor: usize,
     },
+    /// The `F1` keybinding reference: a scrollable, read-only list of sections (`crate::HELP_SECTIONS`).
+    /// Modeled on [`Overlay::Pager`]'s scroll semantics, but over static content rather than a
+    /// streamed file, so there is no session id and no effect fires when it closes.
+    Help {
+        /// Index of the topmost visible display row (a row is either a section header or one
+        /// keybinding entry — see [`crate::help_line_count`]).
+        scroll: usize,
+    },
+    /// The `F9` action menu: a categorized, cursor-selectable list of actions (`crate::MENU_SECTIONS`).
+    /// `Enter` closes the overlay and dispatches the selected entry's [`crate::Action`] through the
+    /// normal action-handling path (`apply_menu_action` in `update.rs`) rather than duplicating each
+    /// action's logic here. `Esc` closes without acting.
+    Menu {
+        /// Index into the flattened selectable entries (`crate::menu_entries()`), skipping the
+        /// category headers, which are not selectable.
+        cursor: usize,
+    },
 }
 
 /// A stable identifier for an in-flight remote-edit session (RFC-0012 P3): download → edit →

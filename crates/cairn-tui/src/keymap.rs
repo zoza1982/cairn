@@ -170,6 +170,8 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "pin_connection" => Action::PinConnection,
         "hide_connection" => Action::HideConnection,
         "toggle_show_hidden" => Action::ToggleShowHidden,
+        "show_help" => Action::ShowHelp,
+        "show_menu" => Action::ShowMenu,
         _ => return None,
     })
 }
@@ -263,6 +265,11 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
     }
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
+        // F1 = help (opens a scrollable keybinding reference); F9 = the categorized action menu;
+        // F10 = quit — all three are the classic MC function-bar conventions (RFC: function-key bar).
+        KeyCode::F(1) => Some(Action::ShowHelp),
+        KeyCode::F(9) => Some(Action::ShowMenu),
+        KeyCode::F(10) => Some(Action::Quit),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::CursorDown),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::CursorUp),
         KeyCode::Char('g') | KeyCode::Home => Some(Action::CursorTop),
@@ -636,6 +643,8 @@ mod tests {
             "pin_connection",
             "hide_connection",
             "toggle_show_hidden",
+            "show_help",
+            "show_menu",
         ];
         for name in names {
             assert!(
@@ -643,7 +652,15 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 41);
+        assert_eq!(names.len(), 43);
+    }
+
+    #[test]
+    fn function_bar_keys() {
+        // F1 help / F9 menu / F10 quit — the new MC-style function-bar bindings.
+        assert_eq!(action_for(press(KeyCode::F(1))), Some(Action::ShowHelp));
+        assert_eq!(action_for(press(KeyCode::F(9))), Some(Action::ShowMenu));
+        assert_eq!(action_for(press(KeyCode::F(10))), Some(Action::Quit));
     }
 
     #[test]

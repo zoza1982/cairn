@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Menu 10Quit
+┌ / ─┌ Help — keybindings ────────────────────────────────────────────────┐────┐
+│>  s│Navigation                                                          │    │
+│   d│  ↑/k  ↓/j         Move the cursor                                  │    │
+│   C│  g/Home  G/End    Jump to top / bottom                             │    │
+│   R│  Enter/l/→        Open / enter the highlighted entry               │    │
+│    │  Backspace/h/←    Go up a directory                                │    │
+│    │  Tab              Switch the active pane                           │    │
+│    │  Space/Insert     Mark / unmark the highlighted entry              │    │
+│    │  /                Filter the listing as you type                   │    │
+│    │  .                Toggle hidden files                              │    │
+│    │  s                Cycle sort mode (name → size → modified → type)  │    │
+│    │  r                Refresh the active pane                          │    │
+│    │File ops                                                            │    │
+│    │  F5/c             Copy marked (or current) entries                 │    │
+│    │  F6/m             Move marked (or current) entries                 │    │
+│    │  F8/Delete/d      Delete marked (or current) entries               │    │
+│    │  F2               Rename the highlighted entry                     │    │
+│    │  F7               Create a new directory                           │    │
+│    │  p                Pause / resume the active transfer(s)            │    │
+│    │  Esc              Cancel the active transfer(s)                    │    │
+│    │  Ctrl-T           Open the transfer queue                          │    │
+└────└─────────────────────────────── [Esc/F1] Close  ↑↓ PgUp/PgDn Scroll ┘ame ┘
+ 1/4   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move

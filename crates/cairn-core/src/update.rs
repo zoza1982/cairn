@@ -376,6 +376,14 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             open_scheme_picker(state);
             Vec::new()
         }
+        Action::ShowHelp => {
+            state.overlay = Some(Overlay::Help { scroll: 0 });
+            Vec::new()
+        }
+        Action::ShowMenu => {
+            state.overlay = Some(Overlay::Menu { cursor: 0 });
+            Vec::new()
+        }
         // EditConnection/DeleteConnection/TestConnection/PinConnection/HideConnection/
         // ToggleShowHidden are only meaningful inside the Connections overlay (RFC-0011 P4/P6).
         // Outside it they are silent no-ops so a misrouted key does not confuse the user.
@@ -1751,6 +1759,8 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         Some(Overlay::TransferQueue { .. }) => apply_transfer_queue_action(state, action),
         Some(Overlay::LogViewer { .. }) => apply_log_viewer_action(state, action),
         Some(Overlay::Pager { .. }) => apply_pager_action(state, action),
+        Some(Overlay::Help { .. }) => apply_help_action(state, action),
+        Some(Overlay::Menu { .. }) => apply_menu_action(state, action),
         Some(Overlay::ExecPane { .. }) => apply_exec_pane_action(state, action),
         Some(Overlay::PortForwardStatus { .. }) => apply_port_forward_status_action(state, action),
         Some(Overlay::ConnectionForm { .. }) => apply_connection_form_action(state, action),
@@ -3396,6 +3406,96 @@ fn apply_pager_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             let pager_id = *id;
             state.overlay = None;
             vec![AppEffect::ClosePager { id: pager_id }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Scroll or close the `F1` help overlay. Mirrors [`apply_pager_action`]'s scroll arms, but over
+/// the static [`crate::HELP_SECTIONS`] table rather than a streamed file — there is no session id
+/// and no effect to fire on close.
+fn apply_help_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    let total = crate::help_line_count();
+    let Some(Overlay::Help { scroll }) = &mut state.overlay else {
+        return Vec::new();
+    };
+    match action {
+        Action::CursorUp => {
+            *scroll = scroll.saturating_sub(1);
+            Vec::new()
+        }
+        Action::PageUp => {
+            *scroll = scroll.saturating_sub(PAGER_PAGE);
+            Vec::new()
+        }
+        Action::CursorDown => {
+            if *scroll + 1 < total {
+                *scroll += 1;
+            }
+            Vec::new()
+        }
+        Action::PageDown => {
+            *scroll = (*scroll + PAGER_PAGE).min(total.saturating_sub(1));
+            Vec::new()
+        }
+        Action::CursorTop => {
+            *scroll = 0;
+            Vec::new()
+        }
+        Action::CursorBottom => {
+            *scroll = total.saturating_sub(1);
+            Vec::new()
+        }
+        // `F1` pressed again toggles the overlay closed, same as `Esc`.
+        Action::Cancel | Action::ShowHelp => {
+            state.overlay = None;
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Navigate or act on the `F9` action menu. `CursorUp`/`CursorDown`/`CursorTop`/`CursorBottom` move
+/// over the flattened selectable entries (`crate::menu_entries()`), skipping category headers.
+/// `Enter`/`Confirm` closes the overlay and re-dispatches the selected entry's `Action` through
+/// [`apply_action`] — the exact path a direct keypress for that action takes — so each action's
+/// behavior lives in exactly one place, never duplicated here. `Esc` closes without acting; `F9`
+/// again toggles it closed, mirroring [`Overlay::Help`]'s `ShowHelp` toggle.
+fn apply_menu_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    let total = crate::menu_entries().count();
+    let Some(Overlay::Menu { cursor }) = &mut state.overlay else {
+        return Vec::new();
+    };
+    match action {
+        Action::CursorUp => {
+            *cursor = cursor.saturating_sub(1);
+            Vec::new()
+        }
+        Action::CursorDown => {
+            if *cursor + 1 < total {
+                *cursor += 1;
+            }
+            Vec::new()
+        }
+        Action::CursorTop => {
+            *cursor = 0;
+            Vec::new()
+        }
+        Action::CursorBottom => {
+            *cursor = total.saturating_sub(1);
+            Vec::new()
+        }
+        Action::Cancel | Action::ShowMenu => {
+            state.overlay = None;
+            Vec::new()
+        }
+        Action::Confirm | Action::Enter => {
+            let idx = *cursor;
+            state.overlay = None;
+            match crate::menu_entries().nth(idx) {
+                Some(entry) => apply_action(state, entry.action),
+                None => Vec::new(),
+            }
         }
         _ => Vec::new(),
     }

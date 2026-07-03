@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+1Help 2Rename 3View 4Edit 5Copy 10Quit
+┌ Help — keybindings ──────────────────┐
+│Navigation                            │
+│  ↑/k  ↓/j         Move the cursor    │
+│  g/Home  G/End    Jump to top / botto│
+│  Enter/l/→        Open / enter the hi│
+│  Backspace/h/←    Go up a directory  │
+│  Tab              Switch the active p│
+│  Space/Insert     Mark / unmark the h│
+│  /                Filter the listing │
+└─ [Esc/F1] Close  ↑↓ PgUp/PgDn Scroll ┘
+ 1/4   q quit · Tab · ↵ open · F3 view ·

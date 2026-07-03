@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ Menu ────────────────────────────────┐
+│  FILE                                │
+│>   Copy       F5                     │
+│    Move       F6                     │
+│    Delete     F8                     │
+│    Rename     F2                     │
+│    MakeDir    F7                     │
+│  VIEW                                │
+│    View       F3                     │
+│    Edit       F4                     │
+│[Enter] Run    [Esc] Close            │
+└──────────────────────────────────────┘
