@@ -851,8 +851,8 @@ pub enum Overlay {
     /// normal action-handling path (`apply_menu_action` in `update.rs`) rather than duplicating each
     /// action's logic here. `Esc` closes without acting.
     Menu {
-        /// Index into the flattened selectable entries (`crate::menu_entries()`), skipping the
-        /// category headers, which are not selectable.
+        /// Index into the flattened selectable entries (see [`crate::menu_entries`]), skipping
+        /// the category headers, which are not selectable.
         cursor: usize,
     },
 }

@@ -10,9 +10,9 @@ use crate::msg::Action;
 
 /// The `F1` help overlay's content: sections in display order, each a `(keys, description)` list.
 ///
-/// This is a static reference, not a live dump of the active [`crate::Keymap`]-equivalent — like
-/// the bottom status line's hint text, it documents the tool's default bindings and does not
-/// reflect user `[ui.keybindings]` overrides configured in `cairn-tui`.
+/// This is a static reference, not a live dump of the active `cairn_tui::Keymap` — like the bottom
+/// status line's hint text, it documents the tool's default bindings and does not reflect user
+/// `[ui.keybindings]` overrides configured in `cairn-tui`.
 pub const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Navigation",
@@ -75,9 +75,20 @@ pub const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "General",
         &[
-            ("F1", "Show this help (Esc or F1 again to close)"),
-            ("F9", "Open the action menu"),
-            ("F10/q/Ctrl-C", "Quit Cairn"),
+            (
+                "F1",
+                "Show this help, from the main view (Esc or F1 again to close; press Esc first \
+                 to leave another overlay)",
+            ),
+            (
+                "F9",
+                "Open the action menu, from the main view (press Esc first to leave another \
+                 overlay)",
+            ),
+            (
+                "F10/q/Ctrl-C",
+                "Quit Cairn — works from anywhere, overlay or not",
+            ),
         ],
     ),
 ];

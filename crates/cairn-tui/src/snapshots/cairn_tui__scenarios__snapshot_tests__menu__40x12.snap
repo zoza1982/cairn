@@ -2,6 +2,7 @@
 source: crates/cairn-tui/src/scenarios.rs
 expression: frame
 ---
+1Help 2Rename 3View 4Edit 5Copy 10Quit
 ┌ Menu ────────────────────────────────┐
 │  FILE                                │
 │>   Copy       F5                     │
@@ -10,7 +11,6 @@ expression: frame
 │    Rename     F2                     │
 │    MakeDir    F7                     │
 │  VIEW                                │
-│    View       F3                     │
-│    Edit       F4                     │
 │[Enter] Run    [Esc] Close            │
 └──────────────────────────────────────┘
+ 1/4   q quit · Tab · ↵ open · F3 view ·

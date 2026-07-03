@@ -113,9 +113,12 @@ visible for as long as possible since they're the most important to be able to f
 
 | Key | Action |
 |-----|--------|
-| `F1` | Open a scrollable keybinding reference, grouped by section (Navigation, File ops, View/Edit, Connections, Vault, AI, General). `F1` again, or `Esc`, closes it. |
-| `F9` | Open a categorized action menu (Copy/Move/Delete/Rename/MakeDir, View/Edit, connection Switch/New, Vault Unlock, AI Ask, Help/Quit) — each entry shows its shortcut. `↑↓`/`j`/`k` move the selection, `Enter` runs it (through the same code path a direct keypress would take), `Esc` closes without acting. `F9` again toggles it closed. |
-| `F10` | Quit — an alias for the existing `q`/`Ctrl-C`. |
+| `F1` | From the main view, open a scrollable keybinding reference, grouped by section (Navigation, File ops, View/Edit, Connections, Vault, AI, General). `F1` again, or `Esc`, closes it. |
+| `F9` | From the main view, open a categorized action menu (Copy/Move/Delete/Rename/MakeDir, View/Edit, connection Switch/New, Vault Unlock, AI Ask, Help/Quit) — each entry shows its shortcut. `↑↓`/`j`/`k` move the selection, `Enter` runs it (through the same code path a direct keypress would take), `Esc` closes without acting. `F9` again toggles it closed. |
+| `F10` | Quit — an alias for the existing `q`/`Ctrl-C`. Unlike `F1`/`F9`, this works from **anywhere**, including inside another overlay or a text prompt. |
+
+`F1` and `F9` only open from the main dual-pane view — like `Ctrl-O`/`Ctrl-N`, Cairn shows one
+overlay at a time, so press `Esc` to leave whatever's open before opening help or the menu.
 
 ```toml
 [ui.keybindings]

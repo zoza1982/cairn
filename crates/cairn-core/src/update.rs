@@ -8963,6 +8963,152 @@ mod tests {
         assert!(matches!(s.pane(Side::Left).listing, Listing::Loading));
         assert!(matches!(s.pane(Side::Right).listing, Listing::Loading));
     }
+
+    // ── F1 help / F9 menu (RFC: function-key bar) ─────────────────────────────────────────────
+
+    #[test]
+    fn show_help_opens_help_overlay_at_scroll_zero() {
+        let mut s = state();
+        let fx = update(&mut s, Msg::Action(Action::ShowHelp));
+        assert!(fx.is_empty());
+        assert!(matches!(s.overlay, Some(Overlay::Help { scroll: 0 })));
+    }
+
+    #[test]
+    fn show_help_again_toggles_it_closed() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::ShowHelp));
+        let fx = update(&mut s, Msg::Action(Action::ShowHelp));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none(), "a second ShowHelp must close it");
+    }
+
+    #[test]
+    fn help_cancel_closes_it() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::ShowHelp));
+        let _ = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn help_cursor_bottom_clamps_to_the_last_row_and_further_down_is_a_no_op() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::ShowHelp));
+        let _ = update(&mut s, Msg::Action(Action::CursorBottom));
+        let expected = crate::help_line_count() - 1;
+        let Some(Overlay::Help { scroll }) = s.overlay else {
+            panic!("expected Overlay::Help");
+        };
+        assert_eq!(scroll, expected);
+        // Further CursorDown past the end must not move — it's already the last row.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let Some(Overlay::Help { scroll }) = s.overlay else {
+            panic!("expected Overlay::Help");
+        };
+        assert_eq!(scroll, expected, "CursorDown past the last row is a no-op");
+    }
+
+    #[test]
+    fn help_cursor_top_resets_scroll_to_zero() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::ShowHelp));
+        let _ = update(&mut s, Msg::Action(Action::CursorBottom));
+        let _ = update(&mut s, Msg::Action(Action::CursorTop));
+        assert!(matches!(s.overlay, Some(Overlay::Help { scroll: 0 })));
+    }
+
+    #[test]
+    fn show_menu_opens_menu_overlay_at_cursor_zero() {
+        let mut s = state();
+        let fx = update(&mut s, Msg::Action(Action::ShowMenu));
+        assert!(fx.is_empty());
+        assert!(matches!(s.overlay, Some(Overlay::Menu { cursor: 0 })));
+    }
+
+    #[test]
+    fn show_menu_again_toggles_it_closed() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::ShowMenu));
+        let fx = update(&mut s, Msg::Action(Action::ShowMenu));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none(), "a second ShowMenu must close it");
+    }
+
+    #[test]
+    fn menu_cancel_closes_without_dispatching_anything() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::ShowMenu));
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(fx.is_empty());
+        assert!(s.overlay.is_none());
+        assert!(!s.should_quit);
+    }
+
+    /// `CursorDown` spammed well past the entry count must land on (and stay on) the last
+    /// selectable entry — never past the end, and never onto a category header (there is no
+    /// separate "header" index in the flattened cursor space to land on in the first place, but
+    /// this proves the bound matches `menu_entries().count()` exactly).
+    #[test]
+    fn menu_cursor_down_spammed_stays_within_the_flattened_entry_count() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::ShowMenu));
+        let total = crate::menu_entries().count();
+        for _ in 0..total + 10 {
+            let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        }
+        let Some(Overlay::Menu { cursor }) = s.overlay else {
+            panic!("expected Overlay::Menu");
+        };
+        assert_eq!(cursor, total - 1);
+        assert!(cursor < total);
+    }
+
+    /// Selecting the last entry (`GENERAL / Quit`, per `MENU_SECTIONS`'s fixed order) and pressing
+    /// Enter must fire `Action::Quit` through the exact same path a direct `F10` keypress takes —
+    /// proving the flattened dispatch order (`menu_entries().nth(cursor)`) agrees with the cursor
+    /// bound used by `CursorBottom`.
+    #[test]
+    fn menu_enter_on_the_last_entry_dispatches_quit() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::ShowMenu));
+        let _ = update(&mut s, Msg::Action(Action::CursorBottom));
+        assert!(
+            matches!(crate::menu_entries().last(), Some(e) if e.action == Action::Quit),
+            "sanity: the last menu entry must be Quit for this test to prove anything"
+        );
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        assert!(s.should_quit, "Enter on the last entry must dispatch Quit");
+        assert!(s.overlay.is_none(), "the menu must have closed first");
+    }
+
+    /// Selecting "Switch" (`OpenConnections`, the first `CONNECTIONS` entry) must leave exactly one
+    /// overlay open (`Overlay::Connections`) — never a stack of two — proving the reducer clears
+    /// `overlay` *before* re-dispatching through `apply_action`, rather than the dispatched action's
+    /// `state.overlay = Some(..)` assignment landing on top of a still-set `Overlay::Menu`.
+    #[test]
+    fn menu_enter_on_switch_opens_exactly_one_connections_overlay() {
+        let mut s = state();
+        s.connections = vec![crate::state::ConnectionChoice {
+            conn: ConnectionId(9),
+            label: "test".to_owned(),
+            ..Default::default()
+        }];
+        let _ = update(&mut s, Msg::Action(Action::ShowMenu));
+        // "Switch" (OpenConnections) is the first CONNECTIONS entry, after FILE (5) and VIEW (2).
+        let idx = crate::menu_entries()
+            .position(|e| e.action == Action::OpenConnections)
+            .expect("OpenConnections must be a menu entry");
+        for _ in 0..idx {
+            let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        }
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        assert!(
+            matches!(s.overlay, Some(Overlay::Connections { .. })),
+            "expected exactly Overlay::Connections, got {:?}",
+            s.overlay
+        );
+    }
 }
 
 #[cfg(test)]

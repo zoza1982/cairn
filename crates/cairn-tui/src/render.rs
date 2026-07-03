@@ -63,7 +63,8 @@ const FUNCTION_BAR_PRIORITY: [usize; 10] = [0, 2, 3, 9, 1, 4, 5, 6, 7, 8];
 /// -independent, and trying a shorter, lower-priority cell after a longer one already failed would
 /// make the result depend on cell order in a way that's harder to reason about and test. Cells that
 /// do fit are always returned in [`FUNCTION_BAR_ENTRIES`]'s natural order, so a dropped cell never
-/// reorders the bar or leaves a gap in the numbering shown.
+/// reorders the surviving cells (dropped cells do leave numeric gaps — e.g. `40` columns keeps
+/// `1 2 3 4 5 … 10` but drops `6`-`9`).
 #[must_use]
 fn function_bar_cells(width: usize) -> Vec<(&'static str, &'static str)> {
     let mut included = [false; FUNCTION_BAR_ENTRIES.len()];
@@ -99,8 +100,10 @@ fn function_bar_cells(width: usize) -> Vec<(&'static str, &'static str)> {
 /// [`function_bar_cells`] for the rule.
 fn render_function_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let cells = function_bar_cells(area.width as usize);
-    // While a modal overlay owns input, most function keys are inert (only Quit, and the Help/Menu
-    // overlays' own F1/F9 toggle, still act) — dim the whole bar as a lightweight, low-cost cue that
+    // While a modal overlay owns input, most function keys are inert: Quit (`F10`/`Ctrl-C`) always
+    // acts, from any overlay including text-capturing ones (`crates/cairn/src/app.rs`'s
+    // `map_input` intercepts it the same way it does `Ctrl-C`); in a non-text overlay, Help/Menu's
+    // own `F1`/`F9` toggle also still acts. Dim the whole bar as a lightweight, low-cost cue that
     // the panes aren't currently reachable, without adding a new theme role for it.
     let dim = state.overlay.is_some();
     let num_style = if dim {
@@ -435,9 +438,14 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
 /// [`render_log_viewer`]/[`render_pager`] (a `scroll`-managed topmost row), but over static content
 /// rather than a streamed file — there is no status indicator or position counter to show.
 fn render_help(frame: &mut Frame, scroll: usize) {
+    // Width matches `render_pager`/`render_log_viewer`'s near-full-width convention rather than a
+    // narrower fixed width: at 80 columns a narrower dialog's bottom border lands on the exact same
+    // row as the panes' own bottom border, and the uncovered margin columns on either side then
+    // bleed the panes' border/title text through next to the dialog. Full width leaves no margin
+    // columns to bleed through, regardless of terminal size.
     let area = centered(
         frame.area(),
-        70,
+        80,
         frame.area().height.saturating_sub(2).max(3),
     );
     frame.render_widget(Clear, area);
@@ -490,11 +498,13 @@ fn render_menu(frame: &mut Frame, cursor: usize) {
         }
     }
 
-    // +3 = 2 borders + 1 hint line at the bottom.
+    // +3 = 2 borders + 1 hint line at the bottom. Clamp against `height - 2`, not the raw frame
+    // height, so the dialog never grows tall enough to cover the function bar (row 0) or the status
+    // line (the last row) the way an unclamped full-height dialog would on a short terminal.
     let h = u16::try_from(items.len())
         .unwrap_or(u16::MAX)
         .saturating_add(3)
-        .min(frame.area().height);
+        .min(frame.area().height.saturating_sub(2));
     let area = centered(frame.area(), 40, h.max(4));
     frame.render_widget(Clear, area);
     let block = Block::bordered()
