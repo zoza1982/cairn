@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **tmux end-to-end tests.** `crates/cairn/tests/tmux_e2e.rs` drives the real binary inside a tmux
+  pane (`send-keys` / `capture-pane`) to cover the genuine raw-mode / alternate-screen / TTY handoff
+  that a headless `TestBackend` can't — startup + clean quit, directory navigation, the F3 pager, and
+  the crown-jewel `$EDITOR` suspend→edit→resume round-trip (driving an interactive editor that reads
+  stdin, which validates the foreground-process-group / SIGTTIN behavior end to end). Env-guarded by
+  `CAIRN_IT_TMUX=1` so the default `cargo test` stays hermetic; runs in a dedicated CI `tmux-e2e` job.
+
 - **Deterministic TUI snapshot testing.** A `scenarios` catalog in `cairn-tui` renders every screen
   (dual-pane, pager text/hex, log/AI-plan/transfer/connection/vault overlays, …) to a plain-text
   frame via ratatui's headless `TestBackend`. `insta` snapshot tests assert each scenario at 80×24

@@ -1,0 +1,47 @@
+name: tui-e2e
+
+# End-to-end TUI tests that drive the real `cairn` binary inside a tmux pane (send-keys /
+# capture-pane), covering the genuine raw-mode / alternate-screen / TTY handoff — including the
+# `$EDITOR` suspend/resume — that a headless `TestBackend` can't exercise. Env-guarded by
+# `CAIRN_IT_TMUX` so the default `cargo test` stays hermetic.
+#
+# This lives in its own workflow (not integration.yml) so its trigger paths — which include the
+# frequently-touched `crates/cairn/**` and `crates/cairn-tui/**` — don't also fire the expensive
+# emulator jobs (MinIO/Azurite/dind/kind) in integration.yml.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/cairn/**"
+      - "crates/cairn-tui/**"
+      # The asserted behaviors (edit gating, the pager title, the "edited …" status) originate in
+      # the reducer, so a cairn-core change must run this suite too.
+      - "crates/cairn-core/**"
+      - ".github/workflows/tui-e2e.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  tmux-e2e:
+    name: TUI e2e (tmux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # tmux is usually preinstalled on ubuntu-latest; ensure it either way.
+      - name: Ensure tmux is installed
+        run: |
+          if ! command -v tmux >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y tmux
+          fi
+          tmux -V
+      - name: Run the tmux end-to-end suite
+        env:
+          CAIRN_IT_TMUX: "1"
+        # Single-threaded: each test owns a full-screen pane, so serializing avoids any contention
+        # between concurrent panes on the shared (dedicated-socket) tmux server.
+        run: cargo test -p cairn --test tmux_e2e -- --test-threads=1 --nocapture
