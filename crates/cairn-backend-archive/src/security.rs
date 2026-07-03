@@ -3,9 +3,9 @@
 //! An archive is arbitrary, attacker-influenceable input (it may be downloaded, received as an
 //! attachment, or copied from anywhere) — unlike the local filesystem it is browsed *through*,
 //! every byte of its structure (paths, sizes, ratios, link targets) must be treated as hostile.
-//! This module centralizes the caps and validation helpers both [`crate::tar_backend::TarOps`] and
-//! [`crate::zip_backend::ZipOps`] apply during indexing and reads, so the two format-specific
-//! scanners can't independently drift on policy.
+//! This module centralizes the caps and validation helpers [`crate::tar_backend::TarOps`],
+//! [`crate::zip_backend::ZipOps`], and `compressed_tar` all apply during indexing/decoding and
+//! reads, so the format-specific scanners can't independently drift on policy.
 
 use cairn_types::VfsPath;
 use cairn_vfs::VfsError;
@@ -44,14 +44,19 @@ pub(crate) const MAX_COMPRESSION_RATIO: u64 = 100;
 pub(crate) const COMPRESSION_RATIO_FLOOR_BYTES: u64 = 1024 * 1024;
 
 /// Hard cap on total decompressed output for one compressed-tar decode pass (RFC-0013 P5): the whole
-/// compressed file (`.tgz`/`.tbz2`/`.txz`/`.tzst`) is decoded exactly once, up front, into a private
-/// temp file before any tar indexing happens (`compressed_tar::decompress_to_temp`) — this is the
-/// backstop that aborts that decode the instant it would exceed the cap, regardless of what the
-/// container's own (untrusted) size hints claim. Deliberately set equal to
-/// [`ARCHIVE_SESSION_BYTE_CAP`]: nothing this backend ever materializes from an archive — whether
-/// read out member-by-member (bounded by the session cap) or decoded once as a whole compressed tar
-/// (bounded by this cap) — exceeds that single budget, which keeps the security model easy to state
-/// and keeps worst-case temp-disk usage bounded on a disk-constrained dev box.
+/// compressed file (`.tgz`/`.tbz2`/`.tzst` — `.txz` is not decoded at all, see `compressed_tar`) is
+/// decoded exactly once, up front, into a private temp file before any tar indexing happens
+/// (`compressed_tar::decompress_to_temp`) — this is the backstop that aborts that decode the instant
+/// it would exceed the cap, regardless of what the container's own (untrusted) size hints claim.
+///
+/// This value is numerically equal to [`ARCHIVE_SESSION_BYTE_CAP`] but the two are **independent
+/// budgets that happen to share a number**, not one shared pool: this cap bounds the one-time
+/// *temp-disk* footprint of decompressing a compressed-tar mount, while `ARCHIVE_SESSION_BYTE_CAP`
+/// separately bounds cumulative *read* traffic back out through `Vfs::open_read` over the life of
+/// the mount. A single compressed-tar mount can therefore use up to ~1 GiB combined in the
+/// worst case (up to this cap on temp disk at mount time, plus up to `ARCHIVE_SESSION_BYTE_CAP` of
+/// reads afterward) — not ~512 MiB total. Kept numerically equal only because there was no reason to
+/// pick two different round numbers, not because they are the same budget.
 pub(crate) const ARCHIVE_MAX_DECOMPRESSED_BYTES: u64 = ARCHIVE_SESSION_BYTE_CAP;
 
 /// Cap on a single path segment's length. Guards against a pathological name (megabytes of a single

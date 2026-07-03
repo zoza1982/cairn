@@ -329,6 +329,28 @@ mod tests {
         assert_eq!(entries, b"hey");
     }
 
+    /// End-to-end: `.txz` is sniffed correctly (routed to `Format::CompressedTar(Compression::Xz)`)
+    /// but `ArchiveVfs::open` must surface a typed, friendly refusal rather than attempt to decode
+    /// it or panic — xz decoding is deliberately not shipped (RFC-0013 P5, ADR-0013: `lzma-rs`'s
+    /// LZMA2 path is not memory-bounded against a decompression bomb).
+    #[tokio::test]
+    async fn open_txz_gives_a_friendly_unsupported_error_not_panic() {
+        let mut bytes = vec![0xfd, b'7', b'z', b'X', b'Z', 0x00];
+        bytes.extend_from_slice(&[0u8; 16]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+
+        match ArchiveVfs::open(ConnectionId(1), tmp.path().to_path_buf()).await {
+            Err(VfsError::Backend { code, .. }) => {
+                assert_eq!(code, "compressed_tar_xz_unsupported");
+            }
+            other => panic!(
+                "expected compressed_tar_xz_unsupported, got ok={}",
+                other.is_ok()
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn open_rejects_a_non_archive_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();

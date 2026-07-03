@@ -1,5 +1,6 @@
-//! Compressed-tar support (RFC-0013 P5): `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`,
-//! `.tar.zst`/`.tzst`.
+//! Compressed-tar support (RFC-0013 P5): `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.zst`/`.tzst`.
+//! `.tar.xz`/`.txz` is *recognized* (magic-sniffed) but deliberately **not decoded** — see
+//! "xz/lzma is not decoded" below.
 //!
 //! **Approach: decompress once to a private temp file, then index it exactly like an ordinary
 //! uncompressed tar.** A compressed tar stream is not randomly seekable — `tar_backend`'s
@@ -16,9 +17,42 @@
 //! O(n) per read, where decompressing once up front is O(1) per read afterward via `TarOps`'s
 //! existing offset index.
 //!
-//! Every decoder is chosen pure-Rust (no C/FFI parsing these untrusted bytes) — see
+//! Every decoder that *is* used is pure-Rust (no C/FFI parsing these untrusted bytes) — see
 //! `Cargo.toml`'s per-dependency comments and `docs/adr/0013-compressed-tar-decoder-selection.md`
 //! for the trade-offs weighed for each format.
+//!
+//! ## xz/lzma is not decoded
+//!
+//! `Compression::Xz` exists and [`sniff`] still recognizes `.txz`/`.tar.xz`'s magic bytes, but
+//! [`decompress_to_temp`] refuses it with a typed, friendly error rather than decoding it. The
+//! pure-Rust `lzma-rs` crate's LZMA2 decode path is not memory-bounded: its internal dictionary
+//! buffer is flushed to the output sink only on specific internal resets, which a crafted stream
+//! can defer indefinitely, letting a tiny `.txz` accumulate multiple GiB in **RAM** before this
+//! module's own [`CappedWriter`] output-byte guard ever gets a chance to see a byte and abort — the
+//! guard bounds the *file* this backend writes, not the *decoder's own internal memory*. Shipping
+//! that would be an unconditional OOM vector reachable from opening a file, so xz was dropped
+//! entirely rather than shipped with a known bomb. See ADR-0013 for the full record and the
+//! follow-up options (a memory-bounded pure-Rust decoder, or a C `liblzma` binding with an explicit
+//! `memlimit`, security-review-gated).
+//!
+//! ## Multi-stream / multi-frame concatenated input is never silently truncated
+//!
+//! gzip, bzip2, and zstd all allow concatenating multiple independent compressed streams/frames
+//! back-to-back in one file (`cat a.gz b.gz`, `bgzip`'s multi-block output, etc.) — a naive
+//! single-stream decoder silently stops at the end of the *first* one, producing a truncated tar
+//! with no error at all. `flate2::read::MultiGzDecoder` (not `GzDecoder`) handles this correctly
+//! for gzip by design. Neither `bzip2-rs` nor `ruzstd` continue past their first stream/frame, so
+//! [`decompress_to_temp`] adds an explicit, decoder-implementation-independent guard for both: after
+//! a successful decode, [`contains_magic_after_start`] scans the *original compressed file's own
+//! bytes* (not anything the decoder reported about itself) for a second occurrence of that format's
+//! magic number anywhere after the first byte. A hit means more stream data exists that was never
+//! decoded, and the mount is refused with `compressed_tar_multi_stream` rather than silently
+//! opening a truncated archive. This is deliberately independent of how much a decoder *claims* to
+//! have consumed from its input reader: `bzip2_rs::DecoderReader` was found, empirically, to read
+//! its *entire* underlying source into an internal buffer regardless of how many logical bzip2
+//! streams are present, so a "bytes consumed from the reader" check alone would report a
+//! concatenated two-stream file as fully consumed even though only the first stream was decoded —
+//! a byte-level scan of the file's own content has no such blind spot.
 
 use crate::security::{compression_ratio_is_bomb, ARCHIVE_MAX_DECOMPRESSED_BYTES};
 use crate::tar_backend::TarOps;
@@ -26,21 +60,52 @@ use crate::ArchiveOps;
 use cairn_types::VfsPath;
 use cairn_vfs::VfsError;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
-use std::path::Path;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+/// `.tar.gz`/`.tgz` magic (RFC 1952).
+const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
+/// `.tar.bz2`/`.tbz2` magic.
+const BZIP2_MAGIC: &[u8] = b"BZh";
+/// `.tar.xz`/`.txz` magic.
+const XZ_MAGIC: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0x00];
+/// `.tar.zst`/`.tzst` magic — the little-endian zstd frame magic number.
+const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
 
 /// The outer compression wrapping a tar stream, detected purely from magic bytes (never a file
 /// extension) by [`sniff`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Compression {
-    /// `.tar.gz` / `.tgz` — magic `1f 8b` (RFC 1952).
+    /// `.tar.gz` / `.tgz` — see [`GZIP_MAGIC`].
     Gzip,
-    /// `.tar.bz2` / `.tbz2` — magic `"BZh"`.
+    /// `.tar.bz2` / `.tbz2` — see [`BZIP2_MAGIC`].
     Bzip2,
-    /// `.tar.xz` / `.txz` — magic `fd 37 7a 58 5a 00`.
+    /// `.tar.xz` / `.txz` — see [`XZ_MAGIC`]. Recognized but not decoded; see the module docs.
     Xz,
-    /// `.tar.zst` / `.tzst` — magic `28 b5 2f fd` (little-endian frame magic number).
+    /// `.tar.zst` / `.tzst` — see [`ZSTD_MAGIC`].
     Zstd,
+}
+
+impl Compression {
+    /// This format's magic bytes, as checked by [`sniff`].
+    fn magic(self) -> &'static [u8] {
+        match self {
+            Self::Gzip => GZIP_MAGIC,
+            Self::Bzip2 => BZIP2_MAGIC,
+            Self::Xz => XZ_MAGIC,
+            Self::Zstd => ZSTD_MAGIC,
+        }
+    }
+
+    /// A human-readable name for error messages.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::Bzip2 => "bzip2",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+        }
+    }
 }
 
 /// Sniff `prefix` (the first bytes of the file) for a recognized outer-compression magic. Checked
@@ -48,16 +113,16 @@ pub(crate) enum Compression {
 /// compression magic never collides with either.
 #[must_use]
 pub(crate) fn sniff(prefix: &[u8]) -> Option<Compression> {
-    if prefix.len() >= 2 && prefix[0..2] == [0x1f, 0x8b] {
+    if prefix.starts_with(GZIP_MAGIC) {
         return Some(Compression::Gzip);
     }
-    if prefix.len() >= 3 && prefix[0..3] == *b"BZh" {
+    if prefix.starts_with(BZIP2_MAGIC) {
         return Some(Compression::Bzip2);
     }
-    if prefix.len() >= 6 && prefix[0..6] == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
+    if prefix.starts_with(XZ_MAGIC) {
         return Some(Compression::Xz);
     }
-    if prefix.len() >= 4 && prefix[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+    if prefix.starts_with(ZSTD_MAGIC) {
         return Some(Compression::Zstd);
     }
     None
@@ -80,10 +145,12 @@ impl CompressedTarOps {
     /// callers must run this inside `tokio::task::spawn_blocking` (see [`crate::ArchiveVfs::open`]).
     ///
     /// # Errors
-    /// A typed `VfsError` (never a panic) for: an unopenable/unreadable input file, malformed
-    /// compressed data, decompressed output exceeding [`ARCHIVE_MAX_DECOMPRESSED_BYTES`] or the
-    /// compression-ratio guard (both "possible archive bomb"), or anything `TarOps::build` itself
-    /// would reject in the decompressed content (entry-count cap, etc. — unchanged from plain tar).
+    /// A typed `VfsError` (never a panic) for: `compression == Xz` (recognized but never decoded —
+    /// see the module docs), an unopenable/unreadable input file, malformed compressed data,
+    /// decompressed output exceeding [`ARCHIVE_MAX_DECOMPRESSED_BYTES`] or the compression-ratio
+    /// guard (both "possible archive bomb"), a second bzip2/zstd stream/frame left un-decoded (see
+    /// `contains_magic_after_start`), or anything `TarOps::build` itself would reject in the
+    /// decompressed content (entry-count cap, etc. — unchanged from plain tar).
     pub(crate) fn build(path: &Path, compression: Compression) -> Result<Self, VfsError> {
         let (temp, _decoded_len) =
             decompress_to_temp(path, compression, ARCHIVE_MAX_DECOMPRESSED_BYTES)?;
@@ -109,7 +176,7 @@ impl ArchiveOps for CompressedTarOps {
 /// A bomb-detection error raised by [`CappedWriter::write`] and threaded back out through whatever
 /// decode function it aborted (a decoder's own I/O error variant almost always just wraps ours) —
 /// stored on the writer itself (not parsed back out of the propagated error), which sidesteps
-/// needing to downcast through four different decoder crates' distinct error types.
+/// needing to downcast through each decoder crate's distinct error type.
 #[derive(Debug, Clone, Copy)]
 enum BombKind {
     /// Total decoded bytes exceeded [`ARCHIVE_MAX_DECOMPRESSED_BYTES`].
@@ -133,9 +200,10 @@ impl BombKind {
 
 /// A [`Write`] sink wrapping the temp file that aborts the instant either bomb guard trips —
 /// enforced incrementally, on every chunk the decoder writes, not after the fact on a fully
-/// decoded buffer. Used uniformly across all four decoders (three drive it via `io::copy` from a
-/// `Read`-based decoder; `xz_decompress` writes into it directly) so the cap/ratio logic exists
-/// exactly once regardless of which crate is decoding.
+/// decoded buffer. Used uniformly across all three decoders that actually run (gzip/bzip2/zstd —
+/// xz is never decoded at all, see the module docs), each driving it via `io::copy` from a
+/// `Read`-based decoder, so the cap/ratio logic exists exactly once regardless of which crate is
+/// decoding.
 struct CappedWriter<'a> {
     file: &'a mut File,
     /// The whole compressed input file's size — the ratio guard's denominator. Never zero (the
@@ -211,50 +279,138 @@ fn decode_err(e: impl std::fmt::Display) -> VfsError {
     }
 }
 
+/// xz is recognized but never decoded — see the module docs for why (`lzma-rs`'s LZMA2 path is not
+/// memory-bounded against a decompression bomb).
+fn xz_unsupported_err() -> VfsError {
+    VfsError::Backend {
+        code: "compressed_tar_xz_unsupported".to_owned(),
+        msg: "xz-compressed tar (.txz/.tar.xz) is not yet supported — its pure-Rust decoder is \
+              not memory-bounded against decompression bombs; tracked as an RFC-0013 follow-up"
+            .to_owned(),
+        retryable: false,
+    }
+}
+
+/// A second stream/frame of `label`-compressed data was found in the input beyond what was
+/// decoded — see [`contains_magic_after_start`] and the module docs' "Multi-stream" section.
+fn multi_stream_err(label: &str) -> VfsError {
+    VfsError::Backend {
+        code: "compressed_tar_multi_stream".to_owned(),
+        msg: format!(
+            "multi-stream/multi-frame {label} archives are only partially decoded; full support \
+             is an RFC-0013 follow-up"
+        ),
+        retryable: false,
+    }
+}
+
+/// Scan `path`'s own bytes (read once, streamed in fixed-size chunks — never the decoder's
+/// interpretation of them) for a second occurrence of `magic` starting at any byte offset at or
+/// after 1 (offset 0 is the file's own leading magic, already established by [`sniff`]).
+///
+/// This is the multi-stream/multi-frame guard described in the module docs: it is deliberately
+/// independent of anything a decoder reports about how much of its input it "consumed", because
+/// that signal was found to be unreliable for at least one decoder in this module (`bzip2-rs`
+/// reads its entire input into an internal buffer regardless of stream count). A hit is a
+/// conservative, fail-closed signal — an extremely rare false positive (the magic bytes
+/// coincidentally recurring within genuine compressed entropy) costs a refused mount, never a
+/// silently truncated one, which is the correct trade-off for a file manager.
+fn contains_magic_after_start(path: &Path, magic: &[u8]) -> Result<bool, VfsError> {
+    debug_assert!(!magic.is_empty());
+    let file = File::open(path).map_err(VfsError::Io)?;
+    let mut reader = io::BufReader::new(file);
+    // `overlap` carries the trailing `magic.len() - 1` bytes of each chunk into the next one, so a
+    // match straddling a chunk boundary is never missed. `base` is the absolute file offset of
+    // `window[0]`, updated every time the window is trimmed back down to the overlap.
+    let overlap = magic.len().saturating_sub(1);
+    let mut window: Vec<u8> = Vec::with_capacity(overlap + 64 * 1024);
+    let mut base: u64 = 0;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).map_err(VfsError::Io)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        window.extend_from_slice(&chunk[..n]);
+        if window.len() >= magic.len() {
+            for (i, w) in window.windows(magic.len()).enumerate() {
+                // Offset 0 is the file's own leading magic (already established by `sniff`) — only
+                // a match starting at offset >= 1 indicates a *second* occurrence.
+                if w == magic && base + i as u64 >= 1 {
+                    return Ok(true);
+                }
+            }
+            let drain = window.len() - overlap;
+            base += drain as u64;
+            window.drain(0..drain);
+        }
+    }
+}
+
+/// Pick a private, per-user temp directory for the decompression destination: `$XDG_RUNTIME_DIR`
+/// (per-user, `0700`, usually tmpfs, torn down at logout) when it's set and really is a directory,
+/// falling back to the platform temp dir (`std::env::temp_dir()`, via `tempfile`'s default)
+/// otherwise. Either way the file itself is still created with `tempfile`'s own `0600`
+/// permissions and a randomized, non-predictable name.
+fn preferred_temp_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let path = PathBuf::from(dir);
+    path.is_dir().then_some(path)
+}
+
+fn new_temp_file() -> Result<tempfile::NamedTempFile, VfsError> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".cairn-archive-");
+    match preferred_temp_dir() {
+        Some(dir) => builder.tempfile_in(dir),
+        None => builder.tempfile(),
+    }
+    .map_err(VfsError::Io)
+}
+
 /// Decompress `path` into a fresh, private temp file, enforcing the decompression-bomb guards
-/// incrementally as bytes are produced (never after the fact on a fully-materialized buffer).
+/// incrementally as bytes are produced (never after the fact on a fully-materialized buffer), then
+/// (for bzip2/zstd) checking for a second stream/frame left un-decoded (see the module docs).
 ///
 /// `max_decompressed_bytes` is [`ARCHIVE_MAX_DECOMPRESSED_BYTES`] in production
 /// (`CompressedTarOps::build`); tests call this directly with a much smaller value so the
 /// absolute-cap guard can be exercised against a tiny, fast fixture instead of one that must
 /// actually approach the real ~512 MiB production cap.
 ///
-/// The temp file is created via [`tempfile::NamedTempFile`] — on Unix this is mode `0o600` (owner
-/// read/write only) with a randomized, non-predictable name, even though the containing directory
-/// (the OS temp dir) is shared across users — and is deleted automatically when the returned
-/// handle is dropped (including on any later error in the caller, since ownership is returned to
-/// it immediately). Returns the handle plus the final decoded byte count.
+/// The temp file is created via [`new_temp_file`] (mode `0o600` on Unix, randomized non-predictable
+/// name, preferring `$XDG_RUNTIME_DIR`) and deleted automatically when the returned handle is
+/// dropped (including on any later error in the caller, since ownership is returned to it
+/// immediately). Returns the handle plus the final decoded byte count.
 fn decompress_to_temp(
     path: &Path,
     compression: Compression,
     max_decompressed_bytes: u64,
 ) -> Result<(tempfile::NamedTempFile, u64), VfsError> {
+    if compression == Compression::Xz {
+        return Err(xz_unsupported_err());
+    }
+
     let compressed_len = std::fs::metadata(path).map_err(VfsError::Io)?.len();
     let source = File::open(path).map_err(VfsError::Io)?;
-    let mut temp = tempfile::Builder::new()
-        .prefix(".cairn-archive-")
-        .tempfile()
-        .map_err(VfsError::Io)?;
+    let mut temp = new_temp_file()?;
 
     let mut capped = CappedWriter::new(temp.as_file_mut(), compressed_len, max_decompressed_bytes);
     let copy_result: io::Result<()> = match compression {
         Compression::Gzip => {
-            let mut decoder = flate2::read::GzDecoder::new(source);
+            // `MultiGzDecoder`, not `GzDecoder`: decodes every concatenated gzip member (e.g.
+            // `bgzip` output), not just the first — see the module docs' "Multi-stream" section.
+            let mut decoder = flate2::read::MultiGzDecoder::new(source);
             io::copy(&mut decoder, &mut capped).map(|_| ())
         }
         Compression::Bzip2 => {
             let mut decoder = bzip2_rs::DecoderReader::new(source);
             io::copy(&mut decoder, &mut capped).map(|_| ())
         }
-        Compression::Xz => {
-            let mut reader = BufReader::new(source);
-            lzma_rs::xz_decompress(&mut reader, &mut capped)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
-        }
         Compression::Zstd => match ruzstd::decoding::StreamingDecoder::new(source) {
             Ok(mut decoder) => io::copy(&mut decoder, &mut capped).map(|_| ()),
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
         },
+        Compression::Xz => unreachable!("handled above"),
     };
 
     let bomb = capped.bomb;
@@ -263,7 +419,16 @@ fn decompress_to_temp(
         // The abort was ours (a bomb guard tripped) — report that specifically, not the decoder's
         // (possibly confusing, generic "broken pipe"-style) wrapping of our forced I/O error.
         (_, Some(kind)) => Err(bomb_err(kind)),
-        (Ok(()), None) => Ok((temp, total)),
+        (Ok(()), None) => {
+            // gzip's `MultiGzDecoder` already handles concatenation correctly; bzip2/zstd don't,
+            // so guard those two explicitly (see `contains_magic_after_start`'s doc comment).
+            if matches!(compression, Compression::Bzip2 | Compression::Zstd)
+                && contains_magic_after_start(path, compression.magic())?
+            {
+                return Err(multi_stream_err(compression.label()));
+            }
+            Ok((temp, total))
+        }
         (Err(e), None) => Err(decode_err(e)),
     }
 }
@@ -371,14 +536,24 @@ mod tests {
         }
     }
 
+    /// xz is sniffed correctly but must never be decoded — see the module docs / ADR-0013 (the
+    /// `lzma-rs` LZMA2 path is not memory-bounded against a decompression bomb). This is the
+    /// regression test for that decision: the trailing bytes here are arbitrary/never a real xz
+    /// stream, and must never be parsed at all — only the typed refusal matters.
     #[test]
-    fn truncated_xz_stream_errors_not_panics() {
-        // A bare xz magic with no valid stream after it — lzma-rs must fail cleanly.
-        let bytes = vec![0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x01, 0x02, 0x03];
+    fn txz_is_recognized_but_not_decoded() {
+        let mut bytes = vec![0xfd, b'7', b'z', b'X', b'Z', 0x00];
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert_eq!(sniff(&bytes), Some(Compression::Xz));
         let tmp = write_temp(&bytes);
         match CompressedTarOps::build(tmp.path(), Compression::Xz) {
-            Err(VfsError::Backend { code, .. }) => assert_eq!(code, "compressed_tar_decode_error"),
-            other => panic!("expected a decode error, got ok={}", other.is_ok()),
+            Err(VfsError::Backend { code, .. }) => {
+                assert_eq!(code, "compressed_tar_xz_unsupported");
+            }
+            other => panic!(
+                "expected compressed_tar_xz_unsupported, got ok={}",
+                other.is_ok()
+            ),
         }
     }
 
@@ -409,14 +584,6 @@ mod tests {
     // stays fast — the property under test ("aborts long before completing", not "aborts exactly
     // at 512 MiB") holds identically at this scale as it does at the real production cap, since
     // the guard is a plain byte-count/ratio comparison with no scale-dependent behavior.
-
-    /// xz-compress `data` (via `lzma_rs::xz_compress`, already a production dependency — used here
-    /// only to build a fixture; the backend itself only ever *decodes* xz).
-    fn xz_bytes(data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        lzma_rs::xz_compress(&mut io::BufReader::new(data), &mut out).unwrap();
-        out
-    }
 
     /// bzip2-compress `data` via `banzai` (dev-dependency only — a pure-Rust encoder used solely to
     /// build test fixtures; the backend itself only ever *decodes* bzip2, via `bzip2-rs`).
@@ -461,6 +628,34 @@ mod tests {
         bytes
     }
 
+    /// Hand-build a minimal, spec-valid zstd frame (RFC 8878) containing `data` verbatim, as a
+    /// chain of *Raw_Block*s (`Block_Type` 0 — uncompressed literal content, each capped at
+    /// [`ZSTD_MAX_BLOCK_SIZE`]) — unlike [`zstd_rle_bytes`] this can carry arbitrary content, not
+    /// just a repeated byte, which is what the happy-path and multi-frame tests below need to
+    /// verify real tar bytes round-trip correctly. Same rationale as `zstd_rle_bytes` for why this
+    /// is hand-built rather than using an encoder crate.
+    fn zstd_raw_frame_bytes(data: &[u8]) -> Vec<u8> {
+        let total = u32::try_from(data.len()).expect("test fixture fits in u32");
+        let mut bytes = vec![0x28, 0xb5, 0x2f, 0xfd];
+        bytes.push(0b1010_0000);
+        bytes.extend_from_slice(&total.to_le_bytes());
+        let mut offset = 0usize;
+        loop {
+            let remaining = data.len() - offset;
+            let this_block = remaining.min(ZSTD_MAX_BLOCK_SIZE as usize);
+            let last_block = u32::from(offset + this_block == data.len());
+            let block_type_raw: u32 = 0;
+            let header = last_block | (block_type_raw << 1) | ((this_block as u32) << 3);
+            bytes.extend_from_slice(&header.to_le_bytes()[0..3]);
+            bytes.extend_from_slice(&data[offset..offset + this_block]);
+            offset += this_block;
+            if offset >= data.len() {
+                break;
+            }
+        }
+        bytes
+    }
+
     /// gzip: a run of zeros compresses at an enormous ratio (~1000:1+), tripping the ratio guard
     /// (not the absolute cap — decoded stays well under [`ARCHIVE_MAX_DECOMPRESSED_BYTES`]) almost
     /// immediately once decoded output crosses `COMPRESSION_RATIO_FLOOR_BYTES`.
@@ -473,26 +668,6 @@ mod tests {
         );
         let tmp = write_temp(&gz_bytes);
         match CompressedTarOps::build(tmp.path(), Compression::Gzip) {
-            Err(VfsError::Backend { code, .. }) => assert_eq!(code, "archive_bomb_detected"),
-            other => panic!("expected archive_bomb_detected, got ok={}", other.is_ok()),
-        }
-    }
-
-    /// xz via the *absolute-cap* guard rather than the ratio guard: `lzma_rs::xz_compress`'s own
-    /// encoder (used only here, to build this fixture — the backend never encodes xz in
-    /// production) doesn't achieve a meaningful compression ratio on all-zero input (its encode
-    /// side is a reference/round-trip implementation, not a space-efficient one — the decode side
-    /// is what matters for this backend and is unaffected), so a ratio-bomb fixture isn't
-    /// achievable through it. The output-byte cap is format-agnostic (the same `CappedWriter` every
-    /// other branch uses), so this still proves xz decoding is bounded: a small injected cap trips
-    /// well before the real decoded size.
-    #[test]
-    fn xz_decode_is_aborted_by_the_absolute_cap() {
-        let payload = vec![0u8; 64 * 1024];
-        let xz_bytes = xz_bytes(&payload);
-        let tmp = write_temp(&xz_bytes);
-        let tiny_cap = 1024u64; // far below `payload`'s real decoded length
-        match decompress_to_temp(tmp.path(), Compression::Xz, tiny_cap) {
             Err(VfsError::Backend { code, .. }) => assert_eq!(code, "archive_bomb_detected"),
             other => panic!("expected archive_bomb_detected, got ok={}", other.is_ok()),
         }
@@ -580,5 +755,131 @@ mod tests {
             "temp file must be deleted once its NamedTempFile handle is dropped"
         );
         drop(ops); // exercise the real struct's Drop path too, not just the bare NamedTempFile
+    }
+
+    // --- Multi-stream / multi-frame concatenated input: never silently truncated -------------
+    //
+    // gzip's `MultiGzDecoder` reconstructs concatenated members correctly (tested directly below);
+    // bzip2/zstd don't continue past their first stream/frame, so `contains_magic_after_start`
+    // must catch it. The bzip2 case is the important regression test: `bzip2_rs::DecoderReader`
+    // reads its *entire* input into an internal buffer regardless of stream count (verified during
+    // development), so a naive "bytes consumed from the reader == input length" check would have
+    // reported this exact fixture as fully, successfully decoded even though only the first stream
+    // was — the byte-level magic scan does not have that blind spot.
+
+    /// Build a two-file uncompressed tar, for splitting/reconstructing across compressed members.
+    fn build_two_file_tar() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut h1 = tar::Header::new_gnu();
+        h1.set_size(5);
+        h1.set_mode(0o644);
+        h1.set_cksum();
+        builder
+            .append_data(&mut h1, "first.txt", &b"AAAAA"[..])
+            .unwrap();
+        let mut h2 = tar::Header::new_gnu();
+        h2.set_size(5);
+        h2.set_mode(0o644);
+        h2.set_cksum();
+        builder
+            .append_data(&mut h2, "second.txt", &b"BBBBB"[..])
+            .unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    /// The real-world shape this guards against: a single logical tar, split at an arbitrary byte
+    /// boundary into two independently-gzipped members (as `bgzip` output looks), concatenated back
+    /// together. `MultiGzDecoder` must reconstruct the exact original byte stream — both files must
+    /// list, not just the first half's worth of content.
+    #[test]
+    fn gzip_multi_member_is_fully_reconstructed() {
+        let full_tar = build_two_file_tar();
+        let split_at = full_tar.len() / 2;
+        let (first_half, second_half) = full_tar.split_at(split_at);
+        let mut combined = gzip_bytes(first_half);
+        combined.extend_from_slice(&gzip_bytes(second_half));
+
+        let tmp = write_temp(&combined);
+        let ops = CompressedTarOps::build(tmp.path(), Compression::Gzip).unwrap();
+        let root = ops.list_children(&VfsPath::root()).unwrap();
+        let mut names: Vec<_> = root.iter().map(|e| e.name.to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["first.txt", "second.txt"]);
+    }
+
+    /// A legitimate single-stream bzip2 archive still decodes normally — the multi-stream guard
+    /// must not false-positive on ordinary input (there is exactly one `"BZh"` occurrence: the
+    /// leading magic itself).
+    #[test]
+    fn decompresses_and_indexes_a_real_bzip2_tar() {
+        let tar_bytes = build_test_tar("hello.txt", b"hello, bzip2 archive");
+        let bz_bytes = bzip2_bytes(&tar_bytes);
+        let tmp = write_temp(&bz_bytes);
+
+        let ops = CompressedTarOps::build(tmp.path(), Compression::Bzip2).unwrap();
+        let root = ops.list_children(&VfsPath::root()).unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].name, "hello.txt");
+        let data = ops
+            .read_member(&VfsPath::parse("hello.txt").unwrap(), 1024)
+            .unwrap();
+        assert_eq!(data, b"hello, bzip2 archive");
+    }
+
+    /// A legitimate single-frame zstd archive still decodes normally — same false-positive check
+    /// as the bzip2 case above, for the zstd magic.
+    #[test]
+    fn decompresses_and_indexes_a_real_zstd_tar() {
+        let tar_bytes = build_test_tar("hello.txt", b"hello, zstd archive");
+        let zst_bytes = zstd_raw_frame_bytes(&tar_bytes);
+        let tmp = write_temp(&zst_bytes);
+
+        let ops = CompressedTarOps::build(tmp.path(), Compression::Zstd).unwrap();
+        let root = ops.list_children(&VfsPath::root()).unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].name, "hello.txt");
+        let data = ops
+            .read_member(&VfsPath::parse("hello.txt").unwrap(), 1024)
+            .unwrap();
+        assert_eq!(data, b"hello, zstd archive");
+    }
+
+    /// THE regression test: two independently-encoded bzip2 streams concatenated. `DecoderReader`
+    /// decodes only the first and (verified empirically) reads the *entire* combined input while
+    /// doing so, so a "bytes consumed == input length" check alone would silently accept this as a
+    /// complete decode. The mount must instead be refused, never opened with the second file
+    /// missing and no error.
+    #[test]
+    fn bzip2_multi_stream_is_refused_not_silently_truncated() {
+        let mut combined = bzip2_bytes(b"hello-bzip2-part-one");
+        combined.extend_from_slice(&bzip2_bytes(b"world-bzip2-part-two"));
+        let tmp = write_temp(&combined);
+        match CompressedTarOps::build(tmp.path(), Compression::Bzip2) {
+            Err(VfsError::Backend { code, .. }) => {
+                assert_eq!(code, "compressed_tar_multi_stream");
+            }
+            other => panic!(
+                "must never silently truncate: expected compressed_tar_multi_stream, got ok={}",
+                other.is_ok()
+            ),
+        }
+    }
+
+    /// Same shape via zstd: two independent frames concatenated. `ruzstd`'s `StreamingDecoder`
+    /// stops after the first frame; the mount must be refused, not silently truncated.
+    #[test]
+    fn zstd_multi_frame_is_refused_not_silently_truncated() {
+        let mut combined = zstd_raw_frame_bytes(b"hello-frame-one-");
+        combined.extend_from_slice(&zstd_raw_frame_bytes(b"world-frame-two!"));
+        let tmp = write_temp(&combined);
+        match CompressedTarOps::build(tmp.path(), Compression::Zstd) {
+            Err(VfsError::Backend { code, .. }) => {
+                assert_eq!(code, "compressed_tar_multi_stream");
+            }
+            other => panic!(
+                "must never silently truncate: expected compressed_tar_multi_stream, got ok={}",
+                other.is_ok()
+            ),
+        }
     }
 }
