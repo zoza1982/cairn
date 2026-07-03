@@ -2,7 +2,7 @@
 source: crates/cairn-tui/src/scenarios.rs
 expression: frame
 ---
-┌ / ───────────────┐┌ / ───────────────┐
+1Help 2Rename 3View 4Edit 5Copy 10Quit
 ┌ logo.png — view ─────────────────────┐
 │00000000  00 01 02 03 04 05 06 07 08 0│
 │00000010  41 42 43 44 45 46 47 48 49 4│

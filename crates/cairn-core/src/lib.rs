@@ -7,6 +7,7 @@
 //! `docs/LLD.md` §5.
 
 pub mod forms;
+mod help;
 mod msg;
 mod state;
 mod update;
@@ -15,6 +16,7 @@ pub use forms::{
     credential_method_fields, credential_methods, scheme_fields, scheme_needs_credentials,
     CredentialDraft, CredentialMethod, FieldSpec, OsSources, ProfileData, KNOWN_SCHEMES,
 };
+pub use help::{help_line_count, menu_entries, MenuEntry, HELP_SECTIONS, MENU_SECTIONS};
 pub use msg::{Action, AppEffect, AppEvent, Msg, TextEdit, WriteBackMode};
 pub use state::{
     detect_file_kind, visible_connection_indices, ActiveTransfer, AppState, ArchiveFormat,

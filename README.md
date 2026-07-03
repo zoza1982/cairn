@@ -99,6 +99,27 @@ back empty (see [RFC-0012](docs/rfcs/0012-file-open-view-edit.md)).
 `p` pauses/resumes and `Esc` cancels (all active transfers); `Ctrl-T` opens the transfer queue. Up
 to two transfers run at once by default — set `[transfers] concurrency = N` in config to change it.
 
+### Function-key bar, help, and menu
+
+A Midnight Commander-style function-key bar runs along the very top of the screen:
+
+```
+1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Menu 10Quit
+```
+
+Each key's number is styled distinctly from its label. On a narrow terminal the bar drops whole
+cells rather than truncating a label mid-word, keeping `F1`/`F3`/`F4`/`F10` (help/view/edit/quit)
+visible for as long as possible since they're the most important to be able to find at a glance.
+
+| Key | Action |
+|-----|--------|
+| `F1` | From the main view, open a scrollable keybinding reference, grouped by section (Navigation, File ops, View/Edit, Connections, Vault, AI, General). `F1` again, or `Esc`, closes it. |
+| `F9` | From the main view, open a categorized action menu (Copy/Move/Delete/Rename/MakeDir, View/Edit, connection Switch/New, Vault Unlock, AI Ask, Help/Quit) — each entry shows its shortcut. `↑↓`/`j`/`k` move the selection, `Enter` runs it (through the same code path a direct keypress would take), `Esc` closes without acting. `F9` again toggles it closed. |
+| `F10` | Quit — an alias for the existing `q`/`Ctrl-C`. Unlike `F1`/`F9`, this works from **anywhere**, including inside another overlay or a text prompt. |
+
+`F1` and `F9` only open from the main dual-pane view — like `Ctrl-O`/`Ctrl-N`, Cairn shows one
+overlay at a time, so press `Esc` to leave whatever's open before opening help or the menu.
+
 ```toml
 [ui.keybindings]
 "ctrl+a" = "ai_propose"   # ask the AI assistant for a plan
