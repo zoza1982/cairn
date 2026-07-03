@@ -33,6 +33,10 @@ azure = ["dep:cairn-backend-object", "cairn-backend-object/azure"]
 # Docker/K8s connect without a vault credential (local socket / kubeconfig).
 docker = ["dep:cairn-backend-docker", "cairn-backend-docker/docker"]
 k8s = ["dep:cairn-backend-k8s", "cairn-backend-k8s/k8s"]
+# Read-only tar/zip archive browsing (RFC-0013). No vault credential and no live-transport SDK —
+# `tar`/`zip` are small pure-Rust codecs — so unlike the other backends there is no inner feature
+# to forward; the crate itself has no "lean" mode to gate.
+archive = ["dep:cairn-backend-archive"]
 # OS keychain: store the vault passphrase in the system credential manager so the user isn't
 # prompted on every launch. Off by default so the lean build avoids platform secret-store deps
 # (security-keyring on Linux, Security framework on macOS, Windows Credential Manager).
@@ -40,7 +44,7 @@ keychain = ["cairn-vault/keychain"]
 # Convenience umbrellas.
 cloud = ["s3", "gcs", "azure"]
 containers = ["docker", "k8s"]
-all-backends = ["ssh", "cloud", "containers"]
+all-backends = ["ssh", "cloud", "containers", "archive"]
 
 [dependencies]
 cairn-core = { workspace = true }
@@ -63,6 +67,7 @@ cairn-backend-ssh = { workspace = true, optional = true }
 cairn-backend-object = { workspace = true, optional = true }
 cairn-backend-docker = { workspace = true, optional = true }
 cairn-backend-k8s = { workspace = true, optional = true }
+cairn-backend-archive = { workspace = true, optional = true }
 cairn-transfer = { workspace = true }
 cairn-tui = { workspace = true }
 cairn-ai = { workspace = true }

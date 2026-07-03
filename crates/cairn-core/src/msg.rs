@@ -417,6 +417,28 @@ pub enum AppEvent {
         /// failure, or the file being on a non-local backend).
         error: bool,
     },
+    /// [`AppEffect::MountArchive`] finished: the archive was indexed and mounted as a fresh,
+    /// ephemeral connection in the registry (RFC-0013). The reducer pushes the pane's pre-mount
+    /// `(conn, cwd)` onto its `mount_stack` and navigates it into `root` (mirroring the
+    /// `ConnectionOpened` success path) — see [`crate::PaneState::mount_stack`].
+    ArchiveMounted {
+        /// The pane that requested the mount (from [`AppEffect::MountArchive`]).
+        pane: Side,
+        /// The freshly-minted connection id for the mounted `ArchiveVfs`.
+        conn: ConnectionId,
+        /// The directory to navigate the pane to (the archive root in v1).
+        root: VfsPath,
+    },
+    /// [`AppEffect::MountArchive`] failed: the source entry has no local path (a `.zip` on a
+    /// remote backend — copy it to a local pane first), the file was not a recognized tar/zip
+    /// archive, indexing hit a security cap, or the binary was built without the `archive`
+    /// feature. No connection is created; the reducer just shows `message`.
+    ArchiveMountFailed {
+        /// The pane that requested the mount.
+        pane: Side,
+        /// Secret-free, redacted error message.
+        message: String,
+    },
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -746,6 +768,26 @@ pub enum AppEffect {
         /// The connection the file lives on.
         conn: ConnectionId,
         /// The file to edit.
+        path: VfsPath,
+    },
+    /// Mount `path` (an entry classified [`crate::FileKind::Archive`] by
+    /// [`AppEffect::SniffFile`]) as a read-only archive backend and open it in `pane`
+    /// (RFC-0013, `docs/adr/0012-archive-mount-model.md`).
+    ///
+    /// The runtime resolves `Vfs::local_path(&path)` first (via `spawn_blocking`); `None` (the
+    /// source entry is not on a local backend) fails cleanly with
+    /// [`AppEvent::ArchiveMountFailed`] and touches nothing else. On `Some(local_path)` it builds
+    /// `ArchiveVfs::open`, mints a fresh [`ConnectionId`], registers the result in the
+    /// [`VfsRegistry`](cairn_vfs::VfsRegistry), and reports back via
+    /// [`AppEvent::ArchiveMounted`]. Gated on the binary's `archive` feature; without it, the
+    /// runner reports a clean "archive support not built in" failure rather than failing to
+    /// compile.
+    MountArchive {
+        /// The pane that will be navigated into the mounted archive.
+        pane: Side,
+        /// The connection the archive file itself lives on.
+        conn: ConnectionId,
+        /// The archive file's path on `conn`.
         path: VfsPath,
     },
 }

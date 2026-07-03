@@ -36,6 +36,14 @@ use tokio_util::sync::CancellationToken;
 const LEFT: ConnectionId = ConnectionId(1);
 const RIGHT: ConnectionId = ConnectionId(2);
 
+/// First [`ConnectionId`] minted for an ephemeral archive mount (RFC-0013,
+/// `docs/adr/0012-archive-mount-model.md`). Deliberately far above anything
+/// [`ConnectionCoordinator`] could plausibly assign (it starts at `RIGHT.0 + 1 = 3` and grows by
+/// one per real connection discovered/saved) — archive mounts live in a disjoint, monotonically
+/// increasing id space of their own for the process lifetime, so the two counters can never
+/// collide without needing to consult each other's claimed-id sets.
+const ARCHIVE_CONN_ID_BASE: u64 = 1_000_000_000;
+
 /// UI progress granularity: the transfer callback notifies the status bar at most every this many
 /// bytes. 256 KiB balances update frequency against channel pressure; progress is sent best-effort
 /// (`try_send`, dropped when the channel is full), so there is no back-pressure on the transfer.
@@ -292,6 +300,7 @@ async fn run_async() -> anyhow::Result<()> {
     // event loop starts.
     let empty_descriptors: HashMap<ConnectionId, ConnectionDescriptor> = HashMap::new();
     let mut startup_in_flight: HashSet<ConnectionId> = HashSet::new();
+    let mut startup_next_archive_conn_id: u64 = ARCHIVE_CONN_ID_BASE;
     for effect in initial {
         dispatch(
             effect,
@@ -306,6 +315,7 @@ async fn run_async() -> anyhow::Result<()> {
             &vault_ctx,
             &empty_descriptors,
             &mut startup_in_flight,
+            &mut startup_next_archive_conn_id,
         );
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
@@ -796,6 +806,11 @@ async fn event_loop(
     // before the first open completes) is dropped here so only one backend connection is
     // established. The id is removed when the matching ConnectionOpened event arrives.
     let mut open_connection_in_flight: HashSet<ConnectionId> = HashSet::new();
+    // Monotonic id source for ephemeral archive-mount connections (RFC-0013). Lives for the whole
+    // event-loop lifetime (unlike the per-transfer/session maps above) because, unlike those, there
+    // is no "done" event that could reclaim an id for reuse — each mount is a genuinely new,
+    // permanently-registered (for the session) connection. See `ARCHIVE_CONN_ID_BASE`.
+    let mut next_archive_conn_id: u64 = ARCHIVE_CONN_ID_BASE;
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -864,6 +879,7 @@ async fn event_loop(
                 vault_ctx,
                 &descriptor_map,
                 &mut open_connection_in_flight,
+                &mut next_archive_conn_id,
             );
         }
     }
@@ -1060,6 +1076,7 @@ fn dispatch(
     vault_ctx: &VaultContext,
     descriptor_map: &HashMap<ConnectionId, ConnectionDescriptor>,
     open_connection_in_flight: &mut HashSet<ConnectionId>,
+    next_archive_conn_id: &mut u64,
 ) {
     match effect {
         AppEffect::List {
@@ -1357,6 +1374,19 @@ fn dispatch(
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
                 let ev = run_sniff_file_effect(&registry, pane, conn, path).await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::MountArchive { pane, conn, path } => {
+            // Minted here, not by the reducer: `ConnectionId` allocation is the coordinator's job
+            // (RFC-0011) everywhere else, and this is the runtime-side equivalent for the one kind
+            // of connection that isn't enumerated at startup. See `ARCHIVE_CONN_ID_BASE`.
+            let new_conn = ConnectionId(*next_archive_conn_id);
+            *next_archive_conn_id += 1;
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let ev = run_mount_archive_effect(&registry, pane, conn, path, new_conn).await;
                 let _ = event_tx.send(ev).await;
             });
         }
@@ -1659,6 +1689,75 @@ async fn run_sniff_file_effect(
         kind,
         prefetch: bytes::Bytes::from(buf),
     }
+}
+
+/// Mount `path` (already classified [`cairn_core::FileKind::Archive`] by the sniff) as a read-only
+/// [`cairn_backend_archive::ArchiveVfs`] and register it as `new_conn`, or report a clean failure
+/// (RFC-0013, `docs/adr/0012-archive-mount-model.md`).
+///
+/// `Vfs::local_path` is resolved first, off the render path: a `None` result (a remote backend, or
+/// a path that doesn't resolve to a real local file) refuses cleanly — v1 requires the archive
+/// itself to already be on a local pane; auto-staging a remote archive to a temp file is deferred
+/// (see the RFC's "Deferred" section). Indexing (`ArchiveVfs::open`) is CPU/IO-bound sync work that
+/// runs in its own `spawn_blocking` inside that call, so nothing here blocks the runtime either.
+async fn run_mount_archive_effect(
+    registry: &VfsRegistry,
+    pane: Side,
+    conn: ConnectionId,
+    path: VfsPath,
+    new_conn: ConnectionId,
+) -> AppEvent {
+    let Some(vfs) = registry.get(conn).await else {
+        return AppEvent::ArchiveMountFailed {
+            pane,
+            message: "connection unavailable".to_owned(),
+        };
+    };
+    let real_path = {
+        let (vfs, path) = (vfs.clone(), path.clone());
+        match tokio::task::spawn_blocking(move || vfs.local_path(&path)).await {
+            Ok(Some(p)) => p,
+            _ => {
+                return AppEvent::ArchiveMountFailed {
+                    pane,
+                    message: "Copy the archive to a local pane to browse it".to_owned(),
+                };
+            }
+        }
+    };
+    match open_archive(new_conn, real_path).await {
+        Ok(archive_vfs) => {
+            registry.insert(new_conn, archive_vfs).await;
+            AppEvent::ArchiveMounted {
+                pane,
+                conn: new_conn,
+                root: VfsPath::root(),
+            }
+        }
+        Err(e) => AppEvent::ArchiveMountFailed {
+            pane,
+            message: e.redacted().to_string(),
+        },
+    }
+}
+
+/// Build the real [`cairn_backend_archive::ArchiveVfs`] (behind the `archive` feature).
+#[cfg(feature = "archive")]
+async fn open_archive(conn: ConnectionId, path: PathBuf) -> Result<Arc<dyn Vfs>, VfsError> {
+    let vfs = cairn_backend_archive::ArchiveVfs::open(conn, path).await?;
+    Ok(Arc::new(vfs))
+}
+
+/// Lean-build stand-in: reports "not built in" instead of failing to compile without the
+/// `archive` feature. Mirrors `ConnectionOpener::open_docker`/`open_k8s`'s feature-gated pattern
+/// in `crates/cairn/src/connect/mod.rs`.
+#[cfg(not(feature = "archive"))]
+async fn open_archive(_conn: ConnectionId, _path: PathBuf) -> Result<Arc<dyn Vfs>, VfsError> {
+    Err(VfsError::Backend {
+        code: "archive_not_built".to_owned(),
+        msg: "archive support not built into this binary".to_owned(),
+        retryable: false,
+    })
 }
 
 /// Read buffer size for the pager stream (matches the transfer engine's chunk size).

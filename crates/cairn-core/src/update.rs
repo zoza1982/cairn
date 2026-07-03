@@ -3,9 +3,9 @@
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
 use crate::state::{
     ActiveTransfer, AppState, ChoiceStatus, ConnectionFormStage, ConnectionKind, FieldValue,
-    FileKind, Listing, LogViewerStatus, MaskedInput, Overlay, PagerMode, PagerStatus, PromptKind,
-    QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId, PAGER_HEX_ROW_BYTES,
-    PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
+    FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame, Overlay, PagerMode, PagerStatus,
+    PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId,
+    PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
 use bytes::Bytes;
 use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, VfsPath};
@@ -3140,7 +3140,17 @@ fn leave_dir(state: &mut AppState) -> Vec<AppEffect> {
     let parent = state.pane(side).cwd.parent();
     match parent {
         Some(dir) => navigate(state, side, dir),
-        None => Vec::new(),
+        // At the VFS root: if this pane descended into a mounted archive (RFC-0013), pop back to
+        // the connection/directory it came from instead of the previous no-op. Generalizes to
+        // nested archives — each mount pushed its own frame, so popping always returns exactly one
+        // level up. A pane that never mounted anything has an empty stack and this is still a no-op.
+        None => match state.pane_mut(side).mount_stack.pop() {
+            Some(frame) => {
+                state.pane_mut(side).conn = frame.conn;
+                navigate(state, side, frame.cwd)
+            }
+            None => Vec::new(),
+        },
     }
 }
 
@@ -3389,6 +3399,10 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                         prefetch,
                     )
                 }
+                // RFC-0013: `Enter` on a recognized tar/zip archive mounts it as a fresh,
+                // ephemeral connection rather than opening the pager/editor — see
+                // `AppEffect::MountArchive` and its runner in `crates/cairn/src/app.rs`.
+                FileKind::Archive(_format) => vec![AppEffect::MountArchive { pane, conn, path }],
             }
         }
         AppEvent::SniffFailed { message } => {
@@ -3407,6 +3421,22 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 // for the entire duration, so no user action can change `state.focus` meanwhile.
                 reload(state, state.focus)
             }
+        }
+        AppEvent::ArchiveMounted { pane, conn, root } => {
+            // Push the pane's pre-mount origin so a later `..`-out (see `leave_dir`) can restore
+            // it. Nested mounts stack correctly since this is a `Vec`, not a single slot.
+            let frame = MountFrame {
+                conn: state.pane(pane).conn,
+                cwd: state.pane(pane).cwd.clone(),
+            };
+            state.pane_mut(pane).mount_stack.push(frame);
+            state.status = Some("Mounted archive — Leave at the top to unmount".to_owned());
+            state.pane_mut(pane).conn = conn;
+            navigate(state, pane, root)
+        }
+        AppEvent::ArchiveMountFailed { pane: _, message } => {
+            state.status = Some(format!("error: {message}"));
+            Vec::new()
         }
         AppEvent::PagerChunk { id, bytes } => {
             if let Some(Overlay::Pager {
@@ -6922,6 +6952,130 @@ mod tests {
             panic!("pager overlay must be open");
         };
         assert_eq!(*mode, PagerMode::Hex);
+    }
+
+    // ── RFC-0013: archive mount + `..`-out ────────────────────────────────────────────────────
+
+    /// `Enter` on an entry the sniff classifies as an archive mounts it (`MountArchive`) instead
+    /// of routing to the editor/pager — no overlay opens here; the mount effect's runner drives
+    /// the rest via `AppEvent::ArchiveMounted`.
+    #[test]
+    fn file_sniffed_archive_emits_mount_archive() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("bundle.zip", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Enter));
+        let AppEffect::SniffFile { pane, conn, path } = fx.into_iter().next().unwrap() else {
+            panic!("expected SniffFile");
+        };
+        let expected_path = path.clone();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::FileSniffed {
+                pane,
+                conn,
+                path,
+                kind: FileKind::Archive(crate::state::ArchiveFormat::Zip),
+                prefetch: Bytes::from_static(b"PK\x03\x04"),
+            }),
+        );
+        assert!(
+            matches!(
+                &fx[..],
+                [AppEffect::MountArchive { pane: p, conn: c, path: pa }]
+                    if *p == pane && *c == conn && *pa == expected_path
+            ),
+            "Archive FileSniffed must emit MountArchive, got {fx:?}"
+        );
+        assert!(s.overlay.is_none());
+    }
+
+    /// A successful mount pushes the pane's pre-mount `(conn, cwd)` onto `mount_stack` and
+    /// navigates the pane into the new connection at its root.
+    #[test]
+    fn archive_mounted_pushes_frame_and_navigates_into_it() {
+        let mut s = state();
+        let origin_conn = s.pane(Side::Left).conn;
+        let origin_cwd = s.pane(Side::Left).cwd.clone();
+        let new_conn = ConnectionId(42);
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::ArchiveMounted {
+                pane: Side::Left,
+                conn: new_conn,
+                root: VfsPath::root(),
+            }),
+        );
+        assert!(matches!(&fx[..], [AppEffect::List { conn, .. }] if *conn == new_conn));
+        assert_eq!(s.pane(Side::Left).conn, new_conn);
+        assert_eq!(s.pane(Side::Left).cwd, VfsPath::root());
+        assert_eq!(s.pane(Side::Left).mount_stack.len(), 1);
+        let frame = &s.pane(Side::Left).mount_stack[0];
+        assert_eq!(frame.conn, origin_conn);
+        assert_eq!(frame.cwd, origin_cwd);
+    }
+
+    /// Leaving from the mounted archive's root pops the frame and restores the origin connection
+    /// and directory — the end-to-end `..`-out described in RFC-0013.
+    #[test]
+    fn leave_dir_at_archive_root_pops_mount_frame_and_restores_origin() {
+        let mut s = AppState::new(
+            ConnectionId(1),
+            ConnectionId(2),
+            VfsPath::parse("/work").unwrap(),
+        );
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("bundle.zip", EntryKind::File)],
+        );
+        let origin_conn = s.pane(Side::Left).conn;
+
+        let new_conn = ConnectionId(77);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ArchiveMounted {
+                pane: Side::Left,
+                conn: new_conn,
+                root: VfsPath::root(),
+            }),
+        );
+        assert_eq!(s.pane(Side::Left).conn, new_conn);
+
+        // At the archive's root, Leave must pop the frame rather than no-op.
+        let fx = update(&mut s, Msg::Action(Action::Leave));
+        assert!(
+            !fx.is_empty(),
+            "leaving a mounted archive's root must re-list the origin"
+        );
+        assert_eq!(s.pane(Side::Left).conn, origin_conn);
+        assert_eq!(s.pane(Side::Left).cwd.as_str(), "/work");
+        assert!(
+            s.pane(Side::Left).mount_stack.is_empty(),
+            "the frame must be consumed, not left dangling"
+        );
+    }
+
+    /// A failed mount (no local path, unrecognized archive, or a security cap) leaves the pane
+    /// exactly where it was and only updates the status line.
+    #[test]
+    fn archive_mount_failed_sets_status_without_navigating() {
+        let mut s = state();
+        let before_conn = s.pane(Side::Left).conn;
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::ArchiveMountFailed {
+                pane: Side::Left,
+                message: "Copy the archive to a local pane to browse it".to_owned(),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert_eq!(s.pane(Side::Left).conn, before_conn);
+        assert!(s.pane(Side::Left).mount_stack.is_empty());
+        assert!(s.status.unwrap().contains("Copy the archive"));
     }
 
     /// `SniffFailed` shows a redacted status message and opens no overlay.

@@ -48,6 +48,9 @@ pub enum Scheme {
     Docker,
     /// Kubernetes.
     Kubernetes,
+    /// A read-only mount of a local `.tar`/`.zip` archive, browsed as a directory tree
+    /// (RFC-0013). Ephemeral: minted when a pane descends into an archive, not user-configured.
+    Archive,
     /// A scheme provided by a third-party plugin, identified by name.
     Plugin(SmolStr),
 }
@@ -64,6 +67,7 @@ impl Scheme {
             Self::Azure => "azure",
             Self::Docker => "docker",
             Self::Kubernetes => "k8s",
+            Self::Archive => "archive",
             Self::Plugin(name) => name.as_str(),
         }
     }
@@ -94,6 +98,7 @@ mod tests {
     fn scheme_strings() {
         assert_eq!(Scheme::S3.as_str(), "s3");
         assert_eq!(Scheme::Kubernetes.as_str(), "k8s");
+        assert_eq!(Scheme::Archive.as_str(), "archive");
         assert_eq!(Scheme::Plugin(SmolStr::new("ftp")).as_str(), "ftp");
     }
 
