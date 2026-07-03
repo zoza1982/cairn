@@ -6,10 +6,10 @@ expression: frame
 │>  src/           ││>  src/           │
 │   docs/          ││   docs/          │
 ┌ Open connection (showing hidden) ────┐
-│  📌  local: /                         │
+│  [pinned] local: /                   │
 │> ssh: bastion                        │
 │  [auto] docker: (default) [hidden]   │
-│[Ctrl-N] New  [t] Test  [P] Pin  [H] H│
+│[Esc] Close  [Ctrl-N] New  [t] Test   │
 └──────────────────────────────────────┘
 │                  ││                  │
 └────── sort: name ┘└────── sort: name ┘

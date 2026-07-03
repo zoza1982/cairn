@@ -12,10 +12,10 @@ expression: frame
 │                                      ││                                      │
 │                                      ││                                      │
 │           ┌ Open connection (showing hidden) ────────────────────┐           │
-│           │  📌  local: /                                         │           │
+│           │  [pinned] local: /                                   │           │
 │           │> ssh: bastion                                        │           │
 │           │  [auto] docker: (default) [hidden]                   │           │
-│           │[Ctrl-N] New  [t] Test  [P] Pin  [H] Hide  [S] Show hi│           │
+│           │[Esc] Close  [Ctrl-N] New  [t] Test  [P] Pin  [H] Hide│           │
 │           └──────────────────────────────────────────────────────┘           │
 │                                      ││                                      │
 │                                      ││                                      │

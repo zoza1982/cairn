@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SSH/S3/GCS/Azure probe performs genuine credential resolution + a network handshake; Docker
   additionally pings the daemon) but never mounts the result, and a vault-locked entry reports
   "needs unlock" instead of forcing the vault overlay open. `P` pins an entry to the top of the
-  list; `H` hides it from the default view — both persist to a new `[discovery].pinned`/`.hidden`
-  entry in `cairn.toml` (atomic write). `S` toggles showing hidden entries for the current session
+  list; `H` hides it from the default view — both persist to the existing (RFC-0011 P3)
+  `[discovery].pinned`/`.hidden` config fields; what's new is the switcher UI writing to them, not
+  the fields themselves. `S` toggles showing hidden entries for the current session
   so a hidden entry can always be found again and un-hidden (hiding is never a one-way trap).
   Pin/hide apply to any switcher entry (built-in, saved, or auto-discovered), not just discovered
   ones. Renaming a discovered entry is deferred (see the RFC's P6 section for why).

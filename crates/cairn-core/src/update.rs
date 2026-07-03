@@ -4247,6 +4247,31 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                     } else {
                         format!("Unpinned {label}")
                     });
+                    // The sort above can silently retarget the switcher's cursor (a *positional*
+                    // index into the visible subset) at a different entry than the one the user
+                    // just toggled — e.g. pinning the highlighted last entry floats it to the
+                    // front, but the cursor stays put and now highlights whatever slid into that
+                    // slot. Re-point it at `conn`'s new position so a follow-up
+                    // Enter/e/d/t/P/H acts on the entry the user actually just acted on, not a
+                    // different one that happens to occupy the old cursor position.
+                    if let Some(Overlay::Connections {
+                        cursor,
+                        show_hidden,
+                    }) = &mut state.overlay
+                    {
+                        let visible = crate::state::visible_connection_indices(
+                            &state.connections,
+                            *show_hidden,
+                        );
+                        if let Some(new_cursor) = visible.iter().position(|&raw_idx| {
+                            state
+                                .connections
+                                .get(raw_idx)
+                                .is_some_and(|c| c.conn == conn)
+                        }) {
+                            *cursor = new_cursor;
+                        }
+                    }
                 }
                 Err(msg) => {
                     state.status = Some(format!("Failed to update pin: {msg}"));
@@ -10427,6 +10452,36 @@ mod p6_connection_polish_tests {
         assert!(s.connections[0].pinned);
         assert_eq!(s.connections[0].conn, ConnectionId(5));
         assert!(s.status.as_deref().is_some_and(|m| m.contains("Pinned")));
+    }
+
+    /// Regression test for a P6 gate finding: pinning an entry that isn't already at the front
+    /// reorders `state.connections`, and the switcher's cursor (a *positional* index) must follow
+    /// the pinned entry to its new slot — otherwise the highlight silently jumps onto whatever
+    /// entry slid into the old cursor position, so a subsequent Enter/e/d/t/P/H acts on the wrong
+    /// connection (a delete could remove the wrong saved profile).
+    #[test]
+    fn connection_pin_set_ok_moves_the_cursor_to_follow_the_pinned_entry() {
+        let mut s = state_with_three_choices();
+        // Put the cursor on the entry about to be pinned (raw index 2, conn5 "s3: prod").
+        set_cursor(&mut s, 2);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionPinSet {
+                conn: ConnectionId(5),
+                pinned: true,
+                result: Ok(()),
+            }),
+        );
+        // conn5 floated to raw index 0; the cursor must follow it there, not stay at 2 (which
+        // would now highlight whatever slid into that slot instead).
+        assert_eq!(s.connections[0].conn, ConnectionId(5));
+        let Some(Overlay::Connections { cursor, .. }) = s.overlay else {
+            panic!("expected Overlay::Connections");
+        };
+        assert_eq!(
+            cursor, 0,
+            "cursor must track the pinned entry (conn 5) to its new position"
+        );
     }
 
     #[test]

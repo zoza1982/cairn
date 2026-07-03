@@ -14,7 +14,7 @@ expression: frame
 │           ┌ Open connection ─────────────────────────────────────┐           │
 │           │> local: /                                            │           │
 │           │  local: ~/work                                       │           │
-│           │[Ctrl-N] New  [t] Test  [P] Pin  [H] Hide  [S] Show hi│           │
+│           │[Esc] Close  [Ctrl-N] New  [t] Test  [P] Pin  [H] Hide│           │
 │           └──────────────────────────────────────────────────────┘           │
 │                                      ││                                      │
 │                                      ││                                      │

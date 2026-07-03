@@ -440,9 +440,19 @@ impl Config {
     /// Serialize and write the config to `path` (creating parent directories), atomically.
     ///
     /// Writes to a temp file in the same directory, fsyncs it, then renames it into place —
-    /// mirroring `cairn-vault`'s `atomic_write`. A reader (or a crash mid-write) never observes a
-    /// partially-written `cairn.toml`; frequent small writes (RFC-0011 P6 pin/hide toggles,
-    /// connection add/edit/delete) never risk corrupting the file a user hand-edits.
+    /// mirroring `cairn-vault`'s `atomic_write`. This guards against exactly one failure mode: a
+    /// reader (or a crash mid-write) never observes a *torn*, partially-written `cairn.toml` — the
+    /// rename is a single filesystem operation, so the file is either the old contents or the new
+    /// ones, never a mix.
+    ///
+    /// It does **not** guard against two *concurrent writers* racing each other (the caller must
+    /// serialize those itself — `crates/cairn/src/app.rs`'s `CONFIG_WRITE_LOCK` does this for the
+    /// effect runner), and it does **not** preserve comments or fields this build doesn't know
+    /// about: the whole file is regenerated from this struct's serde model on every save, so a
+    /// hand-added comment or a newer field only a future Cairn version understands is silently
+    /// dropped on the next save from this build. A follow-up to migrate to `toml_edit` for
+    /// in-place, comment-preserving mutation (at least for the small, frequent `[discovery]`
+    /// pin/hide toggles) is tracked but not implemented here.
     ///
     /// # Errors
     /// Serialization or I/O errors.

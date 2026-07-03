@@ -402,6 +402,29 @@ async fn register_connections(
     coordinator.run(registry, &ctx, &HashMap::new()).await
 }
 
+/// Process-wide lock serializing every `cairn.toml` read-modify-write cycle.
+///
+/// `run_save_connection_effect`, `run_delete_connection_effect`, and
+/// `run_set_discovery_flag_effect` (RFC-0011 P6 pin/hide) each do `Config::load` → mutate →
+/// `Config::save` with no coordination between them. Pin/hide are one-keystroke, rapid-fire
+/// actions in the switcher, so two of these effects can easily run concurrently on the
+/// multi-thread runtime; without a lock they interleave and the second `save` silently clobbers
+/// the first's change (in-memory state shows it applied, the file on disk does not) even though
+/// each individual write is atomic (`Config::save`'s temp-file + rename only makes *one* write
+/// safe against a torn file — it says nothing about *two* writers racing each other). All of
+/// these effects target the same file, so a single process-wide lock is the right granularity:
+/// there is only ever one writer for the whole file at a time.
+static CONFIG_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// Acquire the process-wide config-write lock. Hold the returned guard for the entire
+/// load→mutate→save cycle; drop it only once the save has completed (or failed).
+async fn config_write_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    CONFIG_WRITE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 /// Convert a [`cairn_core::forms::ProfileData`] into a [`cairn_config::ConnectionProfile`].
 ///
 /// The mapping is one-to-one: both structs share the same field names and types (the core
@@ -427,6 +450,9 @@ async fn run_save_connection_effect(
     profile: cairn_core::forms::ProfileData,
     is_edit: bool,
 ) -> AppEvent {
+    // Held for the whole load→mutate→save cycle below — see `CONFIG_WRITE_LOCK`'s doc.
+    let _guard = config_write_lock().await;
+
     let Some(config_path) = cairn_config::default_config_path() else {
         return AppEvent::ConnectionOpFailed {
             message: "Cannot determine config file path".to_owned(),
@@ -508,6 +534,10 @@ async fn run_delete_connection_effect(
             tracing::warn!(error = %e, %cred_id, "failed to remove vault credential on delete; proceeding");
         }
     }
+
+    // Held for the whole load→mutate→save cycle below — see `CONFIG_WRITE_LOCK`'s doc. The vault
+    // removal above is a separate resource (the broker, not `cairn.toml`) and does not need it.
+    let _guard = config_write_lock().await;
 
     let Some(config_path) = cairn_config::default_config_path() else {
         return AppEvent::ConnectionOpFailed {
@@ -2531,7 +2561,22 @@ async fn run_set_discovery_flag_effect(
     let Some(config_path) = cairn_config::default_config_path() else {
         return Err("cannot determine config file path".to_owned());
     };
-    set_discovery_flag_at_path(&config_path, flag, key_str, set)
+    set_discovery_flag_at_path_locked(&config_path, flag, key_str, set).await
+}
+
+/// The locked core of [`run_set_discovery_flag_effect`]: acquires [`CONFIG_WRITE_LOCK`] for the
+/// entire load→mutate→save cycle, then delegates to [`set_discovery_flag_at_path`]. Split out
+/// (taking an explicit `&Path`) so a test can exercise the actual concurrency-safety guarantee —
+/// two of these racing must never lose one's update — against a temp file instead of the real
+/// platform config path.
+async fn set_discovery_flag_at_path_locked(
+    config_path: &Path,
+    flag: DiscoveryFlag,
+    key_str: &str,
+    set: bool,
+) -> Result<(), String> {
+    let _guard = config_write_lock().await;
+    set_discovery_flag_at_path(config_path, flag, key_str, set)
 }
 
 /// The testable core of [`run_set_discovery_flag_effect`], split out so unit tests can point it
@@ -6611,5 +6656,55 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("cairn.toml")]);
+    }
+
+    /// P6 gate fix: two config-flag writes racing on the same file must not lose an update. Before
+    /// `CONFIG_WRITE_LOCK`, `Config::load → mutate → save` had no coordination, so two concurrent
+    /// pin/hide toggles could interleave (both load the pre-change file, each save clobbers the
+    /// other's in-memory mutation) even though each individual `save` is atomic — atomicity only
+    /// guards against a *torn* file, not against *two* writers racing each other. Runs on a real
+    /// multi-thread runtime so the two tasks can genuinely execute concurrently, not just be
+    /// interleaved cooperatively on one thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_discovery_flag_writes_do_not_lose_an_update() {
+        let dir = tempfile_dir();
+        let path = dir.path().join("cairn.toml");
+        cairn_config::Config::default().save(&path).unwrap();
+
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let a = tokio::spawn(async move {
+            set_discovery_flag_at_path_locked(
+                &path_a,
+                DiscoveryFlag::Pinned,
+                "docker:socket:default",
+                true,
+            )
+            .await
+        });
+        let b = tokio::spawn(async move {
+            set_discovery_flag_at_path_locked(
+                &path_b,
+                DiscoveryFlag::Hidden,
+                "kube:kubeconfig",
+                true,
+            )
+            .await
+        });
+        let (ra, rb) = tokio::join!(a, b);
+        ra.unwrap().unwrap();
+        rb.unwrap().unwrap();
+
+        let loaded = cairn_config::Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.discovery.pinned,
+            vec!["docker:socket:default".to_owned()],
+            "the first task's write must have survived the race"
+        );
+        assert_eq!(
+            loaded.discovery.hidden,
+            vec!["kube:kubeconfig".to_owned()],
+            "the second task's write must have survived the race too — neither may clobber the other"
+        );
     }
 }

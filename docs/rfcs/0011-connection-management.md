@@ -368,19 +368,26 @@ The remaining three:
     (the switcher's "k8s" entry represents the whole kubeconfig, not one context) and is deferred,
     pending `kube-staff-engineer` design input.
 - **Discovered-entry pin/hide** — `P`/`H` in the switcher toggle `ConnectionChoice::pinned`/`hidden`,
-  persisted to `[discovery].pinned`/`.hidden` in `cairn.toml` via `AppEffect::SetConnectionPinned`/
-  `SetConnectionHidden` (atomic write — `Config::save` now writes through a temp-file + rename,
-  matching `cairn-vault`'s `atomic_write`, a fix that also benefits the pre-existing
-  `SaveConnection`/`DeleteConnection` writes). Pin/hide are **not** restricted to `AutoDiscovered`
-  entries — matching the `[discovery]` overlay's existing scope (already documented as applying to
-  "ALL descriptor types: builtin, saved, discovered"), any switcher entry can be pinned or hidden.
-  Hiding was changed from *dropping* a matching descriptor entirely (P3 behavior) to *marking* it
-  (`ConnectionChoice::hidden = true`) while keeping it enumerated — a drop would make a hidden entry
-  unrecoverable from the UI. `S` toggles a this-session-only, unpersisted "show hidden" view
-  (`Overlay::Connections::show_hidden`) that reveals hidden entries so the same `H` key can un-hide
-  them — hiding is never a one-way trap. The switcher's cursor indexes the *visible* subset (see
-  `cairn_core::visible_connection_indices`), shared between the reducer and the renderer so the two
-  can never disagree about which row a given cursor position refers to.
+  persisted via `AppEffect::SetConnectionPinned`/`SetConnectionHidden` to the *existing* (P3)
+  `[discovery].pinned`/`.hidden` fields in `cairn.toml` — P6 adds the switcher UI that writes to
+  them, not the fields themselves. Writes are atomic (`Config::save` writes through a temp-file +
+  rename, matching `cairn-vault`'s `atomic_write` — a fix that also benefits the pre-existing
+  `SaveConnection`/`DeleteConnection` writes) *and* serialized: every config load→mutate→save cycle
+  (save/delete/pin/hide) now holds a process-wide `CONFIG_WRITE_LOCK` for the whole cycle, so two
+  rapid pin/hide presses (or a pin racing a delete) can no longer interleave and silently clobber
+  one another's change — atomicity alone only guards against a *torn* file, not two writers racing.
+  Pin/hide are **not** restricted to `AutoDiscovered` entries — matching the `[discovery]` overlay's
+  existing scope (already documented as applying to "ALL descriptor types: builtin, saved,
+  discovered"), any switcher entry can be pinned or hidden. Hiding was changed from *dropping* a
+  matching descriptor entirely (P3 behavior) to *marking* it (`ConnectionChoice::hidden = true`)
+  while keeping it enumerated — a drop would make a hidden entry unrecoverable from the UI. `S`
+  toggles a this-session-only, unpersisted "show hidden" view (`Overlay::Connections::show_hidden`)
+  that reveals hidden entries so the same `H` key can un-hide them — hiding is never a one-way trap.
+  The switcher's cursor indexes the *visible* subset (see `cairn_core::visible_connection_indices`),
+  shared between the reducer and the renderer so the two can never disagree about which row a given
+  cursor position refers to; pinning also re-points the cursor at the toggled entry's new
+  post-reorder position (a gate finding — the initial cut left the cursor at its old positional
+  index, silently retargeting the highlight onto whichever entry slid into that slot).
 - **Discovered-entry rename** — **deferred.** Per this RFC's own guidance ("if that's a larger
   change than fits cleanly, implement pin+hide fully and defer rename with a tracked note"): an
   alias needs a new `[discovery].aliases: HashMap<String, String>` config field (key → display
@@ -393,6 +400,31 @@ The remaining three:
   *automatic* background sweep (periodically re-checking `NeedsOpen`/`Unreachable` entries without
   user action) does not exist today and is out of scope here — deferred as a follow-up, not
   gold-plated into this PR.
+
+### P6 tracked follow-ups (not implemented in this PR)
+
+Raised in the P6 gate review (`bug-bot` + `code-review`); intentionally deferred rather than
+gold-plating this PR:
+
+- **`toml_edit` migration** for comment-preserving, in-place `[discovery]` mutation — `Config::save`
+  regenerates the whole file from the serde model on every write, so a hand-added comment or a
+  field only a newer Cairn build understands is silently dropped. Worth doing at least for the
+  small, frequent pin/hide toggles even if the rest of `Config::save` stays as-is.
+- Revealing hidden entries via `S` can shift the cursor to a different row than the one visually
+  under it (cosmetic — the cursor is re-clamped for bounds, not re-targeted to "the same entry").
+- `Action::TestConnection`'s `Ready`-is-a-no-op short-circuit never re-probes a connection that was
+  reachable a while ago but has since gone away; it always reports the stale "already connected".
+- A `ConnectionId` reused across a re-enumeration (e.g. a `Refresh` that races an in-flight probe)
+  could apply a `ConnectionTested`/`ConnectionOpened` result to the *new* descriptor that now holds
+  that id — an epoch/generation tag on `ConnectionId` (or on the descriptor map) would close this.
+- `Config::load`/`save` run blocking `std::fs` calls directly on the async runtime instead of via
+  `spawn_blocking` — consistent with the pre-existing `run_save_connection_effect`/
+  `run_delete_connection_effect`, but worth revisiting together.
+- The Kubernetes test-connection probe (see the known limitation above) can over-report "reachable"
+  since `KubeRsOps::new()`/`new_incluster()` never touch the network.
+- A transient per-row "Testing…" status while a probe is in flight (today the status line shows it
+  process-wide, not attached to the specific row) would make concurrent-feeling multi-entry testing
+  clearer.
 
 ### Companion ADRs (accepted as phases land)
 
