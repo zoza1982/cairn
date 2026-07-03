@@ -26,7 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry-count cap, path-traversal/absolute-path/UNC/drive-letter rejection, and inert (never
   followed) symlink/hardlink members. Compressed tar (`.tgz`/`.txz`/`.tbz2`/`.tzst`) is a follow-up
   (RFC-0013 P5). See RFC-0013 and ADR-0012.
->>>>>>> 7d88bd8 (feat(archive): RFC-0013 P4 — read-only tar + zip archive backend)
 
 - **Deterministic TUI snapshot testing.** A `scenarios` catalog in `cairn-tui` renders every screen
   (dual-pane, pager text/hex, log/AI-plan/transfer/connection/vault overlays, …) to a plain-text

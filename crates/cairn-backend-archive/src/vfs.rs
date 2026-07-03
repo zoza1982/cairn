@@ -166,8 +166,24 @@ impl Vfs for ArchiveVfs {
             // followed or read as if they were the linked-to content (RFC-0013 §Security).
             return Err(VfsError::Unsupported(Caps::READ));
         }
+        let declared = meta.size.unwrap_or(0);
+        // How many bytes we need decoded from the *start* of the member to satisfy this request:
+        // `read_member` always decodes from byte 0 and `apply_byte_range` slices afterward, so a
+        // ranged read must decode `offset + len` bytes; a read-to-end (`len: None`) or a full read
+        // needs the whole member. Clamped to the member's real length so we never try to decode past
+        // its end (fixes the earlier `offset + declared` over-estimate for `len: None`).
+        let wanted = match range {
+            Some(r) => match r.len {
+                Some(len) => r.offset.saturating_add(len),
+                None => declared,
+            },
+            None => declared,
+        }
+        .min(declared);
         let remaining = self.remaining_session_budget();
-        if remaining == 0 {
+        // Only the session cap being exhausted for a *non-empty* request is an error; a zero-byte
+        // read (empty member, or a zero-length range) trivially succeeds even at the cap.
+        if remaining == 0 && wanted > 0 {
             return Err(VfsError::Backend {
                 code: "archive_session_cap_reached".to_owned(),
                 msg:
@@ -176,13 +192,25 @@ impl Vfs for ArchiveVfs {
                 retryable: false,
             });
         }
-        let declared = meta.size.unwrap_or(0);
-        // How many bytes we need decoded from the start of the member to satisfy this request.
-        let wanted = match range {
-            Some(r) => r.offset.saturating_add(r.len.unwrap_or(declared)),
-            None => declared,
-        };
         let cap = wanted.min(ARCHIVE_PER_MEMBER_CAP).min(remaining);
+        // A *full-member* read (`range: None`, e.g. a copy-out through the transfer engine) that the
+        // caps would truncate must fail loudly rather than silently return a short buffer: otherwise
+        // extracting an over-cap member would produce a truncated file that even `VerifyPolicy::Size`
+        // accepts (it compares bytes-written to bytes-read, both short — see the transfer engine),
+        // i.e. silent data loss. `declared` is the member's authoritative content length by both the
+        // tar and zip formats, so `declared > cap` is exactly the truncation condition. A *ranged*
+        // read is a deliberate bounded window (the sniff's ~8 KiB prefix, a pager preview) and is
+        // honored up to the cap without erroring.
+        if range.is_none() && declared > cap {
+            return Err(VfsError::Backend {
+                code: "archive_member_too_large".to_owned(),
+                msg:
+                    "archive member exceeds the per-member/session read limit; extracting members \
+                      this large is a follow-up (streaming extraction, RFC-0013)"
+                        .to_owned(),
+                retryable: false,
+            });
+        }
         let ops = self.ops.clone();
         let path_owned = path.clone();
         let data = tokio::task::spawn_blocking(move || ops.read_member(&path_owned, cap))
@@ -268,5 +296,114 @@ mod tests {
         assert!(!caps.contains(Caps::WRITE));
         assert!(!caps.contains(Caps::DELETE));
         assert!(vfs.local_path(&VfsPath::root()).is_none());
+    }
+
+    /// Build a single-file zip and return an opened `ArchiveVfs` over it (kept alive by the returned
+    /// tempfile).
+    async fn zip_with(name: &str, content: &[u8]) -> (ArchiveVfs, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = tmp.reopen().unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            use std::io::Write as _;
+            zw.write_all(content).unwrap();
+            zw.finish().unwrap();
+        }
+        let vfs = ArchiveVfs::open(ConnectionId(1), tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        (vfs, tmp)
+    }
+
+    async fn read_all(vfs: &ArchiveVfs, path: &str, range: Option<ByteRange>) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut handle = vfs
+            .open_read(&VfsPath::parse(path).unwrap(), range)
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        handle.read_to_end(&mut out).await.unwrap();
+        out
+    }
+
+    /// A full read (`range: None`) of a normal member returns its entire content.
+    #[tokio::test]
+    async fn open_read_full_member_returns_all_bytes() {
+        let (vfs, _tmp) = zip_with("a.txt", b"hello, cairn archive").await;
+        assert_eq!(read_all(&vfs, "a.txt", None).await, b"hello, cairn archive");
+    }
+
+    /// A ranged read returns exactly the requested window — exercising `offset`+`len`, and `len:
+    /// None` (read-to-end) at a non-zero offset (the case whose `wanted` formula was fixed).
+    #[tokio::test]
+    async fn open_read_ranged_returns_the_window() {
+        let (vfs, _tmp) = zip_with("a.txt", b"0123456789").await;
+        // [3, 3+4) = "3456"
+        let mid = read_all(
+            &vfs,
+            "a.txt",
+            Some(ByteRange {
+                offset: 3,
+                len: Some(4),
+            }),
+        )
+        .await;
+        assert_eq!(mid, b"3456");
+        // offset 7, read to end = "789"
+        let tail = read_all(
+            &vfs,
+            "a.txt",
+            Some(ByteRange {
+                offset: 7,
+                len: None,
+            }),
+        )
+        .await;
+        assert_eq!(tail, b"789");
+    }
+
+    /// A *full* read of a member whose declared size exceeds the per-member cap must fail loudly with
+    /// `archive_member_too_large` rather than silently return a truncated buffer — otherwise a
+    /// copy-out through the transfer engine would produce a truncated file that size-verify accepts
+    /// (regression test for the silent-truncation data-loss bug). A hand-written tar header lets us
+    /// declare a huge size without writing the bytes.
+    #[tokio::test]
+    async fn open_read_full_over_cap_member_errors_not_truncates() {
+        use std::io::Write as _;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut f = tmp.reopen().unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_path("huge.bin").unwrap();
+            header.set_size(ARCHIVE_PER_MEMBER_CAP + 1); // just over the per-member cap
+            header.set_mode(0o644);
+            header.set_cksum();
+            f.write_all(header.as_bytes()).unwrap();
+            f.write_all(b"tiny").unwrap();
+        }
+        let vfs = ArchiveVfs::open(ConnectionId(1), tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        // Full read: must error, not truncate.
+        match vfs
+            .open_read(&VfsPath::parse("huge.bin").unwrap(), None)
+            .await
+        {
+            Err(VfsError::Backend { code, .. }) => assert_eq!(code, "archive_member_too_large"),
+            other => panic!("expected archive_member_too_large, got {:?}", other.is_ok()),
+        }
+        // A bounded ranged read of the same member is still honored (a deliberate window).
+        let head = read_all(
+            &vfs,
+            "huge.bin",
+            Some(ByteRange {
+                offset: 0,
+                len: Some(4),
+            }),
+        )
+        .await;
+        assert_eq!(head, b"tiny");
     }
 }
