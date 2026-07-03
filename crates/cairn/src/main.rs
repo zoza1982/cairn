@@ -32,6 +32,27 @@ fn main() -> ExitCode {
             print!("{}", cli::help_text());
             ExitCode::SUCCESS
         }
+        cli::Invocation::FrameDumpList => {
+            for scenario in cairn_tui::scenarios::all() {
+                println!("{:<24} {}", scenario.name, scenario.description);
+            }
+            ExitCode::SUCCESS
+        }
+        cli::Invocation::FrameDump { scenario, size } => {
+            let (w, h) = size;
+            match cairn_tui::scenarios::render_named(&scenario, w, h) {
+                Some(frame) => {
+                    print!("{frame}");
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!(
+                        "{APP_NAME}: unknown scenario '{scenario}' — try `{APP_NAME} --frame-dump-list`"
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+        }
         cli::Invocation::Unknown(arg) => {
             eprintln!("{APP_NAME}: unknown argument '{arg}'\n");
             print!("{}", cli::help_text());

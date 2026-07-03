@@ -170,6 +170,28 @@ explicitly in the PR — never silently.
 - Never write tests that require real cloud credentials to pass in CI; use mocks/local emulators
   (e.g. MinIO for S3-compatible, kind for k8s) in dedicated integration jobs.
 
+### Testing the TUI (never drive it interactively)
+
+The UI is deterministic text: `render(&AppState, &Theme) -> Buffer` is pure, so **never launch the
+app in a real terminal to check rendering** — you can't see it and it can't be asserted on. Instead:
+
+- **Logic** (keys → state) is tested in `cairn-core` with plain reducer unit tests — no terminal.
+- **Rendering** is tested in `cairn-tui` against ratatui's headless `TestBackend`. Screens are named
+  fixtures in `crates/cairn-tui/src/scenarios.rs` (the catalog is the source of truth for both the
+  snapshots and `--frame-dump`; keep adding to it so it approaches full overlay coverage). The
+  snapshot test renders each at **80×24 and 40×12** and diffs it against a checked-in `.snap` file
+  under `crates/cairn-tui/src/snapshots/`. Read those `.snap` files to *see* the exact ASCII frame
+  and fix a rendering bug from the diff alone.
+- After an **intentional** UI change, regenerate snapshots with `cargo insta accept` (or
+  `INSTA_UPDATE=always cargo test -p cairn-tui`) and review the diff before committing.
+- To **inspect any screen** without a TTY, run `cairn --frame-dump <scenario> [WxH]` (list them with
+  `cairn --frame-dump-list`). It prints one rendered frame to stdout.
+- When you add or change a screen, **add/adjust a scenario** so it's covered by both the snapshots
+  and `--frame-dump`. The scenario catalog is the single source of truth for both.
+- Genuine end-to-end terminal behavior that buffers can't capture (raw-mode/TTY handoff, e.g. the
+  `$EDITOR` suspend) needs a PTY/tmux harness — call it out explicitly rather than pretending a unit
+  test covers it.
+
 ## 9. Code style & safety
 
 - Rust stable, edition pinned via `rust-toolchain.toml`. Format with `rustfmt` (config in repo).

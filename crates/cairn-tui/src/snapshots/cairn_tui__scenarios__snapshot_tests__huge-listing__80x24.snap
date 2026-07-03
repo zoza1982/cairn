@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│   file04990                          ││Loading…                              │
+│   file04991                          ││                                      │
+│   file04992                          ││                                      │
+│   file04993                          ││                                      │
+│   file04994                          ││                                      │
+│   file04995                          ││                                      │
+│   file04996                          ││                                      │
+│   file04997                          ││                                      │
+│   file04998                          ││                                      │
+│   file04999                          ││                                      │
+│>  file05000                          ││                                      │
+│   file05001                          ││                                      │
+│   file05002                          ││                                      │
+│   file05003                          ││                                      │
+│   file05004                          ││                                      │
+│   file05005                          ││                                      │
+│   file05006                          ││                                      │
+│   file05007                          ││                                      │
+│   file05008                          ││                                      │
+│   file05009                          ││                                      │
+│   file05010                          ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 5001/10000   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy ·

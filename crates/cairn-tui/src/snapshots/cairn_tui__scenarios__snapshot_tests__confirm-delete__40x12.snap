@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│>  src/           ││>  src/           │
+│   docs/          ││   docs/          │
+┌ Confirm delete ──────────────────────┐
+│           Delete 1 item(s)?          │
+│                                      │
+│           [y] Yes    [n] No          │
+│                                      │
+└──────────────────────────────────────┘
+│                  ││                  │
+└────── sort: name ┘└────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · F3 view ·

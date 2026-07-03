@@ -6,6 +6,7 @@
 
 pub mod keymap;
 mod render;
+pub mod scenarios;
 mod theme;
 
 pub use keymap::{action_for, text_edit_for, Keymap};

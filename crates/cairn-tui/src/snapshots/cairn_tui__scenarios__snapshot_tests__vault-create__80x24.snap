@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│>  src/                               ││>  src/                               │
+│   docs/                              ││   docs/                              │
+│   Cargo.toml                         ││   Cargo.toml                         │
+│   README.md                          ││   README.md                          │
+│                                      ││                                      │
+│            ┌ Create vault ──────────────────────────────────────┐            │
+│            │New passphrase:                                     │            │
+│            │•••••••••••••▏                                      │            │
+│            │                                                    │            │
+│            │Confirm passphrase:                                 │            │
+│            │                                                    │            │
+│            │                                                    │            │
+│            │[Ctrl-R] Remember: Yes (keychain)                   │            │
+│            │Passphrase must be ≥ 12 chars                       │            │
+│            │[Tab] Next field    [Enter] Create    [Esc] Cancel  │            │
+│            └────────────────────────────────────────────────────┘            │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move

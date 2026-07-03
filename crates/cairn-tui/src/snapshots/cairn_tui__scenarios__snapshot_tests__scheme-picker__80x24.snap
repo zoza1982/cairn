@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│>  src/                               ││>  src/                               │
+│   docs/                              ││   docs/                              │
+│   Cargo.toml                         ││   Cargo.toml                         │
+│   README.md                          ││   README.md                          │
+│                                      ││                                      │
+│                                      ││                                      │
+│              ┌ New connection — choose backend ───────────────┐              │
+│              │> SSH / SFTP                                    │              │
+│              │  Amazon S3 / S3-compatible                     │              │
+│              │  Google Cloud Storage                          │              │
+│              │  Azure Blob Storage                            │              │
+│              │  Local directory                               │              │
+│              │                                                │              │
+│              │                                                │              │
+│              │[Enter] Select  [Esc] Cancel                    │              │
+│              └────────────────────────────────────────────────┘              │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move

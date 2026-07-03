@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Deterministic TUI snapshot testing.** A `scenarios` catalog in `cairn-tui` renders every screen
+  (dual-pane, pager text/hex, log/AI-plan/transfer/connection/vault overlays, …) to a plain-text
+  frame via ratatui's headless `TestBackend`. `insta` snapshot tests assert each scenario at 80×24
+  and 40×12 (narrow-layout coverage), so a rendering regression is a readable `.snap` diff. A new
+  `cairn --frame-dump <scenario> [WxH]` flag (and `--frame-dump-list`) prints one rendered frame to
+  stdout for headless inspection — no TTY required. The catalog is the single source of truth shared
+  by the snapshots and the dump flag.
+
 ### Fixed
 
 - **Panes now root at the OS filesystem root** (`/` on Unix, drive root on Windows) so `..`
