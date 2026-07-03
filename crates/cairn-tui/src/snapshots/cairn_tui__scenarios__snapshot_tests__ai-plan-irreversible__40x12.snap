@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│>  src/           ││>  src/           │
+┌ AI plan — review before running ─────┐
+│archive old logs                      │
+│                                      │
+│▶ · copy     [safe]  copy the things  │
+│  · delete   [IRREVERSIBLE]  delete th│
+│                                      │
+│↵ approve · x reject · esc abort · no │
+└──────────────────────────────────────┘
+└────── sort: name ┘└────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · F3 view ·

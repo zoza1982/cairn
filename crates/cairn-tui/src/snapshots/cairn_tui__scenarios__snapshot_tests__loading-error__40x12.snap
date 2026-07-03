@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│Loading…          ││error: permission │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+└────── sort: name ┘└────── sort: name ┘
+ …   q quit · Tab · ↵ open · F3 view · F

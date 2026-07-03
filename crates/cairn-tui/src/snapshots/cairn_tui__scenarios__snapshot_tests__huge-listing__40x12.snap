@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│   file04996      ││Loading…          │
+│   file04997      ││                  │
+│   file04998      ││                  │
+│   file04999      ││                  │
+│>  file05000      ││                  │
+│   file05001      ││                  │
+│   file05002      ││                  │
+│   file05003      ││                  │
+│   file05004      ││                  │
+└────── sort: name ┘└────── sort: name ┘
+ 5001/10000   q quit · Tab · ↵ open · F3

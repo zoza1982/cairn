@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│Loading…                              ││error: permission denied              │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ …   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move ·

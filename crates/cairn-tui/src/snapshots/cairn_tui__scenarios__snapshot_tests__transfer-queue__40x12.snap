@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│>  src/           ││>  src/           │
+│   docs/          ││   docs/          │
+┌ Transfer queue ──────────────────────┐
+│active: transferring… 4.0 MiB (50%)   │
+│> 1. move 1 item(s)                   │
+│                                      │
+│[↑↓] select  [K/J] move  [d] drop  [x]│
+└──────────────────────────────────────┘
+│                  ││                  │
+└────── sort: name ┘└────── sort: name ┘
+ 1/4   ⇅ transferring… 4.0 MiB / 8.0 MiB

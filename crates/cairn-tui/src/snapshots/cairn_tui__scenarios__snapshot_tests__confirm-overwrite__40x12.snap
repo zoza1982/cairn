@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│>  src/           ││>  src/           │
+│   docs/          ││   docs/          │
+┌ Overwrite? ──────────────────────────┐
+│    1 destination(s) already exist.   │
+│                                      │
+│      [y] Overwrite    [n] Cancel     │
+│                                      │
+└──────────────────────────────────────┘
+│                  ││                  │
+└────── sort: name ┘└────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · F3 view ·

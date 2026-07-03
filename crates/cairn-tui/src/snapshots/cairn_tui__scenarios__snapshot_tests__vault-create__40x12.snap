@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ Create vault ────────────────────────┐
+│New passphrase:                       │
+│•••••••••••••▏                        │
+│                                      │
+│Confirm passphrase:                   │
+│                                      │
+│                                      │
+│[Ctrl-R] Remember: Yes (keychain)     │
+│Passphrase must be ≥ 12 chars         │
+│[Tab] Next field    [Enter] Create    │
+└──────────────────────────────────────┘
+ 1/4   q quit · Tab · ↵ open · F3 view ·
