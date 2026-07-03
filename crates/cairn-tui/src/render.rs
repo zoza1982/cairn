@@ -6,7 +6,7 @@ use cairn_core::{
     credential_method_fields, credential_methods, scheme_fields, AppState, ChoiceProvenance,
     ConnectionFormStage, ConnectionKind, CredentialMethod, FieldValue, Listing, LogViewerStatus,
     MaskedInput, Overlay, PagerMode, PagerStatus, PaneState, PromptKind, SessionEnd, SessionRecord,
-    Side, KNOWN_SCHEMES, PAGER_HEX_ROW_BYTES,
+    Side, WritebackChoice, WritebackConflictReason, KNOWN_SCHEMES, PAGER_HEX_ROW_BYTES,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -160,6 +160,13 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             .alignment(Alignment::Center);
             frame.render_widget(body, area);
         }
+        Overlay::ConfirmWriteback {
+            path,
+            temp_path,
+            reason,
+            cursor,
+            ..
+        } => render_confirm_writeback(frame, path, temp_path, *reason, *cursor),
         Overlay::TransferQueue { cursor } => render_transfer_queue(frame, state, *cursor),
         Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
         Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),
@@ -278,6 +285,55 @@ fn render_confirm_delete_connection(frame: &mut Frame, display_name: &str) {
     frame.render_widget(Paragraph::new(msg.as_str()), msg_area);
     frame.render_widget(
         Paragraph::new("[Enter] Delete  [Esc] Cancel").style(Style::default().fg(Color::DarkGray)),
+        hint_area,
+    );
+}
+
+/// Draw the RFC-0012 P3 write-back conflict overlay: explains why (the remote file changed, or
+/// the zero-length guard tripped), shows the remote path and the still-present local temp path,
+/// then a cursor-selectable list of [`WritebackChoice::ALL`] with the current selection
+/// highlighted — mirrors [`render_connections`]'s cursor-list convention.
+fn render_confirm_writeback(
+    frame: &mut Frame,
+    path: &cairn_types::VfsPath,
+    temp_path: &std::path::Path,
+    reason: WritebackConflictReason,
+    cursor: usize,
+) {
+    // 2 borders + reason + path + temp path + blank + 4 choices + hint.
+    let area = centered(frame.area(), 66, 12);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Write back? ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [info_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(WritebackChoice::ALL.len() as u16),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let info = Paragraph::new(vec![
+        Line::from(reason.message()),
+        Line::from(format!("remote: {path}")),
+        Line::from(format!("local copy kept at: {}", temp_path.display())),
+        Line::from(""),
+    ]);
+    frame.render_widget(info, info_area);
+    let items: Vec<ListItem> = WritebackChoice::ALL
+        .iter()
+        .map(|c| ListItem::new(c.label()))
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black))
+        .highlight_symbol("> ");
+    let mut st = ListState::default();
+    st.select(Some(cursor.min(WritebackChoice::ALL.len() - 1)));
+    frame.render_stateful_widget(list, list_area, &mut st);
+    frame.render_widget(
+        Paragraph::new("[↑/↓] Select  [Enter] Confirm  [Esc] Keep editing")
+            .style(Style::default().fg(Color::DarkGray)),
         hint_area,
     );
 }

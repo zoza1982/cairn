@@ -1,11 +1,12 @@
 //! The pure reducer: `update(&mut AppState, Msg) -> Vec<AppEffect>`. No I/O, no `.await`.
 
-use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit};
+use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit, WriteBackMode};
 use crate::state::{
     ActiveTransfer, AppState, ChoiceStatus, ConnectionFormStage, ConnectionKind, FieldValue,
     FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame, Overlay, PagerMode, PagerStatus,
     PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId,
-    PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
+    WritebackChoice, PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES,
+    SESSION_OUTPUT_MAX_LINES,
 };
 use bytes::Bytes;
 use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, VfsPath};
@@ -1731,6 +1732,7 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
     match &state.overlay {
         Some(Overlay::ConfirmDelete { .. }) => apply_confirm_delete_action(state, action),
         Some(Overlay::ConfirmOverwrite { .. }) => apply_confirm_overwrite_action(state, action),
+        Some(Overlay::ConfirmWriteback { .. }) => apply_confirm_writeback_action(state, action),
         Some(Overlay::ConfirmShellAction { .. }) => apply_confirm_shell_action(state, action),
         Some(Overlay::ConfirmDeleteConnection { .. }) => {
             apply_confirm_delete_connection_action(state, action)
@@ -1867,6 +1869,135 @@ fn apply_confirm_overwrite_action(state: &mut AppState, action: Action) -> Vec<A
             Vec::new()
         }
         _ => Vec::new(),
+    }
+}
+
+/// Drive [`Overlay::ConfirmWriteback`] (RFC-0012 P3): `CursorUp`/`CursorDown` move the selection,
+/// `Confirm`/`Enter` acts on the highlighted [`WritebackChoice`]. `Cancel` (Esc) is deliberately
+/// **not** treated as "dismiss and do nothing" the way it is elsewhere: doing nothing here would
+/// abandon the temp file with no way back, contradicting "never silently clobber or discard" — so
+/// Esc is mapped to the same effect as [`WritebackChoice::KeepEditing`], the least destructive
+/// option (nothing is written, nothing is deleted, the temp file is simply edited again).
+fn apply_confirm_writeback_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        Action::CursorUp => {
+            if let Some(Overlay::ConfirmWriteback { cursor, .. }) = &mut state.overlay {
+                *cursor = cursor.saturating_sub(1);
+            }
+            Vec::new()
+        }
+        Action::CursorDown => {
+            if let Some(Overlay::ConfirmWriteback { cursor, .. }) = &mut state.overlay {
+                if *cursor + 1 < WritebackChoice::ALL.len() {
+                    *cursor += 1;
+                }
+            }
+            Vec::new()
+        }
+        Action::Confirm | Action::Enter => {
+            let Some(Overlay::ConfirmWriteback {
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                hash,
+                cursor,
+                ..
+            }) = state.overlay.take()
+            else {
+                return Vec::new();
+            };
+            resolve_writeback_choice(
+                state,
+                WritebackChoice::ALL[cursor.min(WritebackChoice::ALL.len() - 1)],
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                hash,
+            )
+        }
+        Action::Cancel => {
+            let Some(Overlay::ConfirmWriteback {
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                hash,
+                ..
+            }) = state.overlay.take()
+            else {
+                return Vec::new();
+            };
+            resolve_writeback_choice(
+                state,
+                WritebackChoice::KeepEditing,
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                hash,
+            )
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Turn a resolved [`WritebackChoice`] into the effect that carries it out; sets a matching status
+/// message. Shared by both the explicit `Confirm`/`Enter` path and the `Cancel`-as-`KeepEditing`
+/// fallback in [`apply_confirm_writeback_action`].
+#[allow(clippy::too_many_arguments)]
+fn resolve_writeback_choice(
+    state: &mut AppState,
+    choice: WritebackChoice,
+    id: crate::state::RemoteEditId,
+    conn: cairn_types::ConnectionId,
+    path: VfsPath,
+    temp_path: std::path::PathBuf,
+    v0: crate::state::RemoteVersion,
+    orig_size: u64,
+    hash: crate::state::ContentHash,
+) -> Vec<AppEffect> {
+    match choice {
+        WritebackChoice::Overwrite => vec![AppEffect::WriteBack {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size,
+            mode: WriteBackMode::ForceOverwrite,
+        }],
+        WritebackChoice::SaveAs => vec![AppEffect::WriteBack {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size,
+            mode: WriteBackMode::SaveAsSibling,
+        }],
+        WritebackChoice::KeepEditing => vec![AppEffect::EditRemoteTemp {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size,
+            hash,
+        }],
+        WritebackChoice::Discard => {
+            state.status = Some("Edit discarded — nothing written back".to_owned());
+            vec![AppEffect::CancelRemoteEdit { id }]
+        }
     }
 }
 
@@ -2353,6 +2484,7 @@ fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
         Some(
             Overlay::ConfirmDelete { .. }
                 | Overlay::ConfirmOverwrite { .. }
+                | Overlay::ConfirmWriteback { .. }
                 | Overlay::ConfirmShellAction { .. }
                 | Overlay::ConfirmDeleteConnection { .. }
                 | Overlay::AiPlan { .. }
@@ -3421,6 +3553,97 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 // for the entire duration, so no user action can change `state.focus` meanwhile.
                 reload(state, state.focus)
             }
+        }
+        AppEvent::RemoteEditNeedsDownload {
+            conn,
+            path,
+            v0,
+            size,
+        } => {
+            let id = state.next_remote_edit_id;
+            state.next_remote_edit_id += 1;
+            let name = path.file_name().unwrap_or("file").to_owned();
+            state.status = Some(format!("Downloading {name} ({size} bytes) for editing…"));
+            vec![AppEffect::DownloadForEdit {
+                id,
+                conn,
+                path,
+                v0,
+                size,
+            }]
+        }
+        AppEvent::RemoteEditDownloaded {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size,
+            hash,
+        } => vec![AppEffect::EditRemoteTemp {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size,
+            hash,
+        }],
+        AppEvent::RemoteEditNoChange { id: _, name } => {
+            state.status = Some(format!("No changes to {name} — nothing written back"));
+            Vec::new()
+        }
+        AppEvent::RemoteEditModified {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size,
+            hash: _,
+        } => {
+            state.status = Some("Checking for remote changes before writing back…".to_owned());
+            vec![AppEffect::WriteBack {
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                mode: WriteBackMode::CheckThenWrite,
+            }]
+        }
+        AppEvent::RemoteEditFailed { id: _, status } => {
+            state.status = Some(status);
+            Vec::new()
+        }
+        AppEvent::WriteBackConflict {
+            id,
+            conn,
+            path,
+            temp_path,
+            v0,
+            orig_size,
+            hash,
+            reason,
+        } => {
+            state.status = None;
+            state.overlay = Some(Overlay::ConfirmWriteback {
+                id,
+                conn,
+                path,
+                temp_path,
+                v0,
+                orig_size,
+                hash,
+                reason,
+                cursor: 0,
+            });
+            Vec::new()
+        }
+        AppEvent::WriteBackDone { id: _, name } => {
+            state.status = Some(format!("Wrote back {name}"));
+            reload(state, state.focus)
         }
         AppEvent::ArchiveMounted { pane, conn, root } => {
             // Push the pane's pre-mount origin so a later `..`-out (see `leave_dir`) can restore
@@ -7456,7 +7679,7 @@ mod tests {
         );
     }
 
-    /// A failed `EditFinished` (e.g. no `$EDITOR`, non-local backend) sets the status but does
+    /// A failed `EditFinished` (e.g. no `$EDITOR`, connection unavailable) sets the status but does
     /// NOT refresh — nothing changed on disk.
     #[test]
     fn edit_finished_failure_sets_status_without_refresh() {
@@ -7464,16 +7687,352 @@ mod tests {
         let fx = update(
             &mut s,
             Msg::Event(AppEvent::EditFinished {
-                status: "Editing remote files lands in P3 — copy it to a local pane to edit"
-                    .to_owned(),
+                status: "connection unavailable".to_owned(),
                 error: true,
             }),
         );
-        assert_eq!(
-            s.status.as_deref(),
-            Some("Editing remote files lands in P3 — copy it to a local pane to edit")
-        );
+        assert_eq!(s.status.as_deref(), Some("connection unavailable"));
         assert!(fx.is_empty(), "a failed edit must not refresh, got {fx:?}");
+    }
+
+    // ── RFC-0012 P3: remote file edit — download / conflict-check / write-back ───────────────
+
+    fn remote_version_etag(tag: &str) -> crate::RemoteVersion {
+        crate::RemoteVersion::ETag(tag.to_owned())
+    }
+
+    /// `RemoteEditNeedsDownload` mints a fresh `RemoteEditId` (starting at 1) and emits
+    /// `DownloadForEdit` carrying the same connection/path/version/size.
+    #[test]
+    fn remote_edit_needs_download_mints_id_and_emits_download() {
+        let mut s = state();
+        let path = VfsPath::parse("/notes.txt").unwrap();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::RemoteEditNeedsDownload {
+                conn: ConnectionId(1),
+                path: path.clone(),
+                v0: remote_version_etag("v1"),
+                size: 128,
+            }),
+        );
+        assert!(
+            matches!(
+                &fx[..],
+                [AppEffect::DownloadForEdit { id: 1, conn: ConnectionId(1), path: p, v0, size: 128 }]
+                    if *p == path && *v0 == remote_version_etag("v1")
+            ),
+            "got {fx:?}"
+        );
+        assert_eq!(s.next_remote_edit_id, 2, "the id counter must advance");
+        assert!(s.status.as_deref().unwrap_or("").contains("notes.txt"));
+    }
+
+    /// A second `RemoteEditNeedsDownload` mints a distinct, higher id — sessions never collide.
+    #[test]
+    fn remote_edit_needs_download_ids_are_distinct() {
+        let mut s = state();
+        let path = VfsPath::parse("/a.txt").unwrap();
+        let first = update(
+            &mut s,
+            Msg::Event(AppEvent::RemoteEditNeedsDownload {
+                conn: ConnectionId(1),
+                path: path.clone(),
+                v0: remote_version_etag("v1"),
+                size: 10,
+            }),
+        );
+        let second = update(
+            &mut s,
+            Msg::Event(AppEvent::RemoteEditNeedsDownload {
+                conn: ConnectionId(1),
+                path,
+                v0: remote_version_etag("v2"),
+                size: 20,
+            }),
+        );
+        let AppEffect::DownloadForEdit { id: id1, .. } = &first[0] else {
+            panic!()
+        };
+        let AppEffect::DownloadForEdit { id: id2, .. } = &second[0] else {
+            panic!()
+        };
+        assert_ne!(id1, id2);
+    }
+
+    /// `RemoteEditDownloaded` immediately hands off to the editor via `EditRemoteTemp`.
+    #[test]
+    fn remote_edit_downloaded_opens_editor() {
+        let mut s = state();
+        let path = VfsPath::parse("/notes.txt").unwrap();
+        let temp_path = std::path::PathBuf::from("/tmp/.cairn-edit-x/notes.txt");
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::RemoteEditDownloaded {
+                id: 5,
+                conn: ConnectionId(1),
+                path: path.clone(),
+                temp_path: temp_path.clone(),
+                v0: remote_version_etag("v1"),
+                orig_size: 64,
+                hash: [1u8; 32],
+            }),
+        );
+        assert!(
+            matches!(
+                &fx[..],
+                [AppEffect::EditRemoteTemp { id: 5, path: p, temp_path: t, orig_size: 64, hash, .. }]
+                    if *p == path && *t == temp_path && *hash == [1u8; 32]
+            ),
+            "got {fx:?}"
+        );
+    }
+
+    /// A no-op edit sets a status message and emits no effects (nothing to write back, no refresh).
+    #[test]
+    fn remote_edit_no_change_sets_status_only() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::RemoteEditNoChange {
+                id: 5,
+                name: "notes.txt".to_owned(),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(s.status.as_deref().unwrap_or("").contains("No changes"));
+    }
+
+    /// A modified edit routes into `WriteBack` in `CheckThenWrite` mode — the conflict re-check
+    /// always runs first for a fresh (non-user-confirmed) write-back attempt.
+    #[test]
+    fn remote_edit_modified_emits_check_then_write() {
+        let mut s = state();
+        let path = VfsPath::parse("/notes.txt").unwrap();
+        let temp_path = std::path::PathBuf::from("/tmp/.cairn-edit-x/notes.txt");
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::RemoteEditModified {
+                id: 5,
+                conn: ConnectionId(1),
+                path: path.clone(),
+                temp_path: temp_path.clone(),
+                v0: remote_version_etag("v1"),
+                orig_size: 64,
+                hash: [2u8; 32],
+            }),
+        );
+        assert!(
+            matches!(
+                &fx[..],
+                [AppEffect::WriteBack { id: 5, path: p, temp_path: t, orig_size: 64, mode: WriteBackMode::CheckThenWrite, .. }]
+                    if *p == path && *t == temp_path
+            ),
+            "got {fx:?}"
+        );
+    }
+
+    /// `RemoteEditFailed` just sets the status — no effects, no overlay.
+    #[test]
+    fn remote_edit_failed_sets_status_only() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::RemoteEditFailed {
+                id: 5,
+                status: "download failed: timed out".to_owned(),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert_eq!(s.status.as_deref(), Some("download failed: timed out"));
+    }
+
+    /// `WriteBackDone` sets a status message and refreshes the active pane.
+    #[test]
+    fn writeback_done_refreshes_active_pane() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::WriteBackDone {
+                id: 5,
+                name: "notes.txt".to_owned(),
+            }),
+        );
+        assert!(s.status.as_deref().unwrap_or("").contains("notes.txt"));
+        assert!(matches!(&fx[..], [AppEffect::List { .. }]));
+    }
+
+    fn confirm_writeback_overlay(
+        cursor: usize,
+        reason: crate::WritebackConflictReason,
+    ) -> AppState {
+        let mut s = state();
+        s.overlay = Some(Overlay::ConfirmWriteback {
+            id: 5,
+            conn: ConnectionId(1),
+            path: VfsPath::parse("/notes.txt").unwrap(),
+            temp_path: std::path::PathBuf::from("/tmp/.cairn-edit-x/notes.txt"),
+            v0: remote_version_etag("v1"),
+            orig_size: 64,
+            hash: [3u8; 32],
+            reason,
+            cursor,
+        });
+        s
+    }
+
+    /// `WriteBackConflict` opens `Overlay::ConfirmWriteback` with the cursor at 0 (Overwrite).
+    #[test]
+    fn writeback_conflict_opens_overlay() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::WriteBackConflict {
+                id: 5,
+                conn: ConnectionId(1),
+                path: VfsPath::parse("/notes.txt").unwrap(),
+                temp_path: std::path::PathBuf::from("/tmp/.cairn-edit-x/notes.txt"),
+                v0: remote_version_etag("v1"),
+                orig_size: 64,
+                hash: [3u8; 32],
+                reason: crate::WritebackConflictReason::RemoteChanged,
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::ConfirmWriteback { cursor: 0, .. })
+        ));
+    }
+
+    /// Cursor navigation clamps at both ends of `WritebackChoice::ALL`.
+    #[test]
+    fn confirm_writeback_cursor_clamps() {
+        let mut s = confirm_writeback_overlay(0, crate::WritebackConflictReason::RemoteChanged);
+        let _ = update(&mut s, Msg::Action(Action::CursorUp));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::ConfirmWriteback { cursor: 0, .. })
+        ));
+        for _ in 0..10 {
+            let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        }
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::ConfirmWriteback { cursor: 3, .. })
+        ));
+    }
+
+    /// Confirming "Overwrite" emits `WriteBack` in `ForceOverwrite` mode and closes the overlay.
+    #[test]
+    fn confirm_writeback_overwrite_forces_write() {
+        let mut s = confirm_writeback_overlay(0, crate::WritebackConflictReason::RemoteChanged);
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(s.overlay.is_none());
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::WriteBack {
+                mode: WriteBackMode::ForceOverwrite,
+                ..
+            }]
+        ));
+    }
+
+    /// Confirming "Save as a new file" emits `WriteBack` in `SaveAsSibling` mode.
+    #[test]
+    fn confirm_writeback_save_as_emits_sibling_mode() {
+        let mut s = confirm_writeback_overlay(1, crate::WritebackConflictReason::RemoteChanged);
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(s.overlay.is_none());
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::WriteBack {
+                mode: WriteBackMode::SaveAsSibling,
+                ..
+            }]
+        ));
+    }
+
+    /// Confirming "Keep editing" re-emits `EditRemoteTemp` on the same temp file/hash.
+    #[test]
+    fn confirm_writeback_keep_editing_reopens_editor() {
+        let mut s = confirm_writeback_overlay(2, crate::WritebackConflictReason::RemoteChanged);
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(s.overlay.is_none());
+        assert!(matches!(
+            &fx[..],
+            [AppEffect::EditRemoteTemp { hash, .. }] if *hash == [3u8; 32]
+        ));
+    }
+
+    /// Confirming "Discard" emits `CancelRemoteEdit` and sets a status message — nothing written.
+    #[test]
+    fn confirm_writeback_discard_cancels() {
+        let mut s = confirm_writeback_overlay(3, crate::WritebackConflictReason::RemoteChanged);
+        let fx = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(s.overlay.is_none());
+        assert!(matches!(&fx[..], [AppEffect::CancelRemoteEdit { id: 5 }]));
+        assert!(s.status.as_deref().unwrap_or("").contains("discarded"));
+    }
+
+    /// Esc (`Action::Cancel`) is deliberately mapped to the same effect as "Keep editing" — never
+    /// silently discarding or overwriting.
+    #[test]
+    fn confirm_writeback_escape_keeps_editing_not_discards() {
+        let mut s = confirm_writeback_overlay(3, crate::WritebackConflictReason::ZeroLengthGuard);
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(s.overlay.is_none());
+        assert!(
+            matches!(&fx[..], [AppEffect::EditRemoteTemp { .. }]),
+            "Esc must behave like KeepEditing, got {fx:?}"
+        );
+    }
+
+    /// The zero-length-guard conflict reason renders through the same overlay/flow as a remote
+    /// version change — a pure data-shape check (rendering is covered by the cairn-tui snapshot).
+    #[test]
+    fn zero_length_guard_reason_also_opens_overlay() {
+        let mut s = state();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::WriteBackConflict {
+                id: 9,
+                conn: ConnectionId(1),
+                path: VfsPath::parse("/big.bin").unwrap(),
+                temp_path: std::path::PathBuf::from("/tmp/.cairn-edit-y/big.bin"),
+                v0: remote_version_etag("v1"),
+                orig_size: 1024,
+                hash: [0u8; 32],
+                reason: crate::WritebackConflictReason::ZeroLengthGuard,
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::ConfirmWriteback {
+                reason: crate::WritebackConflictReason::ZeroLengthGuard,
+                ..
+            })
+        ));
+    }
+
+    /// `advance_queue` must not start a queued transfer while `ConfirmWriteback` is open — it's a
+    /// modal demanding immediate attention, like `ConfirmOverwrite`.
+    #[test]
+    fn confirm_writeback_blocks_queued_transfers() {
+        let mut s = confirm_writeback_overlay(0, crate::WritebackConflictReason::RemoteChanged);
+        s.concurrency_limit = 1;
+        s.transfer_queue.push_back(QueuedTransfer {
+            src_conn: ConnectionId(1),
+            dst_conn: ConnectionId(2),
+            items: vec![(VfsPath::parse("/a").unwrap(), VfsPath::parse("/b").unwrap())],
+            is_move: false,
+        });
+        let fx = update(&mut s, Msg::Tick);
+        assert!(
+            fx.is_empty(),
+            "queue must stay blocked while ConfirmWriteback is open, got {fx:?}"
+        );
     }
 
     /// `PagerDone` flushes a trailing (incomplete) line into `lines` and sets `Ready`.

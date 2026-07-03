@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│>  src/                               ││>  src/                               │
+│   docs/                              ││   docs/                              │
+│   Cargo.toml                         ││   Cargo.toml                         │
+│   README.md                          ││   README.md                          │
+│                                      ││                                      │
+│      ┌ Write back? ───────────────────────────────────────────────────┐      │
+│      │the remote file changed since you started editing               │      │
+│      │remote: /notes.txt                                              │      │
+│      │local copy kept at: /run/user/1000/.cairn-edit-abc123/notes.txt │      │
+│      │                                                                │      │
+│      │> Overwrite                                                     │      │
+│      │  Save as a new file                                            │      │
+│      │  Keep editing                                                  │      │
+│      │  Discard my changes                                            │      │
+│      │[↑/↓] Select  [Enter] Confirm  [Esc] Keep editing               │      │
+│      │                                                                │      │
+│      └────────────────────────────────────────────────────────────────┘      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move

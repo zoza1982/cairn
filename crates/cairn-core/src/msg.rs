@@ -1,11 +1,15 @@
 //! Messages, events, and effects — the three families of the TEA loop.
 
-use crate::state::{FileKind, LogViewerId, PagerId, Side, TransferId};
+use crate::state::{
+    ContentHash, FileKind, LogViewerId, PagerId, RemoteEditId, RemoteVersion, Side, TransferId,
+    WritebackConflictReason,
+};
 use bytes::Bytes;
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
 use cairn_types::{ConnectionId, SessionId, VfsPath};
 use cairn_vfs::{ListPage, VfsError};
+use std::path::PathBuf;
 
 /// A high-level user action, resolved from input by the TUI keymap. Kept independent of any terminal
 /// library so the core stays UI-agnostic and unit-testable.
@@ -417,6 +421,117 @@ pub enum AppEvent {
         /// failure, or the file being on a non-local backend).
         error: bool,
     },
+    /// A [`AppEffect::SuspendAndEdit`] target has no local path (`Vfs::local_path` returned `None`)
+    /// but is otherwise editable: the backend advertises `Caps::WRITE`, `stat` succeeded, and the
+    /// reported size is within [`crate::REMOTE_EDIT_MAX_BYTES`] (RFC-0012 P3). The runtime has not
+    /// touched the terminal yet. The reducer mints a fresh [`RemoteEditId`] and kicks off the
+    /// download via [`AppEffect::DownloadForEdit`].
+    RemoteEditNeedsDownload {
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The remote file's path.
+        path: VfsPath,
+        /// The version snapshot taken just before download — the write-back baseline.
+        v0: RemoteVersion,
+        /// The remote file's size at this snapshot (drives the later zero-length guard).
+        size: u64,
+    },
+    /// [`AppEffect::DownloadForEdit`] finished successfully: `temp_path` now holds a private local
+    /// copy of the remote file, hashed as `hash`. The reducer emits
+    /// [`AppEffect::EditRemoteTemp`] to run the editor on it.
+    RemoteEditDownloaded {
+        /// Correlates back to the runtime's held temp-file resources.
+        id: RemoteEditId,
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The remote file's path (the eventual write-back target).
+        path: VfsPath,
+        /// The local temp file's real OS path.
+        temp_path: PathBuf,
+        /// The version snapshot taken before download.
+        v0: RemoteVersion,
+        /// The remote file's size at download time.
+        orig_size: u64,
+        /// The freshly downloaded temp file's content hash (the no-op-edit baseline).
+        hash: ContentHash,
+    },
+    /// The `$EDITOR` launched by [`AppEffect::EditRemoteTemp`] exited and the temp file's content is
+    /// byte-identical to before (no-op edit). Nothing is written back; the runtime cleans up the
+    /// temp resources for `id` when this event arrives (see `crates/cairn/src/app.rs`).
+    RemoteEditNoChange {
+        /// Correlates back to the runtime's held temp-file resources (cleaned up on this event).
+        id: RemoteEditId,
+        /// The file's display name, for the status line.
+        name: String,
+    },
+    /// The `$EDITOR` launched by [`AppEffect::EditRemoteTemp`] exited and the temp file's content
+    /// changed. The reducer emits [`AppEffect::WriteBack`] in
+    /// [`WriteBackMode::CheckThenWrite`](crate::WriteBackMode::CheckThenWrite) to re-`stat` the
+    /// remote path and decide whether it is safe to overwrite silently.
+    RemoteEditModified {
+        /// Correlates back to the runtime's held temp-file resources.
+        id: RemoteEditId,
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The remote file's path.
+        path: VfsPath,
+        /// The local temp file's real OS path.
+        temp_path: PathBuf,
+        /// The version snapshot taken before download — the write-back baseline.
+        v0: RemoteVersion,
+        /// The remote file's size at download time.
+        orig_size: u64,
+        /// The temp file's content hash after this edit (the no-op baseline for a further edit
+        /// session, if the user later chooses [`crate::WritebackChoice::KeepEditing`]).
+        hash: ContentHash,
+    },
+    /// A remote-edit session (identified by `id`) ended in a terminal failure: the download failed,
+    /// the editor could not be launched or exited non-zero, or the write-back upload failed. The
+    /// runtime cleans up the held temp resources for `id` when this event arrives. `status` is
+    /// already redacted (secret-free).
+    RemoteEditFailed {
+        /// Correlates back to the runtime's held temp-file resources (cleaned up on this event).
+        id: RemoteEditId,
+        /// Human-readable, secret-free status.
+        status: String,
+    },
+    /// [`AppEffect::WriteBack`] (in
+    /// [`WriteBackMode::CheckThenWrite`](crate::WriteBackMode::CheckThenWrite)) found that it is not
+    /// safe to overwrite silently — either the remote version no longer matches `v0` (including the
+    /// remote file having been deleted), or the temp file is now zero bytes while the original was
+    /// not. The reducer opens [`crate::Overlay::ConfirmWriteback`]; the temp file is **not** cleaned
+    /// up (the runtime keeps holding it while the overlay is open).
+    WriteBackConflict {
+        /// Correlates back to the runtime's held temp-file resources.
+        id: RemoteEditId,
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The remote file's path.
+        path: VfsPath,
+        /// The local temp file's real OS path.
+        temp_path: PathBuf,
+        /// The version snapshot taken before download — carried so `KeepEditing` can re-check
+        /// against the same baseline after a further edit session.
+        v0: RemoteVersion,
+        /// The remote file's size at download time.
+        orig_size: u64,
+        /// The temp file's content hash at the point the conflict was detected.
+        hash: ContentHash,
+        /// Why this conflict was raised — display-only.
+        reason: WritebackConflictReason,
+    },
+    /// [`AppEffect::WriteBack`] finished successfully (the original path in
+    /// [`WriteBackMode::CheckThenWrite`](crate::WriteBackMode::CheckThenWrite)/
+    /// [`WriteBackMode::ForceOverwrite`](crate::WriteBackMode::ForceOverwrite), or a fresh sibling
+    /// path in [`WriteBackMode::SaveAsSibling`](crate::WriteBackMode::SaveAsSibling)). The runtime
+    /// cleans up the held temp resources for `id` when this event arrives; the reducer refreshes
+    /// the active pane's listing.
+    WriteBackDone {
+        /// Correlates back to the runtime's held temp-file resources (cleaned up on this event).
+        id: RemoteEditId,
+        /// The name written to, for the status line (may differ from the original on `SaveAs`).
+        name: String,
+    },
     /// [`AppEffect::MountArchive`] finished: the archive was indexed and mounted as a fresh,
     /// ephemeral connection in the registry (RFC-0013). The reducer pushes the pane's pre-mount
     /// `(conn, cwd)` onto its `mount_stack` and navigates it into `root` (mirroring the
@@ -439,6 +554,21 @@ pub enum AppEvent {
         /// Secret-free, redacted error message.
         message: String,
     },
+}
+
+/// How [`AppEffect::WriteBack`] should resolve a potential conflict before writing (RFC-0012 P3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteBackMode {
+    /// Re-`stat` the remote path, compare against `v0`, and guard against a zero-length write over
+    /// a previously non-empty file; only proceed to write if both checks pass. This is always the
+    /// *first* attempt for a modified edit.
+    CheckThenWrite,
+    /// Skip both checks and overwrite the original path directly — the user already confirmed via
+    /// [`crate::WritebackChoice::Overwrite`] in [`crate::Overlay::ConfirmWriteback`].
+    ForceOverwrite,
+    /// Skip both checks and write to a freshly chosen sibling path instead of the original — the
+    /// user chose [`crate::WritebackChoice::SaveAs`].
+    SaveAsSibling,
 }
 
 /// Intents emitted by the reducer for the effect runner to execute. The reducer never performs I/O.
@@ -769,6 +899,100 @@ pub enum AppEffect {
         conn: ConnectionId,
         /// The file to edit.
         path: VfsPath,
+    },
+    /// Download `path` to a private local temp file so it can be edited via `$EDITOR` (RFC-0012
+    /// P3 — the runtime's `Vfs::local_path(&path)` resolved to `None` inside
+    /// [`AppEffect::SuspendAndEdit`]'s handler, and the backend/size checks passed).
+    ///
+    /// Dispatched through the normal effect runner (spawned, cancellable in principle, never
+    /// blocking the render loop) — unlike `SuspendAndEdit` itself, this does not need the terminal.
+    /// The runtime creates the private temp file (0600, `O_EXCL`, non-predictable directory,
+    /// preferring `$XDG_RUNTIME_DIR`) synchronously before spawning the download, and keeps it
+    /// (keyed by `id`) until the whole remote-edit session reaches a terminal outcome. On success
+    /// this reports [`AppEvent::RemoteEditDownloaded`]; on failure,
+    /// [`AppEvent::RemoteEditFailed`] (and the temp resources are cleaned up immediately).
+    DownloadForEdit {
+        /// Minted by the reducer; addresses this session's held temp-file resources and every
+        /// subsequent effect/event in the flow.
+        id: RemoteEditId,
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The remote file's path.
+        path: VfsPath,
+        /// The version snapshot taken just before this effect was emitted.
+        v0: RemoteVersion,
+        /// The remote file's size at this snapshot (threaded through so `RemoteEditDownloaded`'s
+        /// `orig_size` doesn't need a redundant re-`stat`; also drives the zero-length guard later).
+        size: u64,
+    },
+    /// Suspend the TUI and launch `$VISUAL`/`$EDITOR`/`vi` directly on `temp_path` — the RFC-0012 P3
+    /// analogue of [`AppEffect::SuspendAndEdit`] once a remote file has already been downloaded to a
+    /// local temp copy (no `Vfs::local_path` resolution needed; `temp_path` is already local by
+    /// construction). Also re-entered when the user picks
+    /// [`crate::WritebackChoice::KeepEditing`] in [`crate::Overlay::ConfirmWriteback`] — `hash` is
+    /// then the content hash observed at that point, not necessarily the original download's.
+    ///
+    /// Special-cased inline in the runtime's `event_loop`, exactly like `SuspendAndEdit` (same
+    /// exclusive terminal/stdin ownership requirement — see
+    /// `docs/adr/0011-terminal-suspend-and-editor-launch.md`). After the editor exits the runtime
+    /// re-hashes `temp_path`: unchanged from `hash` reports [`AppEvent::RemoteEditNoChange`];
+    /// changed reports [`AppEvent::RemoteEditModified`] (which the reducer routes into
+    /// [`AppEffect::WriteBack`]); a launch failure or non-zero exit reports
+    /// [`AppEvent::RemoteEditFailed`].
+    EditRemoteTemp {
+        /// Correlates to the runtime's held temp-file resources.
+        id: RemoteEditId,
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The remote file's path (the eventual write-back target).
+        path: VfsPath,
+        /// The local temp file's real OS path.
+        temp_path: PathBuf,
+        /// The version snapshot taken before download — the write-back baseline.
+        v0: RemoteVersion,
+        /// The remote file's size at download time.
+        orig_size: u64,
+        /// The temp file's content hash immediately before this edit session starts.
+        hash: ContentHash,
+    },
+    /// Write `temp_path`'s content back to the remote backend (RFC-0012 P3). Dispatched through the
+    /// normal effect runner (spawned, never blocking the render loop).
+    ///
+    /// [`WriteBackMode::CheckThenWrite`] first re-`stat`s `path` and compares against `v0`
+    /// (`RemoteVersion::confirmed_equal`) and guards against writing zero bytes over a previously
+    /// non-empty file; either guard tripping reports [`AppEvent::WriteBackConflict`] instead of
+    /// writing. `ForceOverwrite`/`SaveAsSibling` skip both guards (the user already confirmed via
+    /// [`crate::Overlay::ConfirmWriteback`]).
+    ///
+    /// The actual write uses a staging-then-rename sequence when the backend advertises
+    /// `Caps::RENAME` at the target (write to a sibling name, then rename over it — atomic-ish);
+    /// otherwise a direct overwrite (documented non-atomic window — Docker/K8s have no rename).
+    WriteBack {
+        /// Correlates to the runtime's held temp-file resources; cleaned up on the terminal event
+        /// this produces ([`AppEvent::WriteBackDone`]/[`AppEvent::RemoteEditFailed`]) but **not**
+        /// on [`AppEvent::WriteBackConflict`] (the flow continues).
+        id: RemoteEditId,
+        /// The connection the file lives on.
+        conn: ConnectionId,
+        /// The remote file's path (the write-back target for `CheckThenWrite`/`ForceOverwrite`).
+        path: VfsPath,
+        /// The local temp file's real OS path (the content being written back).
+        temp_path: PathBuf,
+        /// The version snapshot taken before download — the write-back baseline.
+        v0: RemoteVersion,
+        /// The remote file's size at download time (drives the zero-length guard).
+        orig_size: u64,
+        /// How to resolve a potential conflict before writing.
+        mode: WriteBackMode,
+    },
+    /// Abandon a remote-edit session: drop the runtime's held temp-file resources for `id` (deleting
+    /// the temp file) without writing anything back. Emitted when the user picks
+    /// [`crate::WritebackChoice::Discard`] in [`crate::Overlay::ConfirmWriteback`]. Handled
+    /// synchronously in the effect runner (no spawn needed — it only drops a value), mirroring
+    /// [`AppEffect::CancelTransfer`].
+    CancelRemoteEdit {
+        /// Which remote-edit session to abandon.
+        id: RemoteEditId,
     },
     /// Mount `path` (an entry classified [`crate::FileKind::Archive`] by
     /// [`AppEffect::SniffFile`]) as a read-only archive backend and open it in `pane`

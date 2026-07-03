@@ -1,8 +1,8 @@
 # RFC-0012: File Open, View & Edit — Read-Only Pager, In-Place Editor, Remote Writeback
 
-- **Status:** Draft (P1 + P2 implemented; P3 designed, not yet implemented)
-- **Author(s):** tui-engineer, software-architect (synthesized)
-- **Date:** 2026-07-02
+- **Status:** Implemented (P1 + P2 + P3)
+- **Author(s):** tui-engineer, software-architect, storage-engineer (synthesized)
+- **Date:** 2026-07-03
 - **Tracking item:** M4-7 (see `docs/IMPLEMENTATION_PLAN.md`)
 
 ## Summary
@@ -18,11 +18,12 @@ whole file-open experience in three phases:
    routes to the editor instead of the read-only pager (binary files still open the hex pager).
    Cairn suspends the terminal, hands the real TTY to the editor, and resumes on exit. Remote
    backends refuse cleanly with a pointer to P3 — this phase does not shell out over the wire.
-3. **P3 (designed, not implemented): remote writeback hardening.** Conflict detection (the file
-   changed underneath the editor), atomic replace-on-save semantics where the backend supports
-   them, and large-file editing limits — the from-scratch in-app buffer editor originally sketched
-   for P2 was superseded by the `$EDITOR`-shell-out design once ux-engineer/tui-engineer weighed in
-   (see "P2 — implemented" below); P3 now covers making that shell-out safe for non-local backends.
+3. **P3 (implemented): remote writeback hardening.** Conflict detection (the file changed
+   underneath the editor), atomic replace-on-save semantics where the backend supports them, and a
+   large-file editing limit — the from-scratch in-app buffer editor originally sketched for P2 was
+   superseded by the `$EDITOR`-shell-out design once ux-engineer/tui-engineer weighed in (see "P2 —
+   implemented" below); P3 makes that shell-out safe for non-local backends by downloading to a
+   private temp copy, editing that, and writing it back only after confirming it is safe to do so.
 
 This document covers the full arc so the P1 pager's data model doesn't have to be revisited when
 P3 lands — the `Overlay::Pager` shape, the `AppEffect`/`AppEvent` naming, and the reducer's
@@ -71,11 +72,28 @@ loading the whole thing and writing it back. Cairn had neither. Concretely:
 - **`Enter` on a text file** now opens the same editor (a behavioral change from P1, where it
   opened the read-only pager). `Enter` on a binary file is unchanged — still the hex pager, since
   Cairn is not a hex editor.
-- **Local files only.** Editing a file on a remote backend (SSH, S3, a container, …) shows
-  *"Editing remote files lands in P3 — copy it to a local pane to edit"* and does nothing else —
-  the TUI is never disturbed for a file that can't be edited this way yet.
+- **Local files only in P2.** Editing a file on a remote backend showed a P3-pointer message and
+  did nothing else. **Superseded by P3** (below) — remote files are now editable too.
 - After the editor exits, the active pane's listing refreshes (the file's size/mtime may have
   changed) and the status line shows the outcome (`edited <name>`, or a redacted failure).
+
+### What changes for a user (P3)
+
+- **`F4`/`Enter`-on-text now also works on remote files** — SSH, S3/GCS/Azure, Docker, Kubernetes,
+  or any other backend whose entries aren't backed by a real local path. Behind the scenes: the
+  file is downloaded to a private local temp copy, the same `$EDITOR` opens on that copy, and the
+  result is written back once the editor exits — but the user experience is "press F4, edit, save,
+  done," identical to editing a local file, plus a couple of new safety prompts:
+  - **A no-op edit** (opened the editor, changed nothing) writes nothing back — the status line
+    says so and the temp copy is discarded silently.
+  - **A conflict** (the remote file changed since the download, was deleted, or the local edit came
+    back completely empty while the original was not) opens a confirm overlay: **Overwrite** the
+    remote anyway, **Save as** a new sibling file instead, **Keep editing** the same temp copy, or
+    **Discard** the edit entirely. `Esc` behaves like Keep-editing, not Discard — the write-back
+    path never silently clobbers *or* silently throws away a user's edits.
+  - **Very large files are refused up front** (before any download) — see the size cap below.
+- Nothing changes for local files — they still take the P2 path (no download, no temp file, no
+  conflict check needed since there's no network round-trip to race).
 
 ### What doesn't change
 
@@ -286,34 +304,149 @@ existing `spawn_shell_action`/`sanitized_path` hardening (`docs/adr/0005-shell-c
 - Conflict detection (the file changed underneath the editor) and atomic replace-on-save.
 - Size limits for very large files on backends without cheap ranged writes.
 
-## Reference-level explanation (P3 — designed, not implemented)
+## Reference-level explanation (P3 — implemented)
 
 **Goal:** extend P2's `$EDITOR` shell-out to remote backends safely — "load fully, edit, write
 fully" is unsafe if the file changed underneath you, and expensive for very large remote files.
 
-Sketch:
+**As shipped:** temp-copy-edit-upload, not an in-app buffer, exactly as originally sketched: the
+remote file is downloaded to a local temp copy via the transfer engine (`cairn_transfer::run_transfer`),
+the same `spawn_editor_hardened`/terminal-suspend machinery P2 uses runs against that copy, and on
+a real (non-no-op) change it is written back — also via the transfer engine — after a conflict
+re-check. `crates/cairn/src/app.rs` and `crates/cairn-core/src/{state,msg,update}.rs`;
+`crates/cairn-tui/src/render.rs`.
 
-- **Temp-copy-edit-upload**, not an in-app buffer: download the remote file to a local temp path
-  (reusing the transfer engine's download path), run the same `spawn_editor_hardened` flow against
-  the temp copy, and on a clean exit upload it back (reusing the transfer engine's upload path).
-  This keeps P3 architecturally consistent with P2's "the real `$EDITOR`, on a real local file"
-  model instead of reviving the previously-sketched in-app line-buffer editor.
-- **Conflict detection:** capture the entry's `etag`/`modified` at download time (already present
-  on `Entry`); before uploading the edited temp copy back, re-`stat` the remote original and
-  compare. A mismatch surfaces a `ConfirmOverwrite`-style overlay (an existing pattern —
-  `Overlay::ConfirmOverwrite` already covers the analogous transfer-collision case) rather than
-  silently clobbering a concurrent change.
-- **Atomic replace where the backend supports it:** local/SFTP can write to a temp path and
-  rename; object stores are naturally atomic per-object (a `PUT` fully replaces); this is a
-  per-backend capability, likely a new `Caps` flag, not a core reducer concern.
-- **Size limits:** refuse (with a clear status message) to download-and-edit a file above some cap
-  on backends without cheap ranged writes, rather than hanging on a multi-hundred-MB round trip.
-  Exact threshold is a UX call for `ux-engineer` at P3 implementation time.
-- **Temp-file hygiene:** the downloaded copy must live in a per-session, permission-restricted temp
-  directory and be cleaned up after upload (or on error) — a security-engineer pass is required
-  before this lands, per RFC-0012's Security section below.
-- **Whether P3 lands before or after other backends is a v2 scheduling call**, not architecturally
-  blocking — it can start as soon as P2 lands (now merged).
+### `RemoteVersion`: detecting "did the remote change under me?"
+
+```rust
+/// crates/cairn-core/src/state.rs
+pub enum RemoteVersion {
+    ETag(String),
+    MTimeSize { modified: SystemTime, size: u64 },
+    Unknown,
+}
+impl RemoteVersion {
+    pub fn from_entry(entry: &Entry) -> Self;      // prefers etag, falls back to modified+size
+    pub fn confirmed_equal(&self, other: &Self) -> bool; // false whenever either side is Unknown
+}
+```
+
+A pure function over `Entry` (unit-tested in isolation, no I/O) — **not** a new `Vfs` trait method,
+since every signal it needs (`etag`, `modified`, `size`) is already on `Entry`. `confirmed_equal`
+is `false` whenever either side is `Unknown` (including two `Unknown`s compared to each other) or
+the two sides are different variants — an unverifiable version is *never* treated as "unchanged."
+
+**Per-backend signal availability:**
+
+| Backend | Signal |
+|---|---|
+| S3 / GCS / Azure Blob | `ETag` (object version tag) |
+| SFTP, local, Docker, Kubernetes | `MTimeSize` (no version tag; compared as a pair) |
+| Anything reporting neither | `Unknown` — write-back always opens the confirm overlay |
+
+### The flow
+
+1. **Route to remote-edit.** `run_editor_suspend` (P2, inline in `event_loop` for exclusive
+   terminal ownership) already resolves `Vfs::local_path` *before* touching the terminal. Its
+   `None` arm — previously an outright refusal — now calls `begin_remote_edit`, which (still before
+   the terminal is touched): checks `Caps::WRITE` (refuses read-only backends, e.g. a mounted
+   archive, without ever downloading), `stat`s the path for size + `RemoteVersion` (`v0`), enforces
+   the size cap (below), and pre-resolves `$VISUAL`/`$EDITOR`/`vi` (fail fast before a possibly
+   large download). On success it sends `AppEvent::RemoteEditNeedsDownload`.
+2. **Download.** The reducer mints a `RemoteEditId` (monotonic, like `TransferId`/`PagerId`) and
+   emits `AppEffect::DownloadForEdit` — a **normal dispatched effect** (spawned, non-blocking, shows
+   a status line), unlike the terminal-owning steps. The runtime creates the private temp file
+   synchronously (see below), then streams the remote file into it via `run_transfer` (remote `Vfs`
+   → a `LocalVfs` rooted at the temp file's directory; a sentinel `ConnectionId(u64::MAX)` keeps the
+   transfer engine's same-connection rename fast-path from ever matching a real backend), and
+   SHA-256-hashes the result (`hash_file`, `sha2` — see "Crate impact" below) as the no-op-edit
+   baseline.
+3. **Edit.** `AppEffect::EditRemoteTemp` is special-cased inline in `event_loop`, exactly like
+   `SuspendAndEdit` (same exclusive-terminal requirement) — `run_editor_suspend`'s pause/suspend/
+   spawn/resume sequence was factored out into a shared `suspend_and_run_editor` helper so both P2's
+   local-file path and P3's temp-file path use it verbatim. After the editor exits, the temp file is
+   re-hashed:
+   - **Unchanged** → `AppEvent::RemoteEditNoChange` — nothing is written back, no pane refresh.
+   - **Changed** → `AppEvent::RemoteEditModified` → the reducer emits `AppEffect::WriteBack` in
+     `WriteBackMode::CheckThenWrite`.
+4. **Conflict check + write-back.** `AppEffect::WriteBack` (a normal dispatched effect) in
+   `CheckThenWrite` mode: (a) a **zero-length guard** — if the temp file is now 0 bytes but the
+   original was not, that is a crashed/misbehaving-editor signal, not a deliberate "empty this
+   file" edit; (b) re-`stat`s the remote path for `v1` and compares against the held `v0` — this is
+   the TOCTOU-sensitive step: `v0` was captured once at download time and held since; `v1` is a
+   fresh `stat` taken immediately before the write decision, never re-derived from a re-opened,
+   attacker-swappable path. A `NotFound` on the re-`stat` (the remote file was deleted) maps to
+   `RemoteVersion::Unknown`, which `confirmed_equal` never matches. Either guard tripping emits
+   `AppEvent::WriteBackConflict` (carrying *why*, `WritebackConflictReason::RemoteChanged` or
+   `::ZeroLengthGuard`) instead of writing.
+5. **Conflict resolution.** `AppEvent::WriteBackConflict` opens `Overlay::ConfirmWriteback` — a
+   cursor-selected list (like `Overlay::Connections`), never a plain yes/no, because there are four
+   meaningfully different answers:
+   - **Overwrite** → `AppEffect::WriteBack` in `ForceOverwrite` mode (skips both guards — the user
+     already confirmed).
+   - **Save as** → `ForceOverwrite`'s sibling, `SaveAsSibling` mode: writes to a freshly chosen
+     `"<stem> (edited)<ext>"` (incrementing `" (N)"` on a collision) instead of the original path —
+     a small, local, bounded re-implementation of the same idea as the transfer engine's private
+     `unique_name` (not directly reusable — it's module-private to `cairn-transfer`).
+   - **Keep editing** → re-emits `AppEffect::EditRemoteTemp` on the *same* temp file, carrying the
+     *original* `v0` forward (not a value updated at the conflict) — the question "has the remote
+     drifted since I started editing" stays meaningful across any number of further edit passes.
+   - **Discard** → `AppEffect::CancelRemoteEdit` (synchronous, no spawn — it only drops a value):
+     abandons the session, deleting the temp file, without writing anything.
+   - `Esc` (`Action::Cancel`) is deliberately mapped to the *same effect as Keep-editing*, not
+     Discard — an escape key must never be the trigger for a destructive default.
+6. **The actual write** (`write_temp_to_remote`, shared by `CheckThenWrite`'s pass-through,
+   `ForceOverwrite`, and `SaveAsSibling`): where the backend advertises `Caps::RENAME` at the
+   target, stages the content at a sibling name (`.cairn-edit-tmp-<name>`) via `run_transfer`, then
+   `rename`s it over the target (atomic-ish; cleans up the staged sibling on a failed rename).
+   Where it does not — **Docker and Kubernetes have no atomic rename** — it writes directly to the
+   target, a real, documented non-atomic window (a concurrent reader could see a partially-written
+   file mid-copy). `AppEvent::WriteBackDone` refreshes the active pane.
+
+### Temp-file lifecycle: who owns the RAII handle across an arbitrarily long conflict prompt?
+
+The temp file's lifetime spans multiple async round-trips and arbitrary user think-time at the
+conflict overlay — far longer than any single function call, and the reducer must hold no I/O
+handle (per the project's TEA architecture). The solution mirrors the runtime's other per-session
+maps (`transfer_controls`, `pager_controls`, `session_controls`): `event_loop` holds
+`remote_edit_temps: HashMap<RemoteEditId, tempfile::TempDir>`, created synchronously in
+`dispatch`'s `DownloadForEdit` arm (a few `std::fs` calls — negligible, exactly like the
+`cancel`/`pause_tx` setup the existing `Transfer` effect already does inline) and dropped —
+deleting the directory and the file in it — on every terminal event (`RemoteEditNoChange`,
+`RemoteEditFailed`, `WriteBackDone`) via the same pre-`update()` cleanup convention already used
+for transfers/pagers/sessions. `WriteBackConflict` is deliberately excluded from that cleanup list
+— the flow continues, possibly for a long time, and the temp file must survive. As a last-resort
+safety net, the whole map (and therefore every session's temp directory) drops when the event loop
+itself returns (app quit), so a session left open when the app exits still gets cleaned up.
+
+The directory itself (not just the file) is freshly minted and non-predictable
+(`new_remote_edit_dir`, mirroring `cairn-backend-archive::compressed_tar`'s pattern: prefer
+`$XDG_RUNTIME_DIR`, forced `0700` regardless of the process umask, else the OS temp dir) —
+`create_temp_edit_file` then creates the file *inside it* with the original leaf name (so `$EDITOR`
+still sees the right extension for syntax highlighting), `0600` and `O_EXCL` (`create_new`)
+explicitly rather than relying on umask. Because the directory is already private and
+non-predictable, a predictable filename inside it is not a predictable *path* — this closes the
+classic shared-`/tmp` predictable-temp-file attack without needing a random filename too.
+
+### Size limit
+
+`REMOTE_EDIT_MAX_BYTES = 100 MiB` (`cairn-core`). A deliberate UX guardrail, not a technical
+ceiling — editing a multi-GB file by round-tripping it through `$EDITOR` is the wrong workflow
+regardless of available disk/memory. Enforced in `begin_remote_edit`, before any download starts.
+
+### What is deferred (follow-up, not blocking)
+
+- **Live byte-progress/cancellation for the download and write-back phases.** Both currently show a
+  single status-line message (`"Downloading <name> (<n> bytes) for editing…"`) rather than a live
+  progress bar wired into the `active_transfers`/transfer-queue UI, and there is no cancel button
+  mid-transfer. Reusing that UI wholesale was considered and set aside: piggybacking a transient,
+  system-internal download onto the user-facing bulk-copy queue (pause/resume/reorder semantics
+  that don't apply here) risked surprising interactions for a first cut; a dedicated, lighter-weight
+  progress channel is the natural next step.
+- **A failed write-back currently discards the local edit** rather than offering a redownload-free
+  retry — the temp file is cleaned up on `RemoteEditFailed` just like any other terminal outcome.
+  Keeping it around for a retry is a reasonable follow-up but adds another lifecycle branch; cut
+  from this pass to keep the already-large state machine bounded.
 
 ## Drawbacks
 
@@ -374,18 +507,43 @@ Sketch:
   model and `crates/cairn/src/app.rs`'s `spawn_editor_hardened` test suite for the adversarial
   cases exercised (shell-injection attempt via `$EDITOR`, command-substitution attempt, a
   flag-shaped filename, environment scrubbing, and a secret canary).
-- **P3 (writeback to remote backends)** will need a fresh `security-engineer` pass before landing —
-  a temp-copy-edit-upload path is new attack surface (temp-file permissions/predictability, upload
-  race windows, conflict-detection correctness) that P2's local-only, no-network-I/O editor launch
-  does not have.
+- **P3 (writeback to remote backends, implemented, security-reviewed):** the temp-copy-edit-upload
+  path's specific new attack surface and how it's addressed:
+  - **Temp-file permissions/predictability**: a freshly-minted, non-predictable, `0700` directory
+    (preferring `$XDG_RUNTIME_DIR` — a per-user tmpfs, so plaintext ideally never touches stable
+    storage) containing a single `0600`, `O_EXCL`-created file. The directory's non-predictability
+    is what closes the classic shared-`/tmp` predictable-path attack even though the *filename*
+    inside it (the original leaf name, kept for `$EDITOR` syntax highlighting) is predictable.
+  - **Deleted on every exit path**: success, no-op, editor failure, write-back failure, explicit
+    discard, and (as a last-resort net) whole-process shutdown — see "Temp-file lifecycle" above.
+    Never left behind holding remote plaintext.
+  - **Conflict-detection TOCTOU**: `v0` is captured once at download time and held in the effect/
+    event payloads (plain data, never a live handle); `v1` is a fresh `stat` immediately before the
+    write decision, never re-derived from a re-opened path. `RemoteVersion::Unknown` is never
+    "confirmed equal" to anything, including itself, so an unverifiable version always prompts.
+  - **Zero-length/truncated-save guard**: a crashed or misbehaving editor that empties a previously
+    non-empty file is caught before it reaches the remote, not after.
+  - **Editor spawn**: reuses P2's hardened `spawn_editor_hardened` verbatim (argv-only, env-scrubbed,
+    `--` terminator) — the temp path is the only argument; no new spawn surface.
+  - **Never reaches the AI layer**: the remote-edit effects/events live entirely in `cairn-core`/
+    `cairn` (the binary edge); the temp path and content are never passed to `cairn-ai`.
+  - **Never logged raw**: `RemoteEditFailed`/`WriteBackConflict` carry only redacted messages
+    (`VfsError::redacted()`/`TransferError::redacted()`); the temp path appears in the
+    `ConfirmWriteback` overlay (shown to the user, who already knows their own filesystem) but never
+    in a log line.
 
 ## Unresolved questions
 
 1. ~~Whether P2's editor is a from-scratch line-buffer widget or should defer to a "shell out to
    `$EDITOR`..." model~~ — **Resolved for P2**: shell out to `$VISUAL`/`$EDITOR`/`vi`, local files
    only; see "Rationale and alternatives" and ADR-0011.
-2. The exact P3 size threshold for refusing to download-and-edit a large remote file.
-3. Whether `wrap` gets a keybinding — still open, unrelated to P2's scope.
+2. ~~The exact P3 size threshold for refusing to download-and-edit a large remote file~~ —
+   **Resolved for P3**: `REMOTE_EDIT_MAX_BYTES = 100 MiB`, a deliberate UX guardrail (see the P3
+   reference-level section).
+3. Whether `wrap` gets a keybinding — still open, unrelated to P2/P3's scope.
+4. Live byte-progress/cancellation for the P3 download/write-back phases, and retry-without-
+   redownload after a failed write-back — both deferred as documented follow-ups (see the P3
+   reference-level section's "What is deferred").
 
 ## Crate, dependency, and feature impact
 
@@ -408,3 +566,20 @@ Sketch:
   input). No new backend capability, no `Caps` flag, no config schema change in P2 — P2 is
   entirely TUI/runtime work plus the existing `Vfs::local_path` capability the local backend
   already provides.
+- **P3 additive:** `cairn-core`: `RemoteVersion`/`RemoteEditId`/`ContentHash`/`WritebackChoice`/
+  `WritebackConflictReason`/`REMOTE_EDIT_MAX_BYTES` in `state.rs`; `WriteBackMode` and
+  `AppEffect::{DownloadForEdit,EditRemoteTemp,WriteBack,CancelRemoteEdit}` /
+  `AppEvent::{RemoteEditNeedsDownload,RemoteEditDownloaded,RemoteEditNoChange,RemoteEditModified,
+  RemoteEditFailed,WriteBackConflict,WriteBackDone}` in `msg.rs`; `Overlay::ConfirmWriteback` in
+  `state.rs`. `cairn-tui`: `render_confirm_writeback`; a `confirm-writeback` scenario/snapshot
+  (no new keybinding — the overlay reuses the existing cursor/confirm/cancel actions). `cairn`:
+  `begin_remote_edit`/`run_download_for_edit`/`run_remote_edit_temp`/`run_writeback`/
+  `write_temp_to_remote`/`unique_sibling_path`/`new_remote_edit_dir`/`create_temp_edit_file`/
+  `hash_file` in `app.rs`; `suspend_and_run_editor` factored out of `run_editor_suspend` so P2 and
+  P3 share the terminal pause/suspend/spawn/resume sequence; a `remote_edit_temps` control map in
+  `event_loop`, mirroring `transfer_controls`/`pager_controls`/`session_controls`. Two new
+  dependencies in `cairn`: `tempfile` (promoted from dev-only — already a normal dependency of
+  `cairn-backend-archive`, same temp-file pattern reused here) and `sha2` (already resolved
+  transitively via `wasmtime`/`cranelift` for `cairn-plugin`, so this adds zero new crates to the
+  dependency tree, just a new direct consumer). No new `Caps` flag, no config schema change — the
+  atomic-vs-direct write-back choice reads the existing `Caps::RENAME`.

@@ -127,6 +127,11 @@ pub fn all() -> Vec<Scenario> {
             build: confirm_overwrite,
         },
         Scenario {
+            name: "confirm-writeback",
+            description: "RFC-0012 P3: remote edit write-back conflict (remote file changed)",
+            build: confirm_writeback,
+        },
+        Scenario {
             name: "scheme-picker",
             description: "the add-connection scheme picker (RFC-0011 P4)",
             build: scheme_picker,
@@ -422,6 +427,25 @@ fn confirm_overwrite() -> AppState {
         items: vec![(from, to)],
         is_move: false,
         conflicts: 1,
+    });
+    s
+}
+
+fn confirm_writeback() -> AppState {
+    let mut s = dual_pane();
+    let path = VfsPath::root()
+        .join("notes.txt")
+        .unwrap_or_else(|_| VfsPath::root());
+    s.overlay = Some(Overlay::ConfirmWriteback {
+        id: 1,
+        conn: ConnectionId(1),
+        path,
+        temp_path: std::path::PathBuf::from("/run/user/1000/.cairn-edit-abc123/notes.txt"),
+        v0: cairn_core::RemoteVersion::ETag("v1".to_owned()),
+        orig_size: 128,
+        hash: [0u8; 32],
+        reason: cairn_core::WritebackConflictReason::RemoteChanged,
+        cursor: 0,
     });
     s
 }
