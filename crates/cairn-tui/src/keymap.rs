@@ -166,6 +166,10 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "new_connection" => Action::NewConnection,
         "edit_connection" => Action::EditConnection,
         "delete_connection" => Action::DeleteConnection,
+        "test_connection" => Action::TestConnection,
+        "pin_connection" => Action::PinConnection,
+        "hide_connection" => Action::HideConnection,
+        "toggle_show_hidden" => Action::ToggleShowHidden,
         _ => return None,
     })
 }
@@ -305,6 +309,14 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         // PgUp/PgDn scroll the active overlay.
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::PageDown => Some(Action::PageDown),
+        // RFC-0011 P6: only meaningful inside the connection switcher (Overlay::Connections);
+        // the reducer no-ops them everywhere else, matching 'e'/'d' above. Plain 't' is unbound
+        // by default elsewhere; Shift-P/Shift-H/Shift-S follow the existing Shift-G/K/J precedent
+        // (a direct uppercase-char match, distinct from their lowercase counterparts).
+        KeyCode::Char('t') => Some(Action::TestConnection),
+        KeyCode::Char('P') => Some(Action::PinConnection),
+        KeyCode::Char('H') => Some(Action::HideConnection),
+        KeyCode::Char('S') => Some(Action::ToggleShowHidden),
         _ => None,
     }
 }
@@ -398,6 +410,29 @@ mod tests {
     #[test]
     fn edit_key() {
         assert_eq!(action_for(press(KeyCode::F(4))), Some(Action::Edit));
+    }
+
+    #[test]
+    fn connection_switcher_p6_keys() {
+        // RFC-0011 P6: test/pin/hide/show-hidden. These are global default bindings resolved the
+        // same way as 'e' (EditConnection) — meaningful only while Overlay::Connections is open,
+        // a no-op elsewhere — so this only asserts the keymap resolves them to the right Action.
+        assert_eq!(
+            action_for(press(KeyCode::Char('t'))),
+            Some(Action::TestConnection)
+        );
+        assert_eq!(
+            action_for(press(KeyCode::Char('P'))),
+            Some(Action::PinConnection)
+        );
+        assert_eq!(
+            action_for(press(KeyCode::Char('H'))),
+            Some(Action::HideConnection)
+        );
+        assert_eq!(
+            action_for(press(KeyCode::Char('S'))),
+            Some(Action::ToggleShowHidden)
+        );
     }
 
     #[test]
@@ -597,6 +632,10 @@ mod tests {
             "new_connection",
             "edit_connection",
             "delete_connection",
+            "test_connection",
+            "pin_connection",
+            "hide_connection",
+            "toggle_show_hidden",
         ];
         for name in names {
             assert!(
@@ -604,7 +643,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 37);
+        assert_eq!(names.len(), 41);
     }
 
     #[test]

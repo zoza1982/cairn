@@ -538,8 +538,15 @@ pub enum Overlay {
     },
     /// Pick a connection to open in the active pane (the choices live in [`AppState::connections`]).
     Connections {
-        /// The selection cursor into [`AppState::connections`].
+        /// The selection cursor — an index into the **currently visible** subset of
+        /// [`AppState::connections`] (see [`visible_connection_indices`]), not into the raw list
+        /// directly. A hidden entry only participates in this indexing while `show_hidden` is
+        /// `true`.
         cursor: usize,
+        /// Whether hidden entries (RFC-0011 P6) are currently revealed in this switcher session.
+        /// Always starts `false` when the overlay opens; never persisted — this is purely a
+        /// this-session view toggle, distinct from the persisted `hidden` flag on each choice.
+        show_hidden: bool,
     },
     /// A single-line text entry (new-directory name, rename, …).
     Prompt {
@@ -1110,10 +1117,27 @@ pub struct ConnectionChoice {
     pub status: ChoiceStatus,
     /// Whether the entry is user-editable (gates edit/delete actions in Phase P4+).
     pub kind: ConnectionKind,
+    /// Whether this entry is pinned to the top of the switcher (RFC-0011 P6).
+    ///
+    /// Populated by the `ConnectionCoordinator` from `[discovery].pinned` at enumeration time;
+    /// toggled at runtime by [`crate::Action::PinConnection`]. Pinned entries are floated to the
+    /// front of [`AppState::connections`] (both at enumeration and after a toggle) — display-only
+    /// otherwise, it does not change routing.
+    pub pinned: bool,
+    /// Whether this entry is hidden from the switcher's default view (RFC-0011 P6).
+    ///
+    /// Populated by the `ConnectionCoordinator` from `[discovery].hidden`; toggled by
+    /// [`crate::Action::HideConnection`]. A hidden entry still appears in
+    /// [`AppState::connections`] — only [`Overlay::Connections`]'s *rendering* filters it out by
+    /// default (see [`visible_connection_indices`]) — so toggling "show hidden"
+    /// ([`crate::Action::ToggleShowHidden`]) can reveal it again to be un-hidden. There is
+    /// deliberately no one-way trap: hiding an entry never removes the only path back to it.
+    pub hidden: bool,
 }
 
 impl Default for ConnectionChoice {
-    /// Returns a sentinel choice (`conn = 0`, empty label, `Builtin`/`Ready`/`AutoDiscovered`).
+    /// Returns a sentinel choice (`conn = 0`, empty label, `Builtin`/`Ready`/`AutoDiscovered`, not
+    /// pinned or hidden).
     ///
     /// Primarily used in tests via `..Default::default()` to fill in the additive RFC-0011
     /// fields without having to spell them out at every existing construction site. The sentinel
@@ -1125,8 +1149,30 @@ impl Default for ConnectionChoice {
             provenance: ChoiceProvenance::Builtin,
             status: ChoiceStatus::Ready,
             kind: ConnectionKind::AutoDiscovered,
+            pinned: false,
+            hidden: false,
         }
     }
+}
+
+/// The indices into `connections` that the switcher should currently display, given whether
+/// hidden entries are being revealed ([`Overlay::Connections::show_hidden`]).
+///
+/// Shared by the reducer (cursor navigation and selection in `apply_connections_action`) and the
+/// renderer (the list of rows actually drawn) so the two can never disagree about which
+/// `connections` entry a given cursor position refers to — the classic "renderer and reducer
+/// each filter independently and drift apart" bug class.
+#[must_use]
+pub fn visible_connection_indices(
+    connections: &[ConnectionChoice],
+    show_hidden: bool,
+) -> Vec<usize> {
+    connections
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| show_hidden || !c.hidden)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// The whole application state. Holds plain data only — no service handles, no I/O.

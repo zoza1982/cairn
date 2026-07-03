@@ -15,6 +15,10 @@ workspace = true
 [dependencies]
 directories = "6"
 serde = { version = "1", features = ["derive"] }
+# Atomic config writes (temp file in the target directory + rename), mirroring `cairn-vault`'s
+# `atomic_write` (RFC-0011 P6: pin/hide persistence must never leave a half-written cairn.toml).
+# Already in the workspace's dependency tree via `cairn-vault`/tokio; MIT/Apache-2.0.
+tempfile = "3"
 thiserror = "2"
 toml = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -23,6 +27,3 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Already in the dependency tree (via tokio/tempfile); widely used, permissive (MIT/Apache-2.0/BSD).
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
-
-[dev-dependencies]
-tempfile = "3"

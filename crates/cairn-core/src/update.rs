@@ -181,7 +181,10 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             if state.connections.is_empty() {
                 state.status = Some("No other connections configured".to_owned());
             } else {
-                state.overlay = Some(Overlay::Connections { cursor: 0 });
+                state.overlay = Some(Overlay::Connections {
+                    cursor: 0,
+                    show_hidden: false,
+                });
             }
             Vec::new()
         }
@@ -373,9 +376,15 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             open_scheme_picker(state);
             Vec::new()
         }
-        // EditConnection/DeleteConnection are only meaningful inside the Connections overlay.
+        // EditConnection/DeleteConnection/TestConnection/PinConnection/HideConnection/
+        // ToggleShowHidden are only meaningful inside the Connections overlay (RFC-0011 P4/P6).
         // Outside it they are silent no-ops so a misrouted key does not confuse the user.
-        Action::EditConnection | Action::DeleteConnection => Vec::new(),
+        Action::EditConnection
+        | Action::DeleteConnection
+        | Action::TestConnection
+        | Action::PinConnection
+        | Action::HideConnection
+        | Action::ToggleShowHidden => Vec::new(),
     }
 }
 
@@ -2083,11 +2092,21 @@ fn apply_confirm_delete_connection_action(state: &mut AppState, action: Action) 
 
 /// Drive the connection switcher: navigate the choice list and open the selected connection in the
 /// active pane.
+///
+/// `cursor` indexes the *currently visible* subset of `state.connections` — see
+/// [`visible_connection_indices`] — not the raw list, so a hidden entry (RFC-0011 P6) never
+/// participates in navigation/selection unless `show_hidden` has revealed it.
 fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
-    let n = state.connections.len();
-    let Some(Overlay::Connections { cursor }) = &mut state.overlay else {
+    let Some(Overlay::Connections {
+        cursor,
+        show_hidden,
+    }) = &mut state.overlay
+    else {
         return Vec::new();
     };
+    let show_hidden_val = *show_hidden;
+    let visible = crate::state::visible_connection_indices(&state.connections, show_hidden_val);
+    let n = visible.len();
     match action {
         Action::CursorUp => {
             *cursor = cursor.saturating_sub(1);
@@ -2099,14 +2118,27 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
             }
             Vec::new()
         }
+        Action::ToggleShowHidden => {
+            *show_hidden = !show_hidden_val;
+            // Re-clamp the cursor into the freshly (un)filtered list so it never points past the
+            // end when revealing/re-hiding shrinks or grows the visible set.
+            let new_n =
+                crate::state::visible_connection_indices(&state.connections, !show_hidden_val)
+                    .len();
+            *cursor = (*cursor).min(new_n.saturating_sub(1));
+            Vec::new()
+        }
         Action::Confirm | Action::Enter => {
-            let Some(Overlay::Connections { cursor }) = state.overlay.take() else {
+            let Some(Overlay::Connections { cursor, .. }) = state.overlay.take() else {
                 return Vec::new();
             };
             // Cheap insurance: `cursor` is bounded by `n` (clamped on CursorDown), but
             // P4 will allow mid-switcher removal. Get instead of indexing so any TOCTOU
             // between the cursor bound-check and the take() is handled cleanly.
-            let Some(choice) = state.connections.get(cursor).cloned() else {
+            let Some(&real_idx) = visible.get(cursor) else {
+                return Vec::new();
+            };
+            let Some(choice) = state.connections.get(real_idx).cloned() else {
                 return Vec::new();
             };
             let side = state.focus;
@@ -2176,7 +2208,10 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
             // Copy the cursor value so the mutable borrow on state.overlay ends before we read
             // state.connections and then replace state.overlay.
             let cursor_val = *cursor;
-            let Some(choice) = state.connections.get(cursor_val).cloned() else {
+            let Some(&real_idx) = visible.get(cursor_val) else {
+                return Vec::new();
+            };
+            let Some(choice) = state.connections.get(real_idx).cloned() else {
                 return Vec::new();
             };
             let profile_id = match &choice.kind {
@@ -2222,7 +2257,10 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
         // confirmation dialog rather than immediately deleting (destructive, no undo).
         Action::Delete | Action::DeleteConnection => {
             let cursor_val = *cursor;
-            let Some(choice) = state.connections.get(cursor_val).cloned() else {
+            let Some(&real_idx) = visible.get(cursor_val) else {
+                return Vec::new();
+            };
+            let Some(choice) = state.connections.get(real_idx).cloned() else {
                 return Vec::new();
             };
             let profile_id = match &choice.kind {
@@ -2240,6 +2278,82 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
                 display_name: choice.label.clone(),
             });
             Vec::new()
+        }
+        // Probe reachability without opening a pane (RFC-0011 P6). `Ready` and `NeedsVault` are
+        // resolved purely from state — no I/O:
+        // - `Ready` means the backend is already mounted; re-probing would be wasted work (the
+        //   "debounce/cache" tuning the RFC asks for), so just confirm it.
+        // - `NeedsVault` is reported as "needs unlock" WITHOUT opening the vault-unlock/create
+        //   overlay — testing must never force a vault flow on the user.
+        Action::TestConnection => {
+            let cursor_val = *cursor;
+            let Some(&real_idx) = visible.get(cursor_val) else {
+                return Vec::new();
+            };
+            let Some(choice) = state.connections.get(real_idx).cloned() else {
+                return Vec::new();
+            };
+            match choice.status {
+                ChoiceStatus::Ready => {
+                    state.status = Some(format!("{} — already connected", choice.label));
+                    Vec::new()
+                }
+                ChoiceStatus::NeedsVault => {
+                    state.status = Some(format!(
+                        "{} — needs the vault unlocked to test (Ctrl-U)",
+                        choice.label
+                    ));
+                    Vec::new()
+                }
+                ChoiceStatus::NeedsOpen | ChoiceStatus::Unreachable => {
+                    state.status = Some(format!("Testing {}…", choice.label));
+                    vec![AppEffect::TestConnection { conn: choice.conn }]
+                }
+            }
+        }
+        // Pin/hide apply to any switcher entry (builtin, saved, or discovered) — matching the
+        // `[discovery]` overlay's own scope, which is not restricted to `AutoDiscovered` kinds.
+        Action::PinConnection => {
+            let cursor_val = *cursor;
+            let Some(&real_idx) = visible.get(cursor_val) else {
+                return Vec::new();
+            };
+            let Some(choice) = state.connections.get(real_idx) else {
+                return Vec::new();
+            };
+            let conn = choice.conn;
+            let label = choice.label.clone();
+            let new_pinned = !choice.pinned;
+            state.status = Some(if new_pinned {
+                format!("Pinning {label}…")
+            } else {
+                format!("Unpinning {label}…")
+            });
+            vec![AppEffect::SetConnectionPinned {
+                conn,
+                pinned: new_pinned,
+            }]
+        }
+        Action::HideConnection => {
+            let cursor_val = *cursor;
+            let Some(&real_idx) = visible.get(cursor_val) else {
+                return Vec::new();
+            };
+            let Some(choice) = state.connections.get(real_idx) else {
+                return Vec::new();
+            };
+            let conn = choice.conn;
+            let label = choice.label.clone();
+            let new_hidden = !choice.hidden;
+            state.status = Some(if new_hidden {
+                format!("Hiding {label}… (press S to show hidden entries)")
+            } else {
+                format!("Unhiding {label}…")
+            });
+            vec![AppEffect::SetConnectionHidden {
+                conn,
+                hidden: new_hidden,
+            }]
         }
         _ => Vec::new(),
     }
@@ -4084,6 +4198,129 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 }
             }
         }
+        AppEvent::ConnectionTested { conn, result } => {
+            // Unconditional, like `ConnectionOpened`'s badge flip — a probe's outcome must
+            // reflect reality even if the switcher has since closed. Never touches
+            // `pending_conn_open`/navigation: a test never switches a pane.
+            if let Some(choice) = state.connections.iter_mut().find(|c| c.conn == conn) {
+                match &result {
+                    Ok(()) => choice.status = ChoiceStatus::Ready,
+                    Err(_) => choice.status = ChoiceStatus::Unreachable,
+                }
+            }
+            let label = state
+                .connections
+                .iter()
+                .find(|c| c.conn == conn)
+                .map(|c| c.label.clone())
+                .unwrap_or_default();
+            state.status = Some(match result {
+                Ok(()) => format!("{label} — reachable"),
+                Err(msg) => format!("{label} — unreachable: {msg}"),
+            });
+            Vec::new()
+        }
+        AppEvent::ConnectionPinSet {
+            conn,
+            pinned,
+            result,
+        } => {
+            match result {
+                Ok(()) => {
+                    if let Some(choice) = state.connections.iter_mut().find(|c| c.conn == conn) {
+                        choice.pinned = pinned;
+                    }
+                    // Keep pinned entries floated to the front (stable — ties keep their
+                    // existing relative order), mirroring the coordinator's own pinned-overlay
+                    // ordering at enumeration time.
+                    state
+                        .connections
+                        .sort_by_key(|c| std::cmp::Reverse(c.pinned));
+                    let label = state
+                        .connections
+                        .iter()
+                        .find(|c| c.conn == conn)
+                        .map(|c| c.label.clone())
+                        .unwrap_or_default();
+                    state.status = Some(if pinned {
+                        format!("Pinned {label}")
+                    } else {
+                        format!("Unpinned {label}")
+                    });
+                    // The sort above can silently retarget the switcher's cursor (a *positional*
+                    // index into the visible subset) at a different entry than the one the user
+                    // just toggled — e.g. pinning the highlighted last entry floats it to the
+                    // front, but the cursor stays put and now highlights whatever slid into that
+                    // slot. Re-point it at `conn`'s new position so a follow-up
+                    // Enter/e/d/t/P/H acts on the entry the user actually just acted on, not a
+                    // different one that happens to occupy the old cursor position.
+                    if let Some(Overlay::Connections {
+                        cursor,
+                        show_hidden,
+                    }) = &mut state.overlay
+                    {
+                        let visible = crate::state::visible_connection_indices(
+                            &state.connections,
+                            *show_hidden,
+                        );
+                        if let Some(new_cursor) = visible.iter().position(|&raw_idx| {
+                            state
+                                .connections
+                                .get(raw_idx)
+                                .is_some_and(|c| c.conn == conn)
+                        }) {
+                            *cursor = new_cursor;
+                        }
+                    }
+                }
+                Err(msg) => {
+                    state.status = Some(format!("Failed to update pin: {msg}"));
+                }
+            }
+            Vec::new()
+        }
+        AppEvent::ConnectionHideSet {
+            conn,
+            hidden,
+            result,
+        } => {
+            match result {
+                Ok(()) => {
+                    let label = state
+                        .connections
+                        .iter()
+                        .find(|c| c.conn == conn)
+                        .map(|c| c.label.clone())
+                        .unwrap_or_default();
+                    if let Some(choice) = state.connections.iter_mut().find(|c| c.conn == conn) {
+                        choice.hidden = hidden;
+                    }
+                    state.status = Some(if hidden {
+                        format!("Hid {label} (press S in the switcher to show hidden entries)")
+                    } else {
+                        format!("Unhid {label}")
+                    });
+                    // A newly-hidden entry may vanish from the visible subset; re-clamp the
+                    // switcher cursor so it never points past the end of the shrunk list.
+                    if let Some(Overlay::Connections {
+                        cursor,
+                        show_hidden,
+                    }) = &mut state.overlay
+                    {
+                        let visible_len = crate::state::visible_connection_indices(
+                            &state.connections,
+                            *show_hidden,
+                        )
+                        .len();
+                        *cursor = (*cursor).min(visible_len.saturating_sub(1));
+                    }
+                }
+                Err(msg) => {
+                    state.status = Some(format!("Failed to update visibility: {msg}"));
+                }
+            }
+            Vec::new()
+        }
         AppEvent::OsSourcesDetected { os_sources } => {
             // Update the default credential method cursor if the picker is currently open AND
             // the user has not manually moved it. We detect "user moved" by comparing the
@@ -5922,7 +6159,10 @@ mod tests {
         assert!(fx.is_empty());
         assert!(matches!(
             s.overlay,
-            Some(Overlay::Connections { cursor: 0 })
+            Some(Overlay::Connections {
+                cursor: 0,
+                show_hidden: false
+            })
         ));
         // Move to the second choice and select it.
         let _ = update(&mut s, Msg::Action(Action::CursorDown));
@@ -5969,13 +6209,19 @@ mod tests {
         let _ = update(&mut s, Msg::Action(Action::CursorUp));
         assert!(matches!(
             s.overlay,
-            Some(Overlay::Connections { cursor: 0 })
+            Some(Overlay::Connections {
+                cursor: 0,
+                show_hidden: false
+            })
         ));
         let _ = update(&mut s, Msg::Action(Action::CursorDown));
         let _ = update(&mut s, Msg::Action(Action::CursorDown));
         assert!(matches!(
             s.overlay,
-            Some(Overlay::Connections { cursor: 1 })
+            Some(Overlay::Connections {
+                cursor: 1,
+                show_hidden: false
+            })
         ));
         // Quit from within the overlay quits the app.
         let _ = update(&mut s, Msg::Action(Action::Quit));
@@ -9647,8 +9893,12 @@ mod p4_form_tests {
             provenance: ChoiceProvenance::Saved,
             status: ChoiceStatus::NeedsOpen,
             kind: ConnectionKind::Profile { id: prof_id },
+            ..Default::default()
         }];
-        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        s.overlay = Some(Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
         s
     }
 
@@ -9832,9 +10082,13 @@ mod p4_form_tests {
             provenance: ChoiceProvenance::Saved,
             status: ChoiceStatus::NeedsOpen,
             kind: ConnectionKind::Profile { id: prof_id },
+            ..Default::default()
         }];
         s.saved_profiles.insert(prof_id, profile);
-        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        s.overlay = Some(Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
 
         // Open the edit form.
         let _ = update(&mut s, Msg::Action(Action::EditConnection));
@@ -9905,8 +10159,12 @@ mod p4_form_tests {
             },
             status: ChoiceStatus::Ready,
             kind: ConnectionKind::AutoDiscovered,
+            ..Default::default()
         }];
-        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        s.overlay = Some(Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
         let effects = update(&mut s, Msg::Action(Action::EditConnection));
         assert!(effects.is_empty());
         let status = s.status.as_deref().unwrap_or("").to_lowercase();
@@ -9933,8 +10191,12 @@ mod p4_form_tests {
             },
             status: ChoiceStatus::Ready,
             kind: ConnectionKind::AutoDiscovered,
+            ..Default::default()
         }];
-        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        s.overlay = Some(Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
         let effects = update(&mut s, Msg::Action(Action::DeleteConnection));
         assert!(effects.is_empty());
         assert!(
@@ -10000,6 +10262,365 @@ mod p4_form_tests {
                     .iter()
                     .all(|e| !matches!(e, AppEffect::DeleteConnection { .. }))
         );
+    }
+}
+
+// ─────────────────────────── P6 polish tests (test/pin/hide/show-hidden) ─────────────────────────
+
+#[cfg(test)]
+mod p6_connection_polish_tests {
+    //! Hermetic unit tests for RFC-0011 P6: test-connection, pin/hide, and the switcher's
+    //! "show hidden" toggle. No I/O — effects are asserted as data, never executed.
+
+    use super::*;
+    use crate::state::ConnectionChoice;
+
+    fn base() -> AppState {
+        AppState::new(ConnectionId(1), ConnectionId(2), VfsPath::root())
+    }
+
+    /// Three switcher entries: `Ready`, `NeedsOpen`, `NeedsVault`. Overlay open, cursor at 0.
+    fn state_with_three_choices() -> AppState {
+        let mut s = base();
+        s.connections = vec![
+            ConnectionChoice {
+                conn: ConnectionId(3),
+                label: "local: /".to_owned(),
+                status: ChoiceStatus::Ready,
+                ..Default::default()
+            },
+            ConnectionChoice {
+                conn: ConnectionId(4),
+                label: "ssh: bastion".to_owned(),
+                status: ChoiceStatus::NeedsOpen,
+                ..Default::default()
+            },
+            ConnectionChoice {
+                conn: ConnectionId(5),
+                label: "s3: prod".to_owned(),
+                status: ChoiceStatus::NeedsVault,
+                ..Default::default()
+            },
+        ];
+        s.overlay = Some(Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
+        s
+    }
+
+    fn set_cursor(s: &mut AppState, cursor: usize) {
+        if let Some(Overlay::Connections { cursor: c, .. }) = &mut s.overlay {
+            *c = cursor;
+        } else {
+            panic!("expected Overlay::Connections");
+        }
+    }
+
+    // ── TestConnection ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_connection_on_ready_entry_is_a_status_only_noop() {
+        let mut s = state_with_three_choices(); // cursor 0 = Ready
+        let effects = update(&mut s, Msg::Action(Action::TestConnection));
+        assert!(
+            effects.is_empty(),
+            "an already-Ready entry must not be re-probed (debounce): {effects:?}"
+        );
+        assert!(s.status.as_deref().is_some_and(|m| m.contains("already")));
+    }
+
+    #[test]
+    fn test_connection_on_needs_vault_reports_without_opening_any_overlay() {
+        let mut s = state_with_three_choices();
+        set_cursor(&mut s, 2); // NeedsVault
+        let effects = update(&mut s, Msg::Action(Action::TestConnection));
+        assert!(
+            effects.is_empty(),
+            "a NeedsVault entry must never trigger I/O for a test: {effects:?}"
+        );
+        // Testing must NEVER force the vault-unlock/create overlay on the user.
+        assert!(
+            matches!(s.overlay, Some(Overlay::Connections { .. })),
+            "the switcher must stay open, not be replaced by a vault overlay"
+        );
+        assert!(
+            s.status
+                .as_deref()
+                .is_some_and(|m| m.contains("unlock") || m.contains("vault")),
+            "status must explain the vault is the blocker: {:?}",
+            s.status
+        );
+    }
+
+    #[test]
+    fn test_connection_on_needs_open_emits_the_probe_effect() {
+        let mut s = state_with_three_choices();
+        set_cursor(&mut s, 1); // NeedsOpen
+        let effects = update(&mut s, Msg::Action(Action::TestConnection));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            AppEffect::TestConnection {
+                conn: ConnectionId(4)
+            }
+        ));
+        assert!(s.status.as_deref().is_some_and(|m| m.contains("Testing")));
+    }
+
+    #[test]
+    fn connection_tested_ok_flips_ready_without_navigating() {
+        let mut s = state_with_three_choices();
+        let prior_side_slots = s.pending_conn_open;
+        let effects = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionTested {
+                conn: ConnectionId(4),
+                result: Ok(()),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            s.connections
+                .iter()
+                .find(|c| c.conn == ConnectionId(4))
+                .unwrap()
+                .status,
+            ChoiceStatus::Ready
+        );
+        assert_eq!(
+            s.pending_conn_open, prior_side_slots,
+            "a test result must never touch pane-navigation state"
+        );
+        assert!(s.status.as_deref().is_some_and(|m| m.contains("reachable")));
+    }
+
+    #[test]
+    fn connection_tested_err_flips_unreachable_and_redacted_message_surfaces() {
+        let mut s = state_with_three_choices();
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionTested {
+                conn: ConnectionId(4),
+                result: Err("ssh: connection failed".to_owned()),
+            }),
+        );
+        assert_eq!(
+            s.connections
+                .iter()
+                .find(|c| c.conn == ConnectionId(4))
+                .unwrap()
+                .status,
+            ChoiceStatus::Unreachable
+        );
+        assert!(s
+            .status
+            .as_deref()
+            .is_some_and(|m| m.contains("unreachable")));
+    }
+
+    // ── PinConnection ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pin_connection_emits_effect_with_the_toggled_state() {
+        let mut s = state_with_three_choices(); // cursor 0, not pinned
+        let effects = update(&mut s, Msg::Action(Action::PinConnection));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            AppEffect::SetConnectionPinned {
+                conn: ConnectionId(3),
+                pinned: true,
+            }
+        ));
+        // Not applied to the display yet — only once ConnectionPinSet confirms the write.
+        assert!(!s.connections[0].pinned);
+    }
+
+    #[test]
+    fn connection_pin_set_ok_applies_and_floats_to_front() {
+        let mut s = state_with_three_choices();
+        // Pin the *last* entry (s3: prod) and confirm it floats to the front on success.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionPinSet {
+                conn: ConnectionId(5),
+                pinned: true,
+                result: Ok(()),
+            }),
+        );
+        assert!(s.connections[0].pinned);
+        assert_eq!(s.connections[0].conn, ConnectionId(5));
+        assert!(s.status.as_deref().is_some_and(|m| m.contains("Pinned")));
+    }
+
+    /// Regression test for a P6 gate finding: pinning an entry that isn't already at the front
+    /// reorders `state.connections`, and the switcher's cursor (a *positional* index) must follow
+    /// the pinned entry to its new slot — otherwise the highlight silently jumps onto whatever
+    /// entry slid into the old cursor position, so a subsequent Enter/e/d/t/P/H acts on the wrong
+    /// connection (a delete could remove the wrong saved profile).
+    #[test]
+    fn connection_pin_set_ok_moves_the_cursor_to_follow_the_pinned_entry() {
+        let mut s = state_with_three_choices();
+        // Put the cursor on the entry about to be pinned (raw index 2, conn5 "s3: prod").
+        set_cursor(&mut s, 2);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionPinSet {
+                conn: ConnectionId(5),
+                pinned: true,
+                result: Ok(()),
+            }),
+        );
+        // conn5 floated to raw index 0; the cursor must follow it there, not stay at 2 (which
+        // would now highlight whatever slid into that slot instead).
+        assert_eq!(s.connections[0].conn, ConnectionId(5));
+        let Some(Overlay::Connections { cursor, .. }) = s.overlay else {
+            panic!("expected Overlay::Connections");
+        };
+        assert_eq!(
+            cursor, 0,
+            "cursor must track the pinned entry (conn 5) to its new position"
+        );
+    }
+
+    #[test]
+    fn connection_pin_set_err_leaves_display_unchanged() {
+        let mut s = state_with_three_choices();
+        let before: Vec<ConnectionId> = s.connections.iter().map(|c| c.conn).collect();
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionPinSet {
+                conn: ConnectionId(5),
+                pinned: true,
+                result: Err("disk full".to_owned()),
+            }),
+        );
+        assert!(!s.connections.iter().any(|c| c.pinned));
+        let after: Vec<ConnectionId> = s.connections.iter().map(|c| c.conn).collect();
+        assert_eq!(before, after, "a failed pin must not reorder the list");
+        assert!(s
+            .status
+            .as_deref()
+            .is_some_and(|m| m.to_lowercase().contains("failed")));
+    }
+
+    // ── HideConnection / ToggleShowHidden ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hide_connection_emits_effect_with_the_toggled_state() {
+        let mut s = state_with_three_choices();
+        let effects = update(&mut s, Msg::Action(Action::HideConnection));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            AppEffect::SetConnectionHidden {
+                conn: ConnectionId(3),
+                hidden: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn connection_hide_set_ok_removes_entry_from_default_view() {
+        let mut s = state_with_three_choices();
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionHideSet {
+                conn: ConnectionId(3),
+                hidden: true,
+                result: Ok(()),
+            }),
+        );
+        assert!(s.connections[0].hidden);
+        // The entry is still enumerated (recoverable)...
+        assert_eq!(s.connections.len(), 3);
+        // ...but absent from the default (show_hidden = false) visible set.
+        let visible = crate::state::visible_connection_indices(&s.connections, false);
+        assert!(
+            !visible.contains(&0),
+            "hidden entry must not be visible by default"
+        );
+        // ...and present once hidden entries are revealed.
+        let visible_all = crate::state::visible_connection_indices(&s.connections, true);
+        assert!(visible_all.contains(&0));
+    }
+
+    #[test]
+    fn hiding_the_cursor_entry_reclamps_the_switcher_cursor() {
+        let mut s = state_with_three_choices();
+        set_cursor(&mut s, 2); // last entry
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::ConnectionHideSet {
+                conn: ConnectionId(5), // the entry the cursor is on
+                hidden: true,
+                result: Ok(()),
+            }),
+        );
+        let Some(Overlay::Connections { cursor, .. }) = s.overlay else {
+            panic!("overlay must still be Connections");
+        };
+        // Only 2 entries are now visible (indices 0,1); cursor must not point past the end.
+        assert!(cursor < 2, "cursor {cursor} must be re-clamped");
+    }
+
+    #[test]
+    fn hidden_entry_never_traps_the_user_toggle_show_hidden_reveals_it_for_unhiding() {
+        let mut s = state_with_three_choices();
+        s.connections[1].hidden = true; // pre-hidden "ssh: bastion"
+
+        // Default view: only 2 of 3 are navigable.
+        let visible = crate::state::visible_connection_indices(&s.connections, false);
+        assert_eq!(visible, vec![0, 2]);
+
+        // Toggle "show hidden" on.
+        let _ = update(&mut s, Msg::Action(Action::ToggleShowHidden));
+        let Some(Overlay::Connections { show_hidden, .. }) = s.overlay else {
+            panic!("expected Connections overlay");
+        };
+        assert!(show_hidden, "ToggleShowHidden must flip show_hidden on");
+
+        // Now the hidden entry can be reached and un-hidden.
+        set_cursor(&mut s, 1); // second visible-in-full-list row = the hidden ssh entry
+        let effects = update(&mut s, Msg::Action(Action::HideConnection));
+        assert!(matches!(
+            effects.as_slice(),
+            [AppEffect::SetConnectionHidden {
+                conn: ConnectionId(4),
+                hidden: false,
+            }]
+        ));
+    }
+
+    #[test]
+    fn cursor_navigation_skips_hidden_entries_by_default() {
+        let mut s = state_with_three_choices();
+        s.connections[1].hidden = true; // hide the middle entry ("ssh: bastion")
+                                        // Rebuild the overlay so the cursor starts fresh at the top of the visible set.
+        s.overlay = Some(Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let Some(Overlay::Connections { cursor, .. }) = s.overlay else {
+            panic!("expected Connections overlay");
+        };
+        // Only 2 visible entries (indices 0 and 2 in the raw list) — CursorDown must land on
+        // the second *visible* row, not stop early or skip past the end.
+        assert_eq!(cursor, 1);
+        // Confirming from here must act on the raw entry at index 2 (s3: prod), not the hidden
+        // one at index 1 — proving selection uses the same visible-index mapping as navigation.
+        // `PinConnection` (unlike `TestConnection`) always emits regardless of `ChoiceStatus`, so
+        // it isolates the index-mapping behavior from status-dependent branching.
+        let effects = update(&mut s, Msg::Action(Action::PinConnection));
+        assert!(matches!(
+            effects.as_slice(),
+            [AppEffect::SetConnectionPinned {
+                conn: ConnectionId(5),
+                pinned: true,
+            }]
+        ));
     }
 }
 
@@ -10453,9 +11074,13 @@ mod p5_cred_tests {
             provenance: ChoiceProvenance::Saved,
             status: ChoiceStatus::NeedsOpen,
             kind: ConnectionKind::Profile { id: prof_id },
+            ..Default::default()
         }];
         s.saved_profiles.insert(prof_id, profile);
-        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        s.overlay = Some(Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
 
         let _ = update(&mut s, Msg::Action(Action::EditConnection));
 
@@ -10498,9 +11123,13 @@ mod p5_cred_tests {
             provenance: ChoiceProvenance::Saved,
             status: ChoiceStatus::NeedsOpen,
             kind: ConnectionKind::Profile { id: prof_id },
+            ..Default::default()
         }];
         s.saved_profiles.insert(prof_id, profile);
-        s.overlay = Some(Overlay::Connections { cursor: 0 });
+        s.overlay = Some(Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
 
         let _ = update(&mut s, Msg::Action(Action::EditConnection));
         let _ = update(&mut s, Msg::Text(TextEdit::Submit)); // → CredentialMethodPicker

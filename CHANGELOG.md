@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Test a connection, pin/hide discovered entries** (RFC-0011 P6): the connection switcher
+  (`Ctrl-O`) gains three new keys. `t` probes the highlighted entry's reachability without opening
+  it into a pane or switching any pane — it reuses the same vetted per-scheme open path (so a real
+  SSH/S3/GCS/Azure probe performs genuine credential resolution + a network handshake; Docker
+  additionally pings the daemon) but never mounts the result, and a vault-locked entry reports
+  "needs unlock" instead of forcing the vault overlay open. `P` pins an entry to the top of the
+  list; `H` hides it from the default view — both persist to the existing (RFC-0011 P3)
+  `[discovery].pinned`/`.hidden` config fields; what's new is the switcher UI writing to them, not
+  the fields themselves. `S` toggles showing hidden entries for the current session
+  so a hidden entry can always be found again and un-hidden (hiding is never a one-way trap).
+  Pin/hide apply to any switcher entry (built-in, saved, or auto-discovered), not just discovered
+  ones. Renaming a discovered entry is deferred (see the RFC's P6 section for why).
+
 - **Edit remote files** (RFC-0012 P3, `M4-7`): `F4`/`Enter`-on-text now works on any backend, not
   just local files — a remote file is downloaded to a private temp copy (0600 permissions, `O_EXCL`,
   a freshly-minted non-predictable directory preferring `$XDG_RUNTIME_DIR`), edited through the same
@@ -65,6 +78,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cairn --frame-dump <scenario> [WxH]` flag (and `--frame-dump-list`) prints one rendered frame to
   stdout for headless inspection — no TTY required. The catalog is the single source of truth shared
   by the snapshots and the dump flag.
+
+### Changed
+
+- **`cairn.toml` writes are now atomic** (temp file in the same directory + rename, fsynced before
+  the rename — mirroring `cairn-vault`'s `atomic_write`). Applies to every config save path
+  (connection add/edit/delete, and the new pin/hide toggles), not just the new RFC-0011 P6 code.
+- **A hidden discovered connection is marked, not dropped** (RFC-0011 P6): the switcher previously
+  removed a `[discovery].hidden` entry from enumeration entirely; it is now still enumerated (with
+  `ConnectionChoice::hidden = true`) so the switcher's "show hidden" toggle (`S`) can reveal — and
+  un-hide — it. The on-disk `[discovery]` schema is unchanged.
 
 ### Fixed
 

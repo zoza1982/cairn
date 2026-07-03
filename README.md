@@ -118,6 +118,31 @@ focused_border = "magenta"
 dir            = "#5fafff"
 ```
 
+### Connections
+
+`Ctrl-O` opens the connection switcher — pick a backend to open in the active pane. Docker and
+Kubernetes connections appear automatically (auto-discovery; opt out per-source with
+`[discovery] docker = false` / `kubernetes = false`), alongside your saved profiles and the local
+filesystem roots. Inside the switcher:
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Open the highlighted connection in the active pane |
+| `Ctrl-N` | Add a new connection (scheme picker → fields → credential) |
+| `e` | Edit the highlighted saved profile |
+| `d` | Delete the highlighted saved profile (asks to confirm; cleans up its vault credential) |
+| `t` | Test the highlighted connection's reachability — **without** opening it into a pane |
+| `P` | Pin/unpin the highlighted entry to the top of the list |
+| `H` | Hide/un-hide the highlighted entry from the default view |
+| `S` | Show hidden entries for this session (so a hidden one can be found again and un-hidden) |
+
+Pin/hide apply to any entry (built-in, saved, or auto-discovered) and persist to
+`[discovery].pinned` / `[discovery].hidden` in `config.toml`, keyed by a stable identifier — not
+the display name, so renaming a profile never orphans its pin/hide state. Testing reuses the same
+connection logic as a real open (so a real SSH/S3/GCS/Azure test performs genuine credential
+resolution) but never mounts the result or switches any pane; a connection that needs the secrets
+vault unlocked reports that directly rather than popping the vault-unlock prompt.
+
 ### Shell-command actions
 
 Bind a key to run a local program against the entry under the cursor. Each `[[shell_actions]]` entry
