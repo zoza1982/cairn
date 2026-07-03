@@ -33,6 +33,7 @@ cairn-plugin = { path = "crates/cairn-plugin", version = "0.1.0" }
 cairn-backend-ssh = { path = "crates/cairn-backend-ssh", version = "0.1.0" }
 cairn-backend-docker = { path = "crates/cairn-backend-docker", version = "0.1.0" }
 cairn-backend-k8s = { path = "crates/cairn-backend-k8s", version = "0.1.0" }
+cairn-backend-archive = { path = "crates/cairn-backend-archive", version = "0.1.0" }
 cairn-mcp = { path = "crates/cairn-mcp", version = "0.1.0" }
 
 

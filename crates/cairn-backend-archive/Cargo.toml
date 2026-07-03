@@ -1,0 +1,38 @@
+[package]
+name = "cairn-backend-archive"
+description = "Read-only archive backend for Cairn: browse a local tar/zip file as a directory tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types = { workspace = true }
+cairn-vfs = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "io-util"] }
+tracing = "0.1"
+# Uncompressed-tar reading (RFC-0013 P4). MIT/Apache-2.0, the crate Cargo itself uses to unpack
+# crate sources — small, pure-Rust, no TLS/FFI, so (unlike the S3/GCS/Azure SDKs, ADR-0006) it
+# carries no cross-platform build risk. We only need `entries_with_seek` over a local `File`; no
+# writer support required in v1 (read-only backend).
+tar = { version = "0.4.46", default-features = false }
+# Random-access zip reading (RFC-0013 P4) via the maintained `zip2` fork published as `zip`. MIT.
+# `default-features = false` + the read-only deflate decoder only: the `deflate` umbrella feature
+# would also pull in `deflate-zopfli` (a write-only, high-ratio *compressor* used solely by
+# `ZipWriter`), so we select `deflate-flate2-zlib-rs` directly — pure-Rust inflate via
+# flate2/zlib-rs, no zopfli, no C/FFI. The vast majority of zip archives are Stored or Deflated;
+# dropping bzip2/lzma/zstd/xz/ppmd/aes-crypto keeps the tree lean (CLAUDE.md §10) — an entry using
+# an unsupported method surfaces as a clear, typed error rather than a panic.
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+tempfile = "3"

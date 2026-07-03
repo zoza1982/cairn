@@ -1213,6 +1213,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "cairn-ai",
+ "cairn-backend-archive",
  "cairn-backend-docker",
  "cairn-backend-k8s",
  "cairn-backend-local",
@@ -1256,6 +1257,21 @@ dependencies = [
  "tokio",
  "wiremock",
  "zeroize",
+]
+
+[[package]]
+name = "cairn-backend-archive"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cairn-types",
+ "cairn-vfs",
+ "futures",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -2777,6 +2793,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -7382,6 +7399,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8696,6 +8719,25 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
+
+[[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "typed-path",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5431d5661c32445236631278f27946e444ddafe4684cac70b185272d4f9c52d5"
 
 [[package]]
 name = "zmij"

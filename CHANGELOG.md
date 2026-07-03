@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdin, which validates the foreground-process-group / SIGTTIN behavior end to end). Env-guarded by
   `CAIRN_IT_TMUX=1` so the default `cargo test` stays hermetic; runs in a dedicated CI `tmux-e2e` job.
 
+- **Browse tar/zip archives read-only** (RFC-0013 P4, `M4-8`): `Enter` on a local `.tar` or `.zip`
+  file — recognized by magic bytes, never by extension — mounts it and browses it like any other
+  directory. `..` at the archive's root leaves back to wherever the pane was before. Copying files
+  out of the archive works through the normal copy/move flow. New `cairn-backend-archive` crate
+  (`ArchiveVfs`, read-only: `Caps::LIST | Caps::READ | Caps::RANDOM_READ`), gated behind a new
+  `archive` Cargo feature (included in `all-backends`). Hardened against untrusted archive bytes:
+  bounded per-member and per-session decode caps, a zip compression-ratio (bomb) guard, an
+  entry-count cap, path-traversal/absolute-path/UNC/drive-letter rejection, and inert (never
+  followed) symlink/hardlink members. Compressed tar (`.tgz`/`.txz`/`.tbz2`/`.tzst`) is a follow-up
+  (RFC-0013 P5). See RFC-0013 and ADR-0012.
+
 - **Deterministic TUI snapshot testing.** A `scenarios` catalog in `cairn-tui` renders every screen
   (dual-pane, pager text/hex, log/AI-plan/transfer/connection/vault overlays, …) to a plain-text
   frame via ratatui's headless `TestBackend`. `insta` snapshot tests assert each scenario at 80×24

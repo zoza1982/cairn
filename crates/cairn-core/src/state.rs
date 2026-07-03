@@ -247,6 +247,24 @@ pub struct PaneState {
     /// per-pane and persists across a pane switch: switching away pauses capture (the other pane is
     /// active), switching back resumes it. Cleared on directory change and when an overlay takes over.
     pub filter_editing: bool,
+    /// The stack of connections/directories this pane descended *from* to reach an archive mount
+    /// (RFC-0013). A successful [`crate::AppEvent::ArchiveMounted`] pushes the pane's
+    /// pre-mount `(conn, cwd)` here before switching into the archive; the reducer's `leave_dir`
+    /// pops it when the pane is at the archive's root and the user presses `..`/Leave again, restoring the
+    /// origin connection and directory. A `Vec` (not a single slot) so mounting an archive found
+    /// *inside* another mounted archive nests correctly. Empty for a pane that has never mounted
+    /// an archive.
+    pub mount_stack: Vec<MountFrame>,
+}
+
+/// One entry in a pane's archive [`PaneState::mount_stack`]: where to return to when the user
+/// leaves the mounted archive from its root.
+#[derive(Debug, Clone)]
+pub struct MountFrame {
+    /// The connection the pane was browsing before the mount.
+    pub conn: ConnectionId,
+    /// The directory within that connection the pane was at before the mount.
+    pub cwd: VfsPath,
 }
 
 impl PaneState {
@@ -263,6 +281,7 @@ impl PaneState {
             show_hidden: false,
             filter: None,
             filter_editing: false,
+            mount_stack: Vec::new(),
         }
     }
 
@@ -1034,24 +1053,57 @@ pub const PAGER_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// the two can never drift apart.
 pub const PAGER_HEX_ROW_BYTES: usize = 16;
 
-/// Text vs binary classification of a file, produced by [`detect_file_kind`].
+/// Text vs binary vs archive classification of a file, produced by [`detect_file_kind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     /// No NUL byte found in the sampled prefix — treated as text.
     Text,
     /// A NUL byte was found in the sampled prefix — treated as binary.
     Binary,
+    /// The sample's magic bytes matched a recognized archive container (RFC-0013). Carries the
+    /// detected format so the reducer/status line can be specific about what was mounted.
+    Archive(ArchiveFormat),
 }
 
-/// Classify a byte sample as text or binary using a NUL-byte heuristic: any `0x00` byte in
-/// `sample` means binary. Legitimate text (UTF-8, Latin-1, ASCII, …) never legally contains a NUL
-/// byte, while binary formats (images, archives, executables) commonly do within their first few
-/// KiB — the same heuristic `file(1)`, git, and most pagers use to decide binary handling.
+/// An archive container format recognized by [`detect_file_kind`]'s magic-byte sniff.
+///
+/// Deliberately duplicated (rather than depended on) from `cairn-backend-archive`'s own internal
+/// detection: `cairn-core` has no backend dependencies (every backend is wired at the binary edge,
+/// `crates/cairn/src/app.rs`), so the pure sniff-for-routing check here and the authoritative
+/// check `ArchiveVfs::open` performs when actually mounting are two small, independent
+/// implementations of the same two-constant rule — see `docs/rfcs/0013-archive-backend.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    /// A zip archive (`PK\x03\x04` at offset 0).
+    Zip,
+    /// An uncompressed POSIX tar archive (`ustar` at byte offset 257).
+    Tar,
+}
+
+/// Classify a byte sample as archive, text, or binary.
+///
+/// Archive detection runs first and is by **magic bytes only, never a file extension/name** — a
+/// `.txt` file that happens to be a zip is browsed as an archive, and a `.zip` that is not a real
+/// archive falls through to the text/binary check like any other file:
+/// - zip: `PK\x03\x04` at offset 0 (the local file header signature).
+/// - tar: the POSIX `ustar` magic at byte offset 257 (within the ~8 KiB sniff prefix the effect
+///   runner reads, comfortably covering the fixed 512-byte tar header).
+///
+/// Otherwise falls back to the existing NUL-byte heuristic: any `0x00` byte means binary.
+/// Legitimate text (UTF-8, Latin-1, ASCII, …) never legally contains a NUL byte, while binary
+/// formats (images, executables) commonly do within their first few KiB — the same heuristic
+/// `file(1)`, git, and most pagers use to decide binary handling.
 ///
 /// Pure and I/O-free: the effect runner reads the bounded sample
 /// ([`crate::AppEffect::SniffFile`]); this function only inspects the bytes already in hand.
 #[must_use]
 pub fn detect_file_kind(sample: &[u8]) -> FileKind {
+    if sample.len() >= 4 && &sample[0..4] == b"PK\x03\x04" {
+        return FileKind::Archive(ArchiveFormat::Zip);
+    }
+    if sample.len() >= 262 && &sample[257..262] == b"ustar" {
+        return FileKind::Archive(ArchiveFormat::Tar);
+    }
     if sample.contains(&0) {
         FileKind::Binary
     } else {
@@ -1330,5 +1382,45 @@ mod tests {
         sample.push(0);
         sample.extend_from_slice(b"more text after the nul");
         assert_eq!(detect_file_kind(&sample), FileKind::Binary);
+    }
+
+    #[test]
+    fn detect_file_kind_recognizes_zip_magic_at_offset_zero() {
+        let mut sample = b"PK\x03\x04".to_vec();
+        sample.extend_from_slice(&[0u8; 100]); // zip local headers are themselves binary
+        assert_eq!(
+            detect_file_kind(&sample),
+            FileKind::Archive(ArchiveFormat::Zip)
+        );
+    }
+
+    #[test]
+    fn detect_file_kind_recognizes_tar_ustar_magic_at_offset_257() {
+        let mut sample = vec![0u8; 262];
+        sample[257..262].copy_from_slice(b"ustar");
+        assert_eq!(
+            detect_file_kind(&sample),
+            FileKind::Archive(ArchiveFormat::Tar)
+        );
+    }
+
+    #[test]
+    fn detect_file_kind_is_by_magic_bytes_not_extension() {
+        // No `.zip`/`.tar` name is ever inspected here — a `Text` file (no NUL, no archive magic)
+        // must classify as `Text` regardless of whatever a caller might have named it.
+        assert_eq!(detect_file_kind(b"just some text"), FileKind::Text);
+        // Conversely a genuine zip magic is detected even though the sample carries no filename at
+        // all — the function only ever sees bytes.
+        assert_eq!(
+            detect_file_kind(b"PK\x03\x04rest-does-not-matter"),
+            FileKind::Archive(ArchiveFormat::Zip)
+        );
+    }
+
+    #[test]
+    fn detect_file_kind_short_sample_does_not_false_positive_on_archive() {
+        // Shorter than the tar magic's offset+len: must not panic (slice indexing) or misclassify.
+        assert_eq!(detect_file_kind(b"PK"), FileKind::Text);
+        assert_eq!(detect_file_kind(&[0u8; 10]), FileKind::Binary);
     }
 }
