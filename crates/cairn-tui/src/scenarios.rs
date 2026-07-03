@@ -117,6 +117,11 @@ pub fn all() -> Vec<Scenario> {
             build: connections,
         },
         Scenario {
+            name: "connections-pin-hide",
+            description: "RFC-0011 P6: pinned badge, a revealed hidden entry, and a failed test-connection status line",
+            build: connections_pin_hide,
+        },
+        Scenario {
             name: "confirm-delete",
             description: "the delete-confirmation dialog",
             build: confirm_delete,
@@ -394,7 +399,48 @@ fn connections() -> AppState {
             ..Default::default()
         },
     ];
-    s.overlay = Some(Overlay::Connections { cursor: 0 });
+    s.overlay = Some(Overlay::Connections {
+        cursor: 0,
+        show_hidden: false,
+    });
+    s
+}
+
+/// RFC-0011 P6: pin/hide/test-connection badges in the switcher — a pinned entry (badge +
+/// floated-to-front ordering), a hidden entry revealed via `show_hidden`, and a status line left
+/// over from a failed test-connection probe (`ChoiceStatus::Unreachable`).
+fn connections_pin_hide() -> AppState {
+    let mut s = dual_pane();
+    s.connections = vec![
+        cairn_core::ConnectionChoice {
+            conn: ConnectionId(3),
+            label: "local: /".into(),
+            pinned: true,
+            ..Default::default()
+        },
+        cairn_core::ConnectionChoice {
+            conn: ConnectionId(4),
+            label: "ssh: bastion".into(),
+            provenance: cairn_core::ChoiceProvenance::Saved,
+            status: cairn_core::ChoiceStatus::Unreachable,
+            ..Default::default()
+        },
+        cairn_core::ConnectionChoice {
+            conn: ConnectionId(5),
+            label: "docker: (default)".into(),
+            provenance: cairn_core::ChoiceProvenance::Discovered {
+                source: cairn_core::DiscoverySource::Docker,
+            },
+            status: cairn_core::ChoiceStatus::NeedsOpen,
+            hidden: true,
+            ..Default::default()
+        },
+    ];
+    s.overlay = Some(Overlay::Connections {
+        cursor: 1,
+        show_hidden: true,
+    });
+    s.status = Some("ssh: bastion — unreachable: connection failed".to_owned());
     s
 }
 

@@ -28,33 +28,53 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
 /// Compute the display label for a connection choice in the switcher.
 ///
-/// Auto-discovered entries (provenance `Discovered { .. }`) are prefixed with `[auto]` so
-/// users can tell environment-sourced entries apart from manually-configured ones.
+/// Auto-discovered entries (provenance `Discovered { .. }`) are prefixed with `[auto]` so users
+/// can tell environment-sourced entries apart from manually-configured ones. Pinned entries get a
+/// leading pin badge; hidden entries (only ever visible when "show hidden" is on) get a trailing
+/// `[hidden]` badge so a revealed row is never mistaken for a normal one (RFC-0011 P6).
 ///
 /// P4: remove `[auto]` prefix once the sectioned SAVED / DISCOVERED / LOCAL switcher layout lands.
 fn connection_display_label(c: &cairn_core::ConnectionChoice) -> String {
-    match &c.provenance {
+    let base = match &c.provenance {
         ChoiceProvenance::Discovered { .. } => format!("[auto] {}", c.label),
         _ => c.label.clone(),
-    }
+    };
+    let pinned = if c.pinned { "\u{1F4CC} " } else { "" };
+    let hidden = if c.hidden { " [hidden]" } else { "" };
+    format!("{pinned}{base}{hidden}")
 }
 
 /// Draw the connection switcher: a centered list of the configured connections.
+///
+/// `connections` is the raw list (`AppState::connections`); this filters to the entries
+/// `show_hidden` currently reveals (see [`cairn_core::visible_connection_indices`]) — the same
+/// filter the reducer uses, so `cursor` (already an index into that visible subset) lines up with
+/// exactly the row the user sees highlighted.
 fn render_connections(
     frame: &mut Frame,
     connections: &[cairn_core::ConnectionChoice],
     cursor: usize,
+    show_hidden: bool,
 ) {
+    let visible_indices = cairn_core::visible_connection_indices(connections, show_hidden);
+    let visible: Vec<&cairn_core::ConnectionChoice> =
+        visible_indices.iter().map(|&i| &connections[i]).collect();
+
     // +3 = 2 borders + 1 hint line at the bottom.
-    let h = u16::try_from(connections.len())
+    let h = u16::try_from(visible.len())
         .unwrap_or(u16::MAX)
         .saturating_add(3)
         .min(frame.area().height);
     let area = centered(frame.area(), 56, h.max(4));
     frame.render_widget(Clear, area);
     // Overlays use fixed semantic accents (not the user's pane palette) so prompts stay distinct.
+    let title = if show_hidden {
+        " Open connection (showing hidden) "
+    } else {
+        " Open connection "
+    };
     let block = Block::bordered()
-        .title(" Open connection ")
+        .title(title)
         .border_style(Style::default().fg(Color::Cyan));
     // Split the inner area: list rows above, one hint line below.
     let inner = block.inner(area);
@@ -62,11 +82,12 @@ fn render_connections(
     let [list_area, hint_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
-    let items: Vec<ListItem> = connections
+    let items: Vec<ListItem> = visible
         .iter()
         // P3: auto-discovered entries get an [auto] provenance badge and a dimmed style so
         // users understand they come from the environment and cannot be edited in the config.
         // P4: remove [auto] prefix when the sectioned SAVED/DISCOVERED/LOCAL switcher lands.
+        // P6: a revealed-but-hidden entry is dimmed too, marking it as "not normally shown".
         .map(|c| {
             let label = connection_display_label(c);
             let item = ListItem::new(label);
@@ -74,6 +95,7 @@ fn render_connections(
                 ChoiceProvenance::Discovered { .. } => {
                     item.style(Style::default().add_modifier(Modifier::DIM))
                 }
+                _ if c.hidden => item.style(Style::default().add_modifier(Modifier::DIM)),
                 _ => item,
             }
         })
@@ -82,19 +104,23 @@ fn render_connections(
         .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
         .highlight_symbol("> ");
     let mut st = ListState::default();
-    if !connections.is_empty() {
-        st.select(Some(cursor.min(connections.len() - 1)));
+    if !visible.is_empty() {
+        st.select(Some(cursor.min(visible.len() - 1)));
     }
     frame.render_stateful_widget(list, list_area, &mut st);
 
     // Contextual hint: profile entries show edit/delete, auto-discovered entries are read-only.
-    let selected_kind = connections
-        .get(cursor.min(connections.len().saturating_sub(1)))
+    // Test/pin/hide/show-hidden apply to every entry regardless of kind.
+    let selected_kind = visible
+        .get(cursor.min(visible.len().saturating_sub(1)))
         .map(|c| &c.kind);
-    let hint = match selected_kind {
-        Some(ConnectionKind::Profile { .. }) => "[Ctrl-N] New  [e] Edit  [d] Delete  [Esc] Close",
-        _ => "[Ctrl-N] New  [Esc] Close  (auto-discovered — not editable)",
+    let editable_hint = match selected_kind {
+        Some(ConnectionKind::Profile { .. }) => "[e] Edit  [d] Delete  ",
+        _ => "",
     };
+    let hint = format!(
+        "[Ctrl-N] New  {editable_hint}[t] Test  [P] Pin  [H] Hide  [S] Show hidden  [Esc] Close"
+    );
     frame.render_widget(
         Paragraph::new(Line::from(hint)).style(Style::default().fg(Color::Gray)),
         hint_area,
@@ -108,7 +134,10 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
         return;
     };
     match overlay {
-        Overlay::Connections { cursor } => render_connections(frame, &state.connections, *cursor),
+        Overlay::Connections {
+            cursor,
+            show_hidden,
+        } => render_connections(frame, &state.connections, *cursor, *show_hidden),
         Overlay::ConfirmDelete { paths, .. } => {
             let area = centered(frame.area(), 44, 6);
             frame.render_widget(Clear, area);
@@ -1944,7 +1973,10 @@ mod tests {
                 ..Default::default()
             },
         ];
-        s.overlay = Some(cairn_core::Overlay::Connections { cursor: 0 });
+        s.overlay = Some(cairn_core::Overlay::Connections {
+            cursor: 0,
+            show_hidden: false,
+        });
         let text = render_text(&s, 80, 24);
         assert!(text.contains("Open connection"));
         assert!(text.contains("local: /"));
@@ -2230,6 +2262,8 @@ mod tests {
             provenance,
             status: cairn_core::ChoiceStatus::NeedsOpen,
             kind: cairn_core::ConnectionKind::AutoDiscovered,
+            pinned: false,
+            hidden: false,
         }
     }
 

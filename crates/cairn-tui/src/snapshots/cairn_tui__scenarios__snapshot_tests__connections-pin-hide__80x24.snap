@@ -11,9 +11,10 @@ expression: frame
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
-│           ┌ Open connection ─────────────────────────────────────┐           │
-│           │> local: /                                            │           │
-│           │  local: ~/work                                       │           │
+│           ┌ Open connection (showing hidden) ────────────────────┐           │
+│           │  📌  local: /                                         │           │
+│           │> ssh: bastion                                        │           │
+│           │  [auto] docker: (default) [hidden]                   │           │
 │           │[Ctrl-N] New  [t] Test  [P] Pin  [H] Hide  [S] Show hi│           │
 │           └──────────────────────────────────────────────────────┘           │
 │                                      ││                                      │
@@ -23,6 +24,5 @@ expression: frame
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
-│                                      ││                                      │
 └────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
- 1/4   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move
+ 1/4   ssh: bastion — unreachable: connection failed

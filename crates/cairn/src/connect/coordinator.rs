@@ -186,15 +186,15 @@ impl ConnectionCoordinator {
         // to `ConnectionProfile` to enable finer-grained dedup.
         raw = dedup_discovered_vs_saved(raw);
 
-        // ── Apply hidden overlay ──────────────────────────────────────────────────────────────
-        // Drop any descriptor whose stable key string appears in `config.discovery.hidden`.
-        // The overlay applies to ALL descriptor types (builtin, saved, discovered) — the key
-        // strings are the same `as_key_str()` format used everywhere (e.g. `"builtin:/"`,
-        // `"saved:<uuid>"`, `"docker:socket:default"`, `"kube:kubeconfig"`).
-        // Applied before pinned so a hidden+pinned entry is simply absent (hidden wins).
-        if !ctx.config.discovery.hidden.is_empty() {
-            raw.retain(|d| !ctx.config.discovery.hidden.contains(&d.key.as_key_str()));
-        }
+        // ── Hidden overlay: P6 change — mark, don't drop ────────────────────────────────────────
+        // Earlier phases dropped a descriptor whose stable key string appeared in
+        // `config.discovery.hidden` entirely. RFC-0011 P6 adds a switcher "show hidden" toggle
+        // that must be able to reveal (and un-hide) a hidden entry, which requires it to still be
+        // enumerated; the `hidden` flag is now applied per-`ConnectionChoice` below (in the id
+        // loop) instead of filtering `raw` here. The overlay still applies to ALL descriptor
+        // types (builtin, saved, discovered) — the key strings are the same `as_key_str()` format
+        // used everywhere (e.g. `"builtin:/"`, `"saved:<uuid>"`, `"docker:socket:default"`,
+        // `"kube:kubeconfig"`).
 
         // ── Apply pinned overlay ──────────────────────────────────────────────────────────────
         // Entries in `config.discovery.pinned` float to the front of the list, in stated order.
@@ -247,6 +247,13 @@ impl ConnectionCoordinator {
             };
             desc.id = id;
 
+            // P6: pinned/hidden are pure display flags carried on every resulting
+            // `ConnectionChoice`, computed once per descriptor from its stable key string so all
+            // four push sites below stay in sync without repeating the lookup.
+            let key_str = desc.key.as_key_str();
+            let pinned = ctx.config.discovery.pinned.contains(&key_str);
+            let hidden = ctx.config.discovery.hidden.contains(&key_str);
+
             match (&desc.reachability, &desc.target) {
                 // ── LocalRoot (always eager-mount) ────────────────────────────────────────────
                 (Reachability::Ready, OpenTarget::LocalRoot(path)) => {
@@ -259,6 +266,8 @@ impl ConnectionCoordinator {
                         provenance,
                         status: ChoiceStatus::Ready,
                         kind,
+                        pinned,
+                        hidden,
                     });
                 }
                 // ── NeedsVault LocalRoot: provider invariant violation, skip ─────────────────
@@ -284,6 +293,8 @@ impl ConnectionCoordinator {
                         provenance,
                         status: ChoiceStatus::NeedsOpen,
                         kind,
+                        pinned,
+                        hidden,
                     });
                 }
                 // ── Profile, NeedsVault: lazy-open after vault unlock ─────────────────────────
@@ -295,6 +306,8 @@ impl ConnectionCoordinator {
                         provenance,
                         status: ChoiceStatus::NeedsVault,
                         kind,
+                        pinned,
+                        hidden,
                     });
                 }
                 // ── P3 discovered targets: always lazy-open on selection ─────────────────────
@@ -312,6 +325,8 @@ impl ConnectionCoordinator {
                         provenance,
                         status: ChoiceStatus::NeedsOpen,
                         kind,
+                        pinned,
+                        hidden,
                     });
                 }
             }
@@ -754,9 +769,11 @@ mod tests {
 
     // ── P3: hidden overlay ───────────────────────────────────────────────────────────────────
 
-    /// Entries whose key string appears in `config.discovery.hidden` must be absent from choices.
+    /// Entries whose key string appears in `config.discovery.hidden` are marked `hidden` on their
+    /// `ConnectionChoice` — RFC-0011 P6 changed this from dropping them entirely so the switcher's
+    /// "show hidden" toggle can reveal (and un-hide) them.
     #[tokio::test]
-    async fn hidden_overlay_removes_matching_keys() {
+    async fn hidden_overlay_marks_but_does_not_drop_matching_keys() {
         let (coordinator, registry) = make_coordinator();
 
         // Find the key string for the filesystem root so we can hide it.
@@ -792,9 +809,15 @@ mod tests {
             .run(&registry, &ctx(&config), &HashMap::new())
             .await;
 
+        // P6: hidden entries are marked, not dropped — the switcher's "show hidden" toggle must
+        // be able to reveal (and un-hide) them, which requires them to still be enumerated.
+        let root_after = choices_hidden
+            .iter()
+            .find(|c| c.label == "local: /")
+            .expect("hidden root must still be present in choices (marked hidden, not dropped)");
         assert!(
-            !choices_hidden.iter().any(|c| c.label == "local: /"),
-            "hidden root must not appear in choices; hidden key: {root_key_str}"
+            root_after.hidden,
+            "hidden root's ConnectionChoice.hidden must be true; hidden key: {root_key_str}"
         );
     }
 
@@ -843,6 +866,10 @@ mod tests {
         assert_eq!(
             saved_pos_pinned, 0,
             "pinned entry must be the very first choice"
+        );
+        assert!(
+            choices_pinned[saved_pos_pinned].pinned,
+            "a pinned entry's ConnectionChoice.pinned must be true (P6)"
         );
     }
 

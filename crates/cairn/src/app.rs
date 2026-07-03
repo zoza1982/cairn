@@ -5,7 +5,7 @@
 //! [`AppEvent`]s over a bounded channel — see `docs/LLD.md` §4–§6.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -311,6 +311,7 @@ async fn run_async() -> anyhow::Result<()> {
     // event loop starts.
     let empty_descriptors: HashMap<ConnectionId, ConnectionDescriptor> = HashMap::new();
     let mut startup_in_flight: HashSet<ConnectionId> = HashSet::new();
+    let mut startup_test_in_flight: HashSet<ConnectionId> = HashSet::new();
     let mut startup_next_archive_conn_id: u64 = ARCHIVE_CONN_ID_BASE;
     let mut startup_remote_edit_temps: HashMap<RemoteEditId, tempfile::TempDir> = HashMap::new();
     for effect in initial {
@@ -327,6 +328,7 @@ async fn run_async() -> anyhow::Result<()> {
             &vault_ctx,
             &empty_descriptors,
             &mut startup_in_flight,
+            &mut startup_test_in_flight,
             &mut startup_next_archive_conn_id,
             &mut startup_remote_edit_temps,
         );
@@ -819,6 +821,10 @@ async fn event_loop(
     // before the first open completes) is dropped here so only one backend connection is
     // established. The id is removed when the matching ConnectionOpened event arrives.
     let mut open_connection_in_flight: HashSet<ConnectionId> = HashSet::new();
+    // Same idea as `open_connection_in_flight`, but for `AppEffect::TestConnection` (RFC-0011 P6):
+    // a duplicate probe for the same id (repeated `t` presses before the first completes) is
+    // dropped so only one probe runs at a time. Removed when `ConnectionTested` arrives.
+    let mut test_connection_in_flight: HashSet<ConnectionId> = HashSet::new();
     // Monotonic id source for ephemeral archive-mount connections (RFC-0013). Lives for the whole
     // event-loop lifetime (unlike the per-transfer/session maps above) because, unlike those, there
     // is no "done" event that could reclaim an id for reuse — each mount is a genuinely new,
@@ -869,6 +875,10 @@ async fn event_loop(
         // for the same id are unblocked (the first open is done; a retry is now allowed).
         if let Msg::Event(AppEvent::ConnectionOpened { conn, .. }) = &msg {
             open_connection_in_flight.remove(conn);
+        }
+        // Same for `ConnectionTested` (RFC-0011 P6): unblock a future probe of the same id.
+        if let Msg::Event(AppEvent::ConnectionTested { conn, .. }) = &msg {
+            test_connection_in_flight.remove(conn);
         }
         // RFC-0012 P3: every terminal outcome of a remote-edit session drops (and thus deletes)
         // its held temp directory. `WriteBackConflict` is deliberately excluded — the flow
@@ -941,6 +951,7 @@ async fn event_loop(
                 vault_ctx,
                 &descriptor_map,
                 &mut open_connection_in_flight,
+                &mut test_connection_in_flight,
                 &mut next_archive_conn_id,
                 &mut remote_edit_temps,
             );
@@ -1063,6 +1074,41 @@ impl Drop for ConnectionOpenGuard {
     }
 }
 
+/// Same role as [`ConnectionOpenGuard`], for [`AppEffect::TestConnection`] (RFC-0011 P6): if the
+/// probe task panics or is dropped before completing, a synthetic failure `ConnectionTested`
+/// unblocks `test_connection_in_flight` rather than leaving the id permanently un-testable.
+struct ConnectionTestGuard {
+    conn: ConnectionId,
+    event_tx: mpsc::Sender<AppEvent>,
+    armed: bool,
+}
+
+impl ConnectionTestGuard {
+    fn new(conn: ConnectionId, event_tx: mpsc::Sender<AppEvent>) -> Self {
+        Self {
+            conn,
+            event_tx,
+            armed: true,
+        }
+    }
+
+    /// Disarm before emitting the real outcome so the guard does not fire on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionTestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.event_tx.try_send(AppEvent::ConnectionTested {
+                conn: self.conn,
+                result: Err("connection test task interrupted".to_owned()),
+            });
+        }
+    }
+}
+
 /// Runtime-side handles for an active exec or port-forward session, keyed by [`SessionId`].
 ///
 /// Held by the effect runner for the session's lifetime. [`AppEffect::CloseSession`] cancels the
@@ -1139,6 +1185,7 @@ fn dispatch(
     vault_ctx: &VaultContext,
     descriptor_map: &HashMap<ConnectionId, ConnectionDescriptor>,
     open_connection_in_flight: &mut HashSet<ConnectionId>,
+    test_connection_in_flight: &mut HashSet<ConnectionId>,
     next_archive_conn_id: &mut u64,
     remote_edit_temps: &mut HashMap<RemoteEditId, tempfile::TempDir>,
 ) {
@@ -1411,6 +1458,96 @@ fn dispatch(
                 guard.disarm();
                 let _ = event_tx
                     .send(AppEvent::ConnectionOpened { conn, result })
+                    .await;
+            });
+        }
+        AppEffect::TestConnection { conn } => {
+            // In-flight guard mirrors `OpenConnection`'s: a duplicate probe for the same id
+            // (repeated `t` presses before the first completes) is dropped.
+            if test_connection_in_flight.contains(&conn) {
+                return;
+            }
+            test_connection_in_flight.insert(conn);
+
+            let Some(desc) = descriptor_map.get(&conn).cloned() else {
+                tracing::error!(conn = %conn.0, "TestConnection: no descriptor found for id");
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let _ = event_tx
+                        .send(AppEvent::ConnectionTested {
+                            conn,
+                            result: Err("connection descriptor not found".to_owned()),
+                        })
+                        .await;
+                });
+                return;
+            };
+            let opener = vault_ctx.opener.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut guard = ConnectionTestGuard::new(conn, event_tx.clone());
+                let result = run_test_connection_effect(&opener, conn, &desc).await;
+                guard.disarm();
+                let _ = event_tx
+                    .send(AppEvent::ConnectionTested { conn, result })
+                    .await;
+            });
+        }
+        AppEffect::SetConnectionPinned { conn, pinned } => {
+            let Some(desc) = descriptor_map.get(&conn) else {
+                tracing::error!(conn = %conn.0, "SetConnectionPinned: no descriptor found for id");
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let _ = event_tx
+                        .send(AppEvent::ConnectionPinSet {
+                            conn,
+                            pinned,
+                            result: Err("connection descriptor not found".to_owned()),
+                        })
+                        .await;
+                });
+                return;
+            };
+            let key_str = desc.key.as_key_str();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let result =
+                    run_set_discovery_flag_effect(DiscoveryFlag::Pinned, &key_str, pinned).await;
+                let _ = event_tx
+                    .send(AppEvent::ConnectionPinSet {
+                        conn,
+                        pinned,
+                        result,
+                    })
+                    .await;
+            });
+        }
+        AppEffect::SetConnectionHidden { conn, hidden } => {
+            let Some(desc) = descriptor_map.get(&conn) else {
+                tracing::error!(conn = %conn.0, "SetConnectionHidden: no descriptor found for id");
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let _ = event_tx
+                        .send(AppEvent::ConnectionHideSet {
+                            conn,
+                            hidden,
+                            result: Err("connection descriptor not found".to_owned()),
+                        })
+                        .await;
+                });
+                return;
+            };
+            let key_str = desc.key.as_key_str();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let result =
+                    run_set_discovery_flag_effect(DiscoveryFlag::Hidden, &key_str, hidden).await;
+                let _ = event_tx
+                    .send(AppEvent::ConnectionHideSet {
+                        conn,
+                        hidden,
+                        result,
+                    })
                     .await;
             });
         }
@@ -2283,6 +2420,152 @@ async fn open_incluster(registry: &VfsRegistry, conn: ConnectionId) -> Result<()
 #[cfg(not(feature = "k8s"))]
 async fn open_incluster(_registry: &VfsRegistry, _conn: ConnectionId) -> Result<(), String> {
     Err("k8s backend not built into this binary".to_owned())
+}
+
+/// Probe a connection's reachability without mounting it into any pane (RFC-0011 P6, "test
+/// connection"). Called from the [`AppEffect::TestConnection`] handler in [`dispatch`].
+///
+/// Reuses the exact same per-scheme construction [`run_open_connection_effect`] uses for a real
+/// open — the vetted path, no new credential handling — but never inserts the resulting `Vfs`
+/// into the registry: the handle (if any) is dropped immediately on success, so a probe never
+/// leaves a live backend connection running. Errors are the same redacted strings
+/// `run_open_connection_effect` produces.
+async fn run_test_connection_effect(
+    opener: &crate::connect::ConnectionOpener,
+    conn: ConnectionId,
+    desc: &ConnectionDescriptor,
+) -> Result<(), String> {
+    match &desc.target {
+        // Never actually dispatched in practice: the coordinator eager-mounts LocalRoot targets
+        // as `ChoiceStatus::Ready`, and the reducer's `TestConnection` arm short-circuits `Ready`
+        // entries without emitting this effect at all. Kept for match exhaustiveness and
+        // defensive symmetry with `run_open_connection_effect`.
+        OpenTarget::LocalRoot(_) => Ok(()),
+        // The credential-bearing schemes: `opener.open` performs the real broker resolution +
+        // network handshake, so a successful probe here is a genuine reachability signal. A
+        // vault-locked profile is never reached — the reducer already reports "needs unlock"
+        // for `ChoiceStatus::NeedsVault` without dispatching this effect.
+        OpenTarget::Profile(profile) => match opener.open(Actor::User, conn, profile).await {
+            Ok(_vfs) => Ok(()), // constructed (and authenticated) successfully; drop, don't mount
+            Err(e) => Err(format!("{}: {e}", profile.scheme)),
+        },
+        OpenTarget::DockerSocket { path } => test_docker_socket(path).await,
+        OpenTarget::KubeconfigDefault => test_kubeconfig().await,
+        OpenTarget::InCluster => test_incluster().await,
+    }
+}
+
+/// Probe Docker daemon reachability: construct the client, then `ping()` it — a real signal,
+/// unlike `open_docker_socket`'s construct-only path. Deliberately skips
+/// `ensure_background_tasks()`: starting the image-browse ephemeral-container reapers for a
+/// connection that is about to be dropped would be pure waste.
+#[cfg(feature = "docker")]
+async fn test_docker_socket(path: &Option<std::path::PathBuf>) -> Result<(), String> {
+    let ops = match path.as_deref() {
+        Some(p) => cairn_backend_docker::BollardDocker::connect_with_socket(p),
+        None => cairn_backend_docker::BollardDocker::connect_local(),
+    }
+    .map_err(|e| format!("docker: {e}"))?;
+    ops.ping().await.map_err(|e| format!("docker: {e}"))
+}
+
+#[cfg(not(feature = "docker"))]
+async fn test_docker_socket(_path: &Option<std::path::PathBuf>) -> Result<(), String> {
+    Err("docker backend not built into this binary".to_owned())
+}
+
+/// Probe Kubernetes reachability via the default kubeconfig.
+///
+/// **Known limitation (RFC-0011 P6 follow-up):** `KubeRsOps::new()` is an infallible, I/O-free
+/// constructor — building a `kube::Client` (and any exec-credential plugin it might run) happens
+/// lazily on the first real API call, matching `open_kubeconfig`'s own construct-only behavior.
+/// This probe therefore only confirms the feature is compiled in, not that the cluster is
+/// actually reachable. A genuine network probe needs a specific context to call a cheap
+/// version/list endpoint against — deferred pending `kube-staff-engineer` design input (the
+/// switcher's "k8s" entry represents the *whole* kubeconfig, not one context).
+#[cfg(feature = "k8s")]
+async fn test_kubeconfig() -> Result<(), String> {
+    let _ops = cairn_backend_k8s::KubeRsOps::new();
+    Ok(())
+}
+
+#[cfg(not(feature = "k8s"))]
+async fn test_kubeconfig() -> Result<(), String> {
+    Err("k8s backend not built into this binary".to_owned())
+}
+
+/// Probe in-cluster Kubernetes reachability. Same known limitation as [`test_kubeconfig`].
+#[cfg(feature = "k8s")]
+async fn test_incluster() -> Result<(), String> {
+    let _ops = cairn_backend_k8s::KubeRsOps::new_incluster();
+    Ok(())
+}
+
+#[cfg(not(feature = "k8s"))]
+async fn test_incluster() -> Result<(), String> {
+    Err("k8s backend not built into this binary".to_owned())
+}
+
+/// Which `[discovery]` list a pin/hide toggle mutates (RFC-0011 P6). The two effects are
+/// identical except which `Vec<String>` in `cairn.toml` they touch, so
+/// [`run_set_discovery_flag_effect`] shares one implementation between them.
+enum DiscoveryFlag {
+    /// `[discovery].pinned`.
+    Pinned,
+    /// `[discovery].hidden`.
+    Hidden,
+}
+
+/// Toggle `key_str`'s membership in `[discovery].pinned` or `[discovery].hidden` and persist the
+/// config atomically (`Config::save` writes via temp-file + rename). Called from the
+/// [`AppEffect::SetConnectionPinned`]/[`AppEffect::SetConnectionHidden`] handlers in [`dispatch`].
+///
+/// `key_str` is a stable `ConnectionKey` string
+/// (e.g. `"builtin:/"`, `"saved:<uuid>"`, `"docker:socket:default"`, `"kube:kubeconfig"`) — never
+/// a display label, so a later rename never orphans a pin/hide entry.
+async fn run_set_discovery_flag_effect(
+    flag: DiscoveryFlag,
+    key_str: &str,
+    set: bool,
+) -> Result<(), String> {
+    let Some(config_path) = cairn_config::default_config_path() else {
+        return Err("cannot determine config file path".to_owned());
+    };
+    set_discovery_flag_at_path(&config_path, flag, key_str, set)
+}
+
+/// The testable core of [`run_set_discovery_flag_effect`], split out so unit tests can point it
+/// at a temp file instead of the real platform config path (which `default_config_path()` always
+/// resolves to and which a hermetic test must never touch).
+fn set_discovery_flag_at_path(
+    config_path: &Path,
+    flag: DiscoveryFlag,
+    key_str: &str,
+    set: bool,
+) -> Result<(), String> {
+    let mut config = match cairn_config::Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load config for discovery-flag update");
+            return Err(format!("failed to load config: {e}"));
+        }
+    };
+    let list = match flag {
+        DiscoveryFlag::Pinned => &mut config.discovery.pinned,
+        DiscoveryFlag::Hidden => &mut config.discovery.hidden,
+    };
+    if set {
+        if !list.iter().any(|k| k == key_str) {
+            list.push(key_str.to_owned());
+        }
+    } else {
+        list.retain(|k| k != key_str);
+    }
+    if let Err(e) = config.save(config_path) {
+        tracing::warn!(error = %e, "failed to save config after discovery-flag update");
+        return Err(format!("failed to save config: {e}"));
+    }
+    Ok(())
 }
 
 /// A compact "N file(s), M dir(s)" summary shared by the success and cancelled status messages.
@@ -6221,5 +6504,112 @@ mod tests {
             matches!(ev, AppEvent::RemoteEditFailed { id: 1, ref status } if status.contains("connection")),
             "unexpected event"
         );
+    }
+
+    // ── RFC-0011 P6: test-connection + pin/hide persistence ────────────────────────────────────
+
+    use crate::connect::descriptor::{ConnectionKey, DescriptorProvenance, Reachability};
+
+    fn locked_opener() -> crate::connect::ConnectionOpener {
+        crate::connect::ConnectionOpener::new(Arc::new(Broker::locked()))
+    }
+
+    fn profile_descriptor(scheme: &str) -> ConnectionDescriptor {
+        ConnectionDescriptor {
+            id: ConnectionId(42),
+            key: ConnectionKey::Saved(uuid::Uuid::nil()),
+            provenance: DescriptorProvenance::Saved {
+                profile_id: uuid::Uuid::nil(),
+            },
+            scheme: scheme.to_owned(),
+            display_name: "test-conn".to_owned(),
+            target: OpenTarget::Profile(cairn_config::ConnectionProfile::new(scheme, "test-conn")),
+            reachability: Reachability::Ready,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_effect_on_local_root_is_always_ok() {
+        let opener = locked_opener();
+        let desc = ConnectionDescriptor {
+            id: ConnectionId(1),
+            key: ConnectionKey::Builtin(PathBuf::from("/")),
+            provenance: DescriptorProvenance::Builtin,
+            scheme: "local".to_owned(),
+            display_name: "local: /".to_owned(),
+            target: OpenTarget::LocalRoot(PathBuf::from("/")),
+            reachability: Reachability::Ready,
+        };
+        let result = run_test_connection_effect(&opener, ConnectionId(1), &desc).await;
+        assert!(result.is_ok(), "a LocalRoot probe must always succeed");
+    }
+
+    #[tokio::test]
+    async fn test_connection_effect_reuses_the_opener_and_never_registers_anything() {
+        // "ftp" is a known-unsupported scheme for the opener (see connect::mod's own dispatch
+        // tests) — deterministic in every feature configuration (lean or all-features), so this
+        // test doesn't need to be gated on any backend feature.
+        let opener = locked_opener();
+        let desc = profile_descriptor("ftp");
+        let result = run_test_connection_effect(&opener, ConnectionId(42), &desc).await;
+        assert!(
+            result.is_err(),
+            "an unsupported scheme must surface as a probe failure, not silently succeed"
+        );
+        assert!(
+            result.unwrap_err().contains("ftp"),
+            "the error should name the scheme it dispatched on"
+        );
+    }
+
+    #[test]
+    fn discovery_flag_at_path_sets_then_unsets_without_touching_unrelated_fields() {
+        let dir = tempfile_dir();
+        let path = dir.path().join("cairn.toml");
+        // Seed a pre-existing profile so the round-trip can confirm it survives untouched.
+        let mut seed = cairn_config::Config::default();
+        seed.connections
+            .push(cairn_config::ConnectionProfile::new("local", "work"));
+        seed.save(&path).unwrap();
+
+        let key = "docker:socket:default";
+        set_discovery_flag_at_path(&path, DiscoveryFlag::Pinned, key, true).unwrap();
+        let after_set = cairn_config::Config::load(&path).unwrap();
+        assert_eq!(after_set.discovery.pinned, vec![key.to_owned()]);
+        assert_eq!(
+            after_set.connections.len(),
+            1,
+            "an unrelated section must round-trip untouched"
+        );
+
+        // Setting the same key again must not duplicate it.
+        set_discovery_flag_at_path(&path, DiscoveryFlag::Pinned, key, true).unwrap();
+        let after_dup = cairn_config::Config::load(&path).unwrap();
+        assert_eq!(after_dup.discovery.pinned, vec![key.to_owned()]);
+
+        // Unset removes it cleanly.
+        set_discovery_flag_at_path(&path, DiscoveryFlag::Pinned, key, false).unwrap();
+        let after_unset = cairn_config::Config::load(&path).unwrap();
+        assert!(after_unset.discovery.pinned.is_empty());
+
+        // Hidden is a completely independent list.
+        set_discovery_flag_at_path(&path, DiscoveryFlag::Hidden, key, true).unwrap();
+        let after_hide = cairn_config::Config::load(&path).unwrap();
+        assert_eq!(after_hide.discovery.hidden, vec![key.to_owned()]);
+        assert!(after_hide.discovery.pinned.is_empty());
+    }
+
+    #[test]
+    fn discovery_flag_at_path_write_is_atomic() {
+        let dir = tempfile_dir();
+        let path = dir.path().join("cairn.toml");
+        cairn_config::Config::default().save(&path).unwrap();
+        set_discovery_flag_at_path(&path, DiscoveryFlag::Hidden, "kube:kubeconfig", true).unwrap();
+        // Only the target file must remain — no stray temp file from the atomic rename.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("cairn.toml")]);
     }
 }

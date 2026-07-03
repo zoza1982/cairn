@@ -437,7 +437,12 @@ impl Config {
         }
     }
 
-    /// Serialize and write the config to `path` (creating parent directories).
+    /// Serialize and write the config to `path` (creating parent directories), atomically.
+    ///
+    /// Writes to a temp file in the same directory, fsyncs it, then renames it into place —
+    /// mirroring `cairn-vault`'s `atomic_write`. A reader (or a crash mid-write) never observes a
+    /// partially-written `cairn.toml`; frequent small writes (RFC-0011 P6 pin/hide toggles,
+    /// connection add/edit/delete) never risk corrupting the file a user hand-edits.
     ///
     /// # Errors
     /// Serialization or I/O errors.
@@ -446,9 +451,20 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(path, text)?;
-        Ok(())
+        atomic_write(path, text.as_bytes())
     }
+}
+
+/// Write `bytes` to `path` atomically: a temp file created in the same directory (so the final
+/// rename is same-filesystem and therefore atomic), fsynced, then persisted over `path`.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| ConfigError::Io(e.error))?;
+    Ok(())
 }
 
 /// Whether `path` is trusted to define executable shell actions: owned by the current user and not
@@ -527,6 +543,38 @@ mod tests {
             Some("eu-west-1")
         );
         assert!(p.secret_ref.is_some());
+    }
+
+    /// `Config::save` writes atomically (temp file + rename): after a successful save, only the
+    /// target file exists in the directory — the temp file used for the rename must never be
+    /// left behind.
+    #[test]
+    fn save_is_atomic_no_stray_temp_files_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cairn.toml");
+        Config::default().save(&path).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("cairn.toml")]);
+    }
+
+    /// A second `save` over an existing file (as every pin/hide toggle and connection
+    /// add/edit/delete does) must fully replace its contents, not merge or append.
+    #[test]
+    fn save_overwrites_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cairn.toml");
+        let mut cfg = Config::default();
+        cfg.discovery.pinned = vec!["a".to_owned()];
+        cfg.save(&path).unwrap();
+
+        cfg.discovery.pinned = vec!["b".to_owned()];
+        cfg.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.discovery.pinned, vec!["b".to_owned()]);
     }
 
     #[test]

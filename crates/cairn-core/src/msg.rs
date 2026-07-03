@@ -116,6 +116,25 @@ pub enum Action {
     /// active (bypassing the normal text-routing path so the key is not inserted into the
     /// passphrase field). Silently ignored everywhere else.
     ToggleRemember,
+    /// Probe the highlighted switcher entry's reachability without opening it into a pane
+    /// (RFC-0011 P6 "test connection"). Only meaningful inside [`crate::Overlay::Connections`];
+    /// a no-op elsewhere. See [`AppEffect::TestConnection`] for how the probe is dispatched and
+    /// [`AppEvent::ConnectionTested`] for how the result comes back.
+    TestConnection,
+    /// Toggle whether the highlighted switcher entry is pinned to the top of the list (RFC-0011
+    /// P6). Only meaningful inside [`crate::Overlay::Connections`]; a no-op elsewhere. Persisted
+    /// to `[discovery].pinned` in `cairn.toml` — see [`AppEffect::SetConnectionPinned`].
+    PinConnection,
+    /// Toggle whether the highlighted switcher entry is hidden from the switcher's default view
+    /// (RFC-0011 P6). Only meaningful inside [`crate::Overlay::Connections`]; a no-op elsewhere.
+    /// Persisted to `[discovery].hidden` — see [`AppEffect::SetConnectionHidden`]. Toggling a
+    /// currently-hidden entry (visible only because "show hidden" is on) un-hides it — hiding is
+    /// never a one-way trap.
+    HideConnection,
+    /// Toggle whether hidden entries are revealed in the connection switcher (RFC-0011 P6).
+    /// Ephemeral: resets to `false` every time [`crate::Overlay::Connections`] opens and is never
+    /// persisted. Only meaningful inside that overlay; a no-op elsewhere.
+    ToggleShowHidden,
 }
 
 /// A message into the reducer.
@@ -335,6 +354,37 @@ pub enum AppEvent {
         conn: ConnectionId,
         /// `Ok(())` on success. `Err(message)` on failure — the message is already redacted and
         /// never carries host names, paths, or credential material.
+        result: Result<(), String>,
+    },
+    /// [`AppEffect::TestConnection`] finished (RFC-0011 P6). Unlike [`AppEvent::ConnectionOpened`]
+    /// this never touches `pending_conn_open` or navigates a pane — it only updates the choice's
+    /// reachability badge and the status line with a result distinct from a real open ("reachable"
+    /// / "unreachable: …" rather than "Opened …").
+    ConnectionTested {
+        /// Which connection was probed.
+        conn: ConnectionId,
+        /// The probe outcome; the error string is already redacted (never a host, path, or
+        /// credential value — the effect runner reuses `OpenError`'s redaction contract).
+        result: Result<(), String>,
+    },
+    /// [`AppEffect::SetConnectionPinned`] finished persisting to `cairn.toml` (RFC-0011 P6).
+    ConnectionPinSet {
+        /// Which connection's pin state was requested to change.
+        conn: ConnectionId,
+        /// The state that was requested. Applied to [`crate::ConnectionChoice::pinned`] only when
+        /// `result` is `Ok`; on `Err` the display is left unchanged (the write never happened).
+        pinned: bool,
+        /// `Ok(())` on success; `Err(message)` if the config write failed.
+        result: Result<(), String>,
+    },
+    /// [`AppEffect::SetConnectionHidden`] finished persisting to `cairn.toml` (RFC-0011 P6).
+    ConnectionHideSet {
+        /// Which connection's hidden state was requested to change.
+        conn: ConnectionId,
+        /// The state that was requested. Applied to [`crate::ConnectionChoice::hidden`] only when
+        /// `result` is `Ok`; on `Err` the display is left unchanged.
+        hidden: bool,
+        /// `Ok(())` on success; `Err(message)` if the config write failed.
         result: Result<(), String>,
     },
     /// A port-forward session has bound its local TCP port and is ready to accept connections.
@@ -819,6 +869,36 @@ pub enum AppEffect {
     OpenConnection {
         /// The connection to open.
         conn: ConnectionId,
+    },
+    /// Probe a connection's reachability without mounting it into any pane (RFC-0011 P6, "test
+    /// connection"). The runner reuses the exact same per-scheme construction
+    /// [`AppEffect::OpenConnection`] uses (no new credential handling), but the resulting backend
+    /// handle is dropped immediately rather than inserted into the [`VfsRegistry`](cairn_vfs::VfsRegistry)
+    /// — a probe never leaves a live connection running. Reports back via
+    /// [`AppEvent::ConnectionTested`]. Never emitted for a [`crate::ChoiceStatus::NeedsVault`]
+    /// entry — the reducer detects that purely from state and reports "needs unlock" without any
+    /// I/O (see `apply_connections_action`'s `TestConnection` arm).
+    TestConnection {
+        /// The connection to probe.
+        conn: ConnectionId,
+    },
+    /// Persist whether a switcher entry is pinned, to `[discovery].pinned` in `cairn.toml`
+    /// (RFC-0011 P6). Reports back via [`AppEvent::ConnectionPinSet`]; the reducer only updates
+    /// [`crate::ConnectionChoice::pinned`] once that event confirms the write succeeded.
+    SetConnectionPinned {
+        /// The connection to (un)pin.
+        conn: ConnectionId,
+        /// The new pinned state to persist.
+        pinned: bool,
+    },
+    /// Persist whether a switcher entry is hidden, to `[discovery].hidden` in `cairn.toml`
+    /// (RFC-0011 P6). Reports back via [`AppEvent::ConnectionHideSet`]; the reducer only updates
+    /// [`crate::ConnectionChoice::hidden`] once that event confirms the write succeeded.
+    SetConnectionHidden {
+        /// The connection to (un)hide.
+        conn: ConnectionId,
+        /// The new hidden state to persist.
+        hidden: bool,
     },
     /// Drop the stdin sender for an exec session, signalling EOF to the remote process without
     /// cancelling the session. The overlay stays open to show remaining output; `SessionEnded`

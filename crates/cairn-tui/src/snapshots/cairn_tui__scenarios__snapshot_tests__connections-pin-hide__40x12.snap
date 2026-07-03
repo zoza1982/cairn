@@ -5,12 +5,12 @@ expression: frame
 ┌ / ───────────────┐┌ / ───────────────┐
 │>  src/           ││>  src/           │
 │   docs/          ││   docs/          │
-┌ Open connection ─────────────────────┐
-│> local: /                            │
-│  local: ~/work                       │
+┌ Open connection (showing hidden) ────┐
+│  📌  local: /                         │
+│> ssh: bastion                        │
+│  [auto] docker: (default) [hidden]   │
 │[Ctrl-N] New  [t] Test  [P] Pin  [H] H│
 └──────────────────────────────────────┘
 │                  ││                  │
-│                  ││                  │
 └────── sort: name ┘└────── sort: name ┘
- 1/4   q quit · Tab · ↵ open · F3 view ·
+ 1/4   ssh: bastion — unreachable: conne

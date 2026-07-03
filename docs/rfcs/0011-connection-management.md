@@ -72,6 +72,9 @@ the AI/plugin boundary.
 - New keybinding `Ctrl-N` = new connection (also available as `[Ctrl-N] New` hint inside the switcher; `e`/`d` contextually edit/delete inside the switcher).
 - New `[discovery]` section in `config.toml` (opt-out, hidden/pinned entries) — see below.
 - New overlays: the connection form, the vault-create prompt, the remove-connection confirm.
+- P6: inside the switcher, `t` tests the highlighted entry's reachability, `P`/`H` toggle
+  pinned/hidden (persisted to `[discovery]`), and `S` toggles showing hidden entries for this
+  session (so a hidden entry can always be found again and un-hidden).
 
 ## Reference-level explanation
 
@@ -298,9 +301,14 @@ non-secret and non-executable, unlike `shell_actions`). `ConnectionProfile` stay
    `network-engineer` before P5.
 2. Whether the in-cluster K8s entry should appear alongside a kubeconfig entry or replace it when
    both are present (lean: both).
-3. "Test connection" credential path needs a small `ConnectionOpener::open_with_credential` (bypass
-   the vault for an ephemeral probe) — finalize its shape in P6.
+3. ~~"Test connection" credential path needs a small `ConnectionOpener::open_with_credential`
+   (bypass the vault for an ephemeral probe) — finalize its shape in P6.~~ **Resolved in P6**: no
+   bypass was needed — `run_test_connection_effect` reuses `ConnectionOpener::open` verbatim and
+   simply skips the registry insert on success. A locked vault is detected purely from
+   `ChoiceStatus::NeedsVault` before any effect is dispatched, so the broker is never even asked.
 4. Editing a saved credential when it is referenced by multiple profiles (delete-shared warning).
+   Still open — out of scope for P6 (which touches display-only pin/hide/test, not credential
+   sharing).
 
 ## Crate, dependency, and feature impact
 
@@ -332,6 +340,59 @@ the credential phases also require `security-review`.
 Critical paths: `P0→P1→P2→P3` (discovery) and `P0→P1→P4→P4.5→P5→P6` (provisioning); P3 ∥ P4. The
 security gate is `P4.5→P5` — credential provisioning cannot land until vault-create-from-UI does and
 `security-review` passes.
+
+### P6 status
+
+Two of the five P6 items were already delivered in earlier phases and are **not** re-scoped here:
+edit-endpoint-fields shipped in P4 (`ConnectionForm` + `Action::EditConnection`), and
+remove-with-credential-cleanup shipped in P5 (`Broker::remove` wired into `DeleteConnection`).
+
+The remaining three:
+
+- **Test connection** — `t` in the switcher probes the highlighted entry's reachability without
+  mounting it into a pane. `Action::TestConnection` resolves `Ready`/`NeedsVault` purely from state
+  (no I/O for either — `Ready` is treated as already-verified, and `NeedsVault` reports "needs
+  unlock" instead of forcing the vault-unlock/create overlay per this RFC's own non-negotiable).
+  `NeedsOpen`/`Unreachable` emit `AppEffect::TestConnection`, whose runner
+  (`run_test_connection_effect`) reuses the exact same per-scheme construction
+  `run_open_connection_effect` uses (the vetted open path, no new credential handling) but never
+  inserts the resulting `Vfs` into the registry — a probe is dropped immediately on success, so it
+  never leaves a live connection running. This resolves Unresolved Question 3 in the RFC-0011-as-written
+  form: rather than a bespoke `open_with_credential` bypass, the existing opener is reused verbatim
+  and only the registry-insert step is skipped.
+  - **Known limitation:** for SSH/S3/GCS/Azure the probe is a genuine network+auth round trip
+    (`opener.open` performs real credential resolution). For Docker it additionally calls `ping()` —
+    a real daemon-reachability signal. For Kubernetes, `KubeRsOps::new()`/`new_incluster()` are
+    infallible, I/O-free constructors (matching `open_kubeconfig`/`open_incluster`'s own
+    construct-only behavior) — a genuine k8s reachability probe needs a specific context to query
+    (the switcher's "k8s" entry represents the whole kubeconfig, not one context) and is deferred,
+    pending `kube-staff-engineer` design input.
+- **Discovered-entry pin/hide** — `P`/`H` in the switcher toggle `ConnectionChoice::pinned`/`hidden`,
+  persisted to `[discovery].pinned`/`.hidden` in `cairn.toml` via `AppEffect::SetConnectionPinned`/
+  `SetConnectionHidden` (atomic write — `Config::save` now writes through a temp-file + rename,
+  matching `cairn-vault`'s `atomic_write`, a fix that also benefits the pre-existing
+  `SaveConnection`/`DeleteConnection` writes). Pin/hide are **not** restricted to `AutoDiscovered`
+  entries — matching the `[discovery]` overlay's existing scope (already documented as applying to
+  "ALL descriptor types: builtin, saved, discovered"), any switcher entry can be pinned or hidden.
+  Hiding was changed from *dropping* a matching descriptor entirely (P3 behavior) to *marking* it
+  (`ConnectionChoice::hidden = true`) while keeping it enumerated — a drop would make a hidden entry
+  unrecoverable from the UI. `S` toggles a this-session-only, unpersisted "show hidden" view
+  (`Overlay::Connections::show_hidden`) that reveals hidden entries so the same `H` key can un-hide
+  them — hiding is never a one-way trap. The switcher's cursor indexes the *visible* subset (see
+  `cairn_core::visible_connection_indices`), shared between the reducer and the renderer so the two
+  can never disagree about which row a given cursor position refers to.
+- **Discovered-entry rename** — **deferred.** Per this RFC's own guidance ("if that's a larger
+  change than fits cleanly, implement pin+hide fully and defer rename with a tracked note"): an
+  alias needs a new `[discovery].aliases: HashMap<String, String>` config field (key → display
+  name), a render-time label override, and a small text-prompt overlay (reusing `Overlay::Prompt`).
+  None of that is wired yet. Tracked as a P6 follow-up.
+- **Reachability sweep tuning** — a *light* form landed: `Action::TestConnection` treats an
+  already-`Ready` entry as a no-op ("already connected") rather than re-probing it, and the runtime
+  keeps a `test_connection_in_flight` guard so a repeated `t` press before the first probe completes
+  is dropped rather than starting a second concurrent probe for the same connection. A genuine
+  *automatic* background sweep (periodically re-checking `NeedsOpen`/`Unreachable` entries without
+  user action) does not exist today and is out of scope here — deferred as a follow-up, not
+  gold-plated into this PR.
 
 ### Companion ADRs (accepted as phases land)
 
