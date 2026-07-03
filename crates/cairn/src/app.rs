@@ -5820,6 +5820,11 @@ mod tests {
 
     #[tokio::test]
     async fn begin_remote_edit_succeeds_within_cap() {
+        // `begin_remote_edit` fails fast if no editor resolves. On Windows `$EDITOR`/`$VISUAL`
+        // unset yields an error (there's no `vi` fallback), so pin a resolvable editor to reach the
+        // success path on every platform. Serialize against the other env-mutating editor tests.
+        let _serialize = env_test_lock().lock().await;
+        let _env = EnvVarGuard::set(&[("VISUAL", ""), ("EDITOR", "vi")]);
         let dir = tempfile_dir();
         std::fs::write(dir.path().join("f.txt"), b"small").unwrap();
         let vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
