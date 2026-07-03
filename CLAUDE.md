@@ -189,8 +189,11 @@ app in a real terminal to check rendering** — you can't see it and it can't be
 - When you add or change a screen, **add/adjust a scenario** so it's covered by both the snapshots
   and `--frame-dump`. The scenario catalog is the single source of truth for both.
 - Genuine end-to-end terminal behavior that buffers can't capture (raw-mode/TTY handoff, e.g. the
-  `$EDITOR` suspend) needs a PTY/tmux harness — call it out explicitly rather than pretending a unit
-  test covers it.
+  `$EDITOR` suspend/resume) is covered by the **tmux e2e suite** in `crates/cairn/tests/tmux_e2e.rs`:
+  it launches the real binary in a tmux pane, `send-keys`, and asserts on `capture-pane` text. It is
+  env-guarded (`CAIRN_IT_TMUX=1`, like the other `CAIRN_IT_*` integration tests) so the default
+  `cargo test` stays hermetic; CI runs it in the `tmux-e2e` job. Add a case there for behavior only a
+  real terminal exercises — don't pretend a `TestBackend` unit test covers it.
 
 ## 9. Code style & safety
 
