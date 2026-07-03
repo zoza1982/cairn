@@ -7,7 +7,7 @@ use crate::state::{
 use bytes::Bytes;
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
-use cairn_types::{ConnectionId, SessionId, VfsPath};
+use cairn_types::{ConnectionId, SessionId, UnixPerms, VfsPath};
 use cairn_vfs::{ListPage, VfsError};
 use std::path::PathBuf;
 
@@ -435,9 +435,13 @@ pub enum AppEvent {
         v0: RemoteVersion,
         /// The remote file's size at this snapshot (drives the later zero-length guard).
         size: u64,
+        /// The remote file's Unix permissions at this snapshot, if the backend reports them —
+        /// restored on the target after a staging-rename write-back (see
+        /// [`AppEffect::WriteBack`]'s doc for why that path needs this).
+        orig_perms: Option<UnixPerms>,
     },
     /// [`AppEffect::DownloadForEdit`] finished successfully: `temp_path` now holds a private local
-    /// copy of the remote file, hashed as `hash`. The reducer emits
+    /// copy of the remote file, hashed as `download_hash`. The reducer emits
     /// [`AppEffect::EditRemoteTemp`] to run the editor on it.
     RemoteEditDownloaded {
         /// Correlates back to the runtime's held temp-file resources.
@@ -452,12 +456,21 @@ pub enum AppEvent {
         v0: RemoteVersion,
         /// The remote file's size at download time.
         orig_size: u64,
-        /// The freshly downloaded temp file's content hash (the no-op-edit baseline).
-        hash: ContentHash,
+        /// The remote file's Unix permissions at download time, if reported.
+        orig_perms: Option<UnixPerms>,
+        /// The freshly downloaded temp file's content hash. **Stable for the whole remote-edit
+        /// session** — this is the "is there anything at all to write back" baseline, and is
+        /// carried forward unchanged through every subsequent event/effect (including any number
+        /// of [`crate::WritebackChoice::KeepEditing`] loops); it is never replaced by a
+        /// later/"current" hash. See [`AppEffect::EditRemoteTemp`]'s doc for why this distinction
+        /// matters.
+        download_hash: ContentHash,
     },
     /// The `$EDITOR` launched by [`AppEffect::EditRemoteTemp`] exited and the temp file's content is
-    /// byte-identical to before (no-op edit). Nothing is written back; the runtime cleans up the
-    /// temp resources for `id` when this event arrives (see `crates/cairn/src/app.rs`).
+    /// byte-identical to the **original download** (`download_hash`) — a true no-op across the
+    /// whole session, not just this one editor invocation. Nothing is written back; the runtime
+    /// cleans up the temp resources for `id` when this event arrives (see
+    /// `crates/cairn/src/app.rs`).
     RemoteEditNoChange {
         /// Correlates back to the runtime's held temp-file resources (cleaned up on this event).
         id: RemoteEditId,
@@ -465,7 +478,9 @@ pub enum AppEvent {
         name: String,
     },
     /// The `$EDITOR` launched by [`AppEffect::EditRemoteTemp`] exited and the temp file's content
-    /// changed. The reducer emits [`AppEffect::WriteBack`] in
+    /// no longer matches `download_hash` (the original download) — there is something to write
+    /// back, whether or not it changed further *in this particular invocation* (see
+    /// [`AppEffect::EditRemoteTemp`]'s doc). The reducer emits [`AppEffect::WriteBack`] in
     /// [`WriteBackMode::CheckThenWrite`](crate::WriteBackMode::CheckThenWrite) to re-`stat` the
     /// remote path and decide whether it is safe to overwrite silently.
     RemoteEditModified {
@@ -481,8 +496,15 @@ pub enum AppEvent {
         v0: RemoteVersion,
         /// The remote file's size at download time.
         orig_size: u64,
-        /// The temp file's content hash after this edit (the no-op baseline for a further edit
-        /// session, if the user later chooses [`crate::WritebackChoice::KeepEditing`]).
+        /// The remote file's Unix permissions at download time, if reported.
+        orig_perms: Option<UnixPerms>,
+        /// The stable original-download hash, carried forward unchanged — see
+        /// [`AppEvent::RemoteEditDownloaded`]'s doc.
+        download_hash: ContentHash,
+        /// The temp file's content hash observed right now, after this edit — becomes the
+        /// "unchanged since reopen" reference if the user later chooses
+        /// [`crate::WritebackChoice::KeepEditing`] (informational only; the terminal no-op
+        /// decision always compares against `download_hash`, never against this value).
         hash: ContentHash,
     },
     /// A remote-edit session (identified by `id`) ended in a terminal failure: the download failed,
@@ -515,6 +537,13 @@ pub enum AppEvent {
         v0: RemoteVersion,
         /// The remote file's size at download time.
         orig_size: u64,
+        /// The remote file's Unix permissions at download time, if reported.
+        orig_perms: Option<UnixPerms>,
+        /// The stable original-download hash, carried forward unchanged — see
+        /// [`AppEvent::RemoteEditDownloaded`]'s doc. `KeepEditing` re-emits
+        /// [`AppEffect::EditRemoteTemp`] with this same value, never a value updated at a
+        /// conflict — see the "Keep editing" note on that effect.
+        download_hash: ContentHash,
         /// The temp file's content hash at the point the conflict was detected.
         hash: ContentHash,
         /// Why this conflict was raised — display-only.
@@ -904,8 +933,10 @@ pub enum AppEffect {
     /// P3 — the runtime's `Vfs::local_path(&path)` resolved to `None` inside
     /// [`AppEffect::SuspendAndEdit`]'s handler, and the backend/size checks passed).
     ///
-    /// Dispatched through the normal effect runner (spawned, cancellable in principle, never
-    /// blocking the render loop) — unlike `SuspendAndEdit` itself, this does not need the terminal.
+    /// Dispatched through the normal effect runner (spawned, never blocking the render loop) —
+    /// unlike `SuspendAndEdit` itself, this does not need the terminal. **Not currently
+    /// cancellable**: no `CancellationToken` is wired to this effect yet (wiring UI cancellation
+    /// for the download/write-back phases is a tracked follow-up — see RFC-0012's deferred list).
     /// The runtime creates the private temp file (0600, `O_EXCL`, non-predictable directory,
     /// preferring `$XDG_RUNTIME_DIR`) synchronously before spawning the download, and keeps it
     /// (keyed by `id`) until the whole remote-edit session reaches a terminal outcome. On success
@@ -924,21 +955,28 @@ pub enum AppEffect {
         /// The remote file's size at this snapshot (threaded through so `RemoteEditDownloaded`'s
         /// `orig_size` doesn't need a redundant re-`stat`; also drives the zero-length guard later).
         size: u64,
+        /// The remote file's Unix permissions at this snapshot, if reported — threaded through so
+        /// a later staging-rename write-back can restore them (see `WriteBack`'s doc).
+        orig_perms: Option<UnixPerms>,
     },
     /// Suspend the TUI and launch `$VISUAL`/`$EDITOR`/`vi` directly on `temp_path` — the RFC-0012 P3
     /// analogue of [`AppEffect::SuspendAndEdit`] once a remote file has already been downloaded to a
     /// local temp copy (no `Vfs::local_path` resolution needed; `temp_path` is already local by
     /// construction). Also re-entered when the user picks
-    /// [`crate::WritebackChoice::KeepEditing`] in [`crate::Overlay::ConfirmWriteback`] — `hash` is
-    /// then the content hash observed at that point, not necessarily the original download's.
+    /// [`crate::WritebackChoice::KeepEditing`] in [`crate::Overlay::ConfirmWriteback`] — note that
+    /// doing so does **not** clear or resolve the conflict that led here, it only re-opens the same
+    /// temp file; the next exit re-runs the same conflict check from scratch.
     ///
     /// Special-cased inline in the runtime's `event_loop`, exactly like `SuspendAndEdit` (same
     /// exclusive terminal/stdin ownership requirement — see
     /// `docs/adr/0011-terminal-suspend-and-editor-launch.md`). After the editor exits the runtime
-    /// re-hashes `temp_path`: unchanged from `hash` reports [`AppEvent::RemoteEditNoChange`];
-    /// changed reports [`AppEvent::RemoteEditModified`] (which the reducer routes into
-    /// [`AppEffect::WriteBack`]); a launch failure or non-zero exit reports
-    /// [`AppEvent::RemoteEditFailed`].
+    /// re-hashes `temp_path` and compares against **`download_hash`** (the stable, original-download
+    /// baseline — see its doc below): a match reports [`AppEvent::RemoteEditNoChange`]; any
+    /// difference reports [`AppEvent::RemoteEditModified`] (which the reducer routes into
+    /// [`AppEffect::WriteBack`]) — regardless of whether this particular invocation changed
+    /// anything further, so a `KeepEditing` pass that exits with the *same* (already-differing-from-
+    /// `download_hash`) content still gets written back rather than silently discarded. A launch
+    /// failure or non-zero exit reports [`AppEvent::RemoteEditFailed`].
     EditRemoteTemp {
         /// Correlates to the runtime's held temp-file resources.
         id: RemoteEditId,
@@ -952,11 +990,26 @@ pub enum AppEffect {
         v0: RemoteVersion,
         /// The remote file's size at download time.
         orig_size: u64,
-        /// The temp file's content hash immediately before this edit session starts.
+        /// The remote file's Unix permissions at download time, if reported.
+        orig_perms: Option<UnixPerms>,
+        /// The content hash captured right after the original download. **Stable for the whole
+        /// remote-edit session** — never replaced by a later/"current" hash, including across any
+        /// number of `KeepEditing` loops. This is the *only* value the post-edit no-op decision
+        /// compares against (see the effect's doc above) — comparing against a per-round hash
+        /// instead was a real bug (a `KeepEditing` pass that changed nothing *in that round* could
+        /// silently discard an earlier, still-unwritten edit; fixed by keeping this baseline fixed).
+        download_hash: ContentHash,
+        /// The temp file's content hash immediately before *this* edit invocation starts — i.e.
+        /// after any prior edit round in this session, not necessarily the original download's.
+        /// Informational/for a future "no further changes since reopen" optimization; the
+        /// authoritative no-op decision always uses `download_hash`, never this field.
         hash: ContentHash,
     },
     /// Write `temp_path`'s content back to the remote backend (RFC-0012 P3). Dispatched through the
-    /// normal effect runner (spawned, never blocking the render loop).
+    /// normal effect runner (spawned, never blocking the render loop). **Not currently
+    /// cancellable** (see `DownloadForEdit`'s doc) and not subject to the `[transfers] concurrency`
+    /// cap — a remote edit's download/write-back always runs as its own single transfer, outside
+    /// the bulk-copy queue.
     ///
     /// [`WriteBackMode::CheckThenWrite`] first re-`stat`s `path` and compares against `v0`
     /// (`RemoteVersion::confirmed_equal`) and guards against writing zero bytes over a previously
@@ -967,6 +1020,11 @@ pub enum AppEffect {
     /// The actual write uses a staging-then-rename sequence when the backend advertises
     /// `Caps::RENAME` at the target (write to a sibling name, then rename over it — atomic-ish);
     /// otherwise a direct overwrite (documented non-atomic window — Docker/K8s have no rename).
+    /// **The staging-rename path creates a brand-new inode**, so afterward it best-effort restores
+    /// `orig_perms` onto the target (guarded by `Caps::CHMOD`; a failure here does not fail the
+    /// overall write) — without this, a `0600` file would come back as the staged copy's
+    /// umask-default mode after one remote edit. The direct-overwrite path needs no such fix-up: it
+    /// truncates the existing inode in place, so its mode is untouched.
     WriteBack {
         /// Correlates to the runtime's held temp-file resources; cleaned up on the terminal event
         /// this produces ([`AppEvent::WriteBackDone`]/[`AppEvent::RemoteEditFailed`]) but **not**
@@ -982,6 +1040,14 @@ pub enum AppEffect {
         v0: RemoteVersion,
         /// The remote file's size at download time (drives the zero-length guard).
         orig_size: u64,
+        /// The remote file's Unix permissions at download time, if reported — restored on the
+        /// target after a staging-rename write (see this effect's doc).
+        orig_perms: Option<UnixPerms>,
+        /// The stable original-download hash, forwarded purely so a resulting
+        /// [`AppEvent::WriteBackConflict`] can carry it into
+        /// [`crate::Overlay::ConfirmWriteback`] for a subsequent `KeepEditing` pass — not consulted
+        /// by this effect's own conflict/zero-length guards.
+        download_hash: ContentHash,
         /// How to resolve a potential conflict before writing.
         mode: WriteBackMode,
     },

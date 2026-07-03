@@ -443,6 +443,8 @@ fn confirm_writeback() -> AppState {
         temp_path: std::path::PathBuf::from("/run/user/1000/.cairn-edit-abc123/notes.txt"),
         v0: cairn_core::RemoteVersion::ETag("v1".to_owned()),
         orig_size: 128,
+        orig_perms: None,
+        download_hash: [0u8; 32],
         hash: [0u8; 32],
         reason: cairn_core::WritebackConflictReason::RemoteChanged,
         cursor: 0,

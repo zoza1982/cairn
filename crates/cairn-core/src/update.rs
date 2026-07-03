@@ -1902,6 +1902,8 @@ fn apply_confirm_writeback_action(state: &mut AppState, action: Action) -> Vec<A
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 hash,
                 cursor,
                 ..
@@ -1918,6 +1920,8 @@ fn apply_confirm_writeback_action(state: &mut AppState, action: Action) -> Vec<A
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 hash,
             )
         }
@@ -1929,6 +1933,8 @@ fn apply_confirm_writeback_action(state: &mut AppState, action: Action) -> Vec<A
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 hash,
                 ..
             }) = state.overlay.take()
@@ -1944,6 +1950,8 @@ fn apply_confirm_writeback_action(state: &mut AppState, action: Action) -> Vec<A
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 hash,
             )
         }
@@ -1954,6 +1962,10 @@ fn apply_confirm_writeback_action(state: &mut AppState, action: Action) -> Vec<A
 /// Turn a resolved [`WritebackChoice`] into the effect that carries it out; sets a matching status
 /// message. Shared by both the explicit `Confirm`/`Enter` path and the `Cancel`-as-`KeepEditing`
 /// fallback in [`apply_confirm_writeback_action`].
+///
+/// `KeepEditing` forwards `download_hash` **unchanged** — it is the stable, whole-session no-op
+/// baseline (see `AppEffect::EditRemoteTemp`'s doc) — and `hash` (the pre-round baseline, i.e. the
+/// content this same conflict was raised over) as the new invocation's starting point.
 #[allow(clippy::too_many_arguments)]
 fn resolve_writeback_choice(
     state: &mut AppState,
@@ -1964,6 +1976,8 @@ fn resolve_writeback_choice(
     temp_path: std::path::PathBuf,
     v0: crate::state::RemoteVersion,
     orig_size: u64,
+    orig_perms: Option<cairn_types::UnixPerms>,
+    download_hash: crate::state::ContentHash,
     hash: crate::state::ContentHash,
 ) -> Vec<AppEffect> {
     match choice {
@@ -1974,6 +1988,8 @@ fn resolve_writeback_choice(
             temp_path,
             v0,
             orig_size,
+            orig_perms,
+            download_hash,
             mode: WriteBackMode::ForceOverwrite,
         }],
         WritebackChoice::SaveAs => vec![AppEffect::WriteBack {
@@ -1983,6 +1999,8 @@ fn resolve_writeback_choice(
             temp_path,
             v0,
             orig_size,
+            orig_perms,
+            download_hash,
             mode: WriteBackMode::SaveAsSibling,
         }],
         WritebackChoice::KeepEditing => vec![AppEffect::EditRemoteTemp {
@@ -1992,6 +2010,8 @@ fn resolve_writeback_choice(
             temp_path,
             v0,
             orig_size,
+            orig_perms,
+            download_hash,
             hash,
         }],
         WritebackChoice::Discard => {
@@ -3559,6 +3579,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             path,
             v0,
             size,
+            orig_perms,
         } => {
             let id = state.next_remote_edit_id;
             state.next_remote_edit_id += 1;
@@ -3570,6 +3591,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 path,
                 v0,
                 size,
+                orig_perms,
             }]
         }
         AppEvent::RemoteEditDownloaded {
@@ -3579,7 +3601,8 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             temp_path,
             v0,
             orig_size,
-            hash,
+            orig_perms,
+            download_hash,
         } => vec![AppEffect::EditRemoteTemp {
             id,
             conn,
@@ -3587,7 +3610,11 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             temp_path,
             v0,
             orig_size,
-            hash,
+            orig_perms,
+            download_hash,
+            // The first edit round's pre-round baseline is the download itself — the two
+            // coincide exactly once, at session start.
+            hash: download_hash,
         }],
         AppEvent::RemoteEditNoChange { id: _, name } => {
             state.status = Some(format!("No changes to {name} — nothing written back"));
@@ -3600,6 +3627,8 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             temp_path,
             v0,
             orig_size,
+            orig_perms,
+            download_hash,
             hash: _,
         } => {
             state.status = Some("Checking for remote changes before writing back…".to_owned());
@@ -3610,6 +3639,8 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 mode: WriteBackMode::CheckThenWrite,
             }]
         }
@@ -3624,6 +3655,8 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             temp_path,
             v0,
             orig_size,
+            orig_perms,
+            download_hash,
             hash,
             reason,
         } => {
@@ -3635,6 +3668,8 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 hash,
                 reason,
                 cursor: 0,
@@ -7714,12 +7749,13 @@ mod tests {
                 path: path.clone(),
                 v0: remote_version_etag("v1"),
                 size: 128,
+                orig_perms: None,
             }),
         );
         assert!(
             matches!(
                 &fx[..],
-                [AppEffect::DownloadForEdit { id: 1, conn: ConnectionId(1), path: p, v0, size: 128 }]
+                [AppEffect::DownloadForEdit { id: 1, conn: ConnectionId(1), path: p, v0, size: 128, .. }]
                     if *p == path && *v0 == remote_version_etag("v1")
             ),
             "got {fx:?}"
@@ -7740,6 +7776,7 @@ mod tests {
                 path: path.clone(),
                 v0: remote_version_etag("v1"),
                 size: 10,
+                orig_perms: None,
             }),
         );
         let second = update(
@@ -7749,6 +7786,7 @@ mod tests {
                 path,
                 v0: remote_version_etag("v2"),
                 size: 20,
+                orig_perms: None,
             }),
         );
         let AppEffect::DownloadForEdit { id: id1, .. } = &first[0] else {
@@ -7775,16 +7813,19 @@ mod tests {
                 temp_path: temp_path.clone(),
                 v0: remote_version_etag("v1"),
                 orig_size: 64,
-                hash: [1u8; 32],
+                orig_perms: None,
+                download_hash: [1u8; 32],
             }),
         );
         assert!(
             matches!(
                 &fx[..],
-                [AppEffect::EditRemoteTemp { id: 5, path: p, temp_path: t, orig_size: 64, hash, .. }]
-                    if *p == path && *t == temp_path && *hash == [1u8; 32]
+                [AppEffect::EditRemoteTemp {
+                    id: 5, path: p, temp_path: t, orig_size: 64, download_hash, hash, ..
+                }]
+                    if *p == path && *t == temp_path && *download_hash == [1u8; 32] && *hash == [1u8; 32]
             ),
-            "got {fx:?}"
+            "the first edit round's pre-round hash must equal the download hash; got {fx:?}"
         );
     }
 
@@ -7819,14 +7860,16 @@ mod tests {
                 temp_path: temp_path.clone(),
                 v0: remote_version_etag("v1"),
                 orig_size: 64,
+                orig_perms: None,
+                download_hash: [1u8; 32],
                 hash: [2u8; 32],
             }),
         );
         assert!(
             matches!(
                 &fx[..],
-                [AppEffect::WriteBack { id: 5, path: p, temp_path: t, orig_size: 64, mode: WriteBackMode::CheckThenWrite, .. }]
-                    if *p == path && *t == temp_path
+                [AppEffect::WriteBack { id: 5, path: p, temp_path: t, orig_size: 64, download_hash, mode: WriteBackMode::CheckThenWrite, .. }]
+                    if *p == path && *t == temp_path && *download_hash == [1u8; 32]
             ),
             "got {fx:?}"
         );
@@ -7874,6 +7917,8 @@ mod tests {
             temp_path: std::path::PathBuf::from("/tmp/.cairn-edit-x/notes.txt"),
             v0: remote_version_etag("v1"),
             orig_size: 64,
+            orig_perms: None,
+            download_hash: [1u8; 32],
             hash: [3u8; 32],
             reason,
             cursor,
@@ -7894,6 +7939,8 @@ mod tests {
                 temp_path: std::path::PathBuf::from("/tmp/.cairn-edit-x/notes.txt"),
                 v0: remote_version_etag("v1"),
                 orig_size: 64,
+                orig_perms: None,
+                download_hash: [1u8; 32],
                 hash: [3u8; 32],
                 reason: crate::WritebackConflictReason::RemoteChanged,
             }),
@@ -7953,7 +8000,12 @@ mod tests {
         ));
     }
 
-    /// Confirming "Keep editing" re-emits `EditRemoteTemp` on the same temp file/hash.
+    /// Confirming "Keep editing" re-emits `EditRemoteTemp` on the same temp file, carrying the
+    /// overlay's `hash` forward as the new pre-round baseline — and, critically, `download_hash`
+    /// forward **unchanged** as the stable whole-session no-op baseline (the bug this regression
+    /// guards: an earlier implementation used the conflict-time hash as the no-op baseline, which
+    /// silently discarded an edit that stayed unchanged across a `KeepEditing` re-open — see
+    /// `crates/cairn/src/app.rs`'s `keep_editing_after_conflict_does_not_discard_the_edit`).
     #[test]
     fn confirm_writeback_keep_editing_reopens_editor() {
         let mut s = confirm_writeback_overlay(2, crate::WritebackConflictReason::RemoteChanged);
@@ -7961,7 +8013,8 @@ mod tests {
         assert!(s.overlay.is_none());
         assert!(matches!(
             &fx[..],
-            [AppEffect::EditRemoteTemp { hash, .. }] if *hash == [3u8; 32]
+            [AppEffect::EditRemoteTemp { download_hash, hash, .. }]
+                if *download_hash == [1u8; 32] && *hash == [3u8; 32]
         ));
     }
 
@@ -8002,6 +8055,8 @@ mod tests {
                 temp_path: std::path::PathBuf::from("/tmp/.cairn-edit-y/big.bin"),
                 v0: remote_version_etag("v1"),
                 orig_size: 1024,
+                orig_perms: None,
+                download_hash: [1u8; 32],
                 hash: [0u8; 32],
                 reason: crate::WritebackConflictReason::ZeroLengthGuard,
             }),

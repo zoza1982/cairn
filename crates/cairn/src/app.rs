@@ -24,7 +24,7 @@ use cairn_core::{
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
 use cairn_types::SessionId;
-use cairn_types::{Caps, ConnectionId, VfsPath};
+use cairn_types::{Caps, ConnectionId, UnixPerms, VfsPath};
 use cairn_vault::Vault;
 use cairn_vfs::{ByteRange, ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
@@ -906,11 +906,24 @@ async fn event_loop(
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 hash,
             } = effect
             {
                 run_remote_edit_temp(
-                    terminal, input_gate, event_tx, id, conn, path, temp_path, v0, orig_size, hash,
+                    terminal,
+                    input_gate,
+                    event_tx,
+                    id,
+                    conn,
+                    path,
+                    temp_path,
+                    v0,
+                    orig_size,
+                    orig_perms,
+                    download_hash,
+                    hash,
                 )
                 .await;
                 continue;
@@ -1601,6 +1614,7 @@ fn dispatch(
             path,
             v0,
             size,
+            orig_perms,
         } => {
             // The temp dir + file are created here, synchronously (a handful of fast std::fs
             // calls — no different in cost from the `cancel`/`pause_tx` setup `AppEffect::Transfer`
@@ -1631,8 +1645,10 @@ fn dispatch(
             let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let ev =
-                    run_download_for_edit(&registry, id, conn, path, v0, size, temp_path).await;
+                let ev = run_download_for_edit(
+                    &registry, id, conn, path, v0, size, orig_perms, temp_path,
+                )
+                .await;
                 let _ = event_tx.send(ev).await;
             });
         }
@@ -1643,13 +1659,26 @@ fn dispatch(
             temp_path,
             v0,
             orig_size,
+            orig_perms,
+            download_hash,
             mode,
         } => {
             let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let ev =
-                    run_writeback(&registry, id, conn, path, temp_path, v0, orig_size, mode).await;
+                let ev = run_writeback(
+                    &registry,
+                    id,
+                    conn,
+                    path,
+                    temp_path,
+                    v0,
+                    orig_size,
+                    orig_perms,
+                    download_hash,
+                    mode,
+                )
+                .await;
                 let _ = event_tx.send(ev).await;
             });
         }
@@ -3418,6 +3447,7 @@ async fn begin_remote_edit(
         return;
     }
     let v0 = RemoteVersion::from_entry(&entry);
+    let orig_perms = entry.perms;
     send_event_detached(
         event_tx,
         AppEvent::RemoteEditNeedsDownload {
@@ -3425,6 +3455,7 @@ async fn begin_remote_edit(
             path,
             v0,
             size,
+            orig_perms,
         },
     );
 }
@@ -3509,6 +3540,7 @@ async fn hash_file(path: &std::path::Path) -> std::io::Result<ContentHash> {
 /// reports [`AppEvent::RemoteEditDownloaded`]; on any failure, reports
 /// [`AppEvent::RemoteEditFailed`] (the caller in `dispatch` cleans up the temp directory for `id`
 /// when that event arrives).
+#[allow(clippy::too_many_arguments)]
 async fn run_download_for_edit(
     registry: &VfsRegistry,
     id: RemoteEditId,
@@ -3516,6 +3548,7 @@ async fn run_download_for_edit(
     path: VfsPath,
     v0: RemoteVersion,
     size: u64,
+    orig_perms: Option<UnixPerms>,
     temp_path: PathBuf,
 ) -> AppEvent {
     let Some(src) = registry.get(conn).await else {
@@ -3573,14 +3606,15 @@ async fn run_download_for_edit(
         };
     }
     match hash_file(&temp_path).await {
-        Ok(hash) => AppEvent::RemoteEditDownloaded {
+        Ok(download_hash) => AppEvent::RemoteEditDownloaded {
             id,
             conn,
             path,
             temp_path,
             v0,
             orig_size: size,
-            hash,
+            orig_perms,
+            download_hash,
         },
         Err(e) => AppEvent::RemoteEditFailed {
             id,
@@ -3595,10 +3629,17 @@ async fn run_download_for_edit(
 /// editor on the same copy). Special-cased inline in `event_loop` for the same reason
 /// `SuspendAndEdit` is: exclusive terminal/stdin ownership.
 ///
-/// After the editor exits, re-hashes `temp_path`: unchanged from `hash` reports
-/// [`AppEvent::RemoteEditNoChange`] (nothing to write back); changed reports
-/// [`AppEvent::RemoteEditModified`] (the reducer routes this into [`AppEffect::WriteBack`]); a
-/// launch failure or non-zero exit reports [`AppEvent::RemoteEditFailed`].
+/// After the editor exits, re-hashes `temp_path` and compares it against **`download_hash`** — the
+/// hash captured right after the *original* download, stable for the whole session — never against
+/// `hash` (the pre-round baseline for *this* invocation only). Comparing against `hash` instead was
+/// a real bug: after a `KeepEditing` re-open, `hash` is the conflict-time content, so an editor exit
+/// with no further changes would compare equal to it and report a false no-op — silently discarding
+/// an edit that still differs from the remote and was never written back. Comparing against the
+/// stable `download_hash` instead means *any* content that differs from the original download
+/// always reports [`AppEvent::RemoteEditModified`] (routing to [`AppEffect::WriteBack`]), no matter
+/// how many `KeepEditing` rounds it took to get there. Only a match against `download_hash` reports
+/// [`AppEvent::RemoteEditNoChange`] (truly nothing to write back). A launch failure or non-zero
+/// exit reports [`AppEvent::RemoteEditFailed`].
 #[allow(clippy::too_many_arguments)]
 async fn run_remote_edit_temp(
     terminal: &mut ratatui::DefaultTerminal,
@@ -3610,6 +3651,8 @@ async fn run_remote_edit_temp(
     temp_path: PathBuf,
     v0: RemoteVersion,
     orig_size: u64,
+    orig_perms: Option<UnixPerms>,
+    download_hash: ContentHash,
     hash: ContentHash,
 ) {
     let (program, fixed_args) = match resolve_editor_argv() {
@@ -3667,21 +3710,83 @@ async fn run_remote_edit_temp(
             return;
         }
     };
-    if new_hash == hash {
-        send_event_detached(event_tx, AppEvent::RemoteEditNoChange { id, name });
+    match decide_remote_edit_outcome(new_hash, download_hash, hash) {
+        RemoteEditOutcome::NoChange => {
+            send_event_detached(event_tx, AppEvent::RemoteEditNoChange { id, name });
+        }
+        RemoteEditOutcome::Modified {
+            unchanged_since_reopen,
+        } => {
+            if unchanged_since_reopen {
+                // Nothing changed in *this* invocation, but the content still differs from the
+                // original download (a prior round already diverged) — still must be written back.
+                tracing::debug!(
+                    remote_edit_id = id,
+                    "content unchanged since reopen but still differs from the original download; \
+                     writing back"
+                );
+            }
+            send_event_detached(
+                event_tx,
+                AppEvent::RemoteEditModified {
+                    id,
+                    conn,
+                    path,
+                    temp_path,
+                    v0,
+                    orig_size,
+                    orig_perms,
+                    download_hash,
+                    hash: new_hash,
+                },
+            );
+        }
+    }
+}
+
+/// The outcome of [`decide_remote_edit_outcome`] — whether a completed edit round leaves anything
+/// to write back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteEditOutcome {
+    /// `new_hash` matches `download_hash` — truly nothing to write back for the whole session.
+    NoChange,
+    /// `new_hash` differs from `download_hash` — something must be written back.
+    Modified {
+        /// Whether `new_hash` also matches `hash` (the pre-round baseline for *this* invocation
+        /// only) — i.e. this particular editor invocation changed nothing further, but an earlier
+        /// round already diverged from the original download and that edit still needs writing
+        /// back. Purely informational (used for a debug-level log), never gates the outcome.
+        unchanged_since_reopen: bool,
+    },
+}
+
+/// Pure decision made after an edit round completes (the editor has already run and `new_hash` is
+/// the temp file's freshly-observed content hash): compares `new_hash` against **`download_hash`**
+/// — the hash captured once, right after the original download, stable for the whole remote-edit
+/// session — never against `hash` (the pre-round baseline for only this invocation).
+///
+/// This split exists to fix a real bug: an earlier implementation compared `new_hash` against
+/// `hash` (which is *updated* to the latest content after every edit round, including a
+/// `KeepEditing` re-open). After a conflict, `KeepEditing` re-opens the temp file with `hash` set to
+/// the conflict-time content; if the user then quit the editor **without making any further
+/// changes**, `new_hash == hash` was true, and the old code reported [`RemoteEditOutcome::NoChange`]
+/// — silently discarding an edit that had never been written back (it still differed from the
+/// remote, which is exactly why the conflict/`KeepEditing` cycle happened in the first place).
+/// Comparing against the *stable* `download_hash` instead means the only way to reach `NoChange` is
+/// for the content to be genuinely, literally identical to what was downloaded — regardless of how
+/// many edit/conflict/`KeepEditing` rounds it took to get there.
+#[must_use]
+fn decide_remote_edit_outcome(
+    new_hash: ContentHash,
+    download_hash: ContentHash,
+    hash: ContentHash,
+) -> RemoteEditOutcome {
+    if new_hash == download_hash {
+        RemoteEditOutcome::NoChange
     } else {
-        send_event_detached(
-            event_tx,
-            AppEvent::RemoteEditModified {
-                id,
-                conn,
-                path,
-                temp_path,
-                v0,
-                orig_size,
-                hash: new_hash,
-            },
-        );
+        RemoteEditOutcome::Modified {
+            unchanged_since_reopen: new_hash == hash,
+        }
     }
 }
 
@@ -3730,15 +3835,25 @@ async fn unique_sibling_path(vfs: &Arc<dyn Vfs>, original: &VfsPath) -> Result<V
 /// Write `temp_path`'s content to `target` on `vfs`. Where the backend advertises `Caps::RENAME` at
 /// `target`, this stages the content at a sibling name first and renames it over `target` (an
 /// atomic-ish replace on backends with atomic rename; best-effort ordering otherwise) — cleaning up
-/// the staged sibling on a failed rename. Where it does not (Docker/K8s: no atomic rename), this
-/// writes directly to `target`, which has a real (documented) non-atomic window: a reader could see
-/// a partially-written file mid-copy. Either way conflicts are resolved by direct overwrite here —
-/// the caller (`run_writeback`) has already decided writing is safe.
+/// the staged sibling on a failed staging write *or* a failed rename. Where it does not (Docker/K8s:
+/// no atomic rename), this writes directly to `target`, which has a real (documented) non-atomic
+/// window: a reader could see a partially-written file mid-copy. Either way conflicts are resolved
+/// by direct overwrite here — the caller (`run_writeback`) has already decided writing is safe.
+///
+/// **Mode preservation on the RENAME path:** staging writes to a brand-new inode, so after a
+/// successful rename the target's mode is whatever the staged file happened to get (umask-default),
+/// not the original's — silently loosening (or tightening) permissions on every remote edit. When
+/// `orig_perms` is `Some` and the backend advertises `Caps::CHMOD`, this restores the original mode
+/// on `target` afterward, best-effort (a failure here does **not** fail an otherwise-successful
+/// write-back — the content landed correctly; only the mode restoration is advisory). The
+/// direct-overwrite path needs no such fix-up: it truncates the existing inode in place, so the
+/// mode was never touched.
 async fn write_temp_to_remote(
     vfs: &Arc<dyn Vfs>,
     temp_dir_vfs: &Arc<dyn Vfs>,
     temp_dst_path: &VfsPath,
     target: &VfsPath,
+    orig_perms: Option<UnixPerms>,
 ) -> Result<(), cairn_transfer::TransferError> {
     let spec = TransferSpec {
         op: TransferOp::Copy,
@@ -3754,7 +3869,7 @@ async fn write_temp_to_remote(
             .parent()
             .unwrap_or_else(VfsPath::root)
             .join(&staging_name)?;
-        cairn_transfer::run_transfer(
+        if let Err(e) = cairn_transfer::run_transfer(
             temp_dir_vfs,
             vfs,
             &[(temp_dst_path.clone(), staging.clone())],
@@ -3763,11 +3878,32 @@ async fn write_temp_to_remote(
             &paused,
             &mut |_| {},
         )
-        .await?;
+        .await
+        {
+            // Best-effort cleanup: a failed staging write can still have left a partial object at
+            // `staging` (e.g. a one-off network failure mid-copy) — don't leave debris on the remote.
+            let _ = vfs.remove(&staging, Recurse::No).await;
+            return Err(e);
+        }
         if let Err(e) = vfs.rename(&staging, target).await {
             // Best-effort cleanup of the staged copy so a failed rename doesn't leave debris.
             let _ = vfs.remove(&staging, Recurse::No).await;
             return Err(e.into());
+        }
+        if let Some(perms) = orig_perms {
+            if vfs.caps_at(target).contains(Caps::CHMOD) {
+                if let Err(e) = vfs
+                    .set_perms(target, UnixPerms::from_mode(perms.mode))
+                    .await
+                {
+                    // Advisory only: the content write-back already succeeded; losing the original
+                    // mode is a (logged, redacted) degradation, not a failed write-back.
+                    tracing::warn!(
+                        error = %e.redacted(),
+                        "could not restore original file permissions after remote edit write-back"
+                    );
+                }
+            }
         }
         Ok(())
     } else {
@@ -3798,6 +3934,8 @@ async fn run_writeback(
     temp_path: PathBuf,
     v0: RemoteVersion,
     orig_size: u64,
+    orig_perms: Option<UnixPerms>,
+    download_hash: ContentHash,
     mode: WriteBackMode,
 ) -> AppEvent {
     let Some(vfs) = registry.get(conn).await else {
@@ -3860,6 +3998,8 @@ async fn run_writeback(
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 hash,
                 reason: cairn_core::WritebackConflictReason::ZeroLengthGuard,
             };
@@ -3897,6 +4037,8 @@ async fn run_writeback(
                 temp_path,
                 v0,
                 orig_size,
+                orig_perms,
+                download_hash,
                 hash,
                 reason: cairn_core::WritebackConflictReason::RemoteChanged,
             };
@@ -3922,7 +4064,7 @@ async fn run_writeback(
         }
     };
 
-    match write_temp_to_remote(&vfs, &temp_dir_vfs, &temp_dst_path, &target).await {
+    match write_temp_to_remote(&vfs, &temp_dir_vfs, &temp_dst_path, &target, orig_perms).await {
         Ok(()) => AppEvent::WriteBackDone { id, name },
         Err(e) => AppEvent::RemoteEditFailed {
             id,
@@ -5539,6 +5681,74 @@ mod tests {
         assert_ne!(h1, h3, "a content change must change the hash");
     }
 
+    // ── `decide_remote_edit_outcome` (RFC-0012 P3 gate-fix regression) ───────────────────────
+
+    const H0: ContentHash = [0u8; 32];
+    const H1: ContentHash = [1u8; 32];
+    const H2: ContentHash = [2u8; 32];
+
+    #[test]
+    fn decide_outcome_true_no_op_first_round() {
+        // First edit round: `hash` and `download_hash` coincide (nothing has diverged yet). The
+        // editor changes nothing at all.
+        assert_eq!(
+            decide_remote_edit_outcome(H0, H0, H0),
+            RemoteEditOutcome::NoChange
+        );
+    }
+
+    #[test]
+    fn decide_outcome_modified_first_round() {
+        // First edit round, content changed: download_hash == hash == H0, new content is H1.
+        assert_eq!(
+            decide_remote_edit_outcome(H1, H0, H0),
+            RemoteEditOutcome::Modified {
+                unchanged_since_reopen: false
+            }
+        );
+    }
+
+    /// Regression for the bug-bot HIGH finding: after a conflict, `KeepEditing` re-opens the temp
+    /// file with `hash` set to the conflict-time content (H1, which already differs from the
+    /// original download H0). If the user quits the editor **without making any further changes**
+    /// (`new_hash` is still H1), the outcome must be `Modified` (so the edit is written back), never
+    /// `NoChange` — the old, buggy comparison (`new_hash == hash`) would have said `NoChange` here
+    /// and silently discarded an edit that was never written back.
+    #[test]
+    fn decide_outcome_keep_editing_unchanged_since_reopen_is_still_modified() {
+        let outcome = decide_remote_edit_outcome(H1, H0, H1);
+        assert_eq!(
+            outcome,
+            RemoteEditOutcome::Modified {
+                unchanged_since_reopen: true
+            },
+            "an edit that stayed unchanged across a KeepEditing reopen, but still differs from the \
+             original download, must be Modified (written back), never silently discarded as NoChange"
+        );
+    }
+
+    /// A `KeepEditing` round where the user edits *further* (new content H2, differing from both
+    /// the original download H0 and the conflict-time reopen baseline H1) must also be `Modified`,
+    /// with `unchanged_since_reopen: false`.
+    #[test]
+    fn decide_outcome_keep_editing_further_change_is_modified() {
+        let outcome = decide_remote_edit_outcome(H2, H0, H1);
+        assert_eq!(
+            outcome,
+            RemoteEditOutcome::Modified {
+                unchanged_since_reopen: false
+            }
+        );
+    }
+
+    /// If, across any number of `KeepEditing` rounds, the content is eventually restored to exactly
+    /// the original download's bytes, that is a genuine (if unusual) no-op — nothing to write back.
+    #[test]
+    fn decide_outcome_restored_to_original_is_no_op() {
+        let outcome = decide_remote_edit_outcome(H0, H0, H1);
+        assert_eq!(outcome, RemoteEditOutcome::NoChange);
+    }
+
     #[tokio::test]
     async fn begin_remote_edit_refuses_read_only_backend() {
         let dir = tempfile_dir();
@@ -5648,6 +5858,7 @@ mod tests {
             &temp_vfs,
             &VfsPath::parse("/f.txt").unwrap(),
             &VfsPath::parse("/f.txt").unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -5668,6 +5879,43 @@ mod tests {
         );
     }
 
+    /// Regression (bug-bot MEDIUM): the RENAME path stages a *new* inode and renames it over the
+    /// target, which silently loses the original file's mode (umask-default on the staged copy) —
+    /// a 0600 secret would come back world-readable after one remote edit. `orig_perms` must be
+    /// restored on the target after the rename.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_temp_to_remote_restores_original_mode_on_rename_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile_dir();
+        std::fs::write(temp_dir.path().join("f.txt"), b"edited content").unwrap();
+        let temp_vfs: Arc<dyn Vfs> =
+            Arc::new(LocalVfs::new(REMOTE_EDIT_TEMP_CONN_ID, temp_dir.path()));
+        let remote_dir = tempfile_dir();
+        let remote_file = remote_dir.path().join("f.txt");
+        std::fs::write(&remote_file, b"original").unwrap();
+        std::fs::set_permissions(&remote_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let remote_vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new(RIGHT, remote_dir.path()));
+        write_temp_to_remote(
+            &remote_vfs,
+            &temp_vfs,
+            &VfsPath::parse("/f.txt").unwrap(),
+            &VfsPath::parse("/f.txt").unwrap(),
+            Some(UnixPerms::from_mode(0o600)),
+        )
+        .await
+        .unwrap();
+        let mode = std::fs::metadata(&remote_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the original 0600 mode must survive a staging-rename write-back"
+        );
+    }
+
     #[tokio::test]
     async fn write_temp_to_remote_direct_overwrite_when_backend_lacks_rename() {
         let temp_dir = tempfile_dir();
@@ -5685,6 +5933,7 @@ mod tests {
             &temp_vfs,
             &VfsPath::parse("/f.txt").unwrap(),
             &VfsPath::parse("/f.txt").unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -5711,6 +5960,7 @@ mod tests {
             VfsPath::parse("/f.txt").unwrap(),
             RemoteVersion::Unknown,
             14,
+            None,
             temp_path.clone(),
         )
         .await;
@@ -5718,7 +5968,7 @@ mod tests {
             id,
             temp_path: tp,
             orig_size,
-            hash,
+            download_hash,
             ..
         } = ev
         else {
@@ -5727,7 +5977,7 @@ mod tests {
         assert_eq!(id, 1);
         assert_eq!(tp, temp_path);
         assert_eq!(orig_size, 14);
-        assert_eq!(hash, hash_file(&temp_path).await.unwrap());
+        assert_eq!(download_hash, hash_file(&temp_path).await.unwrap());
         assert_eq!(std::fs::read(&temp_path).unwrap(), b"remote content");
     }
 
@@ -5779,6 +6029,8 @@ mod tests {
             temp_path,
             v0,
             8,
+            None,
+            [0u8; 32],
             WriteBackMode::CheckThenWrite,
         )
         .await;
@@ -5813,6 +6065,8 @@ mod tests {
             temp_path,
             v0,
             8,
+            None,
+            [0u8; 32],
             WriteBackMode::CheckThenWrite,
         )
         .await;
@@ -5853,6 +6107,8 @@ mod tests {
             temp_path,
             v0,
             8, // orig_size > 0, current temp content is empty
+            None,
+            [0u8; 32],
             WriteBackMode::CheckThenWrite,
         )
         .await;
@@ -5882,6 +6138,8 @@ mod tests {
             temp_path,
             RemoteVersion::Unknown,
             8,
+            None,
+            [0u8; 32],
             WriteBackMode::ForceOverwrite,
         )
         .await;
@@ -5906,6 +6164,8 @@ mod tests {
             temp_path,
             RemoteVersion::Unknown,
             8,
+            None,
+            [0u8; 32],
             WriteBackMode::SaveAsSibling,
         )
         .await;
@@ -5947,6 +6207,8 @@ mod tests {
             PathBuf::from("/tmp/does-not-matter"),
             RemoteVersion::Unknown,
             0,
+            None,
+            [0u8; 32],
             WriteBackMode::ForceOverwrite,
         )
         .await;

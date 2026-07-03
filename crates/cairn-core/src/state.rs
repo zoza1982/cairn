@@ -3,7 +3,7 @@
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
 use cairn_types::SessionId;
-use cairn_types::{ConnectionId, Entry, VfsPath};
+use cairn_types::{ConnectionId, Entry, UnixPerms, VfsPath};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
@@ -814,8 +814,17 @@ pub enum Overlay {
         v0: RemoteVersion,
         /// The remote file's size at download time (drives the zero-length guard).
         orig_size: u64,
-        /// The most recently observed content hash of the temp file (the write-back baseline for a
-        /// further edit session if `KeepEditing` is chosen).
+        /// The remote file's Unix permissions at download time, if reported — restored on the
+        /// target after a staging-rename write-back (see `crate::AppEffect::WriteBack`'s doc).
+        orig_perms: Option<UnixPerms>,
+        /// The content hash captured right after the original download. **Stable for the whole
+        /// session** — carried forward unchanged into a subsequent `EditRemoteTemp` if
+        /// `KeepEditing` is chosen; this is the only value the no-op-edit decision ever compares
+        /// against (see `crate::AppEffect::EditRemoteTemp`'s doc for why that distinction matters).
+        download_hash: ContentHash,
+        /// The most recently observed content hash of the temp file (the pre-round baseline for a
+        /// further edit session if `KeepEditing` is chosen — informational only, not used for the
+        /// no-op decision).
         hash: ContentHash,
         /// Why this overlay opened — display-only, doesn't change the four choices offered.
         reason: WritebackConflictReason,
@@ -848,10 +857,14 @@ pub type ContentHash = [u8; 32];
 /// Built once from the [`Entry`] returned by `stat` just before download (`v0`, the baseline) and
 /// again immediately before write-back (`v1`); [`confirmed_equal`](Self::confirmed_equal) decides
 /// whether it is safe to overwrite silently. Per-backend signal availability (documented in
-/// `docs/rfcs/0012-file-open-view-edit.md`): S3/GCS/Azure report an `etag`; SFTP/local/Docker/K8s
-/// report `modified`+`size` but no `etag`; anything reporting neither degrades to `Unknown`, which
-/// is deliberately **never** treated as a match — an unverifiable version must always prompt rather
-/// than risk a silent clobber.
+/// `docs/rfcs/0012-file-open-view-edit.md`): S3/GCS/Azure report an `etag`; SFTP/local report
+/// `modified`+`size` but no `etag`; **Docker/K8s currently report neither** (their `Entry` never
+/// populates `modified`), so they degrade to `Unknown` today — moot in practice since neither
+/// advertises `Caps::WRITE` yet, so remote-edit write-back is refused before `RemoteVersion` is
+/// ever consulted for them; if/when they gain write support, they will always prompt on conflict
+/// until `modified` is plumbed through. Anything reporting neither `etag` nor `modified`+`size`
+/// degrades to `Unknown`, which is deliberately **never** treated as a match — an unverifiable
+/// version must always prompt rather than risk a silent clobber.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteVersion {
     /// The backend reports a content/version tag (object stores). Compared for exact equality.
