@@ -1,6 +1,7 @@
 //! [`ArchiveVfs`]: maps an `ArchiveOps` onto the [`Vfs`] trait, plus the magic-byte format sniff
 //! that picks tar vs zip at [`ArchiveVfs::open`] time.
 
+use crate::compressed_tar::{CompressedTarOps, Compression};
 use crate::security::{ARCHIVE_PER_MEMBER_CAP, ARCHIVE_SESSION_BYTE_CAP};
 use crate::tar_backend::TarOps;
 use crate::zip_backend::ZipOps;
@@ -36,17 +37,28 @@ pub struct ArchiveVfs {
 enum Format {
     Zip,
     Tar,
+    /// A tar stream wrapped in an outer compression (RFC-0013 P5) — `.tgz`/`.tbz2`/`.txz`/`.tzst`.
+    CompressedTar(Compression),
 }
 
 /// Sniff `prefix` (the first bytes of the file) for a recognized archive magic:
 /// - zip: `PK\x03\x04` at offset 0 (the local file header signature).
 /// - tar: the POSIX `ustar` magic at byte offset 257.
+/// - compressed tar: one of the four outer-compression magics (see `compressed_tar::sniff`), all
+///   at offset 0 and none colliding with the zip/tar signatures above.
+///
+/// Checked in this order deliberately: the zip and plain-tar signatures are structural markers of
+/// an *uncompressed* container and take priority; a compression magic is only meaningful once
+/// those two have already been ruled out.
 fn sniff_format(prefix: &[u8]) -> Option<Format> {
     if prefix.len() >= 4 && &prefix[0..4] == b"PK\x03\x04" {
         return Some(Format::Zip);
     }
     if prefix.len() >= 262 && &prefix[257..262] == b"ustar" {
         return Some(Format::Tar);
+    }
+    if let Some(compression) = crate::compressed_tar::sniff(prefix) {
+        return Some(Format::CompressedTar(compression));
     }
     None
 }
@@ -61,9 +73,12 @@ fn open_sync(path: &Path) -> Result<Arc<dyn ArchiveOps>, VfsError> {
     match sniff_format(&prefix[..n]) {
         Some(Format::Zip) => Ok(Arc::new(ZipOps::build(path)?)),
         Some(Format::Tar) => Ok(Arc::new(TarOps::build(path)?)),
+        Some(Format::CompressedTar(compression)) => {
+            Ok(Arc::new(CompressedTarOps::build(path, compression)?))
+        }
         None => Err(VfsError::Backend {
             code: "unrecognized_archive".to_owned(),
-            msg: "not a recognized tar or zip archive".to_owned(),
+            msg: "not a recognized tar, zip, or compressed-tar archive".to_owned(),
             retryable: false,
         }),
     }
@@ -259,6 +274,59 @@ mod tests {
 
         assert_eq!(sniff_format(b"not an archive"), None);
         assert_eq!(sniff_format(&[]), None);
+    }
+
+    /// The zip/tar structural signatures win over a compression-magic guess, and each of the four
+    /// compression magics is recognized when neither of those two matched (RFC-0013 P5).
+    #[test]
+    fn sniffs_every_compressed_tar_magic() {
+        assert_eq!(
+            sniff_format(&[0x1f, 0x8b, 0x08, 0x00]),
+            Some(Format::CompressedTar(Compression::Gzip))
+        );
+        assert_eq!(
+            sniff_format(b"BZh91AY&SY"),
+            Some(Format::CompressedTar(Compression::Bzip2))
+        );
+        assert_eq!(
+            sniff_format(&[0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00]),
+            Some(Format::CompressedTar(Compression::Xz))
+        );
+        assert_eq!(
+            sniff_format(&[0x28, 0xb5, 0x2f, 0xfd, 0x00]),
+            Some(Format::CompressedTar(Compression::Zstd))
+        );
+    }
+
+    /// End-to-end through `ArchiveVfs::open`: a real `.tar.gz` is decompressed, indexed, and
+    /// browsable exactly like a plain tar — the whole point of P5 being additive to P4's dispatch.
+    #[tokio::test]
+    async fn open_mounts_a_real_gzip_compressed_tar() {
+        let tar_bytes = {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(3);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "hi.txt", &b"hey"[..])
+                .unwrap();
+            builder.into_inner().unwrap()
+        };
+        let gz_bytes = {
+            use std::io::Write as _;
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&tar_bytes).unwrap();
+            enc.finish().unwrap()
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &gz_bytes).unwrap();
+
+        let vfs = ArchiveVfs::open(ConnectionId(1), tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let entries = read_all(&vfs, "hi.txt", None).await;
+        assert_eq!(entries, b"hey");
     }
 
     #[tokio::test]

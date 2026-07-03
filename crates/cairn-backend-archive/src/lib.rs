@@ -1,25 +1,30 @@
-//! Read-only archive backend for Cairn: browse a local `.tar` or `.zip` file as a directory tree
-//! (RFC-0013 P4, `docs/adr/0012-archive-mount-model.md`).
+//! Read-only archive backend for Cairn: browse a local `.tar`, `.zip`, or compressed-tar file as a
+//! directory tree (RFC-0013 P4/P5, `docs/adr/0012-archive-mount-model.md`,
+//! `docs/adr/0013-compressed-tar-decoder-selection.md`).
 //!
 //! [`ArchiveVfs`] implements [`Vfs`](cairn_vfs::Vfs) over an `ArchiveOps` built by
-//! [`ArchiveVfs::open`], which sniffs the file's magic bytes (never its extension) to pick the tar
-//! or zip indexer. Both indexers (`tar_backend::TarOps`, `zip_backend::ZipOps`) build their
-//! whole directory tree once, up front, inside `tokio::task::spawn_blocking` (the `tar`/`zip`
-//! crates are sync-only — there is no maintained async fork; `tokio-tar` is abandoned and is
-//! deliberately not used here) — see the crate-level rustdoc on `ArchiveOps` for why the trait is
-//! object-safe (`dyn`) rather than generic like `cairn-backend-ssh`'s `SftpOps`.
+//! [`ArchiveVfs::open`], which sniffs the file's magic bytes (never its extension) to pick the tar,
+//! zip, or compressed-tar indexer. All three (`tar_backend::TarOps`, `zip_backend::ZipOps`,
+//! `compressed_tar::CompressedTarOps`) build their whole directory tree once, up front, inside
+//! `tokio::task::spawn_blocking` (the `tar`/`zip` crates, and every compressed-tar decoder, are
+//! sync-only — there is no maintained async fork; `tokio-tar` is abandoned and is deliberately not
+//! used here) — see the crate-level rustdoc on `ArchiveOps` for why the trait is object-safe
+//! (`dyn`) rather than generic like `cairn-backend-ssh`'s `SftpOps`.
 //!
-//! **Scope (P4):** local archives only (an archive on a remote backend must be copied to a local
-//! pane first — see `AppEffect::MountArchive`'s runner in `crates/cairn/src/app.rs`), uncompressed
-//! `.tar` and `.zip` only (compressed tar — `.tgz`/`.txz`/`.tbz2`/`.tzst` — is RFC-0013 P5), no
-//! writing back into the archive, and no auto-descent into a nested archive member (it is shown as
-//! a plain file). See `docs/rfcs/0013-archive-backend.md` for the full design and what is deferred.
+//! **Scope:** local archives only (an archive on a remote backend must be copied to a local pane
+//! first — see `AppEffect::MountArchive`'s runner in `crates/cairn/src/app.rs`); `.tar`, `.zip`,
+//! and — since RFC-0013 P5 — compressed tar (`.tgz`/`.tar.gz`, `.tbz2`/`.tar.bz2`, `.txz`/`.tar.xz`,
+//! `.tzst`/`.tar.zst`, decompressed once to a private temp file and then indexed via the same
+//! `tar_backend::TarOps` as a plain tar — see `compressed_tar`); no writing back into the archive,
+//! and no auto-descent into a nested archive member (it is shown as a plain file). See
+//! `docs/rfcs/0013-archive-backend.md` for the full design and what remains deferred.
 //!
 //! Every member path is validated (traversal/absolute/UNC/drive-letter/control-char rejection),
 //! every read is bounded (per-member and cumulative-session byte caps, entry-count cap, a zip
 //! compression-ratio guard), and symlink/hardlink members are presented inert — never followed —
 //! per the threat model in `docs/rfcs/0013-archive-backend.md` §Security.
 
+mod compressed_tar;
 mod index;
 mod security;
 mod tar_backend;

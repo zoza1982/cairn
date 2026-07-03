@@ -18,9 +18,9 @@ With a secure secrets vault and an agentic AI assistant.
 > navigate, sort, mark) with **configurable keybindings**, a cross-backend **transfer engine**
 > (copy/move/delete with a confirm dialog), an encrypted **secrets vault** (XChaCha20-Poly1305 +
 > Argon2id) behind a capability **broker**, TOML **config**, an **AI plan → confirm** overlay, a
-> read-only **file pager** + in-place `$EDITOR` editing (RFC-0012), and read-only **tar/zip archive
-> browsing** — `Enter` on a `.tar`/`.zip` mounts it like a directory (RFC-0013, behind the `archive`
-> feature).
+> read-only **file pager** + in-place `$EDITOR` editing (RFC-0012), and read-only **archive
+> browsing** — `Enter` on a `.tar`/`.zip`/`.tgz`/`.tbz2`/`.txz`/`.tzst` mounts it like a directory
+> (RFC-0013, behind the `archive` feature).
 > **Backend mapping cores** for **SSH/SFTP**, **object stores** (S3/GCS/Azure-shaped), **Docker**, and
 > **Kubernetes** are implemented against a transport seam and fully unit-tested with in-memory mocks,
 > and the **WASM plugin host** (wasmtime, resource-limited, default-deny) runs sandboxed modules.

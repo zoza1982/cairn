@@ -32,7 +32,47 @@ tar = { version = "0.4.46", default-features = false }
 # dropping bzip2/lzma/zstd/xz/ppmd/aes-crypto keeps the tree lean (CLAUDE.md §10) — an entry using
 # an unsupported method surfaces as a clear, typed error rather than a panic.
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# Compressed-tar decode (RFC-0013 P5): decompress once to a temp file, then index it with the same
+# `TarOps` as an ordinary uncompressed tar (see `src/compressed_tar.rs`). All four picked as
+# pure-Rust decoders — no C/FFI in this backend's parse of untrusted bytes — per the design memo's
+# security posture; each Context7/crates.io-verified against its current published version.
+#
+# gzip: `flate2` — already a transitive dependency (via `zip`'s deflate backend); depended on
+# directly here too, pinned to the pure-Rust `rust_backend` (miniz_oxide) feature set explicitly
+# rather than relying on the default, so a future default change upstream can't silently pull in a
+# C zlib backend for this crate.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# zstd: `ruzstd` (MIT) — a pure-Rust zstd decoder, actively maintained (0.8.3, updated 2026) and
+# widely used (tens of millions of downloads/month), unlike the alternative `zstd` crate (C-FFI
+# bindings to libzstd). `StreamingDecoder` implements `Read`, decoding blocks lazily as read.
+# Default features (`std`, `hash` for the optional frame content-checksum) kept as-is — both are
+# small and this crate is already `no_std`-capable upstream, not a dependency-bloat concern here.
+ruzstd = "0.8"
+# xz/lzma: `lzma-rs` (MIT) — a pure-Rust LZMA/LZMA2/XZ codec. Its last crates.io release (0.3.0) is
+# from 2023, but the upstream repo has commits into 2024 (MSRV/CI maintenance); no functional gaps
+# have been found for our read-only xz-container use. Preferred over the C-FFI `xz2`/`liblzma`
+# bindings (also stale, and — unlike this crate — would add a C dependency parsing adversarial
+# bytes). Known caveat, called out in ADR-0013: `xz_decompress` has no public `memlimit`/dictionary
+# cap for the xz-container path, so a crafted header's declared dictionary size is bounded only by
+# the xz/LZMA2 spec's own ceiling (1.5 GiB), not by us, before our output-byte cap can abort the
+# decode — the incremental output cap below still bounds the actual decoded byte count.
+lzma-rs = "0.3"
+# bzip2: `bzip2-rs` (MIT/Apache-2.0) — a "100% safe" (no `unsafe`) pure-Rust bzip2 decompressor with
+# its own fuzz corpus. Chosen over the far more widely used `bzip2` crate (C-FFI bindings to
+# libbzip2) specifically because this backend's whole job is parsing attacker-influenceable bytes:
+# a logic bug in a `forbid(unsafe_code)` Rust decoder is a bounded, safe failure mode, where a bug in
+# a C decoder risks memory corruption. Trade-off (recorded in ADR-0013 for security-review): far
+# fewer downloads/users than the FFI crate, so less real-world adversarial mileage; mitigated by our
+# own bomb caps/ratio guard applying regardless of the codec's own internal robustness.
+bzip2-rs = "0.1"
+# Now a real (non-dev) dependency as of RFC-0013 P5: `compressed_tar::decompress_to_temp` creates
+# the private, owner-only (0600), RAII-deleted temp file every compressed-tar mount decodes into
+# (was dev-only in P4, used only by tests to build fixture archives).
+tempfile = "3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
-tempfile = "3"
+# Test-fixture-only bzip2 *encoder* (pure Rust) for the compressed-tar bomb tests
+# (`compressed_tar::tests`) — `bzip2-rs` (our production decoder) is decode-only. Never reachable
+# from production code; kept off the real dependency tree.
+banzai = "0.3"
