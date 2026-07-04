@@ -9,18 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **MC-style function-key bar, `F1` help, `F9` menu, `F10` quit**: a new top row (row 0, above the
-  panes) shows the classic Midnight Commander function-key bar —
-  `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Menu 10Quit` — with each key's number
-  styled distinctly from its label. At narrow widths (e.g. 40 columns) the bar drops whole cells
-  rather than truncating a label mid-word, prioritizing `F1`/`F3`/`F4`/`F10` (help/view/edit/quit)
-  so they stay visible even when the row can't fit everything. The existing bottom status/hint
-  line is unchanged. `F1` opens a scrollable keybinding reference grouped by section (Navigation,
-  File ops, View/Edit, Connections, Vault, AI, General); `F9` opens a categorized action menu
-  (`Enter` dispatches the highlighted action through the normal action-handling path — nothing is
-  duplicated — `Esc` closes without acting); `F10` quits (an alias for the existing `q`/`Ctrl-C`).
-  Both overlays toggle closed if their own key is pressed again.
-
 - **Test a connection, pin/hide discovered entries** (RFC-0011 P6): the connection switcher
   (`Ctrl-O`) gains three new keys. `t` probes the highlighted entry's reachability without opening
   it into a pane or switching any pane — it reuses the same vetted per-scheme open path (so a real

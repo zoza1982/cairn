@@ -2,9 +2,9 @@
 source: crates/cairn-tui/src/scenarios.rs
 expression: frame
 ---
-1Help 2Rename 3View 4Edit 5Copy 10Quit
 ┌ / ───────────────┐┌ / ───────────────┐
 │>  src/           ││>  src/           │
+│   docs/          ││   docs/          │
 ┌ Open connection ─────────────────────┐
 │> local: /                            │
 │  local: ~/work                       │
