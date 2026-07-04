@@ -135,14 +135,6 @@ pub enum Action {
     /// Ephemeral: resets to `false` every time [`crate::Overlay::Connections`] opens and is never
     /// persisted. Only meaningful inside that overlay; a no-op elsewhere.
     ToggleShowHidden,
-    /// Open the `F1` keybinding help overlay ([`crate::Overlay::Help`]), or close it if it is
-    /// already open (a toggle, like most overlay-opening keys re-pressed while their own overlay
-    /// is active).
-    ShowHelp,
-    /// Open the `F9` action menu ([`crate::Overlay::Menu`]), or close it if it is already open.
-    /// Selecting an entry with `Enter` closes the menu and dispatches that entry's `Action`
-    /// through the normal action-handling path — see `apply_menu_action` in `update.rs`.
-    ShowMenu,
 }
 
 /// A message into the reducer.

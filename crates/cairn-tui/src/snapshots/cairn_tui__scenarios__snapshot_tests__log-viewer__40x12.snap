@@ -2,7 +2,7 @@
 source: crates/cairn-tui/src/scenarios.rs
 expression: frame
 ---
-1Help 2Rename 3View 4Edit 5Copy 10Quit
+┌ / ───────────────┐┌ / ───────────────┐
 ┌ my-pod — logs ───────────────────────┐
 │2026-07-02T10:00:00 starting up       │
 │2026-07-02T10:00:01 listening on :8080│

@@ -1157,19 +1157,14 @@ struct SessionControls {
 /// Translate a terminal event into a reducer message (or `None` to ignore).
 ///
 /// While a text prompt is capturing input, keys are routed to the field as [`Msg::Text`] rather than
-/// resolved to actions — except `Ctrl-C`/`F10`, which always quit so the user is never trapped in a
-/// field (the function bar advertises `10Quit` everywhere, including while a capturing overlay is
-/// open, so `F10` must not silently do nothing there).
+/// resolved to actions — except `Ctrl-C`, which always quits so the user is never trapped in a field.
 fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
     use cairn_core::TextEdit;
     match input {
         Event::Key(key) if state.capturing_text() => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            // Ctrl-C/F10 always quit — the user must never be trapped in any capturing field, and
-            // F10 is a universal quit key everywhere else (`Keymap::action_for`/`action_for`), so a
-            // capturing overlay must not be the one place it's swallowed by `text_edit_for` (which
-            // has no mapping for it).
-            if (ctrl && key.code == KeyCode::Char('c')) || key.code == KeyCode::F(10) {
+            // Ctrl-C always quits — the user must never be trapped in any capturing field.
+            if ctrl && key.code == KeyCode::Char('c') {
                 return Some(Msg::Action(Action::Quit));
             }
             // Inside an ExecPane:
@@ -4817,14 +4812,6 @@ mod tests {
         let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(
             map_input(ctrl_c, &km, &st),
-            Some(Msg::Action(Action::Quit))
-        ));
-        // F10 also quits even while capturing — the function bar advertises `10Quit` regardless of
-        // what overlay is open, and `text_edit_for` has no mapping for it (it would otherwise be a
-        // silent no-op here, unlike everywhere else F10 is bound).
-        let f10 = Event::Key(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
-        assert!(matches!(
-            map_input(f10, &km, &st),
             Some(Msg::Action(Action::Quit))
         ));
     }

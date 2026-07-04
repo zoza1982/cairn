@@ -2,7 +2,7 @@
 source: crates/cairn-tui/src/scenarios.rs
 expression: frame
 ---
-1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Menu 10Quit
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
 ┌ main.rs — view ──────────────────────────────────────────────────────────────┐
 │fn main() {                                                                   │
 │    println!("hello, cairn");                                                 │

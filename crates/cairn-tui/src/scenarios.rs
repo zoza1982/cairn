@@ -151,16 +151,6 @@ pub fn all() -> Vec<Scenario> {
             description: "the interactive exec/shell session pane",
             build: exec_pane,
         },
-        Scenario {
-            name: "help",
-            description: "the F1 keybinding help overlay",
-            build: help,
-        },
-        Scenario {
-            name: "menu",
-            description: "the F9 action menu overlay",
-            build: menu,
-        },
     ]
 }
 
@@ -566,18 +556,6 @@ fn exec_pane() -> AppState {
         scroll: 0,
         follow: true,
     });
-    s
-}
-
-fn help() -> AppState {
-    let mut s = dual_pane();
-    s.overlay = Some(Overlay::Help { scroll: 0 });
-    s
-}
-
-fn menu() -> AppState {
-    let mut s = dual_pane();
-    s.overlay = Some(Overlay::Menu { cursor: 0 });
     s
 }
 
