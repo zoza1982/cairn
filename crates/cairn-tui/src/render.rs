@@ -10,7 +10,7 @@ use cairn_core::{
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
@@ -1254,7 +1254,16 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
     } else {
         theme.unfocused_border
     };
-    let title = format!(" {} ", pane.cwd.as_str());
+    // Top title: the pane's connection-aware location. Remote backends render a full
+    // `scheme://user@host:path` locator in an accent color so the user can tell which connection a
+    // pane is on and distinguish it from the local filesystem (which shows just the path).
+    let location = state.pane_location(side);
+    let title_style = if location.is_remote {
+        Style::default().fg(theme.remote)
+    } else {
+        Style::default().fg(border)
+    };
+    let title = Line::from(Span::styled(format!(" {} ", location.text), title_style));
     // Bottom-right status: current sort mode, plus a `+hidden` flag when dotfiles are shown.
     let hidden = if pane.show_hidden { " +hidden" } else { "" };
     let status = format!(" sort: {}{hidden} ", pane.sort.label());
@@ -2333,6 +2342,7 @@ mod tests {
         cairn_core::ConnectionChoice {
             conn: ConnectionId(42),
             label: label.to_owned(),
+            scheme: String::new(),
             provenance,
             status: cairn_core::ChoiceStatus::NeedsOpen,
             kind: cairn_core::ConnectionKind::AutoDiscovered,

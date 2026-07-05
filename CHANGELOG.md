@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pane connection header**: each pane's top border now shows *which* backend it is browsing, so a
+  remote pane is instantly distinguishable from the local filesystem. A remote pane renders a full
+  `scheme://user@host:path` locator (e.g. `ssh://root@dietpi6:/home`, `s3://bucket:/prefix`) in a
+  distinct accent color (`remote` theme role, default yellow); a local pane shows just its path as
+  before. The identity is joined at render time from the pane's connection id against the
+  connection/profile registries, with a graceful path-only fallback when it can't be resolved (e.g.
+  inside an archive mount). Add `remote = "<color>"` under `[ui.colors]` to recolor it.
+
 - **Test a connection, pin/hide discovered entries** (RFC-0011 P6): the connection switcher
   (`Ctrl-O`) gains three new keys. `t` probes the highlighted entry's reachability without opening
   it into a pane or switching any pane — it reuses the same vetted per-scheme open path (so a real

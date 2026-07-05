@@ -1498,6 +1498,7 @@ dependencies = [
  "insta",
  "ratatui",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

@@ -150,8 +150,8 @@ pub(crate) struct ConnectionDescriptor {
     /// How this connection entered the list.
     pub(crate) provenance: DescriptorProvenance,
     /// The URI scheme string (e.g. `"local"`, `"ssh"`, `"s3"`).
-    // Read by the coordinator's log calls and future P3/P4 re-enumeration diffing.
-    #[allow(dead_code)]
+    // Read by the coordinator's log calls, the per-pane header locator (via `ConnectionChoice`),
+    // and future P3/P4 re-enumeration diffing.
     pub(crate) scheme: String,
     /// Human-readable display name shown in the switcher.
     pub(crate) display_name: String,

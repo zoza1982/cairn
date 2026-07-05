@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ ssh://root@dietpi┐┌ /home/me ────────┐
+│>  src/           ││>  src/           │
+│   docs/          ││   docs/          │
+│   Cargo.toml     ││   Cargo.toml     │
+│   README.md      ││   README.md      │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+└────── sort: name ┘└────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · F3 view ·

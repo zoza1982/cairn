@@ -20,10 +20,10 @@ pub use state::{
     detect_file_kind, visible_connection_indices, ActiveTransfer, AppState, ArchiveFormat,
     ChoiceProvenance, ChoiceStatus, ConnectionChoice, ConnectionFormStage, ConnectionKind,
     ContentHash, DiscoverySource, FieldValue, FileKind, Listing, LogViewerId, LogViewerStatus,
-    MaskedInput, MountFrame, Overlay, PagerId, PagerMode, PagerStatus, PaneState, PendingSave,
-    PromptKind, QueuedTransfer, RemoteEditId, RemoteVersion, SessionEnd, SessionRecord,
-    ShellActionMeta, Side, SortMode, TransferId, WritebackChoice, WritebackConflictReason,
-    LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES, PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES,
-    REMOTE_EDIT_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
+    MaskedInput, MountFrame, Overlay, PagerId, PagerMode, PagerStatus, PaneLocation, PaneState,
+    PendingSave, PromptKind, QueuedTransfer, RemoteEditId, RemoteVersion, SessionEnd,
+    SessionRecord, ShellActionMeta, Side, SortMode, TransferId, WritebackChoice,
+    WritebackConflictReason, LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES, PAGER_HEX_ROW_BYTES,
+    PAGER_MAX_BYTES, REMOTE_EDIT_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
 pub use update::{initial_effects, update, VAULT_PASSPHRASE_MIN_LEN};

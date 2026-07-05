@@ -263,6 +263,7 @@ impl ConnectionCoordinator {
                     choices.push(ConnectionChoice {
                         conn: id,
                         label: desc.display_name.clone(),
+                        scheme: desc.scheme.clone(),
                         provenance,
                         status: ChoiceStatus::Ready,
                         kind,
@@ -290,6 +291,7 @@ impl ConnectionCoordinator {
                     choices.push(ConnectionChoice {
                         conn: id,
                         label: desc.display_name.clone(),
+                        scheme: desc.scheme.clone(),
                         provenance,
                         status: ChoiceStatus::NeedsOpen,
                         kind,
@@ -303,6 +305,7 @@ impl ConnectionCoordinator {
                     choices.push(ConnectionChoice {
                         conn: id,
                         label: desc.display_name.clone(),
+                        scheme: desc.scheme.clone(),
                         provenance,
                         status: ChoiceStatus::NeedsVault,
                         kind,
@@ -322,6 +325,7 @@ impl ConnectionCoordinator {
                     choices.push(ConnectionChoice {
                         conn: id,
                         label: desc.display_name.clone(),
+                        scheme: desc.scheme.clone(),
                         provenance,
                         status: ChoiceStatus::NeedsOpen,
                         kind,

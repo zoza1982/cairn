@@ -109,14 +109,19 @@ to two transfers run at once by default — set `[transfers] concurrency = N` in
 ```
 
 Colors can be themed under `[ui.colors]` — override individual roles
-(`focused_border`, `unfocused_border`, `dir`, `error`, `status`, `selection_bg`, `selection_fg`) over
-the built-in `dark` preset, using color names or `#rrggbb`:
+(`focused_border`, `unfocused_border`, `dir`, `error`, `status`, `remote`, `selection_bg`,
+`selection_fg`) over the built-in `dark` preset, using color names or `#rrggbb`:
 
 ```toml
 [ui.colors]
 focused_border = "magenta"
 dir            = "#5fafff"
+remote         = "yellow"   # accent for a pane on a remote backend (SSH/S3/…)
 ```
+
+Each pane's top border shows which backend it is browsing: a local pane shows just its path,
+while a remote pane shows a full `scheme://user@host:path` locator (e.g.
+`ssh://root@dietpi6:/home`) in the `remote` accent color, so the two are easy to tell apart.
 
 ### Connections
 

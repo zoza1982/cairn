@@ -44,3 +44,4 @@ lcov.info
 # WASM fixture guest build output (the built component is committed under tests/fixtures/).
 crates/cairn-plugin/tests/fixture-guest/target/
 crates/cairn-plugin/tests/fixture-guest/src/bindings.rs
+dist/
