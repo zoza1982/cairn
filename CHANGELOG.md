@@ -91,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Creating the vault no longer fails with "io error" on a fresh install.** The vault's config
+  directory (e.g. `~/.config/cairn`) does not exist until something writes there, and vault creation
+  (triggered the first time you save a credential — e.g. adding an SSH host with a password) failed
+  because the atomic write couldn't create its temp file in a missing directory. Vault writes now
+  create the parent directory first (owner-only `0700` on Unix). Regression test added.
+
 - **Panes now root at the OS filesystem root** (`/` on Unix, drive root on Windows) so `..`
   navigation is unrestricted all the way up. Cairn still opens at the launch directory, but
   the user can navigate above it without hitting an artificial ceiling. The `LocalVfs` base is
