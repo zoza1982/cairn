@@ -20,6 +20,10 @@ ratatui = "0.30"
 # Used by the `scenarios` module to construct AI-plan fixtures (a `PlanStep`'s input is a
 # `serde_json::Value`). Small, permissive (Apache-2.0 OR MIT), already ubiquitous in the tree.
 serde_json = "1"
+# The `scenarios` module builds a `cairn_core::ProfileData` fixture (for the remote-pane header),
+# whose `id` is a `uuid::Uuid`. Same version/config as cairn-core; permissive (Apache-2.0 OR MIT).
+# No features needed — only `Uuid::from_u128` is used.
+uuid = { version = "1", default-features = false }
 
 [dev-dependencies]
 # Snapshot testing: renders each UI scenario to a plain-text frame and diffs it against a checked-in

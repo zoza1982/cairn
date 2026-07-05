@@ -1111,6 +1111,11 @@ pub struct ConnectionChoice {
     pub conn: ConnectionId,
     /// Display label (e.g. `"local: /home/me"` or a profile's name).
     pub label: String,
+    /// The URI scheme this connection speaks (`"local"`, `"ssh"`, `"s3"`, `"docker"`, …), carried
+    /// from the enumerating provider. This is the machine-readable source of truth for a pane's
+    /// backend — the renderer uses it to build the pane-header locator ([`AppState::pane_location`])
+    /// rather than parsing the human-facing `label`. Empty on the sentinel default.
+    pub scheme: String,
     /// How this entry entered the switcher (for icons/badges in Phase P3+).
     pub provenance: ChoiceProvenance,
     /// Current reachability status (drives selection routing in Phase P2+).
@@ -1146,12 +1151,72 @@ impl Default for ConnectionChoice {
         Self {
             conn: ConnectionId(0),
             label: String::new(),
+            scheme: String::new(),
             provenance: ChoiceProvenance::Builtin,
             status: ChoiceStatus::Ready,
             kind: ConnectionKind::AutoDiscovered,
             pinned: false,
             hidden: false,
         }
+    }
+}
+
+/// A pane's header location: the text to render plus whether it is a remote backend (so the
+/// renderer can give remote panes a distinct accent color). See [`AppState::pane_location`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneLocation {
+    /// The header text: a full `scheme://user@host:path` locator for remote backends, or the bare
+    /// path for the local filesystem.
+    pub text: String,
+    /// `true` for a non-local backend — the renderer accents these so a remote pane is instantly
+    /// distinguishable from the local one.
+    pub is_remote: bool,
+}
+
+impl PaneLocation {
+    fn local(text: String) -> Self {
+        Self {
+            text,
+            is_remote: false,
+        }
+    }
+    fn remote(text: String) -> Self {
+        Self {
+            text,
+            is_remote: true,
+        }
+    }
+}
+
+/// Build a `scheme://…:path` locator from a saved remote profile.
+///
+/// The authority is scheme-specific: SSH uses `user@host` (the real endpoint, so an unfamiliar
+/// pane is unambiguous); object stores use the bucket/container; Docker/K8s fall back to the
+/// display name. A missing sub-field degrades gracefully (e.g. no user → just the host).
+fn remote_locator(profile: &crate::forms::ProfileData, path: &str) -> String {
+    let ep = &profile.endpoint;
+    let scheme = profile.scheme.as_str();
+    let get = |k: &str| ep.get(k).map(String::as_str).filter(|s| !s.is_empty());
+    let authority = match scheme {
+        "ssh" => {
+            let host = get("host").unwrap_or(&profile.display_name);
+            match get("user") {
+                Some(user) => format!("{user}@{host}"),
+                None => host.to_owned(),
+            }
+        }
+        "s3" | "gcs" => get("bucket").unwrap_or(&profile.display_name).to_owned(),
+        "azure" => get("container")
+            .or_else(|| get("account"))
+            .unwrap_or(&profile.display_name)
+            .to_owned(),
+        // Docker/K8s and any other scheme: the human-readable name is the most useful authority.
+        _ => profile.display_name.clone(),
+    };
+    if authority.is_empty() {
+        format!("{scheme}://{path}")
+    } else {
+        format!("{scheme}://{authority}:{path}")
     }
 }
 
@@ -1519,6 +1584,43 @@ impl AppState {
         &mut self.panes[side.index()]
     }
 
+    /// The location label for a pane's header: for a remote backend, a full
+    /// `scheme://user@host:path` locator so the user can tell *which* connection a pane is on and
+    /// distinguish it from the local filesystem; for the local backend, just the path.
+    ///
+    /// The pane holds only an opaque [`ConnectionId`]; the human-readable identity lives in the
+    /// [`connections`](Self::connections) / [`saved_profiles`](Self::saved_profiles) registries and
+    /// is joined here by that id. Falls back to path-only when the connection can't be resolved
+    /// (e.g. an archive mount, or a pane pointed at a not-yet-registered connection) — a plain path
+    /// is always a safe, non-misleading header.
+    #[must_use]
+    pub fn pane_location(&self, side: Side) -> PaneLocation {
+        let pane = self.pane(side);
+        let path = pane.cwd.as_str(); // already an owned String
+        let Some(choice) = self.connections.iter().find(|c| c.conn == pane.conn) else {
+            return PaneLocation::local(path);
+        };
+        // The scheme is the machine-readable source of truth (carried from the provider). An empty
+        // or `local` scheme — or a built-in root — is the local filesystem: show the bare path.
+        if choice.scheme.is_empty()
+            || choice.scheme == "local"
+            || choice.provenance == ChoiceProvenance::Builtin
+        {
+            return PaneLocation::local(path);
+        }
+        // A saved profile carries structured endpoint fields — build a precise `scheme://user@host`
+        // locator from them.
+        if let ConnectionKind::Profile { id } = &choice.kind {
+            if let Some(profile) = self.saved_profiles.get(id) {
+                return PaneLocation::remote(remote_locator(profile, &path));
+            }
+        }
+        // Discovered (a Docker socket / kubeconfig context) or a profile whose data isn't loaded:
+        // there is no meaningful `user@host` authority, so show just the scheme and path. Avoids
+        // parsing the human-facing label (which embeds a redundant scheme prefix).
+        PaneLocation::remote(format!("{}:{path}", choice.scheme))
+    }
+
     /// Whether keystrokes should be routed to a text field rather than resolved as actions — either a
     /// text-entry overlay is open, or (with no overlay) the active pane is editing its filter live.
     ///
@@ -1552,6 +1654,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forms::ProfileData;
     use cairn_secrets::ExposeSecret;
 
     #[test]
@@ -1597,6 +1700,220 @@ mod tests {
         let secret = m.take_secret();
         assert_eq!(secret.expose_secret(), "open-sesame");
         assert!(m.is_empty(), "the field is wiped after taking the secret");
+    }
+
+    // ─────────────────────────────── pane_location (header locator) ───────────────────────────
+
+    /// An `AppState` with the left pane pointed at `conn`, and `connections`/`saved_profiles`
+    /// pre-seeded by the caller.
+    fn state_on(conn: ConnectionId) -> AppState {
+        let mut s = AppState::new(conn, ConnectionId(999), VfsPath::root());
+        s.connections.clear();
+        s.pane_mut(Side::Left).cwd = VfsPath::parse("/home/dietpi").unwrap();
+        s
+    }
+
+    fn ssh_profile(id: uuid::Uuid, user: Option<&str>, host: &str, name: &str) -> ProfileData {
+        let mut endpoint = std::collections::BTreeMap::new();
+        endpoint.insert("host".to_owned(), host.to_owned());
+        if let Some(u) = user {
+            endpoint.insert("user".to_owned(), u.to_owned());
+        }
+        ProfileData {
+            id,
+            scheme: "ssh".to_owned(),
+            display_name: name.to_owned(),
+            endpoint,
+            secret_ref: None,
+        }
+    }
+
+    #[test]
+    fn pane_location_builtin_local_shows_path_only() {
+        let mut s = state_on(ConnectionId(1));
+        s.connections.push(ConnectionChoice {
+            conn: ConnectionId(1),
+            label: "local: /".to_owned(),
+            scheme: "local".to_owned(),
+            provenance: ChoiceProvenance::Builtin,
+            ..Default::default()
+        });
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "/home/dietpi");
+        assert!(!loc.is_remote);
+    }
+
+    #[test]
+    fn pane_location_unknown_conn_falls_back_to_path() {
+        // No matching ConnectionChoice (e.g. an archive mount) → bare path, never misleading.
+        let s = state_on(ConnectionId(7));
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "/home/dietpi");
+        assert!(!loc.is_remote);
+    }
+
+    #[test]
+    fn pane_location_ssh_profile_builds_user_host_locator() {
+        let mut s = state_on(ConnectionId(2));
+        let id = uuid::Uuid::from_u128(0x42);
+        s.saved_profiles
+            .insert(id, ssh_profile(id, Some("root"), "dietpi6", "dietpi6"));
+        s.connections.push(ConnectionChoice {
+            conn: ConnectionId(2),
+            label: "ssh: dietpi6".to_owned(),
+            scheme: "ssh".to_owned(),
+            provenance: ChoiceProvenance::Saved,
+            kind: ConnectionKind::Profile { id },
+            ..Default::default()
+        });
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "ssh://root@dietpi6:/home/dietpi");
+        assert!(loc.is_remote);
+    }
+
+    #[test]
+    fn pane_location_ssh_profile_without_user_omits_the_at() {
+        let mut s = state_on(ConnectionId(2));
+        let id = uuid::Uuid::from_u128(0x43);
+        s.saved_profiles
+            .insert(id, ssh_profile(id, None, "10.0.0.5", "box"));
+        s.connections.push(ConnectionChoice {
+            conn: ConnectionId(2),
+            label: "ssh: box".to_owned(),
+            scheme: "ssh".to_owned(),
+            provenance: ChoiceProvenance::Saved,
+            kind: ConnectionKind::Profile { id },
+            ..Default::default()
+        });
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "ssh://10.0.0.5:/home/dietpi");
+        assert!(loc.is_remote);
+    }
+
+    #[test]
+    fn pane_location_s3_profile_uses_bucket_as_authority() {
+        let mut s = state_on(ConnectionId(3));
+        let id = uuid::Uuid::from_u128(0x44);
+        let mut endpoint = std::collections::BTreeMap::new();
+        endpoint.insert("bucket".to_owned(), "backups".to_owned());
+        s.saved_profiles.insert(
+            id,
+            ProfileData {
+                id,
+                scheme: "s3".to_owned(),
+                display_name: "my-s3".to_owned(),
+                endpoint,
+                secret_ref: None,
+            },
+        );
+        s.connections.push(ConnectionChoice {
+            conn: ConnectionId(3),
+            label: "s3: my-s3".to_owned(),
+            scheme: "s3".to_owned(),
+            provenance: ChoiceProvenance::Saved,
+            kind: ConnectionKind::Profile { id },
+            ..Default::default()
+        });
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "s3://backups:/home/dietpi");
+        assert!(loc.is_remote);
+    }
+
+    #[test]
+    fn pane_location_s3_profile_without_bucket_falls_back_to_display_name() {
+        // A remote profile missing its authority sub-field degrades to the display name, never an
+        // empty `s3://:path`.
+        let mut s = state_on(ConnectionId(3));
+        let id = uuid::Uuid::from_u128(0x45);
+        s.saved_profiles.insert(
+            id,
+            ProfileData {
+                id,
+                scheme: "s3".to_owned(),
+                display_name: "archive-store".to_owned(),
+                endpoint: std::collections::BTreeMap::new(),
+                secret_ref: None,
+            },
+        );
+        s.connections.push(ConnectionChoice {
+            conn: ConnectionId(3),
+            label: "s3: archive-store".to_owned(),
+            scheme: "s3".to_owned(),
+            provenance: ChoiceProvenance::Saved,
+            kind: ConnectionKind::Profile { id },
+            ..Default::default()
+        });
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "s3://archive-store:/home/dietpi");
+        assert!(loc.is_remote);
+    }
+
+    #[test]
+    fn pane_location_azure_profile_uses_container_authority() {
+        let mut s = state_on(ConnectionId(6));
+        let id = uuid::Uuid::from_u128(0x46);
+        let mut endpoint = std::collections::BTreeMap::new();
+        endpoint.insert("container".to_owned(), "blobs".to_owned());
+        endpoint.insert("account".to_owned(), "acct".to_owned());
+        s.saved_profiles.insert(
+            id,
+            ProfileData {
+                id,
+                scheme: "azure".to_owned(),
+                display_name: "az".to_owned(),
+                endpoint,
+                secret_ref: None,
+            },
+        );
+        s.connections.push(ConnectionChoice {
+            conn: ConnectionId(6),
+            label: "azure: az".to_owned(),
+            scheme: "azure".to_owned(),
+            provenance: ChoiceProvenance::Saved,
+            kind: ConnectionKind::Profile { id },
+            ..Default::default()
+        });
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "azure://blobs:/home/dietpi");
+        assert!(loc.is_remote);
+    }
+
+    #[test]
+    fn pane_location_empty_scheme_is_treated_as_local() {
+        // A choice with no scheme (e.g. a sentinel/default) must never render as a bogus
+        // `://authority:path` — it falls back to a plain path.
+        let mut s = state_on(ConnectionId(8));
+        s.connections.push(ConnectionChoice {
+            conn: ConnectionId(8),
+            label: "mystery".to_owned(),
+            scheme: String::new(),
+            provenance: ChoiceProvenance::Saved,
+            ..Default::default()
+        });
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "/home/dietpi");
+        assert!(!loc.is_remote);
+    }
+
+    #[test]
+    fn pane_location_discovered_without_profile_shows_scheme_and_path() {
+        // A discovered Docker socket has no saved profile and no `user@host` authority. It carries a
+        // real `scheme` from the provider, so the header is `scheme:path` — no label parsing, and no
+        // doubled scheme even though the real label is `"docker: docker (default)"`.
+        let mut s = state_on(ConnectionId(4));
+        s.connections.push(ConnectionChoice {
+            conn: ConnectionId(4),
+            label: "docker: docker (default)".to_owned(),
+            scheme: "docker".to_owned(),
+            provenance: ChoiceProvenance::Discovered {
+                source: DiscoverySource::Docker,
+            },
+            kind: ConnectionKind::AutoDiscovered,
+            ..Default::default()
+        });
+        let loc = s.pane_location(Side::Left);
+        assert_eq!(loc.text, "docker:/home/dietpi");
+        assert!(loc.is_remote);
     }
 
     #[test]

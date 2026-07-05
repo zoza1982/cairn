@@ -21,6 +21,8 @@ pub struct Theme {
     pub error: Color,
     /// The status bar.
     pub status: Color,
+    /// Accent for a pane header on a remote backend (SSH/S3/…), so it stands out from a local pane.
+    pub remote: Color,
     /// Background of the selected row in the focused pane.
     pub selection_bg: Color,
     /// Foreground of the selected row in the focused pane.
@@ -41,6 +43,7 @@ impl Theme {
         dir: Color::Blue,
         error: Color::Red,
         status: Color::Gray,
+        remote: Color::Yellow,
         selection_bg: Color::Cyan,
         selection_fg: Color::Black,
     };
@@ -72,6 +75,7 @@ impl Theme {
                 "dir" => theme.dir = color,
                 "error" => theme.error = color,
                 "status" => theme.status = color,
+                "remote" => theme.remote = color,
                 "selection_bg" => theme.selection_bg = color,
                 "selection_fg" => theme.selection_fg = color,
                 other => warnings.push(format!("theme: unknown color role `{other}`")),
@@ -121,12 +125,14 @@ mod tests {
             [
                 ("focused_border", "magenta"),
                 ("dir", "#00ff00"),
+                ("remote", "green"),
                 ("bogus_role", "red"),
                 ("error", "notacolor"),
             ],
         );
         assert_eq!(theme.focused_border, Color::Magenta);
         assert_eq!(theme.dir, Color::Rgb(0, 255, 0));
+        assert_eq!(theme.remote, Color::Green);
         // The unknown role and the bad color each warn; valid roles still applied.
         assert_eq!(warnings.len(), 2);
         assert_eq!(theme.error, Theme::DARK.error); // unchanged (override was invalid)

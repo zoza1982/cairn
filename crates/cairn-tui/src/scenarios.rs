@@ -52,6 +52,11 @@ pub fn all() -> Vec<Scenario> {
             build: dual_pane,
         },
         Scenario {
+            name: "remote-pane",
+            description: "left pane on a remote SSH connection (scheme://user@host header), right pane local",
+            build: remote_pane,
+        },
+        Scenario {
             name: "loading-error",
             description: "left pane loading, right pane showing a backend error",
             build: loading_error,
@@ -441,6 +446,58 @@ fn connections_pin_hide() -> AppState {
         show_hidden: true,
     });
     s.status = Some("ssh: bastion — unreachable: connection failed".to_owned());
+    s
+}
+
+/// Pane connection headers: the left pane is on a remote SSH connection (rendered as a full
+/// `ssh://user@host:path` locator in the accent color) while the right pane is on the local
+/// filesystem (path only) — so the two are instantly distinguishable.
+fn remote_pane() -> AppState {
+    let mut s = dual_pane();
+    // Left pane → an SSH profile; right pane → the built-in local root.
+    s.panes[0].conn = ConnectionId(10);
+    s.panes[1].conn = ConnectionId(2);
+    let home_dietpi = VfsPath::root()
+        .join("home")
+        .and_then(|p| p.join("dietpi"))
+        .unwrap_or_else(|_| VfsPath::root());
+    let home_me = VfsPath::root()
+        .join("home")
+        .and_then(|p| p.join("me"))
+        .unwrap_or_else(|_| VfsPath::root());
+    s.panes[0].cwd = home_dietpi;
+    s.panes[1].cwd = home_me;
+
+    let profile_id = uuid::Uuid::from_u128(0xD1E7);
+    let mut endpoint = std::collections::BTreeMap::new();
+    endpoint.insert("host".to_owned(), "dietpi6".to_owned());
+    endpoint.insert("user".to_owned(), "root".to_owned());
+    s.saved_profiles.insert(
+        profile_id,
+        cairn_core::ProfileData {
+            id: profile_id,
+            scheme: "ssh".to_owned(),
+            display_name: "dietpi6".to_owned(),
+            endpoint,
+            secret_ref: None,
+        },
+    );
+    s.connections = vec![
+        cairn_core::ConnectionChoice {
+            conn: ConnectionId(10),
+            label: "ssh: dietpi6".into(),
+            scheme: "ssh".into(),
+            provenance: cairn_core::ChoiceProvenance::Saved,
+            kind: cairn_core::ConnectionKind::Profile { id: profile_id },
+            ..Default::default()
+        },
+        cairn_core::ConnectionChoice {
+            conn: ConnectionId(2),
+            label: "local: /".into(),
+            scheme: "local".into(),
+            ..Default::default()
+        },
+    ];
     s
 }
 
