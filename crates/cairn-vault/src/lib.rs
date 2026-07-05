@@ -404,10 +404,37 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, VaultError> {
     })
 }
 
+/// Resolve `path`'s parent directory, creating it (and any missing ancestors) if absent.
+///
+/// The vault file's containing directory (the platform config dir, e.g. `~/.config/cairn`) does
+/// not exist on a fresh install, and `NamedTempFile::new_in` fails with a raw I/O error ("io
+/// error") if it is missing — so both write paths must ensure it exists first. A directory we
+/// create here is set owner-only (`0700`) on Unix, since it holds the encrypted vault; a directory
+/// the user already set up is left untouched.
+fn ensure_parent_dir(path: &Path) -> Result<PathBuf, VaultError> {
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    // Sampled before the create so the chmod below only tightens a dir we made. Bound under
+    // `cfg(unix)` because that block is its only reader — otherwise it's unused on Windows and
+    // trips `-D warnings`.
+    #[cfg(unix)]
+    let newly_created = !dir.exists();
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    if newly_created {
+        use std::os::unix::fs::PermissionsExt;
+        // Best-effort: never fail the write over a permission tweak on a dir we just made.
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(dir)
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
     use std::io::Write;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let dir = ensure_parent_dir(path)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| VaultError::Io(e.error))?;
@@ -423,8 +450,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
 /// receive the same sentinel as the pre-flight check, not a raw I/O error.
 fn atomic_create(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
     use std::io::Write;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let dir = ensure_parent_dir(path)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist_noclobber(path).map_err(|e| {
@@ -562,6 +589,36 @@ mod tests {
             Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests()),
             Err(VaultError::AlreadyExists)
         ));
+    }
+
+    /// Regression: on a fresh install the platform config dir (e.g. `~/.config/cairn`) does not
+    /// exist yet, and `Vault::create` used to fail with a raw "io error" because
+    /// `NamedTempFile::new_in` can't create a temp file in a nonexistent directory. The create path
+    /// must now create the parent directory itself (owner-only `0700` on Unix).
+    #[test]
+    fn create_succeeds_when_the_parent_directory_is_missing() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base
+            .path()
+            .join("does")
+            .join("not")
+            .join("exist")
+            .join("vault.cvlt");
+        assert!(!path.parent().unwrap().exists());
+        let vault = Vault::create_with_params(&path, &pass("pw"), KdfParams::fast_for_tests())
+            .expect("create must succeed into a missing dir");
+        assert!(path.exists(), "vault file must be written");
+        // The created vault directory is owner-only (0700) on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "created vault dir must be 0700");
+        }
+        drop(vault);
     }
 
     /// Regression test for the create-path clobber window (Fix 2): `atomic_create` must return
