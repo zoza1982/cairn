@@ -2,9 +2,9 @@
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit, WriteBackMode};
 use crate::state::{
-    ActiveTransfer, AppState, ChoiceStatus, ConnectionFormStage, ConnectionKind, FieldValue,
-    FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame, Overlay, PagerMode, PagerStatus,
-    PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId,
+    ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionFormStage, ConnectionKind,
+    FieldValue, FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame, Overlay, PagerMode,
+    PagerStatus, PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId,
     WritebackChoice, PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES,
     SESSION_OUTPUT_MAX_LINES,
 };
@@ -1921,7 +1921,7 @@ fn apply_confirm_overwrite_action(state: &mut AppState, action: Action) -> Vec<A
                 return Vec::new();
             };
             // Post-confirm re-issue: the user just confirmed the overwrite, so surface the dialog.
-            let id = arm_transfer(state, is_move, items.len(), true);
+            let id = arm_transfer(state, is_move, &items, dst_conn, true);
             vec![AppEffect::Transfer {
                 id,
                 src_conn,
@@ -2653,7 +2653,7 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
     // overwrite prompt, nothing was transferred and the selection must survive. `finish_op` clears
     // marks on actual completion (`TransferDone`).
     // User-initiated Copy/Move → auto-open the progress dialog.
-    let id = arm_transfer(state, is_move, items.len(), true);
+    let id = arm_transfer(state, is_move, &items, dst_conn, true);
     // First pass does not overwrite: the effect runner checks for collisions and reports
     // `TransferConflict` (→ confirm overlay) instead of clobbering existing destinations.
     vec![AppEffect::Transfer {
@@ -2708,7 +2708,7 @@ fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
         // front pending item into a newly-appended active slot leaves every combined index unchanged
         // (active grows by 1, that item's pending offset shrinks by 1 — net zero).
         // A queue drain is not user-initiated — never re-raise a dialog the user backgrounded.
-        let id = arm_transfer(state, next.is_move, next.items.len(), false);
+        let id = arm_transfer(state, next.is_move, &next.items, next.dst_conn, false);
         effects.push(AppEffect::Transfer {
             id,
             src_conn: next.src_conn,
@@ -3088,6 +3088,52 @@ fn append_session_output(rec: &mut SessionRecord, text: &str) -> usize {
     )
 }
 
+/// A human label for a transfer describing **what → where**: the source item (a single file's name,
+/// or `N items`) and the destination directory, tagged with the destination connection's name when
+/// it's a remote backend. So several concurrent transfers are distinguishable in the dialog (e.g.
+/// `Copying backup.tar.gz → dietpi6:/srv` vs `Moving 3 items → ~/archive`).
+fn describe_transfer(
+    state: &AppState,
+    is_move: bool,
+    items: &[(VfsPath, VfsPath)],
+    dst_conn: ConnectionId,
+) -> String {
+    debug_assert!(!items.is_empty(), "a transfer always has at least one item");
+    let verb = if is_move { "Moving" } else { "Copying" };
+    let what = match items {
+        [(from, _)] => from.file_name().unwrap_or("…").to_owned(),
+        _ => format!("{} items", items.len()),
+    };
+    let dst_dir = items
+        .first()
+        .and_then(|(_, to)| to.parent())
+        .map_or_else(|| "/".to_owned(), |p| p.as_str());
+    format!("{verb} {what} → {}{dst_dir}", conn_tag(state, dst_conn))
+}
+
+/// A short `name:` prefix for a transfer's destination connection when it is a *remote* backend
+/// (e.g. `dietpi6:`, `s3:`), or an empty string for the local filesystem — so a same-machine copy
+/// isn't cluttered but a cross-backend one shows which backend it's going to. Keyed off the
+/// machine-readable `scheme` (like [`AppState::pane_location`]), never by parsing the display label.
+fn conn_tag(state: &AppState, conn: ConnectionId) -> String {
+    let Some(choice) = state.connections.iter().find(|c| c.conn == conn) else {
+        return String::new();
+    };
+    if choice.scheme.is_empty()
+        || choice.scheme == "local"
+        || choice.provenance == ChoiceProvenance::Builtin
+    {
+        return String::new();
+    }
+    if let ConnectionKind::Profile { id } = &choice.kind {
+        if let Some(p) = state.saved_profiles.get(id) {
+            return format!("{}:", p.display_name);
+        }
+    }
+    // Discovered (a Docker socket / kubeconfig context) or a profile whose data isn't loaded.
+    format!("{}:", choice.scheme)
+}
+
 /// Mint a transfer id, push a fresh [`ActiveTransfer`] tracking it, set the status line, and return
 /// the id. Shared by the initial attempt, the queue drain, and the post-confirm re-issue so they
 /// can't drift. The id is monotonic (no clock/RNG — keeps the reducer pure and tests deterministic).
@@ -3095,13 +3141,16 @@ fn append_session_output(rec: &mut SessionRecord, text: &str) -> usize {
 /// MC-style auto-open: if no overlay is currently open, this also raises the transfer progress
 /// dialog so the user sees the new transfer immediately. It never clobbers an existing overlay — a
 /// `ConfirmOverwrite`/`Prompt`/etc. already has the user's attention and must win.
-fn arm_transfer(state: &mut AppState, is_move: bool, count: usize, auto_open: bool) -> TransferId {
+fn arm_transfer(
+    state: &mut AppState,
+    is_move: bool,
+    items: &[(VfsPath, VfsPath)],
+    dst_conn: ConnectionId,
+    auto_open: bool,
+) -> TransferId {
     let id = state.next_transfer_id;
     state.next_transfer_id += 1;
-    let label = format!(
-        "{} {count} item(s)…",
-        if is_move { "Moving" } else { "Copying" },
-    );
+    let label = describe_transfer(state, is_move, items, dst_conn);
     state.status = Some(label.clone());
     state.active_transfers.push(ActiveTransfer {
         id,
@@ -5629,6 +5678,102 @@ mod tests {
         assert!(s.transfer_queue.is_empty());
         assert_eq!(t_bytes(&s), Some(0));
         assert!(fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })));
+    }
+
+    #[test]
+    fn describe_transfer_shows_what_and_where() {
+        let s = state();
+        let p = |s: &str| VfsPath::parse(s).unwrap();
+        // Single item → the source file name and the destination directory.
+        let one = vec![(p("/home/me/backup.tar.gz"), p("/srv/www/backup.tar.gz"))];
+        assert_eq!(
+            describe_transfer(&s, false, &one, ConnectionId(9)),
+            "Copying backup.tar.gz → /srv/www"
+        );
+        // Multiple items → a count, still with the destination.
+        let many = vec![
+            (p("/a/one.txt"), p("/dst/one.txt")),
+            (p("/a/two.txt"), p("/dst/two.txt")),
+        ];
+        assert_eq!(
+            describe_transfer(&s, true, &many, ConnectionId(9)),
+            "Moving 2 items → /dst"
+        );
+    }
+
+    #[test]
+    fn describe_transfer_tags_a_remote_destination() {
+        let mut s = state();
+        let id = uuid::Uuid::from_u128(0x5583);
+        let mut endpoint = std::collections::BTreeMap::new();
+        endpoint.insert("host".to_owned(), "dietpi6".to_owned());
+        s.saved_profiles.insert(
+            id,
+            crate::forms::ProfileData {
+                id,
+                scheme: "ssh".to_owned(),
+                display_name: "dietpi6".to_owned(),
+                endpoint,
+                secret_ref: None,
+            },
+        );
+        s.connections.push(crate::state::ConnectionChoice {
+            conn: ConnectionId(7),
+            label: "ssh: dietpi6".to_owned(),
+            scheme: "ssh".to_owned(),
+            provenance: ChoiceProvenance::Saved,
+            kind: ConnectionKind::Profile { id },
+            ..Default::default()
+        });
+        let items = vec![(
+            VfsPath::parse("/home/me/site.tar").unwrap(),
+            VfsPath::parse("/srv/site.tar").unwrap(),
+        )];
+        assert_eq!(
+            describe_transfer(&s, false, &items, ConnectionId(7)),
+            "Copying site.tar → dietpi6:/srv"
+        );
+    }
+
+    #[test]
+    fn describe_transfer_tags_a_discovered_destination_by_scheme() {
+        // A discovered backend (a Docker socket / kubeconfig context) has no saved profile, so the
+        // tag comes from the machine-readable `scheme` — never from parsing the display label. A
+        // colon-less label like "web" must NOT be mistaken for a scheme (the old parse-the-label
+        // fallback produced "web:", presenting a local/unresolved backend as remote).
+        let mut s = state();
+        s.connections.push(crate::state::ConnectionChoice {
+            conn: ConnectionId(3),
+            label: "web".to_owned(), // no "scheme:" prefix — would have broken label-parsing
+            scheme: "docker".to_owned(),
+            provenance: ChoiceProvenance::Discovered {
+                source: crate::state::DiscoverySource::Docker,
+            },
+            kind: ConnectionKind::AutoDiscovered,
+            ..Default::default()
+        });
+        let items = vec![(
+            VfsPath::parse("/app/data.bin").unwrap(),
+            VfsPath::parse("/data/data.bin").unwrap(),
+        )];
+        assert_eq!(
+            describe_transfer(&s, false, &items, ConnectionId(3)),
+            "Copying data.bin → docker:/data"
+        );
+    }
+
+    #[test]
+    fn describe_transfer_leaves_local_untagged_at_root() {
+        // An unknown/local destination gets no tag; a root destination folds to "/".
+        let s = state();
+        let items = vec![(
+            VfsPath::parse("/tmp/x").unwrap(),
+            VfsPath::parse("/x").unwrap(),
+        )];
+        assert_eq!(
+            describe_transfer(&s, false, &items, ConnectionId(999)),
+            "Copying x → /"
+        );
     }
 
     #[test]
