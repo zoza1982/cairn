@@ -333,9 +333,9 @@ pub struct UiConfig {
     #[serde(default)]
     pub keybindings: BTreeMap<String, String>,
     /// Theme color overrides on top of the [`theme`](UiConfig::theme) preset: a map of role →
-    /// color. Roles are `focused_border`/`unfocused_border`/`dir`/`error`/`status`/`remote`/
-    /// `selection_bg`/`selection_fg`; color *values must be strings* — names (`"cyan"`,
-    /// `"bright-blue"`) or
+    /// color. Roles are `focused_border`/`unfocused_border`/`dir`/`hidden_dir`/`file`/`hidden_file`/
+    /// `archive`/`executable`/`symlink`/`stream`/`special`/`error`/`status`/`remote`/`selection_bg`/
+    /// `selection_fg`; color *values must be strings* — names (`"cyan"`, `"bright-blue"`) or
     /// `#rrggbb`. Unknown roles, unparseable colors, and an unknown `theme` preset are ignored with a
     /// warning (the dark preset is used).
     #[serde(default)]

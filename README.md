@@ -118,15 +118,21 @@ run at once by default — set `[transfers] concurrency = N` in config to change
 "."      = "toggle_hidden"
 ```
 
-Colors can be themed under `[ui.colors]` — override individual roles
-(`focused_border`, `unfocused_border`, `dir`, `error`, `status`, `remote`, `selection_bg`,
+Entries are colored by **type** so folders, files, and archives read at a glance: blue directories,
+amber archives, green executables, cyan symlinks, purple streams (logs), red special nodes — and a
+hidden (`.`-prefixed) directory or file uses the dimmed variant of its color, so `.git/` is clearly
+a folder but recedes next to `src/`. Colors are themed under `[ui.colors]` — override individual
+roles (`focused_border`, `unfocused_border`, `dir`, `hidden_dir`, `file`, `hidden_file`, `archive`,
+`executable`, `symlink`, `stream`, `special`, `error`, `status`, `remote`, `selection_bg`,
 `selection_fg`) over the built-in `dark` preset, using color names or `#rrggbb`:
 
 ```toml
 [ui.colors]
-focused_border = "magenta"
-dir            = "#5fafff"
-remote         = "yellow"   # accent for a pane on a remote backend (SSH/S3/…)
+dir            = "#7aa2f7"
+hidden_dir     = "#4c5a8c"   # dimmed dir tone for .folders
+archive        = "#e0af68"   # .zip / .tar.gz / …
+executable     = "#9ece6a"
+remote         = "yellow"    # accent for a pane on a remote backend (SSH/S3/…)
 ```
 
 Each pane's top border shows which backend it is browsing: a local pane shows just its path,

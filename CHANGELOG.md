@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Entries are colored by type** so folders, files, and archives are distinguishable at a glance: a
+  modern truecolor `dark` palette (Tokyo-Night family) gives directories blue, archives amber
+  (by extension), executables green, symlinks cyan, streams purple, and special nodes red — and a
+  hidden (`.`-prefixed) directory or file renders in the *dimmed* variant of its color, so a hidden
+  folder still reads as a folder but recedes (previously every folder was one blue and everything
+  else was undifferentiated). All colors are themeable via new `[ui.colors]` roles (`hidden_dir`,
+  `file`, `hidden_file`, `archive`, `executable`, `symlink`, `stream`, `special`). Archive coloring
+  is by extension only — `Enter` still detects real archives by magic bytes.
+
 - **Permission + date columns in the panes** (MC-style): each entry now shows its Unix permissions
   (`drwxr-xr-x`) and last-modified date alongside the name, right-aligned. On a narrow pane the
   columns drop out responsively — permissions go first, keeping the date as long as it fits, then
