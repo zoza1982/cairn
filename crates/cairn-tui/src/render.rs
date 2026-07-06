@@ -897,42 +897,71 @@ fn render_credential_fields(
     }
 }
 
-/// Draw the transfer-queue view: the active transfer(s) plus the pending list, with the selection
-/// cursor marked on the pending rows.
+/// Draw the transfer progress dialog (MC-style): each active transfer as a 3-line block — label
+/// (+ paused marker), a text progress bar, and the byte/rate/ETA line — followed by the pending
+/// queue with the reorder cursor, and a hint line. Auto-opened by the reducer whenever a transfer
+/// starts (`arm_transfer`); backgrounded with `b`, brought back with `Ctrl-T`.
 fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     let pending = &state.transfer_queue;
     let active = &state.active_transfers;
-    // Active section is `active.len()` rows, or 1 row ("active: (none)") when empty.
-    let active_rows = active.len().max(1);
+    // 3 rows per active transfer (label / bar / stats), or 1 "no active transfers" row when idle
+    // (idle-but-open can happen momentarily: e.g. `Ctrl-T` right after the last transfer finished
+    // but before the auto-close event has been processed).
+    let active_rows = if active.is_empty() {
+        1
+    } else {
+        active.len() * 3
+    };
     let rows = active_rows.saturating_add(pending.len());
     let h = u16::try_from(rows)
         .unwrap_or(u16::MAX)
-        .saturating_add(4) // 2 borders + blank separator + hint line
+        .saturating_add(5) // 2 borders + blank separator + 2 hint lines
         .min(frame.area().height);
-    let area = centered(frame.area(), 60, h.max(5));
+    // 70 wide (68 interior) so each control-hint line fits without truncation at typical terminal
+    // sizes; `centered` clamps to the frame width, so a narrow terminal (e.g. 40 cols) still fits and
+    // the hints truncate gracefully there.
+    let area = centered(frame.area(), 70, h.max(6));
     frame.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(" Transfer queue ")
+        .title(" Transfer ")
         .border_style(Style::default().fg(Color::Cyan));
+    // Measure the interior before the block is consumed by `render_widget`, so the bar can span
+    // exactly the dialog's content width at whatever size it was clamped to (70 wide normally, down
+    // to the full frame width — minus borders — at 40×12).
+    let content = block.inner(area);
+    let content_width = usize::from(content.width);
+    frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
     if active.is_empty() {
-        lines.push(Line::from("active: (none)".to_owned()));
+        lines.push(Line::from("No active transfers".to_owned()));
     } else {
         for t in active {
-            let state_label = if t.paused {
-                "paused"
-            } else {
-                "transferring…"
-            };
+            let paused_marker = if t.paused { "  ⏸ paused" } else { "" };
+            lines.push(Line::from(format!("{}{paused_marker}", t.label)));
+
             let pct = match t.total {
-                Some(total) if total > 0 => format!(" ({}%)", pct_of(t.bytes, total)),
-                _ => String::new(),
+                Some(total) if total > 0 => Some(pct_of(t.bytes, total)),
+                _ => None,
             };
-            lines.push(Line::from(format!(
-                "active: {state_label} {}{pct}",
-                human_bytes(t.bytes)
-            )));
+            lines.push(Line::from(progress_bar(pct, content_width)));
+
+            let amount = match t.total {
+                Some(total) if total > 0 => {
+                    format!("{} / {}", human_bytes(t.bytes), human_bytes(total))
+                }
+                _ => human_bytes(t.bytes),
+            };
+            // Rate/ETA shown only when meaningful (shared with the status line via
+            // `transfer_rate_eta`: never for a paused/finished/unknown-rate transfer).
+            let (rate_bps, eta_secs) = transfer_rate_eta(t);
+            let rate = rate_bps
+                .map(|r| format!("   {}/s", human_bytes(r)))
+                .unwrap_or_default();
+            let eta = eta_secs
+                .map(|s| format!("   ETA {}", human_duration(s)))
+                .unwrap_or_default();
+            lines.push(Line::from(format!("{amount}{rate}{eta}")));
         }
     }
     for (i, q) in pending.iter().enumerate() {
@@ -947,12 +976,56 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
         lines.push(Line::styled(line, style));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(if pending.is_empty() {
-        "[Esc] Close".to_owned()
-    } else {
-        "[↑↓] select  [K/J] move  [d] drop  [x] clear all  [Esc] close".to_owned()
-    }));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    // Two hint lines so every live control stays discoverable (`↑↓` select and `x` clear-all were
+    // dropped when this was one line): transfer controls first, then pending-queue controls.
+    lines.push(Line::from(
+        "[b] background · [p] pause · [Esc] abort".to_owned(),
+    ));
+    lines.push(Line::from(
+        "[↑↓] select · [K/J] reorder · [d] drop · [x] clear".to_owned(),
+    ));
+    frame.render_widget(Paragraph::new(lines), content);
+}
+
+/// Render one MC-style text progress bar spanning exactly `width` columns: `█` for the filled
+/// portion, `░` for the rest, followed by a right-aligned ` NN%` suffix. `pct` is `None` when the
+/// transfer's total size isn't known yet (no pre-scan result) — rendered as an all-empty bar with
+/// `--%` rather than a fabricated percentage.
+fn progress_bar(pct: Option<u64>, width: usize) -> String {
+    let suffix = match pct {
+        Some(p) => format!(" {}%", p.min(100)),
+        None => " --%".to_owned(),
+    };
+    // Reserve room for the suffix; always leave at least one column for the bar itself so a very
+    // narrow dialog (e.g. 40-wide) still renders *something* rather than just the percentage.
+    let bar_width = width.saturating_sub(suffix.chars().count()).max(1);
+    let filled = match pct {
+        Some(p) => ((p.min(100) as usize) * bar_width) / 100,
+        None => 0,
+    };
+    let bar: String = std::iter::repeat_n('█', filled)
+        .chain(std::iter::repeat_n('░', bar_width - filled))
+        .collect();
+    format!("{bar}{suffix}")
+}
+
+/// The throughput rate (bytes/sec) and ETA (whole seconds) worth *displaying* for one transfer, or
+/// `None` for each when it shouldn't be shown: a paused transfer, an unknown rate, or an ETA that
+/// isn't meaningful (no known total, zero rate, or already complete / sub-second). Shared by the
+/// progress dialog and the status line so the two can't drift on when a number appears.
+fn transfer_rate_eta(t: &cairn_core::ActiveTransfer) -> (Option<u64>, Option<u64>) {
+    let rate = match t.rate {
+        Some(r) if !t.paused => Some(r),
+        _ => None,
+    };
+    let eta = match (t.total, t.rate) {
+        (Some(tot), Some(r)) if !t.paused && r > 0 && tot > t.bytes => {
+            let secs = (tot - t.bytes) / r;
+            (secs > 0).then_some(secs)
+        }
+        _ => None,
+    };
+    (rate, eta)
 }
 
 /// Draw a single-line text prompt (new directory, rename) with the entered text and a block cursor.
@@ -1356,7 +1429,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     } else if let Some(msg) = &state.status {
         Line::from(format!(" {count}   {msg}"))
     } else {
-        let help = "q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move · d del · p pause · r refresh · ^O conn · ^T queue · ^A ai";
+        let help = "q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move · d del · p pause · r refresh · ^O conn · ^T transfer · ^A ai";
         Line::from(format!(" {count}   {help}"))
     };
     frame.render_widget(
@@ -1404,21 +1477,15 @@ fn transfer_status(state: &AppState) -> String {
         if t.paused {
             return format!("⏸ paused {amount}{suffix}");
         }
-        let rate = match t.rate {
-            Some(r) => format!(" at {}/s", human_bytes(r)),
-            None => String::new(),
-        };
-        let eta = match (t.total, t.rate) {
-            (Some(tot), Some(r)) if r > 0 && tot > t.bytes => {
-                let secs = (tot - t.bytes) / r;
-                if secs > 0 {
-                    format!(", ETA {}", human_duration(secs))
-                } else {
-                    String::new()
-                }
-            }
-            _ => String::new(),
-        };
+        // Same rate/ETA gating as the progress dialog (`transfer_rate_eta`); `t` is non-paused here
+        // (the paused case returned above), just with the status-line's ` at …`/`, ETA …` phrasing.
+        let (rate_bps, eta_secs) = transfer_rate_eta(t);
+        let rate = rate_bps
+            .map(|r| format!(" at {}/s", human_bytes(r)))
+            .unwrap_or_default();
+        let eta = eta_secs
+            .map(|s| format!(", ETA {}", human_duration(s)))
+            .unwrap_or_default();
         return format!("⇅ transferring… {amount}{rate}{eta}{suffix}");
     }
 
@@ -1816,12 +1883,76 @@ mod tests {
         });
         s.overlay = Some(cairn_core::Overlay::TransferQueue { cursor: 0 });
         let text = render_text(&s, 80, 24);
-        assert!(text.contains("Transfer queue"));
-        assert!(text.contains("active"));
-        assert!(text.contains("move"));
+        assert!(text.contains("Transfer"), "dialog title");
+        assert!(
+            text.contains("Copying 1 item(s)"),
+            "the active transfer's label"
+        );
+        assert!(text.contains("--%"), "indeterminate bar (total is unknown)");
+        assert!(text.contains("move"), "the pending move is listed");
+        assert!(text.contains("background")); // the [b] background control
         assert!(text.contains("drop")); // the [d] drop control
-        assert!(text.contains("move")); // the [K/J] reorder control
-        assert!(text.contains("clear all"));
+    }
+
+    #[test]
+    fn progress_bar_renders_filled_empty_and_suffix() {
+        // Unknown total → all-empty bar with `--%`, never a fabricated percentage.
+        let none = progress_bar(None, 24);
+        assert!(none.ends_with(" --%"), "unknown → --%: {none}");
+        assert!(!none.contains('█'), "unknown → no filled cells: {none}");
+
+        // 0% → no filled cells; 100% → no empty cells; the suffix reflects the percentage.
+        let zero = progress_bar(Some(0), 24);
+        assert!(zero.ends_with(" 0%") && !zero.contains('█'), "{zero}");
+        let full = progress_bar(Some(100), 24);
+        assert!(full.ends_with(" 100%") && !full.contains('░'), "{full}");
+        // 50% of a 20-col bar (24 − 4 for " 50%") → 10 filled, 10 empty.
+        let half = progress_bar(Some(50), 24);
+        assert_eq!(half.matches('█').count(), 10, "{half}");
+        assert_eq!(half.matches('░').count(), 10, "{half}");
+
+        // Over-100 input is clamped (defensive) and the bar never overfills.
+        let over = progress_bar(Some(250), 24);
+        assert!(over.ends_with(" 100%") && !over.contains('░'), "{over}");
+
+        // Degenerate widths never panic and always leave at least one bar cell.
+        for w in [0usize, 1, 3, 5] {
+            let s = progress_bar(Some(50), w);
+            assert!(s.contains('█') || s.contains('░'), "w={w}: {s}");
+        }
+    }
+
+    #[test]
+    fn transfer_rate_eta_hides_numbers_when_not_meaningful() {
+        use cairn_core::ActiveTransfer;
+        let t = |bytes, rate, total, paused| ActiveTransfer {
+            id: 1,
+            label: "x".to_owned(),
+            bytes,
+            rate,
+            total,
+            paused,
+        };
+        // Running with a known total: both rate and a positive ETA.
+        assert_eq!(
+            transfer_rate_eta(&t(4 << 20, Some(2 << 20), Some(8 << 20), false)),
+            (Some(2 << 20), Some(2))
+        );
+        // Paused: neither shown even though rate/total are known.
+        assert_eq!(
+            transfer_rate_eta(&t(4 << 20, Some(2 << 20), Some(8 << 20), true)),
+            (None, None)
+        );
+        // Unknown total → rate still shown, ETA suppressed.
+        assert_eq!(
+            transfer_rate_eta(&t(4 << 20, Some(2 << 20), None, false)),
+            (Some(2 << 20), None)
+        );
+        // Zero rate → no ETA (no division), and rate 0 is still "known" so it shows.
+        assert_eq!(
+            transfer_rate_eta(&t(0, Some(0), Some(8 << 20), false)),
+            (Some(0), None)
+        );
     }
 
     #[test]

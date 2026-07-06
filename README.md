@@ -81,7 +81,8 @@ Keys can be remapped under `[ui.keybindings]` — a map of key-chord → action,
 built-in scheme. Chords combine optional `ctrl+`/`alt+`/`shift+` modifiers with a key (a single
 character, a named key like `enter`/`space`/`esc`/`tab`/arrows, or `f1`–`f24`); actions are
 snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `cycle_sort`, `toggle_hidden`,
-`filter`, `make_dir`, `rename`, `view`, `edit`, `open_queue`, `toggle_pause`, `quit`, …). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
+`filter`, `make_dir`, `rename`, `view`, `edit`, `open_queue`, `toggle_pause`, `background`, `quit`,
+…). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
 
 By default `s` cycles the active pane's sort order (name → size → modified → type) and `.` toggles whether
 hidden entries (dotfiles) are listed; the current sort mode and hidden state show in each pane's
@@ -95,9 +96,14 @@ editor, while `Enter` on a binary file still opens the read-only hex pager. Edit
 there, and written back after a conflict check (has the remote file changed since you started
 editing?) — with size limits and a confirm prompt if the remote drifted or the local edit came
 back empty (see [RFC-0012](docs/rfcs/0012-file-open-view-edit.md)).
-`/` filters the listing as you type (`Enter` keeps the filter, `Esc` clears it). During a transfer,
-`p` pauses/resumes and `Esc` cancels (all active transfers); `Ctrl-T` opens the transfer queue. Up
-to two transfers run at once by default — set `[transfers] concurrency = N` in config to change it.
+`/` filters the listing as you type (`Enter` keeps the filter, `Esc` clears it). Copying or moving
+files auto-opens an MC-style transfer dialog — a progress bar, byte count, rate, and ETA per active
+transfer, plus the pending queue. `p` pauses/resumes (all active transfers); `Esc` inside the
+dialog aborts them; `b` sends the dialog to the background (transfers keep running, the status line
+keeps its compact summary) and `Ctrl-T` brings it back to the foreground. In the pending queue,
+`↑`/`↓` select, `K`/`J` reorder, `d` drops the selected pending transfer, and `x` clears them all.
+The dialog dismisses itself once the last transfer finishes and nothing remains queued. Up to two
+transfers run at once by default — set `[transfers] concurrency = N` in config to change it.
 
 ```toml
 [ui.keybindings]

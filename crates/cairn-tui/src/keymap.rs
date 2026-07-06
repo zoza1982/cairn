@@ -150,6 +150,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "queue_move_up" => Action::QueueMoveUp,
         "queue_move_down" => Action::QueueMoveDown,
         "toggle_pause" => Action::TogglePause,
+        "background" => Action::Background,
         "make_dir" => Action::MakeDir,
         "rename" => Action::Rename,
         "open_connections" => Action::OpenConnections,
@@ -289,6 +290,9 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('.') => Some(Action::ToggleHidden),
         // 'p' pauses/resumes the active transfer (no-op when none is running).
         KeyCode::Char('p') => Some(Action::TogglePause),
+        // 'b' backgrounds the transfer progress dialog (MC-style): closes it but leaves any active
+        // transfer running (no-op elsewhere — there is nothing to background with the dialog closed).
+        KeyCode::Char('b') => Some(Action::Background),
         // F7 = make directory, F2 = rename (Total Commander / Norton convention).
         KeyCode::F(7) => Some(Action::MakeDir),
         KeyCode::F(2) => Some(Action::Rename),
@@ -616,6 +620,7 @@ mod tests {
             "queue_move_up",
             "queue_move_down",
             "toggle_pause",
+            "background",
             "make_dir",
             "rename",
             "open_connections",
@@ -643,7 +648,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 41);
+        assert_eq!(names.len(), 42);
     }
 
     #[test]
