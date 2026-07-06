@@ -111,6 +111,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Compressed tarballs (`.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.zst`) now open and browse like folders
+  on `Enter`.** The archive backend already supported mounting them, but the pure front-end
+  file-kind sniff (`detect_file_kind`, which decides whether `Enter` mounts an archive) only
+  recognized zip and *uncompressed* tar, so a `.tar.gz` fell through to the hex pager instead. It now
+  recognizes the four outer-compression magics (gzip/bzip2/xz/zstd) at offset 0, matching the
+  backend's `sniff_format`. `.tar.xz` is recognized but reports a clear "unsupported" message
+  (xz decoding remains disabled for OOM-safety) rather than opening as binary.
+
 - **Creating the vault no longer fails with "io error" on a fresh install.** The vault's config
   directory (e.g. `~/.config/cairn`) does not exist until something writes there, and vault creation
   (triggered the first time you save a credential — e.g. adding an SSH host with a password) failed
