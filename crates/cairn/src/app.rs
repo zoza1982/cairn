@@ -4,7 +4,7 @@
 //! backends. The render path is synchronous; all I/O runs as tokio tasks whose results return as
 //! [`AppEvent`]s over a bounded channel — see `docs/LLD.md` §4–§6.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -2618,20 +2618,33 @@ fn outcome_summary(o: &cairn_transfer::TransferOutcome) -> String {
     format!("{} file(s), {} dir(s)", o.files, o.dirs)
 }
 
-/// Average throughput in bytes/sec over `secs` elapsed. The elapsed time is floored at a small
-/// epsilon so a near-instant transfer reports a sane number rather than an absurd one-frame spike;
-/// the `f64`→`u64` cast saturates (never wraps/panics).
+/// Throughput in bytes/sec: `bytes` transferred over `secs` of (windowed) elapsed time. The elapsed
+/// time is floored at a small epsilon so a near-instant window reports a sane number rather than an
+/// absurd one-frame spike; the `f64`→`u64` cast saturates (never wraps/panics).
 fn avg_rate(bytes: u64, secs: f64) -> u64 {
     let secs = secs.max(0.05);
     (bytes as f64 / secs) as u64
 }
 
-/// Subtract accumulated paused wall-time from the total elapsed to get the effective (active)
-/// elapsed for throughput rate calculation. Saturates to [`Duration::ZERO`] when `paused`
-/// exceeds `total` (e.g., the accumulator raced ahead of the clock); [`avg_rate`]'s own 0.05 s
-/// floor then bounds the reported rate.
-fn effective_elapsed(total: Duration, paused: Duration) -> Duration {
-    total.saturating_sub(paused)
+/// The trailing window, in milliseconds, over which transfer throughput is measured.
+const RATE_WINDOW_MS: u64 = 3_000;
+
+/// Near-instantaneous throughput from a sliding window of `(elapsed_ms, cumulative_bytes)` samples
+/// (oldest first, monotonic). Appends the current sample, drops samples that fall entirely before
+/// the window — keeping the newest one at/before the `now_ms - RATE_WINDOW_MS` edge as the anchor so
+/// the window still spans ~`RATE_WINDOW_MS` between sparse updates — then returns recent-bytes over
+/// recent-seconds. Pure (clock passed in as `now_ms`) so it is unit-testable without sleeps; a
+/// lifetime average instead would stay depressed long after a slow stretch (e.g. contention from a
+/// second concurrent transfer) ended.
+fn windowed_rate(samples: &mut VecDeque<(u64, u64)>, now_ms: u64, bytes: u64) -> u64 {
+    samples.push_back((now_ms, bytes));
+    let cutoff = now_ms.saturating_sub(RATE_WINDOW_MS);
+    while samples.len() > 2 && samples[1].0 <= cutoff {
+        samples.pop_front();
+    }
+    let (t0, b0) = samples.front().copied().unwrap_or((0, 0));
+    let secs = now_ms.saturating_sub(t0) as f64 / 1000.0;
+    avg_rate(bytes.saturating_sub(b0), secs)
 }
 
 /// Sum the source file sizes of a transfer's `items` (recursively for directories), for a
@@ -2748,68 +2761,47 @@ async fn run_transfer_effect(
     // Emit coalesced, non-blocking progress: accumulate bytes and notify the UI at most every
     // `TRANSFER_PROGRESS_STEP` bytes via `try_send`, which drops the update if the bounded channel is
     // full rather than stalling the transfer task (the render path must never be blocked here). The
-    // reported rate is the average throughput over **effective** (non-paused) elapsed time.
-
-    // Track wall-time spent paused so the throughput rate is not skewed by idle clock cycles.
-    // A lightweight accumulator task subscribes to the pause watch: each true→false transition adds
-    // the pause interval (in milliseconds) to a shared `AtomicU64`. The drop-guard cancels the task
-    // when `run_transfer_effect` returns via any path (normal, early-exit, or cancelled).
-    let paused_ms_acc = Arc::new(AtomicU64::new(0));
-    let _accu_guard = {
-        let token = CancellationToken::new();
-        let guard = token.clone().drop_guard();
-        tokio::spawn({
-            let paused_ms = paused_ms_acc.clone();
-            let cancel = token;
-            let mut paused_rx = paused.clone();
-            async move {
-                let mut pause_start: Option<std::time::Instant> = None;
-                loop {
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        result = paused_rx.changed() => {
-                            match result {
-                                Ok(()) => {
-                                    if *paused_rx.borrow() {
-                                        pause_start = Some(std::time::Instant::now());
-                                    } else if let Some(s) = pause_start.take() {
-                                        // Clamp to u64::MAX (≈ 584 million years) to avoid a
-                                        // near-impossible overflow; in practice pauses are seconds.
-                                        let ms = u64::try_from(s.elapsed().as_millis())
-                                            .unwrap_or(u64::MAX);
-                                        paused_ms.fetch_add(ms, Ordering::Relaxed);
-                                    }
-                                }
-                                Err(_) => break, // watch sender dropped; transfer has ended
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        guard
-    };
+    // reported rate is a short trailing window (see below), so a pause needs no special accounting:
+    // no progress arrives while paused and the render hides a paused transfer's rate. The one caveat
+    // is a bounded artifact — for up to `RATE_WINDOW_MS` after *resuming* a long pause, the stale
+    // pre-pause anchor makes the rate read low until it ages out (never high, since elapsed only
+    // grows). A strict improvement over the old lifetime average, which could stay depressed forever.
     let started = std::time::Instant::now();
-    let rate_bps = |bytes: u64| -> u64 {
-        let paused_dur = Duration::from_millis(paused_ms_acc.load(Ordering::Relaxed));
-        avg_rate(
-            bytes,
-            effective_elapsed(started.elapsed(), paused_dur).as_secs_f64(),
-        )
-    };
+    // Sliding-window (near-instantaneous) throughput: recent bytes over recent wall-time. Reporting
+    // a *lifetime* average (cumulative bytes ÷ total elapsed) means that after any slow stretch —
+    // e.g. while a second concurrent transfer contended for the same disk/link — the number stays
+    // dragged down long after real speed recovered, so the user sees it "stuck" at KB/s. A short
+    // trailing window instead tracks current speed and recovers within `RATE_WINDOW_MS`. The reducer
+    // can't do this (it's clock-free and pure), so the rate is measured here at the I/O edge.
+    // `(elapsed_ms_since_started, cumulative_bytes)` samples for the trailing throughput window.
+    let mut rate_samples: VecDeque<(u64, u64)> = VecDeque::from([(0u64, 0u64)]);
+    // The most recent windowed rate, so the one-shot final flush below can read it without
+    // re-borrowing `rate_samples` (which `on_progress` owns for the copy's duration).
+    let last_rate = Arc::new(AtomicU64::new(0));
+
     let mut bytes = 0u64;
     let mut last_sent = 0u64;
-    let mut on_progress = |b: u64| {
-        bytes += b;
-        debug_assert!(bytes >= last_sent, "progress bytes must be cumulative");
-        if bytes - last_sent >= TRANSFER_PROGRESS_STEP {
-            last_sent = bytes;
-            let _ = event_tx.try_send(AppEvent::TransferProgress {
-                id,
-                bytes,
-                rate_bps: rate_bps(bytes),
-                total,
-            });
+    let mut on_progress = {
+        let last_rate = last_rate.clone();
+        move |b: u64| {
+            bytes += b;
+            debug_assert!(bytes >= last_sent, "progress bytes must be cumulative");
+            // Update the window on *every* progress call (cheap, amortized O(1)) so `last_rate` is
+            // always current — including for a transfer that completes in a single sub-step callback
+            // (e.g. the same-connection server-copy fast path), which the final flush relies on.
+            // Only the UI *event* is throttled to every `TRANSFER_PROGRESS_STEP` bytes.
+            let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let rate = windowed_rate(&mut rate_samples, now_ms, bytes);
+            last_rate.store(rate, Ordering::Relaxed);
+            if bytes - last_sent >= TRANSFER_PROGRESS_STEP {
+                last_sent = bytes;
+                let _ = event_tx.try_send(AppEvent::TransferProgress {
+                    id,
+                    bytes,
+                    rate_bps: rate,
+                    total,
+                });
+            }
         }
     };
     match cairn_transfer::run_transfer(&src, &dst, &items, spec, &cancel, &paused, &mut on_progress)
@@ -2817,11 +2809,13 @@ async fn run_transfer_effect(
     {
         Ok(out) => {
             // Flush the exact final total for one frame before `TransferDone` clears the indicator
-            // (so a transfer smaller than the coalescing step doesn't only ever show "0 B").
+            // (so a transfer smaller than the coalescing step doesn't only ever show "0 B"). Reuse
+            // the last windowed rate — kept current on every progress call above, so even a tiny
+            // transfer (one sub-step callback) reports a real rate rather than flashing "0 B/s".
             let _ = event_tx.try_send(AppEvent::TransferProgress {
                 id,
                 bytes: out.bytes,
-                rate_bps: rate_bps(out.bytes),
+                rate_bps: last_rate.load(Ordering::Relaxed),
                 total,
             });
             AppEvent::TransferDone {
@@ -4992,35 +4986,73 @@ mod tests {
         let _ = avg_rate(u64::MAX, 0.000_001);
     }
 
-    /// Pure unit test for [`effective_elapsed`] — no async, no sleeps.
-    /// Verifies that accumulated paused time is correctly subtracted, with saturation to zero when
-    /// paused >= total (the `avg_rate` floor then bounds the reported rate).
     #[test]
-    fn effective_elapsed_saturates_at_zero_and_subtracts_correctly() {
-        // Normal: 5 s elapsed, 2 s paused → 3 s effective.
-        assert_eq!(
-            effective_elapsed(Duration::from_secs(5), Duration::from_secs(2)),
-            Duration::from_secs(3)
+    fn windowed_rate_reflects_recent_speed_and_recovers_after_a_slow_stretch() {
+        let mut s: VecDeque<(u64, u64)> = VecDeque::from([(0u64, 0u64)]);
+        // Steady 1 MiB/s for the first second → 1 MiB/s.
+        assert_eq!(windowed_rate(&mut s, 1_000, 1 << 20), 1 << 20);
+        // A long slow stretch: over the next ~4 s only a trickle arrives. A *lifetime* average would
+        // now read ~(1 MiB + trickle)/5 s ≈ 0.2 MiB/s and stay there. The window instead only sees
+        // the recent (slow) samples.
+        windowed_rate(&mut s, 2_000, (1 << 20) + 10_000);
+        windowed_rate(&mut s, 3_000, (1 << 20) + 20_000);
+        windowed_rate(&mut s, 4_000, (1 << 20) + 30_000);
+        let slow = windowed_rate(&mut s, 5_000, (1 << 20) + 40_000);
+        assert!(
+            slow < 100_000,
+            "window shows the slow recent rate, got {slow}"
         );
-        // Saturates to zero when paused exceeds total (avg_rate's floor then kicks in).
-        assert_eq!(
-            effective_elapsed(Duration::from_secs(1), Duration::from_secs(2)),
-            Duration::ZERO
+        // Speed recovers to 10 MiB/s: within the window the rate climbs back up promptly, unlike a
+        // lifetime average which would stay depressed by the earlier slow stretch.
+        windowed_rate(&mut s, 6_000, (1 << 20) + 40_000 + (10 << 20));
+        windowed_rate(&mut s, 7_000, (1 << 20) + 40_000 + (20 << 20));
+        let recovered = windowed_rate(&mut s, 8_000, (1 << 20) + 40_000 + (30 << 20));
+        assert!(
+            recovered > 8 * (1 << 20),
+            "rate recovered to ~10 MiB/s, got {recovered}"
         );
-        // Exact match: paused == total → zero.
-        assert_eq!(
-            effective_elapsed(Duration::from_secs(3), Duration::from_secs(3)),
-            Duration::ZERO
+    }
+
+    #[test]
+    fn windowed_rate_trims_to_the_window_and_never_panics() {
+        let mut s: VecDeque<(u64, u64)> = VecDeque::from([(0u64, 0u64)]);
+        // Feed many samples well past the window; the deque must stay bounded (anchor + recent), not
+        // grow without limit, and never panic on the front()/index accesses.
+        for i in 1..=1000u64 {
+            windowed_rate(&mut s, i * 100, i * 1_000);
+        }
+        assert!(
+            s.len() <= 40,
+            "samples trimmed to ~window, not unbounded: {}",
+            s.len()
         );
-        // No pause → full elapsed is effective.
-        assert_eq!(
-            effective_elapsed(Duration::from_secs(4), Duration::ZERO),
-            Duration::from_secs(4)
+        // A zero-elapsed first call is floored by avg_rate, no divide-by-zero.
+        let mut z: VecDeque<(u64, u64)> = VecDeque::from([(0u64, 0u64)]);
+        let _ = windowed_rate(&mut z, 0, 5_000);
+    }
+
+    #[test]
+    fn windowed_rate_after_a_long_pause_reads_low_never_high_then_recovers() {
+        // No samples arrive while a transfer is paused, so on resume the pre-pause sample is still
+        // the anchor across a huge time gap. The rate must read LOW (bytes barely moved over a long
+        // span) — never an absurd spike — and recover once the stale anchor ages past the window.
+        let mut s: VecDeque<(u64, u64)> = VecDeque::from([(0u64, 0u64)]);
+        windowed_rate(&mut s, 1_000, 5 << 20); // steady before the pause
+        windowed_rate(&mut s, 2_000, 10 << 20);
+        // 60 s pause, then resume at t=62 s with only a little new data.
+        let just_after = windowed_rate(&mut s, 62_000, (10 << 20) + 20_000);
+        assert!(
+            just_after < (1 << 20),
+            "post-resume rate reads low, not a spike: {just_after}"
         );
-        // Both zero.
-        assert_eq!(
-            effective_elapsed(Duration::ZERO, Duration::ZERO),
-            Duration::ZERO
+        // Real speed after resume is 10 MiB/s; once the pre-pause anchor ages out of the window the
+        // reported rate climbs back to it.
+        windowed_rate(&mut s, 63_000, (10 << 20) + 20_000 + (10 << 20));
+        windowed_rate(&mut s, 64_000, (10 << 20) + 20_000 + (20 << 20));
+        let recovered = windowed_rate(&mut s, 65_500, (10 << 20) + 20_000 + (35 << 20));
+        assert!(
+            recovered > 8 * (1 << 20),
+            "rate recovered after the stale anchor aged out: {recovered}"
         );
     }
 

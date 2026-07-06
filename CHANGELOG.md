@@ -111,6 +111,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Transfer speed now shows the *current* rate, not a lifetime average.** With two transfers
+  running at once, the first would drop to a few KB/s and appear to "never recover" even after the
+  second finished — because the displayed rate was cumulative bytes ÷ total elapsed, which stays
+  depressed long after real throughput returns. The rate (and ETA) are now measured over a short
+  trailing window (~3 s), so they track actual speed and recover promptly. Removes the per-transfer
+  pause-time accumulator task the old average needed.
+
 - **Compressed tarballs (`.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.zst`) now open and browse like folders
   on `Enter`.** The archive backend already supported mounting them, but the pure front-end
   file-kind sniff (`detect_file_kind`, which decides whether `Enter` mounts an archive) only
