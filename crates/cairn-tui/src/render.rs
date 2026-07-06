@@ -8,7 +8,7 @@ use cairn_core::{
     MaskedInput, Overlay, PagerMode, PagerStatus, PaneState, PromptKind, SessionEnd, SessionRecord,
     Side, WritebackChoice, WritebackConflictReason, KNOWN_SCHEMES, PAGER_HEX_ROW_BYTES,
 };
-use cairn_types::{EntryKind, UnixPerms};
+use cairn_types::{Entry, EntryKind, UnixPerms};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -1392,11 +1392,7 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
                     let i = top + offset; // index back into the visible view (marks are absolute)
                     let mark = if pane.marked.contains(&i) { '*' } else { ' ' };
                     let suffix = if e.is_dir() { "/" } else { "" };
-                    let name_style = if e.is_dir() {
-                        Style::default().fg(theme.dir).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
+                    let name_style = entry_style(e, theme);
                     let perms = format_perms(e.kind, e.perms);
                     let date = e.modified.map(format_mtime).unwrap_or_default();
                     let cols = entry_columns(&perms, &date, row_w);
@@ -1410,12 +1406,19 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
                 })
                 .collect();
 
+            // Both panes get an explicit bg+fg cursor bar (not `REVERSED`): now that every entry has
+            // its own fg color, a bare `REVERSED` would swap each cell's color through and produce a
+            // ragged multicolor bar on the inactive pane. The focused pane uses the bright selection
+            // fill; the unfocused pane uses a dimmer (`unfocused_border`) fill so the active pane
+            // stays obvious.
             let highlight = if focused {
                 Style::default()
                     .bg(theme.selection_bg)
                     .fg(theme.selection_fg)
             } else {
-                Style::default().add_modifier(Modifier::REVERSED)
+                Style::default()
+                    .bg(theme.unfocused_border)
+                    .fg(theme.selection_fg)
             };
             let list = List::new(items)
                 .block(block)
@@ -1572,6 +1575,57 @@ fn human_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{v:.1} {}", UNITS[unit])
+}
+
+/// The display style for a listing entry, keyed off its kind so the *type* reads at a glance: blue
+/// folders, amber archives (by extension), green executables, cyan symlinks, purple streams, red
+/// specials. A hidden (`.`-prefixed) directory or plain file uses the dimmed variant of its color so
+/// it recedes but still reads as its kind. Directories/archives/executables are bold, symlinks
+/// italic. The `..` navigation sentinel styles as an ordinary directory.
+fn entry_style(e: &Entry, theme: &Theme) -> Style {
+    let hidden = e.name.starts_with('.') && !e.is_dotdot_sentinel();
+    match e.kind {
+        EntryKind::Dir => Style::default()
+            .fg(if hidden { theme.hidden_dir } else { theme.dir })
+            .add_modifier(Modifier::BOLD),
+        EntryKind::Symlink => Style::default()
+            .fg(theme.symlink)
+            .add_modifier(Modifier::ITALIC),
+        EntryKind::Stream => Style::default().fg(theme.stream),
+        EntryKind::Special => Style::default().fg(theme.special),
+        EntryKind::File => {
+            // An executable bit wins over an archive extension (a runnable file is the more useful
+            // signal); a hidden plain file dims. Object stores expose no perms, so exec never trips
+            // there.
+            if e.perms.is_some_and(|p| p.mode & 0o111 != 0) {
+                Style::default()
+                    .fg(theme.executable)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_archive_name(&e.name) {
+                Style::default()
+                    .fg(theme.archive)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(if hidden {
+                    theme.hidden_file
+                } else {
+                    theme.file
+                })
+            }
+        }
+    }
+}
+
+/// Whether a filename looks like an archive, by extension — for **coloring only**. `Enter` still
+/// detects real archives by magic bytes (`detect_file_kind`), so a mis-named file is never mounted
+/// on the strength of its extension; this only tints the row.
+fn is_archive_name(name: &str) -> bool {
+    const EXTS: &[&str] = &[
+        ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar.zst", ".tzst",
+        ".zip", ".gz", ".bz2", ".xz", ".zst", ".7z", ".rar",
+    ];
+    let lower = name.to_ascii_lowercase();
+    EXTS.iter().any(|ext| lower.ends_with(ext))
 }
 
 /// Format an entry's permissions MC-style as a 10-char `drwxr-xr-x`: a leading type character (from
@@ -2122,6 +2176,56 @@ mod tests {
         assert_eq!(p(EntryKind::Dir, 0o1776), "drwxrwxrwT"); // sticky, x off → 'T'
                                                              // A backend with no permission model → blank column (not a misleading `---------`).
         assert_eq!(format_perms(EntryKind::File, None), "");
+    }
+
+    #[test]
+    fn entry_style_colors_by_type_hidden_exec_and_archive() {
+        let t = &Theme::DARK;
+        let fg = |name: &str, kind| entry_style(&Entry::new(name, kind), t).fg;
+        assert_eq!(fg("src", EntryKind::Dir), Some(t.dir));
+        assert_eq!(fg(".git", EntryKind::Dir), Some(t.hidden_dir));
+        assert_eq!(fg("README.md", EntryKind::File), Some(t.file));
+        assert_eq!(fg(".env", EntryKind::File), Some(t.hidden_file));
+        assert_eq!(fg("latest", EntryKind::Symlink), Some(t.symlink));
+        assert_eq!(fg("app.log", EntryKind::Stream), Some(t.stream));
+        assert_eq!(fg("docker.sock", EntryKind::Special), Some(t.special));
+        // Archive by extension (color only; Enter still sniffs magic bytes).
+        assert_eq!(fg("release.tar.gz", EntryKind::File), Some(t.archive));
+        // A *hidden* archive keeps the archive color (type wins over hidden dimming for archives).
+        assert_eq!(fg(".backup.tar.gz", EntryKind::File), Some(t.archive));
+        // The `..` sentinel is a normal directory, never dimmed as "hidden".
+        assert_eq!(fg("..", EntryKind::Dir), Some(t.dir));
+
+        // The execute bit wins over an archive extension.
+        let mut exe = Entry::new("bundle.zip", EntryKind::File);
+        exe.perms = Some(UnixPerms::from_mode(0o755));
+        assert_eq!(entry_style(&exe, t).fg, Some(t.executable));
+        // A plain (non-exec) file with perms still colors as a file, not exec.
+        let mut plain = Entry::new("notes.md", EntryKind::File);
+        plain.perms = Some(UnixPerms::from_mode(0o644));
+        assert_eq!(entry_style(&plain, t).fg, Some(t.file));
+    }
+
+    #[test]
+    fn is_archive_name_matches_common_extensions() {
+        for n in [
+            "a.zip",
+            "a.tar",
+            "a.tar.gz",
+            "a.tgz",
+            "a.tar.zst",
+            "a.tzst",
+            "a.gz",
+            "A.ZIP",
+            "x.7z",
+        ] {
+            assert!(is_archive_name(n), "{n} should be an archive");
+        }
+        for n in ["a.txt", "README", "archive", "a.gz.txt", ""] {
+            assert!(!is_archive_name(n), "{n:?} should NOT be an archive");
+        }
+        // Degenerate bare-extension names are matched (harmless — color only, no panic).
+        assert!(is_archive_name(".gz") && is_archive_name(".tar"));
     }
 
     #[test]

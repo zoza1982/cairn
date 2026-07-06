@@ -17,9 +17,26 @@ pub struct Theme {
     pub unfocused_border: Color,
     /// Directory entries.
     pub dir: Color,
+    /// Hidden (dot-prefixed) directory entries — a dimmed variant of [`dir`](Self::dir) so a hidden
+    /// folder still reads as a folder but visually recedes.
+    pub hidden_dir: Color,
+    /// Regular file entries.
+    pub file: Color,
+    /// Hidden (dot-prefixed) file entries — a dimmed variant of [`file`](Self::file).
+    pub hidden_file: Color,
+    /// Archive files (`.zip`/`.tar`/`.tar.gz`/…), by extension.
+    pub archive: Color,
+    /// Executable files (any Unix execute bit set).
+    pub executable: Color,
+    /// Symbolic links.
+    pub symlink: Color,
+    /// Live streams (e.g. container/pod logs).
+    pub stream: Color,
+    /// Special nodes (sockets, devices, fifos).
+    pub special: Color,
     /// Error text.
     pub error: Color,
-    /// The status bar.
+    /// The status bar (also the dim secondary text used for the pane permission/date columns).
     pub status: Color,
     /// Accent for a pane header on a remote backend (SSH/S3/…), so it stands out from a local pane.
     pub remote: Color,
@@ -36,16 +53,26 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// The built-in dark preset (the original hard-coded palette).
+    /// The built-in dark preset. A modern truecolor palette (Tokyo-Night family) tuned so entry
+    /// *type* reads at a glance: blue folders, amber archives, green executables, cyan links; hidden
+    /// entries are the dimmed variant of their type.
     pub const DARK: Theme = Theme {
-        focused_border: Color::Cyan,
-        unfocused_border: Color::DarkGray,
-        dir: Color::Blue,
-        error: Color::Red,
-        status: Color::Gray,
-        remote: Color::Yellow,
-        selection_bg: Color::Cyan,
-        selection_fg: Color::Black,
+        focused_border: Color::Rgb(0x7d, 0xcf, 0xff),
+        unfocused_border: Color::Rgb(0x54, 0x5c, 0x7e),
+        dir: Color::Rgb(0x7a, 0xa2, 0xf7),
+        hidden_dir: Color::Rgb(0x4c, 0x5a, 0x8c),
+        file: Color::Rgb(0xc0, 0xca, 0xf5),
+        hidden_file: Color::Rgb(0x6b, 0x73, 0x94),
+        archive: Color::Rgb(0xe0, 0xaf, 0x68),
+        executable: Color::Rgb(0x9e, 0xce, 0x6a),
+        symlink: Color::Rgb(0x7d, 0xcf, 0xff),
+        stream: Color::Rgb(0xbb, 0x9a, 0xf7),
+        special: Color::Rgb(0xf7, 0x76, 0x8e),
+        error: Color::Rgb(0xf7, 0x76, 0x8e),
+        status: Color::Rgb(0x56, 0x5f, 0x89),
+        remote: Color::Rgb(0xe0, 0xaf, 0x68),
+        selection_bg: Color::Rgb(0x33, 0x40, 0x6e),
+        selection_fg: Color::Rgb(0xc0, 0xca, 0xf5),
     };
 
     /// Resolve a theme from a preset name plus per-role color overrides. Returns the theme and a list
@@ -73,6 +100,14 @@ impl Theme {
                 "focused_border" => theme.focused_border = color,
                 "unfocused_border" => theme.unfocused_border = color,
                 "dir" => theme.dir = color,
+                "hidden_dir" => theme.hidden_dir = color,
+                "file" => theme.file = color,
+                "hidden_file" => theme.hidden_file = color,
+                "archive" => theme.archive = color,
+                "executable" => theme.executable = color,
+                "symlink" => theme.symlink = color,
+                "stream" => theme.stream = color,
+                "special" => theme.special = color,
                 "error" => theme.error = color,
                 "status" => theme.status = color,
                 "remote" => theme.remote = color,
@@ -91,7 +126,10 @@ mod tests {
 
     #[test]
     fn default_is_the_dark_preset() {
-        assert_eq!(Theme::default().focused_border, Color::Cyan);
+        assert_eq!(
+            Theme::default().focused_border,
+            Color::Rgb(0x7d, 0xcf, 0xff)
+        );
     }
 
     #[test]
@@ -126,6 +164,8 @@ mod tests {
                 ("focused_border", "magenta"),
                 ("dir", "#00ff00"),
                 ("remote", "green"),
+                ("archive", "#e0af68"),
+                ("hidden_dir", "blue"),
                 ("bogus_role", "red"),
                 ("error", "notacolor"),
             ],
@@ -133,6 +173,8 @@ mod tests {
         assert_eq!(theme.focused_border, Color::Magenta);
         assert_eq!(theme.dir, Color::Rgb(0, 255, 0));
         assert_eq!(theme.remote, Color::Green);
+        assert_eq!(theme.archive, Color::Rgb(0xe0, 0xaf, 0x68));
+        assert_eq!(theme.hidden_dir, Color::Blue);
         // The unknown role and the bad color each warn; valid roles still applied.
         assert_eq!(warnings.len(), 2);
         assert_eq!(theme.error, Theme::DARK.error); // unchanged (override was invalid)
