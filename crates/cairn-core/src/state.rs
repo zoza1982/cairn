@@ -1383,12 +1383,11 @@ pub enum FileKind {
 
 /// An archive container format recognized by [`detect_file_kind`]'s magic-byte sniff.
 ///
-/// Deliberately duplicated (rather than depended on) from `cairn-backend-archive`'s own internal
-/// detection: `cairn-core` has no backend dependencies (every backend is wired at the binary edge,
-/// `crates/cairn/src/app.rs`), so the pure sniff-for-routing check here and the authoritative
-/// check `ArchiveVfs::open` performs when actually mounting are two small, independent
-/// implementations of the same magic-byte rules — they MUST stay in sync (see
-/// `crates/cairn-backend-archive/src/vfs.rs::sniff_format` and `docs/rfcs/0013-archive-backend.md`).
+/// This pure sniff-for-routing check (`cairn-core` has no backend dependency) and the authoritative
+/// check `ArchiveVfs::open` performs when actually mounting are separate implementations, but they
+/// key off the **same** magic-byte constants in `cairn_types::archive_magic`, so the two can't drift
+/// (see `crates/cairn-backend-archive/src/vfs.rs::sniff_format` and
+/// `docs/rfcs/0013-archive-backend.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
     /// A zip archive (`PK\x03\x04` at offset 0).
@@ -1426,24 +1425,22 @@ pub enum ArchiveFormat {
 /// ([`crate::AppEffect::SniffFile`]); this function only inspects the bytes already in hand.
 #[must_use]
 pub fn detect_file_kind(sample: &[u8]) -> FileKind {
-    if sample.len() >= 4 && &sample[0..4] == b"PK\x03\x04" {
+    use cairn_types::archive_magic as magic;
+    if sample.starts_with(magic::ZIP_MAGIC) {
         return FileKind::Archive(ArchiveFormat::Zip);
     }
-    if sample.len() >= 262 && &sample[257..262] == b"ustar" {
+    let ustar_end = magic::TAR_USTAR_OFFSET + magic::TAR_USTAR_MAGIC.len();
+    if sample.len() >= ustar_end
+        && &sample[magic::TAR_USTAR_OFFSET..ustar_end] == magic::TAR_USTAR_MAGIC
+    {
         return FileKind::Archive(ArchiveFormat::Tar);
     }
     // Outer-compression magics for a compressed tar, checked after the structural zip/tar
-    // signatures (which take priority). These MUST match `cairn-backend-archive`'s
-    // `compressed_tar::sniff` — the two are independent by design (see [`ArchiveFormat`]).
-    const COMPRESSED_TAR_MAGICS: &[&[u8]] = &[
-        &[0x1f, 0x8b],                         // gzip
-        b"BZh",                                // bzip2
-        &[0xfd, b'7', b'z', b'X', b'Z', 0x00], // xz
-        &[0x28, 0xb5, 0x2f, 0xfd],             // zstd
-    ];
-    if COMPRESSED_TAR_MAGICS
+    // signatures (which take priority). The constants are shared with the archive backend
+    // (`cairn_types::archive_magic`) so the two sniffs can't drift.
+    if magic::COMPRESSED_TAR_MAGICS
         .iter()
-        .any(|magic| sample.starts_with(magic))
+        .any(|m| sample.starts_with(m))
     {
         return FileKind::Archive(ArchiveFormat::CompressedTar);
     }

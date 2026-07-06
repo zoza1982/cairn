@@ -7,6 +7,7 @@
 //!
 //! See `docs/LLD.md` §3 for the design rationale.
 
+pub mod archive_magic;
 mod caps;
 mod creds;
 mod entry;

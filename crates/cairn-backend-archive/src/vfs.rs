@@ -51,10 +51,14 @@ enum Format {
 /// an *uncompressed* container and take priority; a compression magic is only meaningful once
 /// those two have already been ruled out.
 fn sniff_format(prefix: &[u8]) -> Option<Format> {
-    if prefix.len() >= 4 && &prefix[0..4] == b"PK\x03\x04" {
+    use cairn_types::archive_magic as magic;
+    if prefix.starts_with(magic::ZIP_MAGIC) {
         return Some(Format::Zip);
     }
-    if prefix.len() >= 262 && &prefix[257..262] == b"ustar" {
+    let ustar_end = magic::TAR_USTAR_OFFSET + magic::TAR_USTAR_MAGIC.len();
+    if prefix.len() >= ustar_end
+        && &prefix[magic::TAR_USTAR_OFFSET..ustar_end] == magic::TAR_USTAR_MAGIC
+    {
         return Some(Format::Tar);
     }
     if let Some(compression) = crate::compressed_tar::sniff(prefix) {
