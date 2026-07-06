@@ -141,6 +141,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Remote SSH/SFTP files now show their Unix permissions** in the permission column, like local
+  files. The SFTP transport was dropping the server's mode bits before they reached the entry, so a
+  remote pane always rendered a blank permission column; the mode is now carried through `stat` and
+  `list` and mapped to the entry's permissions (`drwxr-xr-x`).
+
 - **Transfer speed now shows the *current* rate, not a lifetime average.** With two transfers
   running at once, the first would drop to a few KB/s and appear to "never recover" even after the
   second finished — because the displayed rate was cumulative bytes ÷ total elapsed, which stays

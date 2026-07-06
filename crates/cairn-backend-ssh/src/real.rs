@@ -90,6 +90,7 @@ impl SftpOps for RealSftp {
                         None
                     },
                     modified: md.modified().ok(),
+                    mode: md.permissions,
                 });
             }
             Ok(out)
@@ -118,6 +119,7 @@ impl SftpOps for RealSftp {
                     None
                 },
                 modified: md.modified().ok(),
+                mode: md.permissions,
             })
         })
         .await
