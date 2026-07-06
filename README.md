@@ -98,12 +98,13 @@ editing?) — with size limits and a confirm prompt if the remote drifted or the
 back empty (see [RFC-0012](docs/rfcs/0012-file-open-view-edit.md)).
 `/` filters the listing as you type (`Enter` keeps the filter, `Esc` clears it). Copying or moving
 files auto-opens an MC-style transfer dialog — a progress bar, byte count, rate, and ETA per active
-transfer, plus the pending queue. `p` pauses/resumes (all active transfers); `Esc` inside the
-dialog aborts them; `b` sends the dialog to the background (transfers keep running, the status line
-keeps its compact summary) and `Ctrl-T` brings it back to the foreground. In the pending queue,
-`↑`/`↓` select, `K`/`J` reorder, `d` drops the selected pending transfer, and `x` clears them all.
-The dialog dismisses itself once the last transfer finishes and nothing remains queued. Up to two
-transfers run at once by default — set `[transfers] concurrency = N` in config to change it.
+transfer, plus the pending queue. `↑`/`↓` select a row (active transfer or pending item); `p`
+pauses/resumes the **selected** active transfer and `d` cancels it (or drops it if it's a pending
+item); `Esc` aborts **all** active transfers (the panic-stop); `b` sends the dialog to the
+background (transfers keep running, the status line keeps its compact summary) and `Ctrl-T` brings
+it back to the foreground. For the pending queue, `K`/`J` reorder and `x` clears it. The dialog
+dismisses itself once the last transfer finishes and nothing remains queued. Up to two transfers
+run at once by default — set `[transfers] concurrency = N` in config to change it.
 
 ```toml
 [ui.keybindings]

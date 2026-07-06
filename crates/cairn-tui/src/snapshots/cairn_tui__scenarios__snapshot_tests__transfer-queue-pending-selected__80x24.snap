@@ -9,13 +9,13 @@ expression: frame
 │   README.md                          ││   README.md                          │
 │                                      ││                                      │
 │    ┌ Transfer ──────────────────────────────────────────────────────────┐    │
-│    │> Copying 1 item(s)…                                                │    │
+│    │  Copying 1 item(s)…                                                │    │
 │    │  ███████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 50%│    │
 │    │  4.0 MiB / 8.0 MiB   2.0 MiB/s   ETA 2s                            │    │
 │    │  Moving 2 item(s)…  ⏸ paused                                       │    │
 │    │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│    │
 │    │  1.0 MiB                                                           │    │
-│    │  1. move 1 item(s)                                                 │    │
+│    │> 1. move 1 item(s)                                                 │    │
 │    │                                                                    │    │
 │    │[b] background · [p] pause sel · [Esc] abort all                    │    │
 │    │[↑↓] select · [d] cancel/drop · [K/J] reorder · [x] clear           │    │

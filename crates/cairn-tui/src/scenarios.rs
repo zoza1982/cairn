@@ -102,6 +102,11 @@ pub fn all() -> Vec<Scenario> {
             build: ai_plan_irreversible,
         },
         Scenario {
+            name: "transfer-queue-pending-selected",
+            description: "the transfer dialog with the cursor on the pending row (per-item selection)",
+            build: transfer_queue_pending_selected,
+        },
+        Scenario {
             name: "transfer-queue",
             description: "the transfer progress dialog: a running transfer with a progress bar + rate/ETA, a paused transfer with an indeterminate bar, and a queued transfer",
             build: transfer_queue,
@@ -376,6 +381,15 @@ fn transfer_queue() -> AppState {
         is_move: true,
     });
     s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+    s
+}
+
+/// The transfer dialog with the selection cursor on the **pending** row (combined index 2: two
+/// active transfers precede the single queued one) — covers the pending-row highlight/marker, the
+/// counterpart to `transfer_queue`'s active-row selection.
+fn transfer_queue_pending_selected() -> AppState {
+    let mut s = transfer_queue();
+    s.overlay = Some(Overlay::TransferQueue { cursor: 2 });
     s
 }
 

@@ -1755,16 +1755,15 @@ fn apply_vault_create_action(state: &mut AppState, action: Action) -> Vec<AppEff
     Vec::new()
 }
 
-/// Drive the transfer progress dialog (`Overlay::TransferQueue`): navigate the pending list, drop
-/// the selected pending transfer (`Delete`), clear all pending (`Reject`), pause/resume every active
-/// transfer (`TogglePause`, via the shared `toggle_active_transfers_pause` helper), send the dialog
-/// to the background without touching any transfer (`Background`), or close it (`Confirm`/`Enter`).
-/// `Cancel` (Esc) is special: MC-style, Esc *aborts* — if any transfer is active it cancels all of
-/// them (like the no-overlay `Esc` binding) and closes the dialog; with only pending (queued, not yet
-/// started) transfers it just closes, matching `Confirm`/`Enter`, since there is nothing running to
-/// abort.
+/// Drive the transfer progress dialog. The `cursor` indexes a single combined list: the active
+/// transfers first (`0..active_len`), then the pending queue (`active_len..active_len+pending_len`).
+/// Per-item controls target the *selected* row — `p` pauses/resumes the selected active transfer,
+/// `d`/Del cancels it (or drops it if the selection is a pending item). `Esc` still aborts *all*
+/// active transfers (the panic-stop), `b`/Enter background the dialog, `x` clears the pending queue.
 fn apply_transfer_queue_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
-    let len = state.transfer_queue.len();
+    let active = state.active_transfers.len();
+    let pending = state.transfer_queue.len();
+    let total = active + pending;
     let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay else {
         return Vec::new();
     };
@@ -1774,53 +1773,83 @@ fn apply_transfer_queue_action(state: &mut AppState, action: Action) -> Vec<AppE
             Vec::new()
         }
         Action::CursorDown => {
-            if *cursor + 1 < len {
+            if *cursor + 1 < total {
                 *cursor += 1;
             }
             Vec::new()
         }
+        // Reorder acts only within the pending section; a selection on an active transfer is a no-op.
         Action::QueueMoveUp => {
-            if *cursor > 0 && *cursor < len {
-                let c = *cursor;
-                state.transfer_queue.swap(c - 1, c);
-                if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
-                    *cursor -= 1;
+            if *cursor >= active {
+                let p = *cursor - active;
+                if p > 0 && p < pending {
+                    state.transfer_queue.swap(p - 1, p);
+                    if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
+                        *cursor -= 1;
+                    }
                 }
             }
             Vec::new()
         }
         Action::QueueMoveDown => {
-            if *cursor + 1 < len {
-                let c = *cursor;
-                state.transfer_queue.swap(c, c + 1);
-                if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
-                    *cursor += 1;
+            if *cursor >= active {
+                let p = *cursor - active;
+                if p + 1 < pending {
+                    state.transfer_queue.swap(p, p + 1);
+                    if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
+                        *cursor += 1;
+                    }
                 }
             }
             Vec::new()
         }
+        Action::TogglePause => {
+            // Pause/resume the *selected* active transfer. On a pending row there's nothing running
+            // to pause — a no-op with a hint (consistent with how reorder treats an active-row
+            // selection). "Pause all" remains available via `p` with the dialog closed.
+            let c = *cursor;
+            if c < active {
+                toggle_one_transfer_pause(state, c)
+            } else {
+                state.status = Some("Select an active transfer to pause".to_owned());
+                Vec::new()
+            }
+        }
         Action::Delete => {
-            // Drop just the selected pending transfer (the active one keeps running).
-            let idx = *cursor;
-            if idx < len {
-                state.transfer_queue.remove(idx);
+            // On an active transfer → cancel just that one (its slot is reclaimed on `TransferDone`,
+            // which also re-clamps the cursor). On a pending item → drop it from the queue.
+            let c = *cursor;
+            if c < active {
+                let id = state.active_transfers[c].id;
+                state.status = Some("Cancelling transfer…".to_owned());
+                return vec![AppEffect::CancelTransfer { id }];
+            }
+            let p = c - active;
+            if p < pending {
+                state.transfer_queue.remove(p);
                 state.status = Some("Removed 1 queued transfer".to_owned());
-                // Re-clamp the cursor and close the view if the queue is now empty.
-                if state.transfer_queue.is_empty() {
+                let new_total = state.active_transfers.len() + state.transfer_queue.len();
+                if new_total == 0 {
                     state.overlay = None;
                 } else if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
-                    *cursor = (*cursor).min(state.transfer_queue.len() - 1);
+                    *cursor = (*cursor).min(new_total - 1);
                 }
             }
             Vec::new()
         }
         Action::Reject => {
+            // Clear all *pending* transfers; active ones keep running. Close only if nothing is left.
             let n = state.transfer_queue.len();
             state.transfer_queue.clear();
             if n > 0 {
                 state.status = Some(format!("Cleared {n} queued transfer(s)"));
             }
-            state.overlay = None;
+            let active_now = state.active_transfers.len();
+            if active_now == 0 {
+                state.overlay = None;
+            } else if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
+                *cursor = (*cursor).min(active_now - 1);
+            }
             Vec::new()
         }
         Action::Confirm | Action::Enter | Action::Background => {
@@ -1830,10 +1859,9 @@ fn apply_transfer_queue_action(state: &mut AppState, action: Action) -> Vec<AppE
             state.overlay = None;
             Vec::new()
         }
-        Action::TogglePause => toggle_active_transfers_pause(state),
         Action::Cancel => {
-            // With no active transfer there's nothing to abort — degrade to a plain close (pending
-            // items stay queued for later; nothing has started).
+            // Esc is the panic-stop: abort *all* active transfers and close. With none active there
+            // is nothing to abort — degrade to a plain close (pending items stay queued).
             if state.active_transfers.is_empty() {
                 state.overlay = None;
                 return Vec::new();
@@ -1854,6 +1882,27 @@ fn apply_transfer_queue_action(state: &mut AppState, action: Action) -> Vec<AppE
         }
         _ => Vec::new(),
     }
+}
+
+/// Pause/resume a single active transfer by its index in `active_transfers`, emitting the per-id
+/// `SetTransferPaused` effect. Used by the transfer dialog's `p` when a specific transfer is selected
+/// (vs. [`toggle_active_transfers_pause`], which acts on all).
+fn toggle_one_transfer_pause(state: &mut AppState, idx: usize) -> Vec<AppEffect> {
+    let Some(t) = state.active_transfers.get_mut(idx) else {
+        return Vec::new();
+    };
+    let new_paused = !t.paused;
+    t.paused = new_paused;
+    let id = t.id;
+    state.status = Some(if new_paused {
+        "Transfer paused".to_owned()
+    } else {
+        "Transfer resumed".to_owned()
+    });
+    vec![AppEffect::SetTransferPaused {
+        id,
+        paused: new_paused,
+    }]
 }
 
 /// Confirm (or cancel) overwriting existing destinations. On confirm, re-issue the transfer with
@@ -2655,12 +2704,9 @@ fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
         let Some(next) = state.transfer_queue.pop_front() else {
             break;
         };
-        // The front pending item just became active. If the progress dialog is open, shift its
-        // selection cursor down by one so it keeps pointing at the *same* logical pending item
-        // (indices shifted) instead of silently retargeting a later `d`/`K`/`J` at the wrong row.
-        if let Some(Overlay::TransferQueue { cursor }) = &mut state.overlay {
-            *cursor = cursor.saturating_sub(1);
-        }
+        // No cursor adjustment needed: the dialog cursor spans active-then-pending, and draining the
+        // front pending item into a newly-appended active slot leaves every combined index unchanged
+        // (active grows by 1, that item's pending offset shrinks by 1 — net zero).
         // A queue drain is not user-initiated — never re-raise a dialog the user backgrounded.
         let id = arm_transfer(state, next.is_move, next.items.len(), false);
         effects.push(AppEffect::Transfer {
@@ -3633,7 +3679,20 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
         AppEvent::TransferDone { id, status, error } => {
             // Release this transfer's slot — addressed by id so an unrelated op or another transfer
             // finishing can't clear the wrong one. The queue tail-drain then fills the freed slot.
+            let removed_pos = state.active_transfers.iter().position(|t| t.id == id);
             state.active_transfers.retain(|t| t.id != id);
+            // Removing an active transfer shifts every later row of the dialog's combined
+            // (active-then-pending) list down by one, so track the selection cursor past the removed
+            // row, then clamp so it never points past the end.
+            if let (Some(j), Some(Overlay::TransferQueue { cursor })) =
+                (removed_pos, &mut state.overlay)
+            {
+                if *cursor > j {
+                    *cursor -= 1;
+                }
+                let total = state.active_transfers.len() + state.transfer_queue.len();
+                *cursor = (*cursor).min(total.saturating_sub(1));
+            }
             // MC-style auto-dismiss: once the last active transfer finishes and nothing remains
             // queued behind it, the progress dialog has nothing left to show — close it exactly like
             // `b` would rather than leaving an empty dialog for the user to dismiss by hand. Guarded
@@ -5289,11 +5348,15 @@ mod tests {
         // Open the queue view.
         let _ = update(&mut s, Msg::Action(Action::OpenQueue));
         assert!(matches!(s.overlay, Some(Overlay::TransferQueue { .. })));
-        // Reject clears the pending queue but leaves the active transfer running.
+        // Reject clears the pending queue but leaves the active transfer running — and, since a
+        // transfer is still active, the dialog stays open (showing it), cursor clamped onto it.
         let _ = update(&mut s, Msg::Action(Action::Reject));
         assert!(s.transfer_queue.is_empty());
         assert_eq!(t_bytes(&s), Some(0), "the active transfer is untouched");
-        assert!(s.overlay.is_none());
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 0 })
+        ));
     }
 
     #[test]
@@ -5316,28 +5379,34 @@ mod tests {
         let _ = update(&mut s, Msg::Action(Action::Copy)); // queued #2
         assert_eq!(s.transfer_queue.len(), 2);
         let _ = update(&mut s, Msg::Action(Action::OpenQueue));
-        // Move the cursor to the second pending entry, then drop it.
+        // Combined list: cursor 0 = active A, 1 = pending #1, 2 = pending #2. Select pending #2 and
+        // drop it.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
         let _ = update(&mut s, Msg::Action(Action::CursorDown));
         assert!(matches!(
             s.overlay,
-            Some(Overlay::TransferQueue { cursor: 1 })
+            Some(Overlay::TransferQueue { cursor: 2 })
         ));
         let _ = update(&mut s, Msg::Action(Action::Delete));
         assert_eq!(
             s.transfer_queue.len(),
             1,
-            "only the selected one was dropped"
+            "only the selected pending one was dropped"
         );
         assert_eq!(t_bytes(&s), Some(0), "the active transfer is untouched");
-        // The cursor re-clamps to the remaining entry; the view stays open.
+        // The cursor re-clamps onto the remaining pending entry (combined index 1); view stays open.
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 1 })
+        ));
+        // Drop the last pending too: the queue is empty but the active transfer keeps the dialog
+        // open (cursor clamps onto the active row).
+        let _ = update(&mut s, Msg::Action(Action::Delete));
+        assert!(s.transfer_queue.is_empty());
         assert!(matches!(
             s.overlay,
             Some(Overlay::TransferQueue { cursor: 0 })
         ));
-        // Dropping the last one closes the view.
-        let _ = update(&mut s, Msg::Action(Action::Delete));
-        assert!(s.transfer_queue.is_empty());
-        assert!(s.overlay.is_none());
     }
 
     #[test]
@@ -5351,33 +5420,35 @@ mod tests {
         assert_eq!(s.transfer_queue.len(), 2);
         assert!(s.transfer_queue[0].is_move && !s.transfer_queue[1].is_move);
         let _ = update(&mut s, Msg::Action(Action::OpenQueue));
-        // Select the 2nd pending (the copy) and move it up; the cursor follows it.
+        // Combined list: cursor 0 = active A, 1 = pending #1 (move), 2 = pending #2 (copy). Select
+        // the copy and move it up; the cursor follows it to combined index 1.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
         let _ = update(&mut s, Msg::Action(Action::CursorDown));
         let _ = update(&mut s, Msg::Action(Action::QueueMoveUp));
         assert!(!s.transfer_queue[0].is_move, "the copy moved to the front");
         assert!(s.transfer_queue[1].is_move);
         assert!(matches!(
             s.overlay,
-            Some(Overlay::TransferQueue { cursor: 0 })
+            Some(Overlay::TransferQueue { cursor: 1 })
         ));
-        // Moving up at the top is a no-op.
+        // Moving up when already at the top of the pending section is a no-op.
         let _ = update(&mut s, Msg::Action(Action::QueueMoveUp));
         assert!(matches!(
             s.overlay,
-            Some(Overlay::TransferQueue { cursor: 0 })
+            Some(Overlay::TransferQueue { cursor: 1 })
         ));
-        // Move it back down: the copy returns to index 1, cursor follows.
+        // Move it back down: the copy returns to pending index 1 (combined 2), cursor follows.
         let _ = update(&mut s, Msg::Action(Action::QueueMoveDown));
         assert!(s.transfer_queue[0].is_move && !s.transfer_queue[1].is_move);
         assert!(matches!(
             s.overlay,
-            Some(Overlay::TransferQueue { cursor: 1 })
+            Some(Overlay::TransferQueue { cursor: 2 })
         ));
         // Moving down at the bottom is a no-op.
         let _ = update(&mut s, Msg::Action(Action::QueueMoveDown));
         assert!(matches!(
             s.overlay,
-            Some(Overlay::TransferQueue { cursor: 1 })
+            Some(Overlay::TransferQueue { cursor: 2 })
         ));
         // QueueMove with no overlay open is a harmless no-op that leaves the queue unchanged.
         let before = s.transfer_queue.len();
@@ -5601,8 +5672,8 @@ mod tests {
 
     #[test]
     fn pause_toggles_from_inside_the_transfer_dialog() {
-        // `TogglePause` must reach the shared pause helper even while the dialog owns input —
-        // `apply_transfer_queue_action` special-cases it instead of letting the catch-all swallow it.
+        // `TogglePause` reaches the pause logic even while the dialog owns input (the catch-all
+        // would otherwise swallow it). With one active transfer selected it pauses that transfer.
         let mut s = state();
         deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
         let _ = update(&mut s, Msg::Action(Action::Copy));
@@ -5616,6 +5687,126 @@ mod tests {
         assert!(
             matches!(s.overlay, Some(Overlay::TransferQueue { .. })),
             "pausing doesn't close the dialog"
+        );
+    }
+
+    #[test]
+    fn pause_and_cancel_target_only_the_selected_active_transfer() {
+        // Two active transfers; the dialog cursor selects one. `p` pauses only that one, and `d`
+        // cancels only that one — the other keeps running.
+        let mut s = state();
+        s.concurrency_limit = 2;
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+            ],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active (id 1); dialog opens
+        let _ = update(&mut s, Msg::Action(Action::Background));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // B active (id 2), concurrent
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        assert_eq!(s.active_transfers.len(), 2);
+        // Select the 2nd active transfer (combined index 1) and pause only it.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let id_b = s.active_transfers[1].id;
+        let fx = update(&mut s, Msg::Action(Action::TogglePause));
+        assert!(
+            matches!(&fx[..], [AppEffect::SetTransferPaused { id, paused: true }] if *id == id_b),
+            "pauses only the selected transfer, got {fx:?}"
+        );
+        assert!(!s.active_transfers[0].paused, "the other stays running");
+        assert!(s.active_transfers[1].paused);
+        // `d` cancels only the selected one (emits CancelTransfer for its id; the other is untouched).
+        let fx = update(&mut s, Msg::Action(Action::Delete));
+        assert!(
+            matches!(&fx[..], [AppEffect::CancelTransfer { id }] if *id == id_b),
+            "cancels only the selected transfer, got {fx:?}"
+        );
+        assert_eq!(
+            s.active_transfers.len(),
+            2,
+            "still 2 until the cancelled task reports TransferDone"
+        );
+    }
+
+    #[test]
+    fn pause_on_a_pending_row_is_a_no_op_with_a_hint() {
+        // `p` acts on the selected *active* transfer; on a pending row there's nothing running to
+        // pause, so it does nothing (rather than reaching over to toggle unrelated active ones).
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("a", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active
+        let _ = update(&mut s, Msg::Action(Action::Background));
+        let _ = update(&mut s, Msg::Action(Action::Move)); // B queued
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        // Combined: 0 = active A, 1 = pending B. Select the pending row.
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let fx = update(&mut s, Msg::Action(Action::TogglePause));
+        assert!(fx.is_empty(), "no pause effect for a pending selection");
+        assert!(
+            !s.active_transfers[0].paused,
+            "the active transfer is untouched"
+        );
+        assert_eq!(
+            s.status.as_deref(),
+            Some("Select an active transfer to pause")
+        );
+    }
+
+    #[test]
+    fn cursor_tracks_when_the_selected_active_transfer_finishes() {
+        // Two active transfers, the 2nd selected. When that selected one finishes, its row is
+        // removed and the following row slides into its index — the cursor stays put and now selects
+        // whatever occupies that slot (here the pending item that drains in), never a stale index.
+        let mut s = state();
+        s.concurrency_limit = 2;
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a", EntryKind::File),
+                Entry::new("b", EntryKind::File),
+                Entry::new("c", EntryKind::File),
+            ],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // A active (id 1); dialog auto-opens
+        let _ = update(&mut s, Msg::Action(Action::Background));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // B active (id 2); dialog auto-opens
+        let _ = update(&mut s, Msg::Action(Action::Background));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        let _ = update(&mut s, Msg::Action(Action::Copy)); // C queued (both slots full)
+        let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        // Combined: 0 = A, 1 = B, 2 = C(pending). Select B (the 2nd active).
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 1 })
+        ));
+        let id_b = s.active_transfers[1].id;
+        // B finishes → its row (index 1) is removed; C drains into the freed slot and lands at
+        // active index 1. The cursor stays at 1, now selecting C-as-active.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferDone {
+                id: id_b,
+                status: "Copied".to_owned(),
+                error: false,
+            }),
+        );
+        assert_eq!(s.active_transfers.len(), 2, "A and C are active");
+        assert!(s.transfer_queue.is_empty());
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::TransferQueue { cursor: 1 })
+        ));
+        assert!(
+            s.active_transfers[1].label.contains("Copying"),
+            "cursor 1 now selects C, which drained into B's slot"
         );
     }
 
@@ -5720,15 +5911,17 @@ mod tests {
             let _ = update(&mut s, Msg::Action(Action::Copy));
         }
         assert_eq!(s.transfer_queue.len(), 3, "B, C, D queued behind A");
-        // Reopen the dialog and put the cursor on the 2nd pending item (C, index 1).
+        // Reopen the dialog. Combined list: cursor 0 = active A, 1 = B, 2 = C, 3 = D. Put the cursor
+        // on C (combined index 2).
         let _ = update(&mut s, Msg::Action(Action::OpenQueue));
+        let _ = update(&mut s, Msg::Action(Action::CursorDown));
         let _ = update(&mut s, Msg::Action(Action::CursorDown));
         assert!(matches!(
             s.overlay,
-            Some(Overlay::TransferQueue { cursor: 1 })
+            Some(Overlay::TransferQueue { cursor: 2 })
         ));
-        // A finishes → B drains into the freed slot; pending becomes [C, D] and the cursor must
-        // decrement to 0 so it still points at C.
+        // A finishes → its row is removed (shifting later rows down one) and B drains into the freed
+        // slot. Combined becomes [B(active), C, D]; the cursor must follow C from index 2 to 1.
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::TransferDone {
@@ -5739,8 +5932,8 @@ mod tests {
         );
         assert_eq!(s.transfer_queue.len(), 2, "C, D remain queued");
         assert!(
-            matches!(s.overlay, Some(Overlay::TransferQueue { cursor: 0 })),
-            "cursor followed C from index 1 to index 0"
+            matches!(s.overlay, Some(Overlay::TransferQueue { cursor: 1 })),
+            "cursor followed C from combined index 2 to 1"
         );
         // Dropping now removes C (not D): the surviving pending item is D.
         let _ = update(&mut s, Msg::Action(Action::Delete));

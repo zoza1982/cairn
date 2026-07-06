@@ -932,19 +932,33 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     let content_width = usize::from(content.width);
     frame.render_widget(block, area);
 
+    // The cursor spans one combined list: active transfers first (`0..active.len()`), then the
+    // pending queue. A 2-col gutter carries the `>` selection marker; the bar/stats lines indent to
+    // match, and the whole 3-line active block is highlighted when selected.
+    let selected = Style::default().add_modifier(Modifier::REVERSED);
+    let bar_width = content_width.saturating_sub(2).max(1);
     let mut lines: Vec<Line> = Vec::new();
     if active.is_empty() {
         lines.push(Line::from("No active transfers".to_owned()));
     } else {
-        for t in active {
+        for (ai, t) in active.iter().enumerate() {
+            let is_sel = ai == cursor;
+            let style = if is_sel { selected } else { Style::default() };
+            let marker = if is_sel { "> " } else { "  " };
             let paused_marker = if t.paused { "  ⏸ paused" } else { "" };
-            lines.push(Line::from(format!("{}{paused_marker}", t.label)));
+            lines.push(Line::styled(
+                format!("{marker}{}{paused_marker}", t.label),
+                style,
+            ));
 
             let pct = match t.total {
                 Some(total) if total > 0 => Some(pct_of(t.bytes, total)),
                 _ => None,
             };
-            lines.push(Line::from(progress_bar(pct, content_width)));
+            lines.push(Line::styled(
+                format!("  {}", progress_bar(pct, bar_width)),
+                style,
+            ));
 
             let amount = match t.total {
                 Some(total) if total > 0 => {
@@ -961,28 +975,25 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
             let eta = eta_secs
                 .map(|s| format!("   ETA {}", human_duration(s)))
                 .unwrap_or_default();
-            lines.push(Line::from(format!("{amount}{rate}{eta}")));
+            lines.push(Line::styled(format!("  {amount}{rate}{eta}"), style));
         }
     }
     for (i, q) in pending.iter().enumerate() {
+        let is_sel = active.len() + i == cursor;
         let verb = if q.is_move { "move" } else { "copy" };
-        let marker = if i == cursor { "> " } else { "  " };
+        let marker = if is_sel { "> " } else { "  " };
         let line = format!("{marker}{}. {verb} {} item(s)", i + 1, q.items.len());
-        let style = if i == cursor {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
+        let style = if is_sel { selected } else { Style::default() };
         lines.push(Line::styled(line, style));
     }
     lines.push(Line::from(""));
-    // Two hint lines so every live control stays discoverable (`↑↓` select and `x` clear-all were
-    // dropped when this was one line): transfer controls first, then pending-queue controls.
+    // Two hint lines so every live control stays discoverable: per-transfer controls act on the
+    // selected row; `Esc` is the abort-all panic-stop.
     lines.push(Line::from(
-        "[b] background · [p] pause · [Esc] abort".to_owned(),
+        "[b] background · [p] pause sel · [Esc] abort all".to_owned(),
     ));
     lines.push(Line::from(
-        "[↑↓] select · [K/J] reorder · [d] drop · [x] clear".to_owned(),
+        "[↑↓] select · [d] cancel/drop · [K/J] reorder · [x] clear".to_owned(),
     ));
     frame.render_widget(Paragraph::new(lines), content);
 }

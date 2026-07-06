@@ -3,13 +3,13 @@ source: crates/cairn-tui/src/scenarios.rs
 expression: frame
 ---
 ┌ Transfer ────────────────────────────┐
-│> Copying 1 item(s)…                  │
+│  Copying 1 item(s)…                  │
 │  ████████████████░░░░░░░░░░░░░░░░ 50%│
 │  4.0 MiB / 8.0 MiB   2.0 MiB/s   ETA │
 │  Moving 2 item(s)…  ⏸ paused         │
 │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│
 │  1.0 MiB                             │
-│  1. move 1 item(s)                   │
+│> 1. move 1 item(s)                   │
 │                                      │
 │[b] background · [p] pause sel · [Esc]│
 │[↑↓] select · [d] cancel/drop · [K/J] │
