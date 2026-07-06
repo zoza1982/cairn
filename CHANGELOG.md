@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Permission + date columns in the panes** (MC-style): each entry now shows its Unix permissions
+  (`drwxr-xr-x`) and last-modified date alongside the name, right-aligned. On a narrow pane the
+  columns drop out responsively — permissions go first, keeping the date as long as it fits, then
+  the name takes the whole row — and are blank for backends without that metadata (e.g. object
+  stores). Dates are rendered in **UTC**
+  (`YYYY-MM-DD`) to keep the pure, snapshot-testable renderer independent of the host clock and
+  timezone; local-time rendering is a tracked follow-up.
+
 - **Per-transfer controls in the progress dialog**: the `Ctrl-T` dialog's `↑`/`↓` now select an
   individual *active* transfer (not just the pending queue), and `p` pauses/resumes **only the
   selected** transfer while `d` cancels **only** it — so with several transfers running you can

@@ -19,7 +19,7 @@ use cairn_core::{
     AppState, ConnectionFormStage, Listing, MaskedInput, Overlay, PagerMode, PagerStatus,
     PromptKind,
 };
-use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, VfsPath};
+use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, UnixPerms, VfsPath};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -50,6 +50,11 @@ pub fn all() -> Vec<Scenario> {
             name: "dual-pane",
             description: "the main two-pane browser with a ready listing",
             build: dual_pane,
+        },
+        Scenario {
+            name: "pane-columns",
+            description: "pane rows with MC-style permission + date columns (and a metadata-less remote object)",
+            build: pane_columns,
         },
         Scenario {
             name: "remote-pane",
@@ -235,6 +240,34 @@ fn dual_pane() -> AppState {
     ]);
     s.panes[0].listing = Listing::Ready(entries.clone());
     s.panes[1].listing = Listing::Ready(entries);
+    s
+}
+
+/// The listing with MC-style permission + UTC-date columns: a directory, an executable, a `0644`
+/// file, an owner-only dotfile, and a remote object with no permission/mtime metadata (blank
+/// columns). Exercises `format_perms`/`format_mtime`/`entry_columns` in the pane rows.
+fn pane_columns() -> AppState {
+    let mut s = base();
+    let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    let mk = |name: &str, kind, mode: u32, mtime: u64| {
+        let mut e = Entry::new(name, kind);
+        e.perms = Some(UnixPerms::from_mode(mode));
+        e.modified = Some(at(mtime));
+        e
+    };
+    let entries = Arc::new(vec![
+        mk("src", EntryKind::Dir, 0o755, 1_720_137_600), // 2024-07-05
+        mk("build.sh", EntryKind::File, 0o755, 1_719_792_000), // 2024-07-01
+        mk("Cargo.toml", EntryKind::File, 0o644, 1_720_224_000), // 2024-07-06
+        mk(".env", EntryKind::File, 0o600, 1_717_200_000), // 2024-06-01
+        // A remote object store exposes no perms/mtime → the columns render blank for it.
+        Entry::new("bucket-object.bin", EntryKind::File),
+    ]);
+    s.panes[0].listing = Listing::Ready(entries);
+    s.panes[1].listing = Listing::Ready(Arc::new(vec![
+        Entry::new("docs", EntryKind::Dir),
+        Entry::new("README.md", EntryKind::File),
+    ]));
     s
 }
 
