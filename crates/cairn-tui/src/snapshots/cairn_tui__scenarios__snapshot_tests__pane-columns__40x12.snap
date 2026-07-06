@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│>  src/           ││>  docs/          │
+│   build.sh       ││   README.md      │
+│   Cargo.toml     ││                  │
+│   .env           ││                  │
+│   bucket-object.…││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+│                  ││                  │
+└────── sort: name ┘└────── sort: name ┘
+ 1/5   q quit · Tab · ↵ open · F3 view ·

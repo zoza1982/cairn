@@ -8,11 +8,13 @@ use cairn_core::{
     MaskedInput, Overlay, PagerMode, PagerStatus, PaneState, PromptKind, SessionEnd, SessionRecord,
     Side, WritebackChoice, WritebackConflictReason, KNOWN_SCHEMES, PAGER_HEX_ROW_BYTES,
 };
+use cairn_types::{EntryKind, UnixPerms};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use std::time::SystemTime;
 
 /// Render the whole application: two panes over a one-line status bar, themed by `theme`.
 pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
@@ -1379,6 +1381,10 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
             let rows = usize::from(area.height.saturating_sub(2)); // minus top/bottom borders
             let top = list_window(pane.cursor, visible.len(), rows);
             let end = top.saturating_add(rows).min(visible.len());
+            // Row content width = pane interior minus the 2-col highlight-symbol gutter the List
+            // reserves for the selection. The name fills the left; permission + date columns are
+            // right-aligned and drop out responsively on a narrow pane (see `entry_columns`).
+            let row_w = usize::from(area.width.saturating_sub(4));
             let items: Vec<ListItem> = visible[top..end]
                 .iter()
                 .enumerate()
@@ -1386,13 +1392,21 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
                     let i = top + offset; // index back into the visible view (marks are absolute)
                     let mark = if pane.marked.contains(&i) { '*' } else { ' ' };
                     let suffix = if e.is_dir() { "/" } else { "" };
-                    let text = format!("{mark}{}{suffix}", e.name);
-                    let style = if e.is_dir() {
+                    let name_style = if e.is_dir() {
                         Style::default().fg(theme.dir).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     };
-                    ListItem::new(text).style(style)
+                    let perms = format_perms(e.kind, e.perms);
+                    let date = e.modified.map(format_mtime).unwrap_or_default();
+                    let cols = entry_columns(&perms, &date, row_w);
+                    let name_w = row_w.saturating_sub(cols.chars().count());
+                    let namepart = truncate_to(&format!("{mark}{}{suffix}", e.name), name_w);
+                    let pad = " ".repeat(name_w.saturating_sub(namepart.chars().count()));
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{namepart}{pad}"), name_style),
+                        Span::styled(cols, Style::default().fg(theme.status)),
+                    ]))
                 })
                 .collect();
 
@@ -1558,6 +1572,118 @@ fn human_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{v:.1} {}", UNITS[unit])
+}
+
+/// Format an entry's permissions MC-style as a 10-char `drwxr-xr-x`: a leading type character (from
+/// the entry `kind`, since the raw mode may not carry the file-type bits) followed by the `rwxrwxrwx`
+/// user/group/other bits, with the standard `ls -l` set-uid/set-gid/sticky substitutions in the
+/// execute positions (`s`/`S` for set-uid/set-gid, `t`/`T` for sticky; uppercase when the underlying
+/// execute bit is off). Returns an empty string for a backend with no permission model (object
+/// stores) so the column renders blank rather than a misleading `---------`.
+fn format_perms(kind: EntryKind, perms: Option<UnixPerms>) -> String {
+    let Some(p) = perms else {
+        return String::new();
+    };
+    let type_char = match kind {
+        EntryKind::Dir => 'd',
+        EntryKind::Symlink => 'l',
+        EntryKind::Special => 's',
+        EntryKind::Stream => 'p',
+        EntryKind::File => '-',
+    };
+    let m = p.mode;
+    let on = |mask: u32| m & mask != 0;
+    // The execute-position char, folding in a set-id/sticky bit: `set` (lowercase) when the execute
+    // bit is also on, `unset` (uppercase) when it isn't, else the usual `x`/`-`.
+    let exec = |x_mask: u32, special: bool, set: char, unset: char| -> char {
+        match (special, on(x_mask)) {
+            (true, true) => set,
+            (true, false) => unset,
+            (false, true) => 'x',
+            (false, false) => '-',
+        }
+    };
+    let mut s = String::with_capacity(10);
+    s.push(type_char);
+    s.push(if on(0o400) { 'r' } else { '-' });
+    s.push(if on(0o200) { 'w' } else { '-' });
+    s.push(exec(0o100, on(0o4000), 's', 'S')); // set-uid
+    s.push(if on(0o040) { 'r' } else { '-' });
+    s.push(if on(0o020) { 'w' } else { '-' });
+    s.push(exec(0o010, on(0o2000), 's', 'S')); // set-gid
+    s.push(if on(0o004) { 'r' } else { '-' });
+    s.push(if on(0o002) { 'w' } else { '-' });
+    s.push(exec(0o001, on(0o1000), 't', 'T')); // sticky
+    s
+}
+
+/// Format a last-modified time as a `YYYY-MM-DD` **UTC** date. Deterministic and clock-free (a pure
+/// function of the timestamp) so `render` stays pure and snapshots are stable regardless of the host
+/// timezone. UTC (rather than local) is a deliberate tradeoff for that determinism; date-only keeps
+/// the UTC-vs-local gap to a narrow near-midnight window. See the `format_mtime` tests.
+fn format_mtime(t: SystemTime) -> String {
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX),
+    };
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `(year, month, day)` in UTC from a day count relative to the Unix epoch (1970-01-01 = 0), via
+/// Howard Hinnant's well-known `civil_from_days` algorithm. Valid across the full range of practical
+/// file timestamps.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Minimum columns reserved for an entry's name before the metadata columns may appear.
+const ENTRY_NAME_MIN: usize = 12;
+
+/// Truncate `s` to at most `max` **char** positions, appending `…` when it doesn't fit.
+///
+/// KNOWN LIMITATION: this (and the row padding in `render_pane`) counts codepoints, not terminal
+/// display columns, so a filename with wide (CJK) or zero-width glyphs can shift the metadata
+/// columns' alignment by a few cells. Cosmetic only — the buffer still clips safely and never
+/// panics. Making it display-width-aware (via `unicode-width`) is a tracked follow-up.
+fn truncate_to(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+/// The right-hand metadata columns (` perms  date`) that fit in a row of `row_w` columns while
+/// leaving at least [`ENTRY_NAME_MIN`] for the name. Drops columns responsively: both when there's
+/// room, then date-only, then perms-only, then nothing on a very narrow pane. Each present column is
+/// prefixed by a single-space gap; empty inputs (a backend with no perms / no mtime) are skipped.
+fn entry_columns(perms: &str, date: &str, row_w: usize) -> String {
+    let candidate = |cols: &[&str]| -> Option<String> {
+        let s: String = cols
+            .iter()
+            .filter(|c| !c.is_empty())
+            .map(|c| format!(" {c}"))
+            .collect();
+        (!s.is_empty() && ENTRY_NAME_MIN + s.chars().count() <= row_w).then_some(s)
+    };
+    candidate(&[perms, date])
+        .or_else(|| candidate(&[date]))
+        .or_else(|| candidate(&[perms]))
+        .unwrap_or_default()
 }
 
 fn pane_count_label(pane: &PaneState) -> String {
@@ -1976,6 +2102,69 @@ mod tests {
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
         // Unit-boundary rounding must not produce "1024.0 KiB".
         assert_eq!(human_bytes(1_048_575), "1.0 MiB");
+    }
+
+    #[test]
+    fn format_perms_renders_type_char_and_rwx_bits() {
+        let p = |kind, mode| format_perms(kind, Some(UnixPerms::from_mode(mode)));
+        assert_eq!(p(EntryKind::Dir, 0o755), "drwxr-xr-x");
+        assert_eq!(p(EntryKind::File, 0o644), "-rw-r--r--");
+        assert_eq!(p(EntryKind::File, 0o600), "-rw-------");
+        assert_eq!(p(EntryKind::Symlink, 0o777), "lrwxrwxrwx");
+        assert_eq!(p(EntryKind::Special, 0o600), "srw-------");
+        assert_eq!(p(EntryKind::Stream, 0o644), "prw-r--r--");
+        // set-uid / set-gid / sticky substitutions in the execute positions (lowercase when the
+        // execute bit is also set, uppercase when it isn't), matching `ls -l`.
+        assert_eq!(p(EntryKind::File, 0o4755), "-rwsr-xr-x"); // set-uid, x on → 's'
+        assert_eq!(p(EntryKind::File, 0o4655), "-rwSr-xr-x"); // set-uid, x off → 'S'
+        assert_eq!(p(EntryKind::File, 0o2755), "-rwxr-sr-x"); // set-gid → 's'
+        assert_eq!(p(EntryKind::Dir, 0o1777), "drwxrwxrwt"); // sticky, x on → 't'
+        assert_eq!(p(EntryKind::Dir, 0o1776), "drwxrwxrwT"); // sticky, x off → 'T'
+                                                             // A backend with no permission model → blank column (not a misleading `---------`).
+        assert_eq!(format_perms(EntryKind::File, None), "");
+    }
+
+    #[test]
+    fn format_mtime_is_utc_and_deterministic() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(format_mtime(UNIX_EPOCH), "1970-01-01");
+        // 2024-01-01 00:00:00 UTC.
+        assert_eq!(
+            format_mtime(UNIX_EPOCH + Duration::from_secs(1_704_067_200)),
+            "2024-01-01"
+        );
+        // A leap day, and just before/after midnight UTC stay on the right calendar day.
+        assert_eq!(
+            format_mtime(UNIX_EPOCH + Duration::from_secs(1_709_164_800)), // 2024-02-29 00:00
+            "2024-02-29"
+        );
+        assert_eq!(
+            format_mtime(UNIX_EPOCH + Duration::from_secs(1_709_251_199)), // 2024-02-29 23:59:59
+            "2024-02-29"
+        );
+    }
+
+    #[test]
+    fn entry_columns_drops_responsively() {
+        let perms = "drwxr-xr-x"; // 10
+        let date = "2026-07-06"; // 10
+                                 // Plenty of room → both columns, each gap-prefixed.
+        assert_eq!(entry_columns(perms, date, 60), " drwxr-xr-x 2026-07-06");
+        // Room for name + date only (need >= 12 + 11 = 23; not >= 12 + 22 = 34).
+        assert_eq!(entry_columns(perms, date, 25), " 2026-07-06");
+        // Too narrow for any column → empty (name gets the whole row).
+        assert_eq!(entry_columns(perms, date, 20), "");
+        // Missing perms (object store) still shows the date when it fits.
+        assert_eq!(entry_columns("", date, 25), " 2026-07-06");
+        // Nothing to show.
+        assert_eq!(entry_columns("", "", 60), "");
+    }
+
+    #[test]
+    fn truncate_to_appends_ellipsis() {
+        assert_eq!(truncate_to("short", 10), "short");
+        assert_eq!(truncate_to("a-very-long-name.txt", 8), "a-very-…");
+        assert_eq!(truncate_to("x", 0), "");
     }
 
     #[test]

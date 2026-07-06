@@ -84,9 +84,12 @@ snake_case (`cursor_down`, `copy`, `move`, `delete`, `ai_propose`, `cycle_sort`,
 `filter`, `make_dir`, `rename`, `view`, `edit`, `open_queue`, `toggle_pause`, `background`, `quit`,
 …). Unrecognized entries are ignored with a warning, and `Ctrl-C` always quits.
 
-By default `s` cycles the active pane's sort order (name → size → modified → type) and `.` toggles whether
-hidden entries (dotfiles) are listed; the current sort mode and hidden state show in each pane's
-bottom-right corner. `F7` creates a new directory and `F2` renames the entry under the cursor (both
+Each entry shows its Unix permissions (`drwxr-xr-x`) and last-modified date next to the name,
+right-aligned MC-style; on a narrow pane the columns drop out responsively — permissions first,
+keeping the date as long as it fits — so the name keeps priority, and are blank for backends that
+don't expose that metadata. Dates are shown in UTC (`YYYY-MM-DD`). By default `s` cycles the active pane's sort order (name → size → modified →
+type) and `.` toggles whether hidden entries (dotfiles) are listed; the current sort mode and hidden
+state show in each pane's bottom-right corner. `F7` creates a new directory and `F2` renames the entry under the cursor (both
 open a text prompt; `Enter` confirms, `Esc` cancels). `F3` opens a read-only pager on the entry
 under the cursor, auto-detecting text vs. binary content and switching to a hex view for the
 latter. `F4` opens the entry under the cursor in an external editor — `$VISUAL`, then `$EDITOR`,
