@@ -1386,13 +1386,19 @@ pub enum FileKind {
 /// detection: `cairn-core` has no backend dependencies (every backend is wired at the binary edge,
 /// `crates/cairn/src/app.rs`), so the pure sniff-for-routing check here and the authoritative
 /// check `ArchiveVfs::open` performs when actually mounting are two small, independent
-/// implementations of the same two-constant rule — see `docs/rfcs/0013-archive-backend.md`.
+/// implementations of the same magic-byte rules — they MUST stay in sync (see
+/// `crates/cairn-backend-archive/src/vfs.rs::sniff_format` and `docs/rfcs/0013-archive-backend.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
     /// A zip archive (`PK\x03\x04` at offset 0).
     Zip,
     /// An uncompressed POSIX tar archive (`ustar` at byte offset 257).
     Tar,
+    /// A compressed tar (`.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`), detected by its outer
+    /// compression magic. The specific compression is re-sniffed by the backend on mount; `.tar.xz`
+    /// is recognized here but the backend reports a friendly "unsupported" error (xz decoding was
+    /// dropped for OOM-safety, RFC-0013 P5), which is better UX than opening it in the hex pager.
+    CompressedTar,
 }
 
 /// Classify a byte sample as archive, text, or binary.
@@ -1403,6 +1409,12 @@ pub enum ArchiveFormat {
 /// - zip: `PK\x03\x04` at offset 0 (the local file header signature).
 /// - tar: the POSIX `ustar` magic at byte offset 257 (within the ~8 KiB sniff prefix the effect
 ///   runner reads, comfortably covering the fixed 512-byte tar header).
+/// - compressed tar: one of the four outer-compression magics at offset 0 — gzip (`1f 8b`), bzip2
+///   (`BZh`), xz (`fd 37 7a 58 5a 00`), or zstd (`28 b5 2f fd`) — so `.tar.gz`/`.tgz`/`.tar.bz2`/
+///   `.tar.zst`/`.tar.xz` mount and browse like an uncompressed tar. The structural zip/tar
+///   signatures are checked first and win, matching the backend's `sniff_format`. (Magic-only
+///   detection can't tell a `.tar.gz` from a plain `.gz`; a non-tar payload simply fails the mount
+///   with a clear error, same as the backend.)
 ///
 /// Otherwise falls back to the existing NUL-byte heuristic: any `0x00` byte means binary.
 /// Legitimate text (UTF-8, Latin-1, ASCII, …) never legally contains a NUL byte, while binary
@@ -1418,6 +1430,21 @@ pub fn detect_file_kind(sample: &[u8]) -> FileKind {
     }
     if sample.len() >= 262 && &sample[257..262] == b"ustar" {
         return FileKind::Archive(ArchiveFormat::Tar);
+    }
+    // Outer-compression magics for a compressed tar, checked after the structural zip/tar
+    // signatures (which take priority). These MUST match `cairn-backend-archive`'s
+    // `compressed_tar::sniff` — the two are independent by design (see [`ArchiveFormat`]).
+    const COMPRESSED_TAR_MAGICS: &[&[u8]] = &[
+        &[0x1f, 0x8b],                         // gzip
+        b"BZh",                                // bzip2
+        &[0xfd, b'7', b'z', b'X', b'Z', 0x00], // xz
+        &[0x28, 0xb5, 0x2f, 0xfd],             // zstd
+    ];
+    if COMPRESSED_TAR_MAGICS
+        .iter()
+        .any(|magic| sample.starts_with(magic))
+    {
+        return FileKind::Archive(ArchiveFormat::CompressedTar);
     }
     if sample.contains(&0) {
         FileKind::Binary
@@ -1965,6 +1992,40 @@ mod tests {
     #[test]
     fn detect_file_kind_recognizes_tar_ustar_magic_at_offset_257() {
         let mut sample = vec![0u8; 262];
+        sample[257..262].copy_from_slice(b"ustar");
+        assert_eq!(
+            detect_file_kind(&sample),
+            FileKind::Archive(ArchiveFormat::Tar)
+        );
+    }
+
+    #[test]
+    fn detect_file_kind_recognizes_every_compressed_tar_magic() {
+        // Each outer-compression magic (offset 0) classifies as a compressed tar so `.tar.gz` and
+        // friends mount instead of opening in the hex pager. Mirrors the backend's
+        // `compressed_tar::sniff`.
+        for magic in [
+            &[0x1f, 0x8b, 0x08, 0x00][..],         // gzip
+            b"BZh91AY&SY",                         // bzip2
+            &[0xfd, b'7', b'z', b'X', b'Z', 0x00], // xz
+            &[0x28, 0xb5, 0x2f, 0xfd, 0x00],       // zstd
+        ] {
+            assert_eq!(
+                detect_file_kind(magic),
+                FileKind::Archive(ArchiveFormat::CompressedTar),
+                "magic {magic:02x?} should classify as a compressed tar",
+            );
+        }
+    }
+
+    #[test]
+    fn detect_file_kind_tar_ustar_wins_over_leading_compression_magic() {
+        // The genuinely ambiguous case: a buffer carrying BOTH a leading gzip magic (offset 0) and
+        // the `ustar` signature (offset 257) — disjoint ranges that can coexist. The structural tar
+        // check runs first, so it must classify as an (uncompressed) Tar, not CompressedTar,
+        // matching the backend's `sniff_format` ordering.
+        let mut sample = vec![0u8; 262];
+        sample[0..2].copy_from_slice(&[0x1f, 0x8b]);
         sample[257..262].copy_from_slice(b"ustar");
         assert_eq!(
             detect_file_kind(&sample),

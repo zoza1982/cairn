@@ -7854,6 +7854,42 @@ mod tests {
         assert!(s.overlay.is_none());
     }
 
+    /// A compressed tar (`.tar.gz` etc., sniffed as `ArchiveFormat::CompressedTar`) mounts exactly
+    /// like an uncompressed archive — the reducer routes every archive format to `MountArchive`.
+    #[test]
+    fn file_sniffed_compressed_tar_emits_mount_archive() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("bundle.tar.gz", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::Enter));
+        let AppEffect::SniffFile { pane, conn, path } = fx.into_iter().next().unwrap() else {
+            panic!("expected SniffFile");
+        };
+        let expected_path = path.clone();
+        let fx = update(
+            &mut s,
+            Msg::Event(AppEvent::FileSniffed {
+                pane,
+                conn,
+                path,
+                kind: FileKind::Archive(crate::state::ArchiveFormat::CompressedTar),
+                prefetch: Bytes::from_static(&[0x1f, 0x8b, 0x08, 0x00]),
+            }),
+        );
+        assert!(
+            matches!(
+                &fx[..],
+                [AppEffect::MountArchive { pane: p, conn: c, path: pa }]
+                    if *p == pane && *c == conn && *pa == expected_path
+            ),
+            "compressed-tar FileSniffed must emit MountArchive, got {fx:?}"
+        );
+        assert!(s.overlay.is_none());
+    }
+
     /// A successful mount pushes the pane's pre-mount `(conn, cwd)` onto `mount_stack` and
     /// navigates the pane into the new connection at its root.
     #[test]
