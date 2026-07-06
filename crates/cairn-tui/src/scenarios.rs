@@ -302,7 +302,7 @@ fn transfer_active() -> AppState {
     // 4 MiB of 8 MiB at 2 MiB/s → 50%, ETA 2s.
     s.active_transfers.push(cairn_core::ActiveTransfer {
         id,
-        label: "Copying 1 item(s)…".to_owned(),
+        label: "Copying release.tar.gz → /srv/www".to_owned(),
         bytes: 4 * 1024 * 1024,
         rate: Some(2 * 1024 * 1024),
         total: Some(8 * 1024 * 1024),
@@ -401,7 +401,7 @@ fn transfer_queue() -> AppState {
     s.next_transfer_id += 1;
     s.active_transfers.push(cairn_core::ActiveTransfer {
         id: id2,
-        label: "Moving 2 item(s)…".to_owned(),
+        label: "Moving 2 items → dietpi6:/backups".to_owned(),
         bytes: 1024 * 1024,
         rate: None,
         total: None,

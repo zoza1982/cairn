@@ -948,8 +948,15 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
             let style = if is_sel { selected } else { Style::default() };
             let marker = if is_sel { "> " } else { "  " };
             let paused_marker = if t.paused { "  ⏸ paused" } else { "" };
+            // Truncate the label (not the marker/paused tail) so a long "what → where" can't push the
+            // `⏸ paused` indicator off the right edge at narrow widths — the state must stay visible.
+            let label_budget = content_width
+                .saturating_sub(marker.chars().count() + paused_marker.chars().count());
             lines.push(Line::styled(
-                format!("{marker}{}{paused_marker}", t.label),
+                format!(
+                    "{marker}{}{paused_marker}",
+                    truncate_to(&t.label, label_budget)
+                ),
                 style,
             ));
 

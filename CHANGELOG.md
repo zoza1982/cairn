@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The transfer dialog labels each transfer with what → where**, so concurrent transfers are
+  distinguishable: instead of every row reading `Copying 1 item(s)…`, a transfer now shows the
+  source item (a file's name, or `N items`) and its destination directory, tagged with the
+  destination connection when it's remote — e.g. `Copying release.tar.gz → /srv/www` or
+  `Moving 3 items → dietpi6:/backups`.
+
 - **Entries are colored by type** so folders, files, and archives are distinguishable at a glance: a
   modern truecolor `dark` palette (Tokyo-Night family) gives directories blue, archives amber
   (by extension), executables green, symlinks cyan, streams purple, and special nodes red — and a
