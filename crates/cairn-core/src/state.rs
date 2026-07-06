@@ -563,7 +563,8 @@ pub enum Overlay {
     /// reordered (`K`/`J`), dropped (`d`), or cleared (`x`). Deliberately non-blocking, so queued
     /// transfers keep draining and an overwrite-conflict prompt can still supersede it.
     TransferQueue {
-        /// Selection cursor into the pending queue.
+        /// Selection cursor into the combined list: active transfers first (`0..active_len`), then
+        /// the pending queue. `p`/`d` act on the selected row (see `apply_transfer_queue_action`).
         cursor: usize,
     },
     /// Confirm overwriting existing destinations before a copy/move proceeds. Holds the parameters to

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-transfer controls in the progress dialog**: the `Ctrl-T` dialog's `↑`/`↓` now select an
+  individual *active* transfer (not just the pending queue), and `p` pauses/resumes **only the
+  selected** transfer while `d` cancels **only** it — so with several transfers running you can
+  pause or stop one without touching the rest. `Esc` remains the abort-**all** panic-stop, `b`
+  backgrounds, `K`/`J` reorder pending, `x` clears the pending queue. The selection cursor tracks
+  its item as transfers finish or drain from the queue.
+
 - **MC-style transfer progress dialog**: copying or moving files now auto-opens a dialog (retitled
   " Transfer ") showing each active transfer as a label, a text progress bar (`█`/`░`, with an
   indeterminate `--%` bar when the total size isn't known yet), and a byte/rate/ETA line, above the
