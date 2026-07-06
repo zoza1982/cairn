@@ -63,14 +63,9 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// `.tar.gz`/`.tgz` magic (RFC 1952).
-const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
-/// `.tar.bz2`/`.tbz2` magic.
-const BZIP2_MAGIC: &[u8] = b"BZh";
-/// `.tar.xz`/`.txz` magic.
-const XZ_MAGIC: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0x00];
-/// `.tar.zst`/`.tzst` magic — the little-endian zstd frame magic number.
-const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
+// The magic bytes live in `cairn_types::archive_magic` so this backend sniff and the front-end
+// `cairn_core::detect_file_kind` can't drift on what identifies a compressed tar.
+use cairn_types::archive_magic::{BZIP2_MAGIC, GZIP_MAGIC, XZ_MAGIC, ZSTD_MAGIC};
 
 /// The outer compression wrapping a tar stream, detected purely from magic bytes (never a file
 /// extension) by [`sniff`].
