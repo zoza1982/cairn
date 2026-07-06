@@ -103,7 +103,7 @@ pub fn all() -> Vec<Scenario> {
         },
         Scenario {
             name: "transfer-queue",
-            description: "the transfer-queue overlay with an active and a queued transfer",
+            description: "the transfer progress dialog: a running transfer with a progress bar + rate/ETA, a paused transfer with an indeterminate bar, and a queued transfer",
             build: transfer_queue,
         },
         Scenario {
@@ -356,6 +356,19 @@ fn ai_plan_irreversible() -> AppState {
 
 fn transfer_queue() -> AppState {
     let mut s = transfer_active();
+    // A second active transfer, paused, with an unknown total — exercises the indeterminate bar
+    // (no fake percentage) and the "⏸ paused" marker/dropped rate+ETA line alongside the first
+    // transfer's normal (known-total, running) bar in the same dialog.
+    let id2 = s.next_transfer_id;
+    s.next_transfer_id += 1;
+    s.active_transfers.push(cairn_core::ActiveTransfer {
+        id: id2,
+        label: "Moving 2 item(s)…".to_owned(),
+        bytes: 1024 * 1024,
+        rate: None,
+        total: None,
+        paused: true,
+    });
     s.transfer_queue.push_back(cairn_core::QueuedTransfer {
         src_conn: ConnectionId(1),
         dst_conn: ConnectionId(2),

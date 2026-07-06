@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MC-style transfer progress dialog**: copying or moving files now auto-opens a dialog (retitled
+  " Transfer ") showing each active transfer as a label, a text progress bar (`█`/`░`, with an
+  indeterminate `--%` bar when the total size isn't known yet), and a byte/rate/ETA line, above the
+  existing pending-queue list. `b` sends it to the background (the transfer keeps running and the
+  status line keeps its compact summary); `Ctrl-T` brings it back to the foreground; `p`
+  pauses/resumes every active transfer from inside the dialog; `Esc` now aborts all active transfers
+  (like the no-overlay binding) rather than just closing, degrading to a plain close when only
+  pending (not yet started) items remain. The dialog dismisses itself once the last transfer
+  finishes and nothing is left queued. The dialog is intentionally non-blocking: queued transfers
+  keep draining into free slots while it's open, and an overwrite conflict still surfaces its prompt
+  over it instead of being silently swallowed.
+
 - **Pane connection header**: each pane's top border now shows *which* backend it is browsing, so a
   remote pane is instantly distinguishable from the local filesystem. A remote pane renders a full
   `scheme://user@host:path` locator (e.g. `ssh://root@dietpi6:/home`, `s3://bucket:/prefix`) in a

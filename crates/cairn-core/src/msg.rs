@@ -58,6 +58,11 @@ pub enum Action {
     QueueMoveDown,
     /// Toggle pause/resume of the active transfer (no-op when none is running).
     TogglePause,
+    /// Send the transfer progress dialog to the background: closes [`crate::Overlay::TransferQueue`]
+    /// but leaves any active transfers running untouched (MC-style `b`). A no-op elsewhere — there
+    /// is nothing to background when the dialog isn't open. `Ctrl-T`/[`Action::OpenQueue`] brings it
+    /// back to the foreground.
+    Background,
     /// Run the user-defined shell action at the given index (a config `[[shell_actions]]` entry, bound
     /// to a key). The index is into the validated action list shared by the keymap,
     /// `AppState::shell_actions`, and the runtime.

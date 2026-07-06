@@ -8,21 +8,21 @@ expression: frame
 │   Cargo.toml                         ││   Cargo.toml                         │
 │   README.md                          ││   README.md                          │
 │                                      ││                                      │
-│                                      ││                                      │
-│                                      ││                                      │
-│                                      ││                                      │
-│         ┌ Transfer queue ──────────────────────────────────────────┐         │
-│         │active: transferring… 4.0 MiB (50%)                       │         │
-│         │> 1. move 1 item(s)                                       │         │
-│         │                                                          │         │
-│         │[↑↓] select  [K/J] move  [d] drop  [x] clear all  [Esc] cl│         │
-│         └──────────────────────────────────────────────────────────┘         │
-│                                      ││                                      │
-│                                      ││                                      │
-│                                      ││                                      │
+│    ┌ Transfer ──────────────────────────────────────────────────────────┐    │
+│    │Copying 1 item(s)…                                                  │    │
+│    │████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 50%│    │
+│    │4.0 MiB / 8.0 MiB   2.0 MiB/s   ETA 2s                              │    │
+│    │Moving 2 item(s)…  ⏸ paused                                         │    │
+│    │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│    │
+│    │1.0 MiB                                                             │    │
+│    │> 1. move 1 item(s)                                                 │    │
+│    │                                                                    │    │
+│    │[b] background · [p] pause · [Esc] abort                            │    │
+│    │[↑↓] select · [K/J] reorder · [d] drop · [x] clear                  │    │
+│    └────────────────────────────────────────────────────────────────────┘    │
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
 └────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
- 1/4   ⇅ transferring… 4.0 MiB / 8.0 MiB (50%) at 2.0 MiB/s, ETA 2s (+1 queued)
+ 1/4   ⇅ 2 active, 1 paused · 5.0 MiB at 2.0 MiB/s (+1 queued)

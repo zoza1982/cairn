@@ -555,8 +555,13 @@ pub enum Overlay {
         /// The text entered so far.
         input: String,
     },
-    /// View the transfer queue (the active transfer plus pending ones); navigate with the cursor,
-    /// drop the selected pending transfer, or clear them all.
+    /// The transfer **progress dialog** (MC-style): shows each active transfer with a progress bar,
+    /// rate, and ETA, plus the pending queue. Auto-opens when a user-initiated transfer starts and
+    /// auto-closes when the last one finishes with nothing queued. `b` backgrounds it (transfers
+    /// keep running), `Ctrl-T` reopens it, `p` pauses/resumes all, `Esc` aborts all active
+    /// transfers (or just closes when only pending items remain); the pending list can be navigated,
+    /// reordered (`K`/`J`), dropped (`d`), or cleared (`x`). Deliberately non-blocking, so queued
+    /// transfers keep draining and an overwrite-conflict prompt can still supersede it.
     TransferQueue {
         /// Selection cursor into the pending queue.
         cursor: usize,
