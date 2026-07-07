@@ -138,6 +138,10 @@ Pick a **theme** with `[ui] theme = "..."`:
 theme = "mc"
 ```
 
+Or switch **live** in the TUI with **Shift-T**, which cycles through the presets
+(`dark → mc → nord → gruvbox → light → …`) — the status line shows the new theme. (The live choice is
+session-only; set `[ui] theme` to make it the default.)
+
 The truecolor presets (`dark`/`nord`/`gruvbox`/`light`) are best-effort on terminals without
 24-bit color; pick `mc` for a guaranteed-correct look on a limited terminal. `dark` leaves the
 terminal background untouched, while `mc`/`nord`/`gruvbox`/`light` paint their own.

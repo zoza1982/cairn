@@ -141,6 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Switch the color theme live with Shift-T.** Cycles through the built-in presets
+  (`dark → mc → nord → gruvbox → light → …`) without editing config; the status line shows the new
+  theme. The live choice is session-only — set `[ui] theme` for the default.
+
 - **Selectable color themes.** Pick one with `[ui] theme = "..."`: `dark` (default, truecolor
   Tokyo-Night), **`mc`** (classic Midnight Commander — blue panels, cyan folders, black-on-cyan
   selection, using the 16 named ANSI colors so it renders correctly even on a basic terminal),

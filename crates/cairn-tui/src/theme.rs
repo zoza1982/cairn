@@ -284,6 +284,21 @@ mod tests {
     }
 
     #[test]
+    fn core_theme_presets_all_resolve_cleanly() {
+        // The cycle order lives in `cairn_core::THEME_PRESETS`; the palettes live here in
+        // `Theme::resolve`. This gate keeps them in sync: every name the reducer can cycle to must
+        // resolve without a warning (otherwise Shift-T would silently land on a fallback `dark`).
+        let none = std::iter::empty::<(&str, &str)>;
+        for name in cairn_core::THEME_PRESETS {
+            let (_t, warnings) = Theme::resolve(name, none());
+            assert!(
+                warnings.is_empty(),
+                "preset `{name}` from THEME_PRESETS must resolve with no warning: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn each_preset_resolves_to_its_constant() {
         let none = std::iter::empty::<(&str, &str)>;
         for (name, expected) in [

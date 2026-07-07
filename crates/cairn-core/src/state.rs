@@ -1246,6 +1246,20 @@ pub fn visible_connection_indices(
         .collect()
 }
 
+/// The built-in color-theme preset names, in cycle order. Must match the presets `Theme::resolve`
+/// recognizes in `cairn-tui`; an unrecognized name simply falls back to `dark` at render time.
+pub const THEME_PRESETS: [&str; 5] = ["dark", "mc", "nord", "gruvbox", "light"];
+
+/// The next theme preset after `current` in [`THEME_PRESETS`] cycle order (wraps around; an
+/// unrecognized `current` restarts the cycle at the first preset).
+#[must_use]
+pub fn next_theme(current: &str) -> &'static str {
+    match THEME_PRESETS.iter().position(|&t| t == current) {
+        Some(i) => THEME_PRESETS[(i + 1) % THEME_PRESETS.len()],
+        None => THEME_PRESETS[0],
+    }
+}
+
 /// The whole application state. Holds plain data only — no service handles, no I/O.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -1259,6 +1273,10 @@ pub struct AppState {
     pub should_quit: bool,
     /// A transient status/notification line.
     pub status: Option<String>,
+    /// The active color-theme preset name (`dark`/`mc`/`nord`/`gruvbox`/`light`). The renderer
+    /// resolves the actual palette from this each frame, so it can be changed live (see
+    /// [`THEME_PRESETS`] and the cycle-theme action) without editing config.
+    pub theme_name: String,
     /// Whether an AI plan request is in flight (suppresses duplicate requests).
     pub ai_pending: bool,
     /// Whether an approved AI plan is currently executing (so `Esc` can cancel it).
@@ -1590,6 +1608,7 @@ impl AppState {
             overlay: None,
             should_quit: false,
             status: None,
+            theme_name: THEME_PRESETS[0].to_owned(),
             ai_pending: false,
             ai_executing: false,
             connections: Vec::new(),
@@ -1714,6 +1733,25 @@ mod tests {
     use super::*;
     use crate::forms::ProfileData;
     use cairn_secrets::ExposeSecret;
+
+    #[test]
+    fn next_theme_cycles_and_wraps() {
+        // Walks the preset list in order and wraps at the end.
+        assert_eq!(next_theme("dark"), "mc");
+        assert_eq!(next_theme("light"), "dark");
+        assert_eq!(
+            next_theme(THEME_PRESETS[THEME_PRESETS.len() - 1]),
+            THEME_PRESETS[0]
+        );
+        // An unrecognized name restarts the cycle at the first preset.
+        assert_eq!(next_theme("solarized"), "dark");
+        // One full loop returns to the start.
+        let mut name = THEME_PRESETS[0].to_owned();
+        for _ in 0..THEME_PRESETS.len() {
+            name = next_theme(&name).to_owned();
+        }
+        assert_eq!(name, THEME_PRESETS[0]);
+    }
 
     #[test]
     fn masked_input_edits_and_reports_length_only() {

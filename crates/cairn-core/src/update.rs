@@ -2,11 +2,11 @@
 
 use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit, WriteBackMode};
 use crate::state::{
-    ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionFormStage, ConnectionKind,
-    FieldValue, FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame, Overlay, PagerMode,
-    PagerStatus, PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId,
-    TransferPhase, WritebackChoice, PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES,
-    SESSION_OUTPUT_MAX_LINES,
+    next_theme, ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionFormStage,
+    ConnectionKind, FieldValue, FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame,
+    Overlay, PagerMode, PagerStatus, PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side,
+    SortMode, TransferId, TransferPhase, WritebackChoice, PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES,
+    SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
 use bytes::Bytes;
 use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, VfsPath};
@@ -61,6 +61,15 @@ pub fn initial_effects(state: &AppState) -> Vec<AppEffect> {
 }
 
 fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    // Theme cycling is display-only and can't corrupt overlay/plan state, so handle it globally —
+    // before the overlay routing that would otherwise swallow it — so it works with a view overlay
+    // (connections/queue/pager) open too. A literal `T` typed into a text field never reaches here:
+    // the input layer routes keys to `text_edit_for` while a prompt is capturing.
+    if matches!(action, Action::CycleTheme) {
+        state.theme_name = next_theme(&state.theme_name).to_owned();
+        state.status = Some(format!("Theme: {}", state.theme_name));
+        return Vec::new();
+    }
     if state.overlay.is_some() {
         return apply_overlay_action(state, action);
     }
@@ -347,6 +356,9 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             });
             fx
         }
+        // Handled globally at the top of `apply_action` (works with an overlay open too), so this
+        // arm is never reached at runtime — it exists only to keep the match exhaustive.
+        Action::CycleTheme => Vec::new(),
         Action::Quit => {
             state.should_quit = true;
             Vec::new()
@@ -6499,6 +6511,29 @@ mod tests {
         let fx = update(&mut s, Msg::Action(Action::ToggleHidden));
         assert!(!s.active().show_hidden);
         assert!(matches!(&fx[..], [AppEffect::List { all: false, .. }]));
+    }
+
+    #[test]
+    fn cycle_theme_advances_the_preset_and_wraps() {
+        let mut s = state();
+        assert_eq!(s.theme_name, "dark"); // the default
+                                          // Each press advances to the next preset, with a status message and no effects (display-only).
+        let fx = update(&mut s, Msg::Action(Action::CycleTheme));
+        assert!(fx.is_empty(), "theme change needs no effect (no re-list)");
+        assert_eq!(s.theme_name, "mc");
+        assert_eq!(s.status.as_deref(), Some("Theme: mc"));
+        for expected in ["nord", "gruvbox", "light", "dark"] {
+            let _ = update(&mut s, Msg::Action(Action::CycleTheme));
+            assert_eq!(s.theme_name, expected);
+        }
+        // …and wraps back to the first preset (checked by the last iteration above landing on "dark").
+
+        // It also works with a (view) overlay open — it's handled globally, not swallowed by the
+        // overlay router.
+        s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+        let _ = update(&mut s, Msg::Action(Action::CycleTheme));
+        assert_eq!(s.theme_name, "mc");
+        assert!(s.overlay.is_some(), "theme cycling leaves the overlay open");
     }
 
     #[test]

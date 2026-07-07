@@ -83,7 +83,19 @@ fn progress_emit_due(bytes: u64, last_sent: u64, now_ms: u64, last_sent_ms: u64)
 /// The resolved UI configuration threaded through the event loop (input mapping + colors).
 struct Ui {
     keymap: Keymap,
-    theme: Theme,
+    /// The `[ui.colors]` role overrides, applied on top of whichever preset `AppState::theme_name`
+    /// currently names. Kept (rather than a pre-resolved `Theme`) so the palette is resolved fresh
+    /// each frame — a live theme switch (Shift-T) then takes effect immediately.
+    colors: std::collections::BTreeMap<String, String>,
+}
+
+impl Ui {
+    /// Resolve the current palette from the live theme name + the config color overrides. Cheap
+    /// (a match + a small map walk); `Theme` is `Copy`. Startup already logged any warnings, so they
+    /// are dropped here.
+    fn theme(&self, state: &AppState) -> Theme {
+        Theme::resolve(&state.theme_name, &self.colors).0
+    }
 }
 
 /// Runtime-side state for the vault-unlock and lazy-open flows. Lives in the effect layer, never
@@ -296,12 +308,25 @@ async fn run_async() -> anyhow::Result<()> {
         opener: opener.clone(),
     };
 
-    // Resolve the color theme from the preset + per-role config overrides.
-    let (theme, theme_warnings) = Theme::resolve(&config.ui.theme, &config.ui.colors);
+    // Seed the live theme name from config, normalizing to a canonical preset so cycling (Shift-T)
+    // always advances visibly — an alias/typo (`"default"`, `""`, unknown) that `Theme::resolve`
+    // renders as `dark` is stored as `"dark"`, not the raw string (which `next_theme` wouldn't
+    // recognize, wasting the first press). Then resolve once at startup only to surface any warnings
+    // (bad preset/role/color). The palette itself is re-resolved each frame from `state.theme_name`
+    // (see `Ui::theme`) so it can be switched live.
+    state.theme_name = if cairn_core::THEME_PRESETS.contains(&config.ui.theme.as_str()) {
+        config.ui.theme.clone()
+    } else {
+        cairn_core::THEME_PRESETS[0].to_owned()
+    };
+    let (_theme, theme_warnings) = Theme::resolve(&config.ui.theme, &config.ui.colors);
     for w in theme_warnings {
         tracing::warn!("{w}");
     }
-    let ui = Ui { keymap, theme };
+    let ui = Ui {
+        keymap,
+        colors: config.ui.colors.clone(),
+    };
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(256);
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
@@ -353,7 +378,7 @@ async fn run_async() -> anyhow::Result<()> {
             &mut startup_remote_edit_temps,
         );
     }
-    terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme))?;
+    terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme(&state)))?;
 
     let result = event_loop(
         &mut terminal,
@@ -946,7 +971,7 @@ async fn event_loop(
         if state.should_quit {
             break;
         }
-        terminal.draw(|f| cairn_tui::render(f, state, &ui.theme))?;
+        terminal.draw(|f| cairn_tui::render(f, state, &ui.theme(state)))?;
         for effect in effects {
             // `SuspendAndEdit` needs exclusive terminal + stdin ownership to hand off to an
             // external editor — `dispatch` has neither (no `&mut Terminal`, and effects normally
@@ -4804,6 +4829,27 @@ mod tests {
     #[cfg(feature = "s3")]
     use cairn_config::ConnectionProfile;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn ui_theme_resolves_the_live_preset_with_config_overrides() {
+        // `Ui::theme` must resolve the palette from the *live* `state.theme_name` (so a Shift-T switch
+        // takes effect) with the config `[ui.colors]` overrides applied on top.
+        let mut colors = std::collections::BTreeMap::new();
+        colors.insert("dir".to_owned(), "#010203".to_owned());
+        let ui = Ui {
+            keymap: Keymap::from_overrides(std::iter::empty::<(&str, &str)>()).0,
+            colors: colors.clone(),
+        };
+        let mut state = AppState::new(LEFT, RIGHT, VfsPath::root());
+        // A live switch to `mc` is reflected, and the override is layered on the mc preset.
+        state.theme_name = "mc".to_owned();
+        let expected = Theme::resolve("mc", &colors).0;
+        assert_eq!(ui.theme(&state), expected);
+        assert_eq!(ui.theme(&state).dir, ratatui::style::Color::Rgb(1, 2, 3));
+        // Switching the name switches the palette.
+        state.theme_name = "nord".to_owned();
+        assert_eq!(ui.theme(&state), Theme::resolve("nord", &colors).0);
+    }
 
     #[tokio::test]
     async fn list_dir_unknown_connection_is_not_found() {

@@ -145,6 +145,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "refresh" => Action::Refresh,
         "cycle_sort" => Action::CycleSort,
         "toggle_hidden" => Action::ToggleHidden,
+        "cycle_theme" => Action::CycleTheme,
         "filter" => Action::Filter,
         "open_queue" => Action::OpenQueue,
         "queue_move_up" => Action::QueueMoveUp,
@@ -288,6 +289,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         // 's' cycles the sort mode; '.' toggles hidden entries (ranger/vim convention).
         KeyCode::Char('s') => Some(Action::CycleSort),
         KeyCode::Char('.') => Some(Action::ToggleHidden),
+        // Shift-T cycles the color theme (dark → mc → nord → gruvbox → light → …) live.
+        KeyCode::Char('T') => Some(Action::CycleTheme),
         // 'p' pauses/resumes the active transfer (no-op when none is running).
         KeyCode::Char('p') => Some(Action::TogglePause),
         // 'b' backgrounds the transfer progress dialog (MC-style): closes it but leaves any active
@@ -615,6 +618,7 @@ mod tests {
             "refresh",
             "cycle_sort",
             "toggle_hidden",
+            "cycle_theme",
             "filter",
             "open_queue",
             "queue_move_up",
@@ -648,7 +652,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 42);
+        assert_eq!(names.len(), 43);
     }
 
     #[test]
