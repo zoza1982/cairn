@@ -141,6 +141,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Selectable color themes.** Pick one with `[ui] theme = "..."`: `dark` (default, truecolor
+  Tokyo-Night), **`mc`** (classic Midnight Commander — blue panels, cyan folders, black-on-cyan
+  selection, using the 16 named ANSI colors so it renders correctly even on a basic terminal),
+  `nord`, `gruvbox`, and `light`. Themes gain optional `background`/`foreground` roles (a preset can
+  paint its own base surface; `dark` leaves the terminal default); both are overridable under
+  `[ui.colors]`, and accept `none` to clear a preset's forced value. Entry-type coloring stays
+  distinct on every preset. (Overlay/dialog backgrounds still use the terminal default for now; a
+  runtime theme switcher is planned as a follow-up.)
+
 - **The transfer dialog now shows a live pre-flight scan** instead of appearing frozen when a
   copy/move starts. Before any bytes move, the engine walks the source tree to size it; that walk is
   now surfaced as a `Counting` phase — a running item count, bytes discovered, and the path currently

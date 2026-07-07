@@ -324,7 +324,7 @@ fn unknown_placeholder(arg: &str) -> Option<String> {
 pub struct UiConfig {
     /// Keybinding preset: `"mc"`, `"vim"`, or `"custom"`.
     pub keymap: String,
-    /// Theme name.
+    /// Theme preset name: `"dark"` (default), `"mc"`, `"nord"`, `"gruvbox"`, or `"light"`.
     pub theme: String,
     /// User keybinding overrides, applied on top of the preset: a map of key-chord → action name.
     /// Chords look like `"ctrl+a"`, `"j"`, `"f5"`, `"enter"`, `"space"`; action names are snake_case
@@ -333,11 +333,12 @@ pub struct UiConfig {
     #[serde(default)]
     pub keybindings: BTreeMap<String, String>,
     /// Theme color overrides on top of the [`theme`](UiConfig::theme) preset: a map of role →
-    /// color. Roles are `focused_border`/`unfocused_border`/`dir`/`hidden_dir`/`file`/`hidden_file`/
-    /// `archive`/`executable`/`symlink`/`stream`/`special`/`error`/`status`/`remote`/`selection_bg`/
-    /// `selection_fg`; color *values must be strings* — names (`"cyan"`, `"bright-blue"`) or
-    /// `#rrggbb`. Unknown roles, unparseable colors, and an unknown `theme` preset are ignored with a
-    /// warning (the dark preset is used).
+    /// color. Roles are `background`/`foreground`/`focused_border`/`unfocused_border`/`dir`/
+    /// `hidden_dir`/`file`/`hidden_file`/`archive`/`executable`/`symlink`/`stream`/`special`/`error`/
+    /// `status`/`remote`/`selection_bg`/`selection_fg`; color *values must be strings* — names
+    /// (`"cyan"`, `"bright-blue"`) or `#rrggbb`. The optional `background`/`foreground` also accept
+    /// `"none"` to clear a preset's forced value. Unknown roles, unparseable colors, and an unknown
+    /// `theme` preset are ignored with a warning (the dark preset is used).
     #[serde(default)]
     pub colors: BTreeMap<String, String>,
 }
