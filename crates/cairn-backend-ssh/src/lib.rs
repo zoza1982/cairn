@@ -18,7 +18,7 @@ pub use ops::{RemoteEntry, RemoteMeta, SftpOps};
 pub use real::RealSftp;
 
 use async_trait::async_trait;
-use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, VfsPath};
+use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, UnixPerms, VfsPath};
 use cairn_vfs::{
     ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs, VfsError,
     WriteHandle, WriteOpts, WriteSink,
@@ -54,6 +54,7 @@ impl<O: SftpOps> SftpVfs<O> {
                 e.size = r.size;
             }
             e.modified = r.modified;
+            e.perms = r.mode.map(UnixPerms::from_mode);
             entries.push(e);
         }
         Ok(ListPage {
@@ -132,6 +133,7 @@ impl<O: SftpOps> Vfs for SftpVfs<O> {
             e.size = m.size;
         }
         e.modified = m.modified;
+        e.perms = m.mode.map(UnixPerms::from_mode);
         Ok(e)
     }
 
@@ -243,6 +245,33 @@ mod tests {
         let mut names: Vec<_> = page.entries.iter().map(|e| e.name.to_string()).collect();
         names.sort();
         assert_eq!(names, vec!["a.txt", "sub"]);
+    }
+
+    #[tokio::test]
+    async fn maps_remote_mode_to_entry_perms() {
+        // Regression: the SFTP transport used to drop the server's mode bits, so a remote pane
+        // rendered a blank permission column. Both `list` and `stat` must now carry them through to
+        // `Entry.perms` (the full mode, type bits included) so remote files show `drwxr-xr-x` like
+        // local ones. The mock reports dirs as 0o40755 and files as 0o100644.
+        let vfs = backend();
+        let mut s = vfs.list(&p("/"), ListOpts::default());
+        let page = s.next().await.unwrap().unwrap();
+        let by_name = |n: &str| page.entries.iter().find(|e| e.name == n).unwrap().clone();
+        assert_eq!(by_name("top.txt").perms.map(|p| p.mode), Some(0o100_644));
+        assert_eq!(by_name("d").perms.map(|p| p.mode), Some(0o040_755));
+        // `stat` carries them too.
+        assert_eq!(
+            vfs.stat(&p("/top.txt"))
+                .await
+                .unwrap()
+                .perms
+                .map(|p| p.mode),
+            Some(0o100_644)
+        );
+        assert_eq!(
+            vfs.stat(&p("/d")).await.unwrap().perms.map(|p| p.mode),
+            Some(0o040_755)
+        );
     }
 
     #[tokio::test]

@@ -17,6 +17,12 @@ pub struct RemoteEntry {
     pub size: Option<u64>,
     /// Last-modified time.
     pub modified: Option<SystemTime>,
+    /// Raw Unix mode bits (including the file-type `S_IFMT` bits), as reported by the server. `None`
+    /// when the server omits them. Mapped to `Entry.perms` so a remote pane shows `drwxr-xr-x` like
+    /// local. NOTE for a future SFTP `chmod`: since `Entry.perms` now carries the type bits, any
+    /// `set_perms` must mask them off (`mode & 0o7777`) before a `SETSTAT` — the backend has no
+    /// `Caps::CHMOD` today, so nothing consumes them yet.
+    pub mode: Option<u32>,
 }
 
 /// Remote metadata for a single path.
@@ -28,6 +34,8 @@ pub struct RemoteMeta {
     pub size: Option<u64>,
     /// Last-modified time.
     pub modified: Option<SystemTime>,
+    /// Raw Unix mode bits (including the file-type bits); see [`RemoteEntry::mode`].
+    pub mode: Option<u32>,
 }
 
 /// The minimal SFTP transport surface the backend needs. Implemented by the real `russh-sftp`
@@ -126,15 +134,16 @@ pub(crate) mod mock {
                 if rest.is_empty() || rest.contains('/') {
                     continue;
                 }
-                let (kind, size) = match node {
-                    Node::Dir => (EntryKind::Dir, None),
-                    Node::File(b) => (EntryKind::File, Some(b.len() as u64)),
+                let (kind, size, mode) = match node {
+                    Node::Dir => (EntryKind::Dir, None, Some(0o040_755)),
+                    Node::File(b) => (EntryKind::File, Some(b.len() as u64), Some(0o100_644)),
                 };
                 out.push(RemoteEntry {
                     name: rest.to_owned(),
                     kind,
                     size,
                     modified: None,
+                    mode,
                 });
             }
             Ok(out)
@@ -147,11 +156,13 @@ pub(crate) mod mock {
                     kind: EntryKind::Dir,
                     size: None,
                     modified: None,
+                    mode: Some(0o040_755),
                 }),
                 Some(Node::File(b)) => Ok(RemoteMeta {
                     kind: EntryKind::File,
                     size: Some(b.len() as u64),
                     modified: None,
+                    mode: Some(0o100_644),
                 }),
                 None => Err(Self::not_found(path)),
             }
