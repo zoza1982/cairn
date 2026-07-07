@@ -158,6 +158,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Transfer dialog selection no longer looks like a rendering glitch.** The selected transfer's label
+  was reverse-video, painting a solid background block over the text that looked just like the filled
+  progress bar below it. It's now **bold** (with the `>` marker) instead, and each transfer's block is
+  separated by a blank line so the dialog breathes and the label never sits flush against the bar.
+
 - **Transfer dialog polish.** The progress bar now ticks smoothly for small/slow copies (a copy whose
   total is under one 256 KiB step — many tiny files — used to sit at `0 B (0%)` until it finished);
   progress updates are now also time-driven (~120 ms). The pre-flight scan line no longer overflows:

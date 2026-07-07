@@ -933,10 +933,11 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     let content_width = usize::from(width.saturating_sub(2));
     let bar_width = content_width.saturating_sub(2).max(1);
 
-    // Selection highlights only the *label* line (with the `>` marker). Reverse-video across the whole
-    // multi-line block reads as a rendering glitch — and inverts the progress bar/stats — so the
-    // bar and detail lines always render in the normal style.
-    let sel = Style::default().add_modifier(Modifier::REVERSED);
+    // Selection marks only the *label* line, and with **bold** (plus the `>` marker), not
+    // reverse-video: a reversed run paints a solid background block over the label text that looks
+    // just like the filled progress bar below it, which reads as a rendering glitch. Bold + the marker
+    // is an unambiguous, unobtrusive cue, and the bar/detail lines always render in the normal style.
+    let sel = Style::default().add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line> = Vec::new();
     if active.is_empty() {
@@ -945,6 +946,12 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
         lines.push(Line::from("No active transfers".to_owned()));
     } else {
         for (ai, t) in active.iter().enumerate() {
+            // A blank line *between* transfers so consecutive blocks don't run together and the label
+            // never sits flush against the previous bar. Not after the last one — the pre-hint blank
+            // below is the single separator before the hints.
+            if ai > 0 {
+                lines.push(Line::from(""));
+            }
             let is_sel = ai == cursor;
             let marker = if is_sel { "> " } else { "  " };
             let paused_marker = if t.paused { "  ⏸ paused" } else { "" };
@@ -1028,6 +1035,10 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
                 }
             }
         }
+    }
+    // Separate the active section from the pending queue with a blank line (only when both exist).
+    if !active.is_empty() && !pending.is_empty() {
+        lines.push(Line::from(""));
     }
     for (i, q) in pending.iter().enumerate() {
         let is_sel = active.len() + i == cursor;
@@ -2091,9 +2102,9 @@ mod tests {
 
     #[test]
     fn transfer_dialog_highlights_only_the_selected_label_line() {
-        // The selected transfer must highlight only its *label* row — reverse-video across the whole
-        // block (label + bar + stats) reads as a glitch and inverts the progress bar. The snapshot
-        // harness records only glyphs, so this asserts on cell styles directly.
+        // The selected transfer marks only its *label* row, and with bold — never reverse-video,
+        // which paints a background block that looks like the filled progress bar. The bar/stats rows
+        // stay in the normal style. The snapshot harness records only glyphs, so assert on styles.
         let mut s = ready_state();
         set_transfer(
             &mut s,
@@ -2108,31 +2119,34 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
 
         let width = usize::from(buf.area().width);
-        // Group cells into rows and note, per row, its text and whether any cell is reverse-video.
-        let row_reversed = |needle: &str| -> Option<bool> {
+        // For the row containing `needle`, return `(any bold cell, any reverse-video cell)`.
+        let row_style = |needle: &str| -> Option<(bool, bool)> {
             let cells: Vec<_> = buf.content().iter().collect();
             for row in cells.chunks(width) {
                 let text: String = row.iter().map(|c| c.symbol()).collect();
                 if text.contains(needle) {
+                    let bold = row
+                        .iter()
+                        .any(|c| c.style().add_modifier.contains(Modifier::BOLD));
                     let rev = row
                         .iter()
                         .any(|c| c.style().add_modifier.contains(Modifier::REVERSED));
-                    return Some(rev);
+                    return Some((bold, rev));
                 }
             }
             None
         };
-        // The label row ("Copying …") is highlighted…
+        // The label row ("Copying …") is bold and NOT reverse-video…
         assert_eq!(
-            row_reversed("Copying"),
-            Some(true),
-            "the selected transfer's label line must be highlighted"
+            row_style("Copying"),
+            Some((true, false)),
+            "the selected label must be bold, not reverse-video"
         );
-        // …but the progress-bar row is not (it must render in the normal style).
+        // …and the progress-bar row is neither bold nor reversed (normal style).
         assert_eq!(
-            row_reversed("░"),
-            Some(false),
-            "the progress bar must never be reverse-video"
+            row_style("░"),
+            Some((false, false)),
+            "the progress bar must render in the normal style"
         );
     }
 
