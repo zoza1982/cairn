@@ -1539,7 +1539,37 @@ pub enum LogViewerStatus {
     Error(String),
 }
 
-/// Which stage of a transfer's lifecycle is visible right now, so the UI draws each stage honestly
+/// What kind of file operation an [`ActiveTransfer`] entry represents. Copy/move measure progress in
+/// bytes; delete measures it in items (it moves no bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    /// Copy the source, leaving it in place.
+    Copy,
+    /// Move the source (copy then delete the original).
+    Move,
+    /// Delete the target(s).
+    Delete,
+}
+
+impl OpKind {
+    /// The present-tense verb for a progress label ("Copying"/"Moving"/"Deleting").
+    #[must_use]
+    pub fn verb(self) -> &'static str {
+        match self {
+            OpKind::Copy => "Copying",
+            OpKind::Move => "Moving",
+            OpKind::Delete => "Deleting",
+        }
+    }
+
+    /// Whether this op's progress counters are bytes (copy/move) rather than item counts (delete).
+    #[must_use]
+    pub fn counts_bytes(self) -> bool {
+        !matches!(self, OpKind::Delete)
+    }
+}
+
+/// Which stage of an operation's lifecycle is visible right now, so the UI draws each stage honestly
 /// instead of inferring it from a byte ratio (a ratio can't tell "no bytes yet because we're still
 /// walking the source tree" apart from "no bytes yet because it's frozen", nor "all bytes written,
 /// now flushing/verifying" apart from "stuck at 99%").
@@ -1552,6 +1582,10 @@ pub enum TransferPhase {
     Counting,
     /// Bytes are flowing; `bytes`/`total` drive the percentage bar.
     Copying,
+    /// A delete is walking the tree removing items. Progress is the running item count in
+    /// [`ActiveTransfer::scan_entries`]/`bytes` with the current path in `scan_path`; the bar is
+    /// indeterminate (no total).
+    Deleting,
     /// The current (typically last) file's bytes are all written; the engine is flushing/closing it
     /// and, under size-verify, re-stat'ing it. No further byte growth until the next file or
     /// completion — rendered as an honest 100% with a "Finalizing…" label, never a stalled ratio.
@@ -1564,6 +1598,8 @@ pub enum TransferPhase {
 pub struct ActiveTransfer {
     /// Stable identity (never 0).
     pub id: TransferId,
+    /// Which kind of operation this is (copy/move measure bytes; delete measures items).
+    pub kind: OpKind,
     /// Human-readable label, e.g. "Copying 3 item(s)…".
     pub label: String,
     /// The lifecycle stage the UI should render (see [`TransferPhase`]). Starts at

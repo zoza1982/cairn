@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+┌ Transfer ────────────────────────────┐
+│> Deleting 3 item(s)                  │
+│  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│
+│  Deleted 128 item(s)                 │
+│  …oject/build/cache/objects/ab/cdef.o│
+│                                      │
+│[b] background · [p] pause sel · [Esc]│
+│[↑↓] select · [d] cancel/drop · [K/J] │
+└──────────────────────────────────────┘
+└────── sort: name ┘└────── sort: name ┘
+ 1/4   Deleting… 128 items

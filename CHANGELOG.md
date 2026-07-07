@@ -141,6 +141,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Delete now runs as a tracked operation, like copy/move** — with live progress, cancellation, and
+  a reliable refresh. Deleting a large or remote tree used to look frozen (one blocking call, no
+  feedback) and left stale entries in the pane until a manual refresh. It now streams progress into
+  the transfer dialog (a running item count + the path being removed, `Deleting N item(s)`), is
+  cancellable with `d` (or `Esc`), runs multiple deletes concurrently (deletes aren't queued behind
+  copies), continues past an un-deletable file instead of aborting the whole batch, and refreshes
+  both panes on completion (even on cancel/partial). Delete can't be paused — cancel is its stop.
+
 - **Switch the color theme live with Shift-T.** Cycles through the built-in presets
   (`dark → mc → nord → gruvbox → light → …`) without editing config; the status line shows the new
   theme. The live choice is session-only — set `[ui] theme` for the default.

@@ -5,8 +5,8 @@ use cairn_ai::{Plan, Reversibility, StepStatus, Verb};
 use cairn_core::{
     credential_method_fields, credential_methods, scheme_fields, AppState, ChoiceProvenance,
     ConnectionFormStage, ConnectionKind, CredentialMethod, FieldValue, Listing, LogViewerStatus,
-    MaskedInput, Overlay, PagerMode, PagerStatus, PaneState, PromptKind, SessionEnd, SessionRecord,
-    Side, TransferPhase, WritebackChoice, WritebackConflictReason, KNOWN_SCHEMES,
+    MaskedInput, OpKind, Overlay, PagerMode, PagerStatus, PaneState, PromptKind, SessionEnd,
+    SessionRecord, Side, TransferPhase, WritebackChoice, WritebackConflictReason, KNOWN_SCHEMES,
     PAGER_HEX_ROW_BYTES,
 };
 use cairn_types::{Entry, EntryKind, UnixPerms};
@@ -972,7 +972,8 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
             // verify tail moves none), and only `Copying` derives a percentage from bytes/total — so
             // an over-counted scan total can never pin the bar at 99% at the end.
             let pct = match t.phase {
-                TransferPhase::Counting => None,
+                // Pre-flight scan and delete both have no total → indeterminate bar.
+                TransferPhase::Counting | TransferPhase::Deleting => None,
                 // The reducer only enters Finalizing once the whole transfer's bytes are written, so
                 // this is an honest 100% — but derive it from bytes/total anyway so a hypothetical
                 // early Finalizing can never claim more than the bytes justify.
@@ -998,6 +999,18 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
                         t.scan_entries,
                         human_bytes(t.bytes)
                     );
+                    lines.push(Line::from(format!(
+                        "  {}",
+                        truncate_to(&head, content_width.saturating_sub(2))
+                    )));
+                    lines.push(Line::from(format!(
+                        "  {}",
+                        truncate_left(&t.scan_path, content_width.saturating_sub(2))
+                    )));
+                }
+                // Live delete walk: a running item count and the path currently being removed.
+                TransferPhase::Deleting => {
+                    let head = format!("Deleted {} item(s)", t.scan_entries);
                     lines.push(Line::from(format!(
                         "  {}",
                         truncate_to(&head, content_width.saturating_sub(2))
@@ -1560,16 +1573,19 @@ fn transfer_status(state: &AppState) -> String {
     };
     let paused = active.iter().filter(|t| t.paused).count();
 
-    // Aggregate byte/total/rate across active transfers. A transfer still in `Counting` reuses its
-    // `bytes` field for scan-discovered (not transferred) bytes, so exclude it from the transferred
-    // sum — otherwise the footer would inflate the total with bytes nothing has actually copied.
+    // Aggregate byte/total/rate across active transfers. Exclude non-byte ops (delete counts items,
+    // not bytes) and a transfer still in `Counting` (its `bytes` is scan-discovered, not transferred)
+    // — otherwise the footer would inflate the byte total with counts nothing has actually copied.
     // `total` is `None` if any is unknown (a partial percentage would mislead).
     let bytes: u64 = active
         .iter()
-        .filter(|t| t.phase != TransferPhase::Counting)
+        .filter(|t| t.kind.counts_bytes() && t.phase != TransferPhase::Counting)
         .fold(0u64, |acc, t| acc.saturating_add(t.bytes));
+    // Exclude deletes here too: a delete's `total` is always `None`, and an un-filtered `try_fold`
+    // would short-circuit the whole aggregate to `None` — hiding a concurrent copy's percentage.
     let total: Option<u64> = active
         .iter()
+        .filter(|t| t.kind.counts_bytes())
         .try_fold(0u64, |acc, t| t.total.map(|x| acc.saturating_add(x)));
     let amount = match total {
         Some(total) if total > 0 => {
@@ -1586,6 +1602,10 @@ fn transfer_status(state: &AppState) -> String {
     if active.len() == 1 {
         // Single transfer: identical format to the pre-concurrency status line.
         let t = &active[0];
+        if t.kind == OpKind::Delete {
+            // Delete moves no bytes — show the live item count instead of a byte/rate line.
+            return format!("Deleting… {} items{suffix}", t.scan_entries);
+        }
         if t.phase == TransferPhase::Counting {
             // Pre-flight scan: no bytes are moving yet, so say what's actually happening rather than
             // "transferring… 0 B" (which reads as a stall).
@@ -2029,6 +2049,7 @@ mod tests {
         s.next_transfer_id += 1;
         s.active_transfers.push(cairn_core::ActiveTransfer {
             id,
+            kind: OpKind::Copy,
             label: "Copying 1 item(s)…".to_owned(),
             // These helpers model a live byte copy (rate/ETA/percentage assertions), so the phase is
             // Copying, not the initial Counting.
@@ -2319,6 +2340,7 @@ mod tests {
         use cairn_core::ActiveTransfer;
         let t = |bytes, rate, total, paused| ActiveTransfer {
             id: 1,
+            kind: OpKind::Copy,
             label: "x".to_owned(),
             phase: TransferPhase::Copying,
             scan_entries: 0,
@@ -2529,6 +2551,45 @@ mod tests {
         );
         assert!(text.contains("2.0 MiB"), "summed bytes: {text}");
         assert!(text.contains("1.0 MiB/s"), "summed rate: {text}");
+    }
+
+    #[test]
+    fn status_line_keeps_the_copy_percentage_when_a_delete_runs_alongside() {
+        // A concurrent delete (total = None) must not poison the byte aggregate and hide the copy's
+        // percentage — deletes are excluded from both the byte and total sums.
+        let mut s = ready_state();
+        // A copy: 4 MiB of 8 MiB → 50%.
+        set_transfer(
+            &mut s,
+            4 * 1024 * 1024,
+            Some(1024),
+            Some(8 * 1024 * 1024),
+            false,
+        );
+        // A delete running concurrently (items, no byte total).
+        let id = s.next_transfer_id;
+        s.next_transfer_id += 1;
+        s.active_transfers.push(cairn_core::ActiveTransfer {
+            id,
+            kind: OpKind::Delete,
+            label: "Deleting 3 item(s)".to_owned(),
+            phase: TransferPhase::Deleting,
+            scan_entries: 3,
+            scan_path: "/x".to_owned(),
+            bytes: 0,
+            rate: None,
+            total: None,
+            paused: false,
+        });
+        let text = render_text(&s, 120, 24);
+        assert!(
+            text.contains("(50%)"),
+            "the copy's percentage must survive a concurrent delete: {text}"
+        );
+        assert!(
+            text.contains("8.0 MiB"),
+            "the copy's total is still shown: {text}"
+        );
     }
 
     #[test]

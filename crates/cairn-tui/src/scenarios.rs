@@ -92,6 +92,11 @@ pub fn all() -> Vec<Scenario> {
             build: transfer_finalizing,
         },
         Scenario {
+            name: "delete-active",
+            description: "a delete running as a tracked operation: item count + current path, indeterminate bar (no bytes)",
+            build: delete_active,
+        },
+        Scenario {
             name: "pager-text",
             description: "the read-only pager (F3) in text mode",
             build: pager_text,
@@ -312,6 +317,7 @@ fn transfer_active() -> AppState {
     // 4 MiB of 8 MiB at 2 MiB/s → 50%, ETA 2s.
     s.active_transfers.push(cairn_core::ActiveTransfer {
         id,
+        kind: cairn_core::OpKind::Copy,
         label: "Copying release.tar.gz → /srv/www".to_owned(),
         phase: cairn_core::TransferPhase::Copying,
         scan_entries: 0,
@@ -333,6 +339,7 @@ fn transfer_scanning() -> AppState {
     s.next_transfer_id += 1;
     s.active_transfers.push(cairn_core::ActiveTransfer {
         id,
+        kind: cairn_core::OpKind::Copy,
         label: "Copying project → dietpi6:/srv".to_owned(),
         phase: cairn_core::TransferPhase::Counting,
         scan_entries: 1287,
@@ -354,6 +361,7 @@ fn transfer_finalizing() -> AppState {
     s.next_transfer_id += 1;
     s.active_transfers.push(cairn_core::ActiveTransfer {
         id,
+        kind: cairn_core::OpKind::Copy,
         label: "Copying release.tar.gz → /srv/www".to_owned(),
         phase: cairn_core::TransferPhase::Finalizing,
         scan_entries: 0,
@@ -361,6 +369,28 @@ fn transfer_finalizing() -> AppState {
         bytes: 8 * 1024 * 1024,
         rate: Some(2 * 1024 * 1024),
         total: Some(8 * 1024 * 1024),
+        paused: false,
+    });
+    s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+    s
+}
+
+fn delete_active() -> AppState {
+    // A delete running as a tracked operation: an item count + the path being removed, with an
+    // indeterminate bar (delete moves no bytes) — the same dialog as copy/move.
+    let mut s = dual_pane();
+    let id = s.next_transfer_id;
+    s.next_transfer_id += 1;
+    s.active_transfers.push(cairn_core::ActiveTransfer {
+        id,
+        kind: cairn_core::OpKind::Delete,
+        label: "Deleting 3 item(s)".to_owned(),
+        phase: cairn_core::TransferPhase::Deleting,
+        scan_entries: 128,
+        scan_path: "/home/me/project/build/cache/objects/ab/cdef.o".to_owned(),
+        bytes: 0,
+        rate: None,
+        total: None,
         paused: false,
     });
     s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
@@ -457,6 +487,7 @@ fn transfer_queue() -> AppState {
     s.next_transfer_id += 1;
     s.active_transfers.push(cairn_core::ActiveTransfer {
         id: id2,
+        kind: cairn_core::OpKind::Move,
         label: "Moving 2 items → dietpi6:/backups".to_owned(),
         phase: cairn_core::TransferPhase::Copying,
         scan_entries: 0,

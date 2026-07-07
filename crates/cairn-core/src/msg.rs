@@ -733,8 +733,10 @@ pub enum AppEffect {
         /// The entry the action runs against.
         target: VfsPath,
     },
-    /// Delete entries on a connection.
+    /// Delete entries on a connection, tracked as an operation (progress + cancel) under `id`.
     Delete {
+        /// The tracked-operation id (minted by `arm_delete`; targets the cancel token + dialog row).
+        id: TransferId,
         /// The connection.
         conn: ConnectionId,
         /// Paths to delete.
