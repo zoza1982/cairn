@@ -19,6 +19,21 @@ use std::time::SystemTime;
 
 /// Render the whole application: two panes over a one-line status bar, themed by `theme`.
 pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    // Paint the themed base background/foreground over the whole terminal first, so presets whose
+    // identity is their background (Midnight Commander's blue, the light theme) fill every surface a
+    // more-specific widget doesn't. `None` leaves the terminal default (the `dark` preset), so this
+    // is a no-op there. Every downstream widget only sets `.fg()` (bar the explicit selection/
+    // reversed styles), so ratatui's per-field style merge keeps this base without clobbering them.
+    if theme.background.is_some() || theme.foreground.is_some() {
+        let mut base = Style::default();
+        if let Some(bg) = theme.background {
+            base = base.bg(bg);
+        }
+        if let Some(fg) = theme.foreground {
+            base = base.fg(fg);
+        }
+        frame.render_widget(Block::new().style(base), frame.area());
+    }
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
     let [left, right] =
@@ -2007,6 +2022,45 @@ mod tests {
         assert!(text.contains("README.md"));
         assert!(text.contains("src"));
         assert!(text.contains("quit"));
+    }
+
+    #[test]
+    fn themed_background_paints_cells_without_changing_glyphs() {
+        // The base-background fill must be purely a color change: it paints every cell's background
+        // but never alters a glyph — which is why a theme swap can't move a `.snap` (the snapshot
+        // harness records only `cell.symbol()`). This locks both halves of that contract.
+        let state = ready_state();
+        let render_with = |theme: &Theme| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| render(f, &state, theme)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let plain = render_with(&Theme::DARK); // background: None
+        let themed = render_with(&Theme {
+            background: Some(Color::Blue),
+            ..Theme::DARK
+        });
+
+        // (a) Every glyph is identical → a background can never move a snapshot.
+        let glyphs = |b: &ratatui::buffer::Buffer| -> String {
+            b.content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect()
+        };
+        assert_eq!(
+            glyphs(&plain),
+            glyphs(&themed),
+            "fill must not touch glyphs"
+        );
+
+        // (b) …but the fill actually did something: at least one cell's background differs.
+        let changed = plain
+            .content()
+            .iter()
+            .zip(themed.content().iter())
+            .any(|(p, t)| p.style().bg != t.style().bg);
+        assert!(changed, "themed background must paint at least one cell");
     }
 
     fn plan(tools: &[&str]) -> cairn_ai::Plan {

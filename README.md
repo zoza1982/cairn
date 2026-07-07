@@ -121,13 +121,39 @@ run at once by default — set `[transfers] concurrency = N` in config to change
 Entries are colored by **type** so folders, files, and archives read at a glance: blue directories,
 amber archives, green executables, cyan symlinks, purple streams (logs), red special nodes — and a
 hidden (`.`-prefixed) directory or file uses the dimmed variant of its color, so `.git/` is clearly
-a folder but recedes next to `src/`. Colors are themed under `[ui.colors]` — override individual
-roles (`focused_border`, `unfocused_border`, `dir`, `hidden_dir`, `file`, `hidden_file`, `archive`,
-`executable`, `symlink`, `stream`, `special`, `error`, `status`, `remote`, `selection_bg`,
-`selection_fg`) over the built-in `dark` preset, using color names or `#rrggbb`:
+a folder but recedes next to `src/`.
+
+Pick a **theme** with `[ui] theme = "..."`:
+
+| Preset | Look |
+|--------|------|
+| `dark` (default) | modern truecolor Tokyo-Night; leaves your terminal's own background |
+| `mc` | classic **Midnight Commander** — blue panels, cyan folders, black-on-cyan selection. Uses the 16 named ANSI colors, so it renders correctly even on a basic 16-color terminal |
+| `nord` | the arctic Nord palette |
+| `gruvbox` | warm retro Gruvbox (dark) |
+| `light` | a clean light scheme (forces its own light background) |
 
 ```toml
+[ui]
+theme = "mc"
+```
+
+The truecolor presets (`dark`/`nord`/`gruvbox`/`light`) are best-effort on terminals without
+24-bit color; pick `mc` for a guaranteed-correct look on a limited terminal. `dark` leaves the
+terminal background untouched, while `mc`/`nord`/`gruvbox`/`light` paint their own.
+
+Every color role is themeable under `[ui.colors]` on top of the chosen preset — override individual
+roles (`background`, `foreground`, `focused_border`, `unfocused_border`, `dir`, `hidden_dir`,
+`file`, `hidden_file`, `archive`, `executable`, `symlink`, `stream`, `special`, `error`, `status`,
+`remote`, `selection_bg`, `selection_fg`) using color names or `#rrggbb`. `background`/`foreground`
+also accept `none` to clear a preset's forced value back to the terminal default:
+
+```toml
+[ui]
+theme = "mc"
+
 [ui.colors]
+background     = "none"      # keep MC's colors but drop its blue panel background
 dir            = "#7aa2f7"
 hidden_dir     = "#4c5a8c"   # dimmed dir tone for .folders
 archive        = "#e0af68"   # .zip / .tar.gz / …
