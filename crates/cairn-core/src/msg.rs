@@ -48,6 +48,8 @@ pub enum Action {
     CycleSort,
     /// Toggle whether the active pane lists hidden entries (re-lists with the new `all` flag).
     ToggleHidden,
+    /// Cycle the color theme to the next built-in preset (live, no config edit).
+    CycleTheme,
     /// Begin filtering the active pane's listing (filter-as-you-type).
     Filter,
     /// Open the transfer-queue overlay (view active + pending transfers).
