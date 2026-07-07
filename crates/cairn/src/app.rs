@@ -60,6 +60,12 @@ const REMOTE_EDIT_TEMP_CONN_ID: ConnectionId = ConnectionId(u64::MAX);
 /// (`try_send`, dropped when the channel is full), so there is no back-pressure on the transfer.
 const TRANSFER_PROGRESS_STEP: u64 = 256 * 1024;
 
+/// Minimum wall-clock gap between pre-flight scan updates (`TransferScanning`). Throttled by time,
+/// not entry count, because stat/list latency spans orders of magnitude across backends (local vs an
+/// SFTP round-trip vs a cloud API): a fixed entry threshold would flood a fast local scan yet go
+/// silent for seconds on a slow remote one. ~120 ms keeps the walk visibly moving without flooding.
+const TRANSFER_SCAN_MIN_INTERVAL: Duration = Duration::from_millis(120);
+
 /// The resolved UI configuration threaded through the event loop (input mapping + colors).
 struct Ui {
     keymap: Keymap,
@@ -2647,14 +2653,20 @@ fn windowed_rate(samples: &mut VecDeque<(u64, u64)>, now_ms: u64, bytes: u64) ->
     avg_rate(bytes.saturating_sub(b0), secs)
 }
 
-/// Sum the source file sizes of a transfer's `items` (recursively for directories), for a
-/// percentage/ETA. Best-effort: returns `None` if any stat/listing fails or a size is unknown, so
-/// the caller falls back to a byte+rate display rather than a misleading total.
-async fn scan_total_bytes(src: &Arc<dyn Vfs>, items: &[(VfsPath, VfsPath)]) -> Option<u64> {
+/// Recursively sum the byte size of `items` for the percentage/ETA total. `on_scan(bytes_so_far,
+/// current_path)` is called for each node visited so the caller can surface a live "Counting" phase
+/// (it throttles its own emission). Best-effort: any stat/list error returns `None` (degrades to a
+/// byte+rate display). The walk is cancellable by the caller via `tokio::select!` on the outer future.
+async fn scan_total_bytes(
+    src: &Arc<dyn Vfs>,
+    items: &[(VfsPath, VfsPath)],
+    on_scan: &mut (dyn FnMut(u64, &str) + Send),
+) -> Option<u64> {
     let mut total: u64 = 0;
     for (from, _) in items {
         let mut stack = vec![from.clone()];
         while let Some(path) = stack.pop() {
+            on_scan(total, &path.as_str());
             let meta = src.stat(&path).await.ok()?;
             if meta.is_dir() {
                 let mut stream = src.list(&path, ListOpts { all: true });
@@ -2698,6 +2710,27 @@ async fn run_transfer_effect(
             error: true,
         };
     };
+    // Pre-flight "Counting" phase emitter: the conflict pre-check and the size scan below both walk
+    // paths before any byte moves, so they share one monotonic entry counter and a wall-clock
+    // throttle. Each call reports the running entry count, bytes discovered so far, and the path being
+    // visited, so the dialog shows the walk descending the tree in real time instead of a frozen 0%.
+    let mut scan_entries = 0u64;
+    let mut last_scan_emit: Option<std::time::Instant> = None;
+    let mut on_scan = |bytes_found: u64, current: &str| {
+        scan_entries += 1;
+        let now = std::time::Instant::now();
+        let due =
+            last_scan_emit.is_none_or(|t| now.duration_since(t) >= TRANSFER_SCAN_MIN_INTERVAL);
+        if due {
+            last_scan_emit = Some(now);
+            let _ = event_tx.try_send(AppEvent::TransferScanning {
+                id,
+                entries: scan_entries,
+                bytes: bytes_found,
+                current: current.to_owned(),
+            });
+        }
+    };
     // Unless the user already confirmed, refuse to clobber: count existing destinations and bounce
     // back a `TransferConflict` so the UI can ask first (data-safety — no silent overwrite). Only a
     // definite `NotFound` is "safe to write"; any other stat error aborts rather than risk an
@@ -2713,6 +2746,7 @@ async fn run_transfer_effect(
                     error: false,
                 };
             }
+            on_scan(0, &to.as_str());
             match dst.stat(to).await {
                 Ok(_) => conflicts += 1,
                 Err(VfsError::NotFound(_)) => {}
@@ -2754,7 +2788,7 @@ async fn run_transfer_effect(
         None
     } else {
         tokio::select! {
-            t = scan_total_bytes(&src, &items) => t,
+            t = scan_total_bytes(&src, &items, &mut on_scan) => t,
             () = cancel.cancelled() => None,
         }
     };
@@ -2783,7 +2817,23 @@ async fn run_transfer_effect(
     let mut last_sent = 0u64;
     let mut on_progress = {
         let last_rate = last_rate.clone();
-        move |b: u64| {
+        move |ev: cairn_transfer::ProgressEvent| {
+            // `Finalizing` marks the flush/verify tail of a file — no bytes, but it must reach the UI
+            // immediately (unthrottled, once per file) so the bar reads an honest 100% + "Finalizing…"
+            // instead of appearing stuck; it never shares the byte throttle counter.
+            if matches!(ev, cairn_transfer::ProgressEvent::Finalizing) {
+                let _ = event_tx.try_send(AppEvent::TransferProgress {
+                    id,
+                    bytes,
+                    rate_bps: last_rate.load(Ordering::Relaxed),
+                    total,
+                    finalizing: true,
+                });
+                return;
+            }
+            let cairn_transfer::ProgressEvent::Bytes(b) = ev else {
+                return;
+            };
             bytes += b;
             debug_assert!(bytes >= last_sent, "progress bytes must be cumulative");
             // Update the window on *every* progress call (cheap, amortized O(1)) so `last_rate` is
@@ -2800,6 +2850,7 @@ async fn run_transfer_effect(
                     bytes,
                     rate_bps: rate,
                     total,
+                    finalizing: false,
                 });
             }
         }
@@ -2817,6 +2868,7 @@ async fn run_transfer_effect(
                 bytes: out.bytes,
                 rate_bps: last_rate.load(Ordering::Relaxed),
                 total,
+                finalizing: false,
             });
             AppEvent::TransferDone {
                 id,
@@ -4933,6 +4985,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transfer_emits_scanning_then_finalizing_events() {
+        // End-to-end wiring of the pre-flight scan + finalize signals through `run_transfer_effect`:
+        // the pre-scan must put at least one `TransferScanning` on the channel (so the dialog can show
+        // the "Counting" phase), and the copy must emit a `TransferProgress { finalizing: true }`
+        // before completion (so the bar can reach an honest 100%).
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("src.txt"), b"hello world").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        registry
+            .insert(RIGHT, Arc::new(LocalVfs::new(RIGHT, dir.path())))
+            .await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let ev = run_transfer_effect(
+            &registry,
+            1,
+            LEFT,
+            RIGHT,
+            vec![(
+                VfsPath::parse("/src.txt").unwrap(),
+                VfsPath::parse("/dst.txt").unwrap(),
+            )],
+            false,
+            true, // overwrite: the scanning here comes from the size scan, not the conflict loop
+            &tx,
+            CancellationToken::new(),
+            watch::channel(false).1,
+        )
+        .await;
+        assert!(matches!(ev, AppEvent::TransferDone { error: false, .. }));
+
+        let mut saw_scanning = false;
+        let mut saw_finalizing = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                AppEvent::TransferScanning { id, current, .. } => {
+                    assert_eq!(id, 1);
+                    assert!(
+                        !current.is_empty(),
+                        "scanning reports the path being walked"
+                    );
+                    saw_scanning = true;
+                }
+                AppEvent::TransferProgress {
+                    finalizing: true, ..
+                } => saw_finalizing = true,
+                _ => {}
+            }
+        }
+        assert!(saw_scanning, "expected at least one TransferScanning event");
+        assert!(
+            saw_finalizing,
+            "expected a finalizing TransferProgress before completion"
+        );
+    }
+
+    #[tokio::test]
     async fn create_dir_makes_a_directory() {
         let dir = tempfile_dir();
         let registry = VfsRegistry::new();
@@ -4955,7 +5066,14 @@ mod tests {
             (VfsPath::parse("/a.txt").unwrap(), VfsPath::root()),
             (VfsPath::parse("/d").unwrap(), VfsPath::root()),
         ];
-        assert_eq!(scan_total_bytes(&src, &items).await, Some(11));
+        // The scan callback fires for every visited node (a.txt; d and its child b.txt) so the UI
+        // can show the walk progressing — 3 visits for these two items.
+        let mut visits = 0u32;
+        assert_eq!(
+            scan_total_bytes(&src, &items, &mut |_b, _p| visits += 1).await,
+            Some(11)
+        );
+        assert_eq!(visits, 3, "on_scan fires once per visited node");
     }
 
     #[tokio::test]
@@ -4967,12 +5085,20 @@ mod tests {
         let src: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
         // A symlink (no known size) is skipped, not fatal: the directory total is just the file.
         assert_eq!(
-            scan_total_bytes(&src, &[(VfsPath::root(), VfsPath::root())]).await,
+            scan_total_bytes(
+                &src,
+                &[(VfsPath::root(), VfsPath::root())],
+                &mut |_b, _p| {}
+            )
+            .await,
             Some(5)
         );
         // A missing source degrades to None (best-effort) rather than panicking.
         let missing = vec![(VfsPath::parse("/nope").unwrap(), VfsPath::root())];
-        assert_eq!(scan_total_bytes(&src, &missing).await, None);
+        assert_eq!(
+            scan_total_bytes(&src, &missing, &mut |_b, _p| {}).await,
+            None
+        );
     }
 
     #[test]

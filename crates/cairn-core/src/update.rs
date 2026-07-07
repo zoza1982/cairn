@@ -5,7 +5,7 @@ use crate::state::{
     ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionFormStage, ConnectionKind,
     FieldValue, FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame, Overlay, PagerMode,
     PagerStatus, PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side, SortMode, TransferId,
-    WritebackChoice, PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES,
+    TransferPhase, WritebackChoice, PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES,
     SESSION_OUTPUT_MAX_LINES,
 };
 use bytes::Bytes;
@@ -3155,6 +3155,9 @@ fn arm_transfer(
     state.active_transfers.push(ActiveTransfer {
         id,
         label,
+        phase: TransferPhase::Counting,
+        scan_entries: 0,
+        scan_path: String::new(),
         bytes: 0,
         rate: None,
         total: None,
@@ -3675,14 +3678,42 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // Refresh both panes so any filesystem changes the plan made are reflected.
             finish_op(state, &status, error)
         }
+        AppEvent::TransferScanning {
+            id,
+            entries,
+            bytes,
+            current,
+        } => {
+            // Advisory display only; ignore an update for a transfer that already finished.
+            if let Some(t) = state.active_transfers.iter_mut().find(|t| t.id == id) {
+                t.phase = TransferPhase::Counting;
+                t.scan_entries = entries;
+                t.scan_path = current;
+                t.bytes = bytes;
+            }
+            Vec::new()
+        }
         AppEvent::TransferProgress {
             id,
             bytes,
             rate_bps,
             total,
+            finalizing,
         } => {
-            // Advisory display only; ignore an update for a transfer that already finished.
+            // Advisory display only; ignore an update for a transfer that already finished. The first
+            // byte/finalize update is also how a transfer *leaves* the Counting phase.
             if let Some(t) = state.active_transfers.iter_mut().find(|t| t.id == id) {
+                // A `finalizing` signal fires once per file (before its flush/verify). Only treat it
+                // as the transfer-wide Finalizing phase when the *whole* transfer is at its tail —
+                // all bytes written, or an unknown total — otherwise a directory copy would snap the
+                // bar to 100% at every file boundary. A mid-tree per-file finalize stays in Copying.
+                let whole_transfer_done = total.is_none_or(|tot| bytes >= tot);
+                t.phase = if finalizing && whole_transfer_done {
+                    TransferPhase::Finalizing
+                } else {
+                    TransferPhase::Copying
+                };
+                t.scan_path = String::new();
                 t.bytes = bytes;
                 t.rate = Some(rate_bps);
                 t.total = total;
@@ -4933,6 +4964,7 @@ mod tests {
                 bytes: 4096,
                 rate_bps: 2048,
                 total: None,
+                finalizing: false,
             }),
         );
         assert_eq!(t_bytes(&s), Some(4096));
@@ -4951,6 +4983,77 @@ mod tests {
     }
 
     #[test]
+    fn transfer_phase_advances_counting_then_copying_then_finalizing() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        // A freshly-armed transfer starts in the pre-flight Counting phase.
+        assert_eq!(s.active_transfers[0].phase, TransferPhase::Counting);
+
+        // Scan updates keep it Counting and surface the live count + path being walked.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferScanning {
+                id: 1,
+                entries: 42,
+                bytes: 1000,
+                current: "/a/b/c.txt".to_owned(),
+            }),
+        );
+        assert_eq!(s.active_transfers[0].phase, TransferPhase::Counting);
+        assert_eq!(s.active_transfers[0].scan_entries, 42);
+        assert_eq!(s.active_transfers[0].scan_path, "/a/b/c.txt");
+        assert_eq!(s.active_transfers[0].bytes, 1000);
+
+        // The first byte progress flips it to Copying and clears the scan path.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress {
+                id: 1,
+                bytes: 2048,
+                rate_bps: 512,
+                total: Some(4096),
+                finalizing: false,
+            }),
+        );
+        assert_eq!(s.active_transfers[0].phase, TransferPhase::Copying);
+        assert!(s.active_transfers[0].scan_path.is_empty());
+        assert_eq!(s.active_transfers[0].bytes, 2048);
+
+        // A per-file finalize *mid-transfer* (bytes < total: it's one file of many in a directory
+        // copy) must NOT flip the whole transfer to Finalizing — that would snap the bar to 100% at
+        // every file boundary. It stays Copying.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress {
+                id: 1,
+                bytes: 3000,
+                rate_bps: 512,
+                total: Some(4096),
+                finalizing: true,
+            }),
+        );
+        assert_eq!(
+            s.active_transfers[0].phase,
+            TransferPhase::Copying,
+            "a mid-tree per-file finalize stays Copying"
+        );
+
+        // The final file's finalize (all bytes written) flips it to Finalizing (the flush/verify tail).
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress {
+                id: 1,
+                bytes: 4096,
+                rate_bps: 512,
+                total: Some(4096),
+                finalizing: true,
+            }),
+        );
+        assert_eq!(s.active_transfers[0].phase, TransferPhase::Finalizing);
+    }
+
+    #[test]
     fn transfer_progress_after_completion_is_ignored() {
         let mut s = state();
         // No transfer tracked: a late/stray progress event must not resurrect the indicator.
@@ -4961,6 +5064,7 @@ mod tests {
                 bytes: 10,
                 rate_bps: 0,
                 total: None,
+                finalizing: false,
             }),
         );
         assert_eq!(t_bytes(&s), None);
@@ -4989,6 +5093,7 @@ mod tests {
                 bytes: 8192,
                 rate_bps: 0,
                 total: None,
+                finalizing: false,
             }),
         );
         assert_eq!(t_bytes(&s), Some(8192));
@@ -5088,6 +5193,7 @@ mod tests {
                 bytes: 4096,
                 rate_bps: 1024,
                 total: None,
+                finalizing: false,
             }),
         );
         assert_eq!(s.active_transfers[0].bytes, 0, "id 1 untouched");

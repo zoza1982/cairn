@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│>  src/                               ││>  src/                               │
+│   docs/                              ││   docs/                              │
+│   Cargo.toml                         ││   Cargo.toml                         │
+│   README.md                          ││   README.md                          │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│    ┌ Transfer ──────────────────────────────────────────────────────────┐    │
+│    │> Copying release.tar.gz → /srv/www                                 │    │
+│    │  █████████████████████████████████████████████████████████████ 100%│    │
+│    │  8.0 MiB   Finalizing…                                             │    │
+│    │                                                                    │    │
+│    │[b] background · [p] pause sel · [Esc] abort all                    │    │
+│    │[↑↓] select · [d] cancel/drop · [K/J] reorder · [x] clear           │    │
+│    └────────────────────────────────────────────────────────────────────┘    │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 1/4   ⇅ transferring… 8.0 MiB / 8.0 MiB (100%)

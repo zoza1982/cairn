@@ -82,6 +82,16 @@ pub fn all() -> Vec<Scenario> {
             build: transfer_active,
         },
         Scenario {
+            name: "transfer-scanning",
+            description: "the transfer dialog during the pre-flight size scan: a live item count, bytes found, and the path being walked — motion, not a frozen 0%",
+            build: transfer_scanning,
+        },
+        Scenario {
+            name: "transfer-finalizing",
+            description: "the transfer dialog on the flush/verify tail: an honest 100% bar with a Finalizing… label, never a stall at 99%",
+            build: transfer_finalizing,
+        },
+        Scenario {
             name: "pager-text",
             description: "the read-only pager (F3) in text mode",
             build: pager_text,
@@ -303,11 +313,57 @@ fn transfer_active() -> AppState {
     s.active_transfers.push(cairn_core::ActiveTransfer {
         id,
         label: "Copying release.tar.gz → /srv/www".to_owned(),
+        phase: cairn_core::TransferPhase::Copying,
+        scan_entries: 0,
+        scan_path: String::new(),
         bytes: 4 * 1024 * 1024,
         rate: Some(2 * 1024 * 1024),
         total: Some(8 * 1024 * 1024),
         paused: false,
     });
+    s
+}
+
+fn transfer_scanning() -> AppState {
+    // The pre-flight "Counting" phase: the size scan is walking the source tree, so the dialog shows
+    // a live item count, bytes found so far, and the path currently being visited — an indeterminate
+    // bar with motion, not a frozen 0%.
+    let mut s = dual_pane();
+    let id = s.next_transfer_id;
+    s.next_transfer_id += 1;
+    s.active_transfers.push(cairn_core::ActiveTransfer {
+        id,
+        label: "Copying project → dietpi6:/srv".to_owned(),
+        phase: cairn_core::TransferPhase::Counting,
+        scan_entries: 1287,
+        scan_path: "/home/me/project/node_modules/react/index.js".to_owned(),
+        bytes: 42 * 1024 * 1024,
+        rate: None,
+        total: None,
+        paused: false,
+    });
+    s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+    s
+}
+
+fn transfer_finalizing() -> AppState {
+    // The "Finalizing" phase: the last file's bytes are all written and the engine is flushing/
+    // verifying it — a real 100% bar with a "Finalizing…" tail (no rate/ETA), never a stall at 99%.
+    let mut s = dual_pane();
+    let id = s.next_transfer_id;
+    s.next_transfer_id += 1;
+    s.active_transfers.push(cairn_core::ActiveTransfer {
+        id,
+        label: "Copying release.tar.gz → /srv/www".to_owned(),
+        phase: cairn_core::TransferPhase::Finalizing,
+        scan_entries: 0,
+        scan_path: String::new(),
+        bytes: 8 * 1024 * 1024,
+        rate: Some(2 * 1024 * 1024),
+        total: Some(8 * 1024 * 1024),
+        paused: false,
+    });
+    s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
     s
 }
 
@@ -402,6 +458,9 @@ fn transfer_queue() -> AppState {
     s.active_transfers.push(cairn_core::ActiveTransfer {
         id: id2,
         label: "Moving 2 items → dietpi6:/backups".to_owned(),
+        phase: cairn_core::TransferPhase::Copying,
+        scan_entries: 0,
+        scan_path: String::new(),
         bytes: 1024 * 1024,
         rate: None,
         total: None,

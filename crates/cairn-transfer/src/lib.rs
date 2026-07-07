@@ -22,6 +22,19 @@ pub use error::TransferError;
 /// The chunk size used by the stream-through copy path.
 const CHUNK: usize = 1 << 20; // 1 MiB
 
+/// A progress signal from the engine to its caller. Bytes drive the percentage bar; `Finalizing`
+/// marks that a file's bytes are all written and the engine is now flushing/closing (and, under
+/// size-verify, re-stat'ing) it — opaque backend work that moves no bytes, so the caller can show an
+/// honest 100% + "Finalizing…" instead of a bar that appears stuck just short of done. The next
+/// file's first `Bytes` (or the transfer completing) implicitly clears the finalizing state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressEvent {
+    /// `n` more bytes were written by a chunk (or a whole server-side copy).
+    Bytes(u64),
+    /// The current file's bytes are all written; `finish()`/verify is running next.
+    Finalizing,
+}
+
 /// Whether a transfer copies or moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferOp {
@@ -91,7 +104,8 @@ pub struct TransferOutcome {
 
 /// Run a transfer of `items` (source path → destination path) from `src` to `dst`.
 ///
-/// `progress` is called with the number of bytes written by each chunk. Cancellation is cooperative:
+/// `progress` receives a [`ProgressEvent`] per chunk ([`ProgressEvent::Bytes`]) and once per file
+/// right before its flush/verify tail ([`ProgressEvent::Finalizing`]). Cancellation is cooperative:
 /// the token is checked between chunks and between items; an in-flight write is aborted.
 ///
 /// While `paused` holds `true` the transfer blocks at the next check-point (between items, tree
@@ -108,7 +122,7 @@ pub async fn run_transfer(
     spec: TransferSpec,
     cancel: &CancellationToken,
     paused: &watch::Receiver<bool>,
-    progress: &mut (dyn FnMut(u64) + Send),
+    progress: &mut (dyn FnMut(ProgressEvent) + Send),
 ) -> Result<TransferOutcome, TransferError> {
     let mut outcome = TransferOutcome::default();
     for (from, to) in items {
@@ -177,7 +191,7 @@ async fn transfer_one(
     spec: TransferSpec,
     cancel: &CancellationToken,
     paused: &watch::Receiver<bool>,
-    progress: &mut (dyn FnMut(u64) + Send),
+    progress: &mut (dyn FnMut(ProgressEvent) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
     // Same-connection move with rename support: a single atomic rename.
@@ -207,7 +221,7 @@ async fn copy_tree(
     spec: TransferSpec,
     cancel: &CancellationToken,
     paused: &watch::Receiver<bool>,
-    progress: &mut (dyn FnMut(u64) + Send),
+    progress: &mut (dyn FnMut(ProgressEvent) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
     let mut stack: VecDeque<(VfsPath, VfsPath)> = VecDeque::new();
@@ -248,7 +262,7 @@ async fn copy_file(
     spec: TransferSpec,
     cancel: &CancellationToken,
     paused: &watch::Receiver<bool>,
-    progress: &mut (dyn FnMut(u64) + Send),
+    progress: &mut (dyn FnMut(ProgressEvent) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
     // Resolve conflicts against the destination before writing.
@@ -261,11 +275,14 @@ async fn copy_file(
     };
     let (to, overwrite) = target;
 
-    // Same-connection server-side copy fast path.
+    // Same-connection server-side copy fast path. It writes no bytes through us and the server-side
+    // copy can itself be slow (a large same-bucket object), so signal `Finalizing` first — otherwise
+    // the whole operation would be invisible until it's already done.
     if src.connection() == dst.connection() && src.caps_at(from).contains(Caps::COPY_SERVER) {
+        progress(ProgressEvent::Finalizing);
         src.copy_within(from, &to).await?;
         let written = dst.stat(&to).await?.size.unwrap_or(0);
-        progress(written);
+        progress(ProgressEvent::Bytes(written));
         outcome.files += 1;
         outcome.bytes += written;
         return Ok(());
@@ -303,8 +320,12 @@ async fn copy_file(
             .write_chunk(Bytes::copy_from_slice(&buf[..n]))
             .await?;
         written += n as u64;
-        progress(n as u64);
+        progress(ProgressEvent::Bytes(n as u64));
     }
+    // Bytes are all read/written; the flush/close (and the size-verify stat below) is opaque backend
+    // work that moves no bytes — signal it so the caller shows a real 100% + "Finalizing…" rather
+    // than a bar pinned just short of done while a slow remote fsync completes.
+    progress(ProgressEvent::Finalizing);
     let entry: Entry = writer.finish().await?;
 
     if spec.verify == VerifyPolicy::Size {
@@ -393,7 +414,15 @@ mod tests {
         VfsPath::parse(s).unwrap()
     }
 
-    fn noop(_b: u64) {}
+    fn noop(_e: ProgressEvent) {}
+
+    /// Sum only the byte events from a progress stream (ignoring `Finalizing`), for tests that assert
+    /// on total bytes reported.
+    fn add_bytes(acc: &mut u64, e: ProgressEvent) {
+        if let ProgressEvent::Bytes(n) = e {
+            *acc += n;
+        }
+    }
 
     /// A receiver that is never paused. The sender is dropped immediately, which is fine: while the
     /// value is `false`, `wait_while_paused` returns before it ever awaits `changed()`.
@@ -478,7 +507,7 @@ mod tests {
             TransferSpec::default(),
             &cancel,
             &never_paused(),
-            &mut |b| bytes += b,
+            &mut |e| add_bytes(&mut bytes, e),
         )
         .await
         .unwrap();
@@ -506,6 +535,33 @@ mod tests {
         assert_eq!(out.files, 2);
         assert_eq!(read_file(&dst, "/d/a.txt").await, "hello");
         assert_eq!(read_file(&dst, "/d/b.txt").await, "world");
+    }
+
+    #[tokio::test]
+    async fn emits_one_finalizing_signal_per_file() {
+        // The UI relies on exactly one `Finalizing` per file to render the flush/verify tail as an
+        // honest 100% instead of a stall. Copying a two-file tree must emit two.
+        let (src, dst) = cross();
+        let cancel = CancellationToken::new();
+        let mut finalizing = 0u32;
+        let mut byte_calls = 0u32;
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/d"), p("/d"))],
+            TransferSpec::default(),
+            &cancel,
+            &never_paused(),
+            &mut |e| match e {
+                ProgressEvent::Finalizing => finalizing += 1,
+                ProgressEvent::Bytes(_) => byte_calls += 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.files, 2);
+        assert_eq!(finalizing, 2, "one Finalizing per file");
+        assert!(byte_calls >= 2, "each file's bytes were reported");
     }
 
     #[tokio::test]
@@ -646,15 +702,17 @@ mod tests {
     #[tokio::test]
     async fn cancel_after_first_item_reports_partial_outcome() {
         let (src, dst) = cross();
-        // Each small file is one chunk → one progress call. Cancel on the *second* call: the first
-        // item is fully copied, the second is aborted mid-chunk. The reported outcome should reflect
-        // exactly the completed first item.
+        // Each small file is one chunk → one byte-progress call. Cancel on the *second* byte call
+        // (ignoring the per-file `Finalizing` signal): the first item is fully copied, the second is
+        // aborted mid-chunk. The reported outcome should reflect exactly the completed first item.
         let cancel = CancellationToken::new();
         let mut calls = 0u32;
-        let mut on_progress = |_n: u64| {
-            calls += 1;
-            if calls == 2 {
-                cancel.cancel();
+        let mut on_progress = |e: ProgressEvent| {
+            if matches!(e, ProgressEvent::Bytes(_)) {
+                calls += 1;
+                if calls == 2 {
+                    cancel.cancel();
+                }
             }
         };
         let res = run_transfer(
@@ -685,10 +743,12 @@ mod tests {
         let (src, dst) = cross(); // cross-backend → move = copy then remove source
         let cancel = CancellationToken::new();
         let mut calls = 0u32;
-        let mut on_progress = |_n: u64| {
-            calls += 1;
-            if calls == 2 {
-                cancel.cancel();
+        let mut on_progress = |e: ProgressEvent| {
+            if matches!(e, ProgressEvent::Bytes(_)) {
+                calls += 1;
+                if calls == 2 {
+                    cancel.cancel();
+                }
             }
         };
         let spec = TransferSpec {

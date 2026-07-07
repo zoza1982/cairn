@@ -22,7 +22,7 @@ pub use state::{
     ContentHash, DiscoverySource, FieldValue, FileKind, Listing, LogViewerId, LogViewerStatus,
     MaskedInput, MountFrame, Overlay, PagerId, PagerMode, PagerStatus, PaneLocation, PaneState,
     PendingSave, PromptKind, QueuedTransfer, RemoteEditId, RemoteVersion, SessionEnd,
-    SessionRecord, ShellActionMeta, Side, SortMode, TransferId, WritebackChoice,
+    SessionRecord, ShellActionMeta, Side, SortMode, TransferId, TransferPhase, WritebackChoice,
     WritebackConflictReason, LOG_VIEWER_MAX_BYTES, LOG_VIEWER_MAX_LINES, PAGER_HEX_ROW_BYTES,
     PAGER_MAX_BYTES, REMOTE_EDIT_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
