@@ -158,6 +158,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Transfer dialog polish.** The progress bar now ticks smoothly for small/slow copies (a copy whose
+  total is under one 256 KiB step — many tiny files — used to sit at `0 B (0%)` until it finished);
+  progress updates are now also time-driven (~120 ms). The pre-flight scan line no longer overflows:
+  the running item count + bytes sit on one line and the path being walked on its own line,
+  left-truncated to its meaningful tail (`…/functions/foo.js`). And the selected transfer highlights
+  only its label line instead of reverse-video across the whole three-line block (which read as a
+  rendering glitch and inverted the progress bar).
+
 - **The transfer progress bar no longer stalls near 99%.** Progress was a raw bytes÷total ratio, so
   the per-file flush/close/verify tail (slow over SFTP) left the bar pinned just short of done, and a
   slightly over-counted scan total could keep it at 99% until completion. The bar is now phase-driven:

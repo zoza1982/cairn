@@ -60,11 +60,25 @@ const REMOTE_EDIT_TEMP_CONN_ID: ConnectionId = ConnectionId(u64::MAX);
 /// (`try_send`, dropped when the channel is full), so there is no back-pressure on the transfer.
 const TRANSFER_PROGRESS_STEP: u64 = 256 * 1024;
 
-/// Minimum wall-clock gap between pre-flight scan updates (`TransferScanning`). Throttled by time,
-/// not entry count, because stat/list latency spans orders of magnitude across backends (local vs an
-/// SFTP round-trip vs a cloud API): a fixed entry threshold would flood a fast local scan yet go
-/// silent for seconds on a slow remote one. ~120 ms keeps the walk visibly moving without flooding.
-const TRANSFER_SCAN_MIN_INTERVAL: Duration = Duration::from_millis(120);
+/// Minimum wall-clock gap (milliseconds) between coalesced transfer UI updates — both the pre-flight
+/// scan (`TransferScanning`) and the time-driven byte-progress tick. Throttled by time, not
+/// entry/byte count, because stat/list/copy rates span orders of magnitude across backends (local vs
+/// an SFTP round-trip vs a cloud API): a fixed count threshold would flood a fast local operation yet
+/// go silent for seconds on a slow remote one. ~120 ms keeps things visibly moving without flooding.
+const TRANSFER_UI_MIN_INTERVAL_MS: u64 = 120;
+/// [`TRANSFER_UI_MIN_INTERVAL_MS`] as a [`Duration`], for the scan's `Instant`-based throttle.
+const TRANSFER_UI_MIN_INTERVAL: Duration = Duration::from_millis(TRANSFER_UI_MIN_INTERVAL_MS);
+
+/// Whether a byte-progress UI update should be emitted now: on either enough new bytes
+/// ([`TRANSFER_PROGRESS_STEP`]) *or* enough elapsed wall-clock ([`TRANSFER_UI_MIN_INTERVAL_MS`]) since
+/// the last emit — the latter so a small/slow copy (total under one step) still ticks instead of
+/// sitting at 0%. A time-only tick never fires without real progress (`bytes > last_sent`), so a
+/// stalled/zero-byte transfer emits no redundant frames.
+fn progress_emit_due(bytes: u64, last_sent: u64, now_ms: u64, last_sent_ms: u64) -> bool {
+    let step_due = bytes - last_sent >= TRANSFER_PROGRESS_STEP;
+    let time_due = now_ms.saturating_sub(last_sent_ms) >= TRANSFER_UI_MIN_INTERVAL_MS;
+    step_due || (time_due && bytes > last_sent)
+}
 
 /// The resolved UI configuration threaded through the event loop (input mapping + colors).
 struct Ui {
@@ -2719,8 +2733,7 @@ async fn run_transfer_effect(
     let mut on_scan = |bytes_found: u64, current: &str| {
         scan_entries += 1;
         let now = std::time::Instant::now();
-        let due =
-            last_scan_emit.is_none_or(|t| now.duration_since(t) >= TRANSFER_SCAN_MIN_INTERVAL);
+        let due = last_scan_emit.is_none_or(|t| now.duration_since(t) >= TRANSFER_UI_MIN_INTERVAL);
         if due {
             last_scan_emit = Some(now);
             let _ = event_tx.try_send(AppEvent::TransferScanning {
@@ -2815,6 +2828,10 @@ async fn run_transfer_effect(
 
     let mut bytes = 0u64;
     let mut last_sent = 0u64;
+    // Wall-clock of the last UI byte-update, so progress ticks on time too — not only every
+    // `TRANSFER_PROGRESS_STEP` bytes. Without this a copy whose *total* is under one step (many tiny
+    // files, or a slow trickle) sits at "0 B / … (0%)" until it completes.
+    let mut last_sent_ms = 0u64;
     let mut on_progress = {
         let last_rate = last_rate.clone();
         move |ev: cairn_transfer::ProgressEvent| {
@@ -2843,8 +2860,11 @@ async fn run_transfer_effect(
             let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let rate = windowed_rate(&mut rate_samples, now_ms, bytes);
             last_rate.store(rate, Ordering::Relaxed);
-            if bytes - last_sent >= TRANSFER_PROGRESS_STEP {
+            // Emit on either enough bytes *or* enough elapsed time, so both a fast big-file copy
+            // (byte-driven) and a slow/many-small-file copy (time-driven) tick smoothly.
+            if progress_emit_due(bytes, last_sent, now_ms, last_sent_ms) {
                 last_sent = bytes;
+                last_sent_ms = now_ms;
                 let _ = event_tx.try_send(AppEvent::TransferProgress {
                     id,
                     bytes,
@@ -5099,6 +5119,25 @@ mod tests {
             scan_total_bytes(&src, &missing, &mut |_b, _p| {}).await,
             None
         );
+    }
+
+    #[test]
+    fn progress_emit_due_fires_on_bytes_or_time_but_not_on_a_stall() {
+        // Byte-driven: a full step emits even with no elapsed time.
+        assert!(progress_emit_due(TRANSFER_PROGRESS_STEP, 0, 0, 0));
+        // Under a step and under the interval: no emit yet.
+        assert!(!progress_emit_due(100, 0, 50, 0));
+        // Time-driven: past the interval with real progress → emit (this is the small/slow-copy fix).
+        assert!(progress_emit_due(100, 0, TRANSFER_UI_MIN_INTERVAL_MS, 0));
+        // Enough time but NO new bytes (a stall): must not emit a redundant frame.
+        assert!(!progress_emit_due(
+            42,
+            42,
+            10 * TRANSFER_UI_MIN_INTERVAL_MS,
+            0
+        ));
+        // Clock going backwards (defensive) saturates rather than underflowing → no spurious emit.
+        assert!(!progress_emit_due(50, 50, 0, 1000));
     }
 
     #[test]
