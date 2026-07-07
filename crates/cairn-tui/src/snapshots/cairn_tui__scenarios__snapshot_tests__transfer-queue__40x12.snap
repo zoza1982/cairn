@@ -6,11 +6,11 @@ expression: frame
 │> Copying release.tar.gz → /srv/www   │
 │  ████████████████░░░░░░░░░░░░░░░░ 50%│
 │  4.0 MiB / 8.0 MiB   2.0 MiB/s   ETA │
+│                                      │
 │  Moving 2 items → dietpi6:…  ⏸ paused│
 │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│
 │  1.0 MiB                             │
+│                                      │
 │  1. move 1 item(s)                   │
 │                                      │
-│[b] background · [p] pause sel · [Esc]│
-│[↑↓] select · [d] cancel/drop · [K/J] │
 └──────────────────────────────────────┘
