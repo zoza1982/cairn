@@ -1521,6 +1521,25 @@ pub enum LogViewerStatus {
     Error(String),
 }
 
+/// Which stage of a transfer's lifecycle is visible right now, so the UI draws each stage honestly
+/// instead of inferring it from a byte ratio (a ratio can't tell "no bytes yet because we're still
+/// walking the source tree" apart from "no bytes yet because it's frozen", nor "all bytes written,
+/// now flushing/verifying" apart from "stuck at 99%").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransferPhase {
+    /// Pre-flight: the destination conflict-check and recursive size scan are still walking the
+    /// source tree. No bytes move yet; [`ActiveTransfer::scan_entries`] and
+    /// [`ActiveTransfer::scan_path`] are the live counters the dialog shows.
+    #[default]
+    Counting,
+    /// Bytes are flowing; `bytes`/`total` drive the percentage bar.
+    Copying,
+    /// The current (typically last) file's bytes are all written; the engine is flushing/closing it
+    /// and, under size-verify, re-stat'ing it. No further byte growth until the next file or
+    /// completion — rendered as an honest 100% with a "Finalizing…" label, never a stalled ratio.
+    Finalizing,
+}
+
 /// One in-flight transfer the reducer tracks for display and control. The full source/destination
 /// detail lives runtime-side; this is the secret-free view the UI renders.
 #[derive(Debug, Clone)]
@@ -1529,7 +1548,16 @@ pub struct ActiveTransfer {
     pub id: TransferId,
     /// Human-readable label, e.g. "Copying 3 item(s)…".
     pub label: String,
-    /// Cumulative bytes transferred so far.
+    /// The lifecycle stage the UI should render (see [`TransferPhase`]). Starts at
+    /// [`TransferPhase::Counting`]; the first byte/finalize update flips it.
+    pub phase: TransferPhase,
+    /// Entries visited by the pre-flight scan so far — the live "N items" counter shown while
+    /// [`phase`](Self::phase) is [`TransferPhase::Counting`]. Meaningless afterward.
+    pub scan_entries: u64,
+    /// The path the pre-flight scan is currently visiting, so the dialog shows the walk descending
+    /// the tree in real time rather than a static "Counting…". Empty outside `Counting`.
+    pub scan_path: String,
+    /// Cumulative bytes transferred so far (during `Counting`, the bytes discovered by the scan).
     pub bytes: u64,
     /// Average throughput (bytes/sec); `None` until the first progress update.
     pub rate: Option<u64>,

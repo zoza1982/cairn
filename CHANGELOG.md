@@ -139,7 +139,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConnectionChoice::hidden = true`) so the switcher's "show hidden" toggle (`S`) can reveal — and
   un-hide — it. The on-disk `[discovery]` schema is unchanged.
 
+### Added
+
+- **The transfer dialog now shows a live pre-flight scan** instead of appearing frozen when a
+  copy/move starts. Before any bytes move, the engine walks the source tree to size it; that walk is
+  now surfaced as a `Counting` phase — a running item count, bytes discovered, and the path currently
+  being visited (`Scanning 1287 items · 42 MiB /home/me/project/…`) with an indeterminate bar — so a
+  large or remote (SFTP) folder shows the tree being traversed in real time rather than a static 0%.
+
 ### Fixed
+
+- **The transfer progress bar no longer stalls near 99%.** Progress was a raw bytes÷total ratio, so
+  the per-file flush/close/verify tail (slow over SFTP) left the bar pinned just short of done, and a
+  slightly over-counted scan total could keep it at 99% until completion. The bar is now phase-driven:
+  it reaches an honest **100%** with a `Finalizing…` label the moment a file's bytes are all written,
+  and rate/ETA are suppressed during the flush/verify tail where no bytes move.
 
 - **Remote SSH/SFTP files now show their Unix permissions** in the permission column, like local
   files. The SFTP transport was dropping the server's mode bits before they reached the entry, so a

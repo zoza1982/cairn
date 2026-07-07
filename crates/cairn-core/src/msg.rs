@@ -191,6 +191,21 @@ pub enum AppEvent {
         /// The page result.
         result: Result<ListPage, VfsError>,
     },
+    /// Pre-flight sizing progress for an in-flight transfer: the destination conflict-check and the
+    /// recursive size scan walking the source tree, before any bytes move. Carries the running count
+    /// of visited entries, the bytes discovered so far, and the path currently being visited so the
+    /// dialog shows the walk descending the tree in real time. Coalesced by wall-clock and delivered
+    /// best-effort (may be dropped under load) — advisory display only.
+    TransferScanning {
+        /// Which transfer this update is for.
+        id: TransferId,
+        /// Entries visited so far (conflict pre-check + size scan share one running counter).
+        entries: u64,
+        /// Bytes discovered so far by the scan.
+        bytes: u64,
+        /// The path currently being visited (secret-free virtual path).
+        current: String,
+    },
     /// Incremental progress for an in-flight transfer: cumulative bytes written so far, plus the
     /// average rate. Coalesced and delivered best-effort (may be dropped under load), so it is
     /// advisory display only.
@@ -203,6 +218,10 @@ pub enum AppEvent {
         rate_bps: u64,
         /// Total bytes to transfer (from a pre-scan), if known — enables a percentage and ETA.
         total: Option<u64>,
+        /// `true` for the one-shot signal that the current file's bytes are all written and the
+        /// engine is now flushing/verifying it — the transfer is in [`crate::TransferPhase::Finalizing`],
+        /// so the bar shows an honest 100% instead of pinning at 99%.
+        finalizing: bool,
     },
     /// A delete/mkdir/rename/plan operation finished; carries a status message and whether it failed.
     OpDone {

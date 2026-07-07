@@ -6,7 +6,8 @@ use cairn_core::{
     credential_method_fields, credential_methods, scheme_fields, AppState, ChoiceProvenance,
     ConnectionFormStage, ConnectionKind, CredentialMethod, FieldValue, Listing, LogViewerStatus,
     MaskedInput, Overlay, PagerMode, PagerStatus, PaneState, PromptKind, SessionEnd, SessionRecord,
-    Side, WritebackChoice, WritebackConflictReason, KNOWN_SCHEMES, PAGER_HEX_ROW_BYTES,
+    Side, TransferPhase, WritebackChoice, WritebackConflictReason, KNOWN_SCHEMES,
+    PAGER_HEX_ROW_BYTES,
 };
 use cairn_types::{Entry, EntryKind, UnixPerms};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -960,31 +961,64 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
                 style,
             ));
 
-            let pct = match t.total {
-                Some(total) if total > 0 => Some(pct_of(t.bytes, total)),
-                _ => None,
+            // The bar is phase-driven, not a raw byte ratio: `Counting` has no total yet
+            // (indeterminate), `Finalizing` asserts an honest 100% (bytes are all written; the flush/
+            // verify tail moves none), and only `Copying` derives a percentage from bytes/total — so
+            // an over-counted scan total can never pin the bar at 99% at the end.
+            let pct = match t.phase {
+                TransferPhase::Counting => None,
+                // The reducer only enters Finalizing once the whole transfer's bytes are written, so
+                // this is an honest 100% — but derive it from bytes/total anyway so a hypothetical
+                // early Finalizing can never claim more than the bytes justify.
+                TransferPhase::Finalizing => match t.total {
+                    Some(total) if total > 0 => Some(pct_of(t.bytes, total)),
+                    _ => Some(100),
+                },
+                TransferPhase::Copying => match t.total {
+                    Some(total) if total > 0 => Some(pct_of(t.bytes, total)),
+                    _ => None,
+                },
             };
             lines.push(Line::styled(
                 format!("  {}", progress_bar(pct, bar_width)),
                 style,
             ));
 
-            let amount = match t.total {
-                Some(total) if total > 0 => {
-                    format!("{} / {}", human_bytes(t.bytes), human_bytes(total))
+            let stats = match t.phase {
+                // Live pre-flight walk: a running item count + bytes found + the path currently being
+                // visited, so the user sees the tree being traversed rather than a frozen 0%.
+                TransferPhase::Counting => {
+                    let head = format!(
+                        "  Scanning {} items · {} ",
+                        t.scan_entries,
+                        human_bytes(t.bytes)
+                    );
+                    let room = content_width.saturating_sub(head.chars().count());
+                    format!("{head}{}", truncate_to(&t.scan_path, room))
                 }
-                _ => human_bytes(t.bytes),
+                // Bytes all written; the flush/verify tail is opaque backend work — say so instead of
+                // sitting at a stalled ratio with a rate/ETA that no longer applies.
+                TransferPhase::Finalizing => format!("  {}   Finalizing…", human_bytes(t.bytes)),
+                TransferPhase::Copying => {
+                    let amount = match t.total {
+                        Some(total) if total > 0 => {
+                            format!("{} / {}", human_bytes(t.bytes), human_bytes(total))
+                        }
+                        _ => human_bytes(t.bytes),
+                    };
+                    // Rate/ETA shown only when meaningful (shared with the status line via
+                    // `transfer_rate_eta`: never for a paused/finished/scanning/unknown-rate transfer).
+                    let (rate_bps, eta_secs) = transfer_rate_eta(t);
+                    let rate = rate_bps
+                        .map(|r| format!("   {}/s", human_bytes(r)))
+                        .unwrap_or_default();
+                    let eta = eta_secs
+                        .map(|s| format!("   ETA {}", human_duration(s)))
+                        .unwrap_or_default();
+                    format!("  {amount}{rate}{eta}")
+                }
             };
-            // Rate/ETA shown only when meaningful (shared with the status line via
-            // `transfer_rate_eta`: never for a paused/finished/unknown-rate transfer).
-            let (rate_bps, eta_secs) = transfer_rate_eta(t);
-            let rate = rate_bps
-                .map(|r| format!("   {}/s", human_bytes(r)))
-                .unwrap_or_default();
-            let eta = eta_secs
-                .map(|s| format!("   ETA {}", human_duration(s)))
-                .unwrap_or_default();
-            lines.push(Line::styled(format!("  {amount}{rate}{eta}"), style));
+            lines.push(Line::styled(stats, style));
         }
     }
     for (i, q) in pending.iter().enumerate() {
@@ -1034,12 +1068,15 @@ fn progress_bar(pct: Option<u64>, width: usize) -> String {
 /// isn't meaningful (no known total, zero rate, or already complete / sub-second). Shared by the
 /// progress dialog and the status line so the two can't drift on when a number appears.
 fn transfer_rate_eta(t: &cairn_core::ActiveTransfer) -> (Option<u64>, Option<u64>) {
+    // Rate/ETA are meaningful only while bytes are actually flowing: never while paused, and never in
+    // the Counting (pre-scan) or Finalizing (flush/verify) phases where no bytes move.
+    let flowing = !t.paused && t.phase == TransferPhase::Copying;
     let rate = match t.rate {
-        Some(r) if !t.paused => Some(r),
+        Some(r) if flowing => Some(r),
         _ => None,
     };
     let eta = match (t.total, t.rate) {
-        (Some(tot), Some(r)) if !t.paused && r > 0 && tot > t.bytes => {
+        (Some(tot), Some(r)) if flowing && r > 0 && tot > t.bytes => {
             let secs = (tot - t.bytes) / r;
             (secs > 0).then_some(secs)
         }
@@ -1486,10 +1523,13 @@ fn transfer_status(state: &AppState) -> String {
     };
     let paused = active.iter().filter(|t| t.paused).count();
 
-    // Aggregate byte/total/rate across active transfers. `total` is `None` if any is unknown
-    // (a partial percentage would mislead); `rate` sums only running (non-paused) transfers.
+    // Aggregate byte/total/rate across active transfers. A transfer still in `Counting` reuses its
+    // `bytes` field for scan-discovered (not transferred) bytes, so exclude it from the transferred
+    // sum — otherwise the footer would inflate the total with bytes nothing has actually copied.
+    // `total` is `None` if any is unknown (a partial percentage would mislead).
     let bytes: u64 = active
         .iter()
+        .filter(|t| t.phase != TransferPhase::Counting)
         .fold(0u64, |acc, t| acc.saturating_add(t.bytes));
     let total: Option<u64> = active
         .iter()
@@ -1509,6 +1549,11 @@ fn transfer_status(state: &AppState) -> String {
     if active.len() == 1 {
         // Single transfer: identical format to the pre-concurrency status line.
         let t = &active[0];
+        if t.phase == TransferPhase::Counting {
+            // Pre-flight scan: no bytes are moving yet, so say what's actually happening rather than
+            // "transferring… 0 B" (which reads as a stall).
+            return format!("⇅ scanning… {} items{suffix}", t.scan_entries);
+        }
         if t.paused {
             return format!("⏸ paused {amount}{suffix}");
         }
@@ -1529,9 +1574,12 @@ fn transfer_status(state: &AppState) -> String {
     if paused == n {
         return format!("⏸ {n} paused · {amount}{suffix}");
     }
+    // Only transfers actually moving bytes contribute to the rate: a paused, scanning, or finalizing
+    // transfer keeps a stale `rate` field, and counting it would show a phantom throughput. Mirrors
+    // the single-transfer `transfer_rate_eta` gate.
     let running_rate: u64 = active
         .iter()
-        .filter(|t| !t.paused)
+        .filter(|t| t.phase == TransferPhase::Copying && !t.paused)
         .filter_map(|t| t.rate)
         .sum();
     let rate = if running_rate > 0 {
@@ -1930,6 +1978,11 @@ mod tests {
         s.active_transfers.push(cairn_core::ActiveTransfer {
             id,
             label: "Copying 1 item(s)…".to_owned(),
+            // These helpers model a live byte copy (rate/ETA/percentage assertions), so the phase is
+            // Copying, not the initial Counting.
+            phase: TransferPhase::Copying,
+            scan_entries: 0,
+            scan_path: String::new(),
             bytes,
             rate,
             total,
@@ -2126,10 +2179,17 @@ mod tests {
         let t = |bytes, rate, total, paused| ActiveTransfer {
             id: 1,
             label: "x".to_owned(),
+            phase: TransferPhase::Copying,
+            scan_entries: 0,
+            scan_path: String::new(),
             bytes,
             rate,
             total,
             paused,
+        };
+        let with_phase = |mut a: ActiveTransfer, phase| {
+            a.phase = phase;
+            a
         };
         // Running with a known total: both rate and a positive ETA.
         assert_eq!(
@@ -2151,6 +2211,17 @@ mod tests {
             transfer_rate_eta(&t(0, Some(0), Some(8 << 20), false)),
             (Some(0), None)
         );
+        // Non-Copying phases move no bytes, so rate/ETA are suppressed even with a known rate/total.
+        for phase in [TransferPhase::Counting, TransferPhase::Finalizing] {
+            assert_eq!(
+                transfer_rate_eta(&with_phase(
+                    t(4 << 20, Some(2 << 20), Some(8 << 20), false),
+                    phase
+                )),
+                (None, None),
+                "{phase:?} must hide rate/ETA"
+            );
+        }
     }
 
     #[test]

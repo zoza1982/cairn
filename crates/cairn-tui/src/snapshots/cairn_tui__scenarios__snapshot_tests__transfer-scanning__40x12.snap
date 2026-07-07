@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│>  src/           ││>  src/           │
+┌ Transfer ────────────────────────────┐
+│> Copying project → dietpi6:/srv      │
+│  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│
+│  Scanning 1287 items · 42.0 MiB /hom…│
+│                                      │
+│[b] background · [p] pause sel · [Esc]│
+│[↑↓] select · [d] cancel/drop · [K/J] │
+└──────────────────────────────────────┘
+└────── sort: name ┘└────── sort: name ┘
+ 1/4   ⇅ scanning… 1287 items
