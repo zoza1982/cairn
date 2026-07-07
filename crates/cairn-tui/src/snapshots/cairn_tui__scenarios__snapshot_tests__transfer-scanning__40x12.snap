@@ -3,11 +3,11 @@ source: crates/cairn-tui/src/scenarios.rs
 expression: frame
 ---
 ┌ / ───────────────┐┌ / ───────────────┐
-│>  src/           ││>  src/           │
 ┌ Transfer ────────────────────────────┐
 │> Copying project → dietpi6:/srv      │
 │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│
-│  Scanning 1287 items · 42.0 MiB /hom…│
+│  Scanning 1287 items · 42.0 MiB      │
+│  …project/node_modules/react/index.js│
 │                                      │
 │[b] background · [p] pause sel · [Esc]│
 │[↑↓] select · [d] cancel/drop · [K/J] │

@@ -915,53 +915,37 @@ fn render_credential_fields(
     }
 }
 
-/// Draw the transfer progress dialog (MC-style): each active transfer as a 3-line block — label
-/// (+ paused marker), a text progress bar, and the byte/rate/ETA line — followed by the pending
-/// queue with the reorder cursor, and a hint line. Auto-opened by the reducer whenever a transfer
-/// starts (`arm_transfer`); backgrounded with `b`, brought back with `Ctrl-T`.
+/// Draw the transfer progress dialog (MC-style): each active transfer as a 3–4 line block — label
+/// (+ paused marker), a text progress bar, the byte/rate/ETA line, and (while scanning) an extra line
+/// for the path being walked — followed by the pending queue with the reorder cursor, and hint lines.
+/// Auto-opened by the reducer whenever a transfer starts (`arm_transfer`); backgrounded with `b`,
+/// brought back with `Ctrl-T`.
 fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     let pending = &state.transfer_queue;
     let active = &state.active_transfers;
-    // 3 rows per active transfer (label / bar / stats), or 1 "no active transfers" row when idle
-    // (idle-but-open can happen momentarily: e.g. `Ctrl-T` right after the last transfer finished
-    // but before the auto-close event has been processed).
-    let active_rows = if active.is_empty() {
-        1
-    } else {
-        active.len() * 3
-    };
-    let rows = active_rows.saturating_add(pending.len());
-    let h = u16::try_from(rows)
-        .unwrap_or(u16::MAX)
-        .saturating_add(5) // 2 borders + blank separator + 2 hint lines
-        .min(frame.area().height);
-    // 70 wide (68 interior) so each control-hint line fits without truncation at typical terminal
-    // sizes; `centered` clamps to the frame width, so a narrow terminal (e.g. 40 cols) still fits and
-    // the hints truncate gracefully there.
-    let area = centered(frame.area(), 70, h.max(6));
-    frame.render_widget(Clear, area);
-    let block = Block::bordered()
-        .title(" Transfer ")
-        .border_style(Style::default().fg(Color::Cyan));
-    // Measure the interior before the block is consumed by `render_widget`, so the bar can span
-    // exactly the dialog's content width at whatever size it was clamped to (70 wide normally, down
-    // to the full frame width — minus borders — at 40×12).
-    let content = block.inner(area);
-    let content_width = usize::from(content.width);
-    frame.render_widget(block, area);
 
-    // The cursor spans one combined list: active transfers first (`0..active.len()`), then the
-    // pending queue. A 2-col gutter carries the `>` selection marker; the bar/stats lines indent to
-    // match, and the whole 3-line active block is highlighted when selected.
-    let selected = Style::default().add_modifier(Modifier::REVERSED);
+    let frame_area = frame.area();
+    // 70 wide (68 interior) so each control-hint line fits at typical sizes; clamped to the frame so
+    // a narrow terminal (e.g. 40 cols) still fits and content truncates gracefully. Computed up front
+    // so lines can be built before the box is sized to its final line count (a scanning transfer uses
+    // a variable number of rows).
+    let width = 70u16.min(frame_area.width);
+    let content_width = usize::from(width.saturating_sub(2));
     let bar_width = content_width.saturating_sub(2).max(1);
+
+    // Selection highlights only the *label* line (with the `>` marker). Reverse-video across the whole
+    // multi-line block reads as a rendering glitch — and inverts the progress bar/stats — so the
+    // bar and detail lines always render in the normal style.
+    let sel = Style::default().add_modifier(Modifier::REVERSED);
+
     let mut lines: Vec<Line> = Vec::new();
     if active.is_empty() {
+        // Idle-but-open can happen momentarily (e.g. `Ctrl-T` right after the last transfer finished
+        // but before the auto-close event is processed).
         lines.push(Line::from("No active transfers".to_owned()));
     } else {
         for (ai, t) in active.iter().enumerate() {
             let is_sel = ai == cursor;
-            let style = if is_sel { selected } else { Style::default() };
             let marker = if is_sel { "> " } else { "  " };
             let paused_marker = if t.paused { "  ⏸ paused" } else { "" };
             // Truncate the label (not the marker/paused tail) so a long "what → where" can't push the
@@ -973,7 +957,7 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
                     "{marker}{}{paused_marker}",
                     truncate_to(&t.label, label_budget)
                 ),
-                style,
+                if is_sel { sel } else { Style::default() },
             ));
 
             // The bar is phase-driven, not a raw byte ratio: `Counting` has no total yet
@@ -994,26 +978,36 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
                     _ => None,
                 },
             };
-            lines.push(Line::styled(
-                format!("  {}", progress_bar(pct, bar_width)),
-                style,
-            ));
+            lines.push(Line::from(format!("  {}", progress_bar(pct, bar_width))));
 
-            let stats = match t.phase {
-                // Live pre-flight walk: a running item count + bytes found + the path currently being
-                // visited, so the user sees the tree being traversed rather than a frozen 0%.
+            match t.phase {
+                // Live pre-flight walk: a running item count + bytes found on one line, and the path
+                // currently being visited on its own line (left-truncated so the meaningful tail
+                // shows, e.g. `…/functions/foo.js`) — so a long path never overflows the row.
                 TransferPhase::Counting => {
+                    // `truncate_to` guards a pathological item/byte count from overflowing a narrow pane.
                     let head = format!(
-                        "  Scanning {} items · {} ",
+                        "Scanning {} items · {}",
                         t.scan_entries,
                         human_bytes(t.bytes)
                     );
-                    let room = content_width.saturating_sub(head.chars().count());
-                    format!("{head}{}", truncate_to(&t.scan_path, room))
+                    lines.push(Line::from(format!(
+                        "  {}",
+                        truncate_to(&head, content_width.saturating_sub(2))
+                    )));
+                    lines.push(Line::from(format!(
+                        "  {}",
+                        truncate_left(&t.scan_path, content_width.saturating_sub(2))
+                    )));
                 }
                 // Bytes all written; the flush/verify tail is opaque backend work — say so instead of
                 // sitting at a stalled ratio with a rate/ETA that no longer applies.
-                TransferPhase::Finalizing => format!("  {}   Finalizing…", human_bytes(t.bytes)),
+                TransferPhase::Finalizing => {
+                    lines.push(Line::from(format!(
+                        "  {}   Finalizing…",
+                        human_bytes(t.bytes)
+                    )));
+                }
                 TransferPhase::Copying => {
                     let amount = match t.total {
                         Some(total) if total > 0 => {
@@ -1030,10 +1024,9 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
                     let eta = eta_secs
                         .map(|s| format!("   ETA {}", human_duration(s)))
                         .unwrap_or_default();
-                    format!("  {amount}{rate}{eta}")
+                    lines.push(Line::from(format!("  {amount}{rate}{eta}")));
                 }
-            };
-            lines.push(Line::styled(stats, style));
+            }
         }
     }
     for (i, q) in pending.iter().enumerate() {
@@ -1041,8 +1034,10 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
         let verb = if q.is_move { "move" } else { "copy" };
         let marker = if is_sel { "> " } else { "  " };
         let line = format!("{marker}{}. {verb} {} item(s)", i + 1, q.items.len());
-        let style = if is_sel { selected } else { Style::default() };
-        lines.push(Line::styled(line, style));
+        lines.push(Line::styled(
+            line,
+            if is_sel { sel } else { Style::default() },
+        ));
     }
     lines.push(Line::from(""));
     // Two hint lines so every live control stays discoverable: per-transfer controls act on the
@@ -1053,6 +1048,22 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     lines.push(Line::from(
         "[↑↓] select · [d] cancel/drop · [K/J] reorder · [x] clear".to_owned(),
     ));
+
+    // Size the box to the built line count (+2 borders), so a scanning transfer's extra path line is
+    // accommodated instead of clipped.
+    let h = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(frame_area.height);
+    // `.max(6)` is a defensive floor: the minimum line count (idle row + blank + 2 hints) already
+    // yields h = 6, so this only matters if that layout ever shrinks.
+    let area = centered(frame_area, width, h.max(6));
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Transfer ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let content = block.inner(area);
+    frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), content);
 }
 
@@ -1791,6 +1802,21 @@ fn truncate_to(s: &str, max: usize) -> String {
     out
 }
 
+/// Like [`truncate_to`] but keeps the **tail**, prefixing a leading `…` — for a long path where the
+/// meaningful part is the end (`…/fusedpro/functions/foo.js`), not the common `/home/user` prefix.
+fn truncate_left(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    // Keep the last `max - 1` chars, prefixed by the ellipsis.
+    let tail: String = s.chars().skip(len - (max - 1)).collect();
+    format!("…{tail}")
+}
+
 /// The right-hand metadata columns (` perms  date`) that fit in a row of `row_w` columns while
 /// leaving at least [`ENTRY_NAME_MIN`] for the name. Drops columns responsively: both when there's
 /// room, then date-only, then perms-only, then nothing on a very narrow pane. Each present column is
@@ -2061,6 +2087,53 @@ mod tests {
             .zip(themed.content().iter())
             .any(|(p, t)| p.style().bg != t.style().bg);
         assert!(changed, "themed background must paint at least one cell");
+    }
+
+    #[test]
+    fn transfer_dialog_highlights_only_the_selected_label_line() {
+        // The selected transfer must highlight only its *label* row — reverse-video across the whole
+        // block (label + bar + stats) reads as a glitch and inverts the progress bar. The snapshot
+        // harness records only glyphs, so this asserts on cell styles directly.
+        let mut s = ready_state();
+        set_transfer(
+            &mut s,
+            2 * 1024 * 1024,
+            Some(1024),
+            Some(8 * 1024 * 1024),
+            false,
+        );
+        s.overlay = Some(cairn_core::Overlay::TransferQueue { cursor: 0 });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &s, &Theme::default())).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let width = usize::from(buf.area().width);
+        // Group cells into rows and note, per row, its text and whether any cell is reverse-video.
+        let row_reversed = |needle: &str| -> Option<bool> {
+            let cells: Vec<_> = buf.content().iter().collect();
+            for row in cells.chunks(width) {
+                let text: String = row.iter().map(|c| c.symbol()).collect();
+                if text.contains(needle) {
+                    let rev = row
+                        .iter()
+                        .any(|c| c.style().add_modifier.contains(Modifier::REVERSED));
+                    return Some(rev);
+                }
+            }
+            None
+        };
+        // The label row ("Copying …") is highlighted…
+        assert_eq!(
+            row_reversed("Copying"),
+            Some(true),
+            "the selected transfer's label line must be highlighted"
+        );
+        // …but the progress-bar row is not (it must render in the normal style).
+        assert_eq!(
+            row_reversed("░"),
+            Some(false),
+            "the progress bar must never be reverse-video"
+        );
     }
 
     fn plan(tools: &[&str]) -> cairn_ai::Plan {
@@ -2401,6 +2474,20 @@ mod tests {
         assert_eq!(truncate_to("short", 10), "short");
         assert_eq!(truncate_to("a-very-long-name.txt", 8), "a-very-…");
         assert_eq!(truncate_to("x", 0), "");
+    }
+
+    #[test]
+    fn truncate_left_keeps_the_tail() {
+        // Short-enough strings pass through unchanged.
+        assert_eq!(truncate_left("/a/b", 10), "/a/b");
+        assert_eq!(truncate_left("x", 0), "");
+        // Tightest boundary: a budget of 1 leaves room for only the ellipsis.
+        assert_eq!(truncate_left("abcdef", 1), "…");
+        // A long path keeps its meaningful tail behind a leading ellipsis, within the budget.
+        let out = truncate_left("/home/swith/fusedpro/functions/foo.js", 20);
+        assert_eq!(out.chars().count(), 20);
+        assert!(out.starts_with('…'));
+        assert!(out.ends_with("functions/foo.js"), "kept the tail: {out}");
     }
 
     #[test]

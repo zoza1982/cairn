@@ -9,11 +9,11 @@ expression: frame
 │   README.md                          ││   README.md                          │
 │                                      ││                                      │
 │                                      ││                                      │
-│                                      ││                                      │
 │    ┌ Transfer ──────────────────────────────────────────────────────────┐    │
 │    │> Copying project → dietpi6:/srv                                    │    │
 │    │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│    │
-│    │  Scanning 1287 items · 42.0 MiB /home/me/project/node_modules/reac…│    │
+│    │  Scanning 1287 items · 42.0 MiB                                    │    │
+│    │  /home/me/project/node_modules/react/index.js                      │    │
 │    │                                                                    │    │
 │    │[b] background · [p] pause sel · [Esc] abort all                    │    │
 │    │[↑↓] select · [d] cancel/drop · [K/J] reorder · [x] clear           │    │
