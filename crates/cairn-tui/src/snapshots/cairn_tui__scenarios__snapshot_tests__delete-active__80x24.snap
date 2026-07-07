@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│>  src/                               ││>  src/                               │
+│   docs/                              ││   docs/                              │
+│   Cargo.toml                         ││   Cargo.toml                         │
+│   README.md                          ││   README.md                          │
+│                                      ││                                      │
+│                                      ││                                      │
+│    ┌ Transfer ──────────────────────────────────────────────────────────┐    │
+│    │> Deleting 3 item(s)                                                │    │
+│    │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│    │
+│    │  Deleted 128 item(s)                                               │    │
+│    │  /home/me/project/build/cache/objects/ab/cdef.o                    │    │
+│    │                                                                    │    │
+│    │[b] background · [p] pause sel · [Esc] abort all                    │    │
+│    │[↑↓] select · [d] cancel/drop · [K/J] reorder · [x] clear           │    │
+│    └────────────────────────────────────────────────────────────────────┘    │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 1/4   Deleting… 128 items

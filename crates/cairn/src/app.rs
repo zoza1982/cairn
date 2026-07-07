@@ -1351,11 +1351,30 @@ fn dispatch(
                 let _ = event_tx.send(ev).await;
             });
         }
-        AppEffect::Delete { conn, paths } => {
+        AppEffect::Delete { id, conn, paths } => {
             let registry = registry.clone();
             let event_tx = event_tx.clone();
+            // A delete is a tracked op (shown in the dialog with progress) and cancellable, so it
+            // registers a control entry like a transfer. Pause is not supported for delete (the
+            // sender exists only to keep the `TransferControls` shape uniform), so the reducer never
+            // sends `SetTransferPaused` for a delete id.
+            let cancel = CancellationToken::new();
+            let (pause_tx, _paused) = watch::channel(false);
+            transfer_controls.insert(
+                id,
+                TransferControls {
+                    cancel: cancel.clone(),
+                    pause: pause_tx,
+                },
+            );
             tokio::spawn(async move {
-                let ev = run_delete_effect(&registry, conn, paths).await;
+                let mut guard = TransferDoneGuard {
+                    id,
+                    event_tx: event_tx.clone(),
+                    armed: true,
+                };
+                let ev = run_delete_effect(&registry, id, conn, paths, &event_tx, cancel).await;
+                guard.armed = false;
                 let _ = event_tx.send(ev).await;
             });
         }
@@ -3169,30 +3188,124 @@ fn sanitized_path() -> Option<std::ffi::OsString> {
     std::env::join_paths(kept).ok()
 }
 
+/// Delete `paths` as a tracked operation: walk each tree at the app edge (list children → remove
+/// files → remove dirs deepest-first), emitting coalesced per-item progress and honoring
+/// cancellation between nodes. Returns a [`AppEvent::TransferDone`] (not `OpDone`) so the reducer's
+/// transfer-completion path removes the op, closes the dialog, and re-lists both panes via
+/// `finish_op`. Continue-on-error: a single un-deletable node counts as a failure and the walk goes
+/// on, so one bad file never aborts the rest.
 async fn run_delete_effect(
     registry: &VfsRegistry,
+    id: TransferId,
     conn: ConnectionId,
     paths: Vec<VfsPath>,
+    event_tx: &mpsc::Sender<AppEvent>,
+    cancel: CancellationToken,
 ) -> AppEvent {
     let Some(vfs) = registry.get(conn).await else {
-        return AppEvent::OpDone {
+        return AppEvent::TransferDone {
+            id,
             status: "connection unavailable".to_owned(),
             error: true,
         };
     };
-    let mut deleted = 0u64;
-    for path in &paths {
-        if let Err(e) = vfs.remove(path, Recurse::Yes).await {
-            return AppEvent::OpDone {
-                status: format!("Delete failed: {}", e.redacted()),
-                error: true,
-            };
+    let mut done = 0u64;
+    let mut failures = 0u64;
+    // Coalesced progress: emit the running item count + current path at most every
+    // `TRANSFER_UI_MIN_INTERVAL`, best-effort (`try_send`) so a fast local delete can't flood the
+    // render channel and a slow remote one still ticks.
+    let mut last_emit: Option<std::time::Instant> = None;
+    let mut emit = |done: u64, current: &str| {
+        let now = std::time::Instant::now();
+        if last_emit.is_none_or(|t| now.duration_since(t) >= TRANSFER_UI_MIN_INTERVAL) {
+            last_emit = Some(now);
+            let _ = event_tx.try_send(AppEvent::TransferScanning {
+                id,
+                entries: done,
+                bytes: 0,
+                current: current.to_owned(),
+            });
         }
-        deleted += 1;
-    }
-    AppEvent::OpDone {
-        status: format!("Deleted {deleted} item(s)"),
+    };
+    let cancelled = |done: u64| AppEvent::TransferDone {
+        id,
+        status: format!("Delete cancelled ({done} removed)"),
         error: false,
+    };
+
+    // DFS stack of (path, is_dir). Files are removed as they're popped; directories are recorded and
+    // removed deepest-first afterward (they're empty by then). Root kinds come from a stat; child
+    // kinds come from their parent's listing, so there's no extra stat per child.
+    let mut stack: Vec<(VfsPath, bool)> = Vec::new();
+    for root in &paths {
+        match vfs.stat(root).await {
+            Ok(meta) => stack.push((root.clone(), meta.is_dir())),
+            Err(VfsError::NotFound(_)) => {}
+            Err(_) => failures += 1,
+        }
+    }
+    let mut dirs_post: Vec<VfsPath> = Vec::new();
+    while let Some((p, is_dir)) = stack.pop() {
+        if cancel.is_cancelled() {
+            return cancelled(done);
+        }
+        if is_dir {
+            dirs_post.push(p.clone());
+            let mut stream = vfs.list(&p, ListOpts { all: true });
+            loop {
+                let page = tokio::select! {
+                    pg = stream.next() => pg,
+                    () = cancel.cancelled() => return cancelled(done),
+                };
+                let Some(page) = page else { break };
+                match page {
+                    Ok(pg) => {
+                        for e in pg.entries {
+                            if let Ok(child) = p.join(&e.name) {
+                                stack.push((child, e.is_dir()));
+                            }
+                        }
+                        // Tick during enumeration too, so listing a huge/remote directory (which can
+                        // take seconds) still shows motion instead of the count sitting still.
+                        emit(done, &p.as_str());
+                    }
+                    Err(_) => {
+                        failures += 1;
+                        break;
+                    }
+                }
+            }
+        } else {
+            match vfs.remove(&p, Recurse::No).await {
+                Ok(()) => done += 1,
+                Err(VfsError::NotFound(_)) => {}
+                Err(_) => failures += 1,
+            }
+            emit(done, &p.as_str());
+        }
+    }
+    // Remove directories deepest-first (reverse discovery order → children before parents).
+    for d in dirs_post.iter().rev() {
+        if cancel.is_cancelled() {
+            return cancelled(done);
+        }
+        match vfs.remove(d, Recurse::No).await {
+            Ok(()) => done += 1,
+            Err(VfsError::NotFound(_)) => {}
+            Err(_) => failures += 1,
+        }
+        emit(done, &d.as_str());
+    }
+
+    let status = if failures > 0 {
+        format!("Deleted {done} item(s), {failures} failed")
+    } else {
+        format!("Deleted {done} item(s)")
+    };
+    AppEvent::TransferDone {
+        id,
+        status,
+        error: failures > 0,
     }
 }
 
@@ -4968,6 +5081,94 @@ mod tests {
         assert!(matches!(ev, AppEvent::OpDone { error: false, .. }));
         assert!(!dir.path().join("a.txt").exists());
         assert_eq!(std::fs::read(dir.path().join("c.txt")).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn delete_walks_the_tree_emits_progress_and_reports_done() {
+        // End-to-end: a recursive delete removes the whole tree, streams `TransferScanning` progress
+        // (item count + current path) so the dialog isn't frozen, and finishes with `TransferDone`.
+        let dir = tempfile_dir();
+        // A multi-level tree with sibling subdirs, to lock in the deepest-first post-order removal
+        // (a parent dir is only removed after all its children — files and subdirs — are gone).
+        std::fs::create_dir_all(dir.path().join("d/sub1/deep")).unwrap();
+        std::fs::create_dir(dir.path().join("d/sub2")).unwrap();
+        std::fs::write(dir.path().join("d/a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("d/b.txt"), b"b").unwrap();
+        std::fs::write(dir.path().join("d/sub1/x.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("d/sub1/deep/y.txt"), b"y").unwrap();
+        std::fs::write(dir.path().join("d/sub2/z.txt"), b"z").unwrap();
+        std::fs::write(dir.path().join("top.txt"), b"t").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let ev = run_delete_effect(
+            &registry,
+            7,
+            LEFT,
+            vec![
+                VfsPath::parse("/d").unwrap(),
+                VfsPath::parse("/top.txt").unwrap(),
+            ],
+            &tx,
+            CancellationToken::new(),
+        )
+        .await;
+        match ev {
+            AppEvent::TransferDone { id, error, status } => {
+                assert_eq!(id, 7);
+                assert!(!error, "clean delete: {status}");
+                assert!(status.contains("Deleted"), "got: {status}");
+            }
+            _ => panic!("expected TransferDone"),
+        }
+        // Everything is gone (d/, its two files, top.txt).
+        assert!(!dir.path().join("d").exists());
+        assert!(!dir.path().join("top.txt").exists());
+        // At least one progress event carried a non-empty path.
+        let mut saw_progress = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let AppEvent::TransferScanning { id, current, .. } = msg {
+                assert_eq!(id, 7);
+                assert!(!current.is_empty());
+                saw_progress = true;
+            }
+        }
+        assert!(saw_progress, "expected at least one delete progress event");
+    }
+
+    #[tokio::test]
+    async fn cancelled_delete_reports_a_non_error_completion() {
+        // A pre-cancelled token stops the walk immediately; the op still reports completion (so the
+        // dialog closes + panes refresh) as a non-error partial.
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("keep.txt"), b"k").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (tx, _rx) = mpsc::channel(8);
+        let ev = run_delete_effect(
+            &registry,
+            1,
+            LEFT,
+            vec![VfsPath::parse("/keep.txt").unwrap()],
+            &tx,
+            cancel,
+        )
+        .await;
+        match ev {
+            AppEvent::TransferDone { error, status, .. } => {
+                assert!(!error, "cancellation is not a failure: {status}");
+                assert!(status.contains("cancelled"), "got: {status}");
+            }
+            _ => panic!("expected TransferDone"),
+        }
+        // The file survives (the walk was cancelled before removing it).
+        assert!(dir.path().join("keep.txt").exists());
     }
 
     #[tokio::test]

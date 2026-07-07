@@ -4,9 +4,9 @@ use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit, WriteBackMode};
 use crate::state::{
     next_theme, ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionFormStage,
     ConnectionKind, FieldValue, FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame,
-    Overlay, PagerMode, PagerStatus, PromptKind, QueuedTransfer, SessionEnd, SessionRecord, Side,
-    SortMode, TransferId, TransferPhase, WritebackChoice, PAGER_HEX_ROW_BYTES, PAGER_MAX_BYTES,
-    SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
+    OpKind, Overlay, PagerMode, PagerStatus, PromptKind, QueuedTransfer, SessionEnd, SessionRecord,
+    Side, SortMode, TransferId, TransferPhase, WritebackChoice, PAGER_HEX_ROW_BYTES,
+    PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
 use bytes::Bytes;
 use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, VfsPath};
@@ -1903,6 +1903,12 @@ fn toggle_one_transfer_pause(state: &mut AppState, idx: usize) -> Vec<AppEffect>
     let Some(t) = state.active_transfers.get_mut(idx) else {
         return Vec::new();
     };
+    // A delete can't be paused (a half-deleted tree held paused has no real use) — cancel is its
+    // safety valve. No-op with a hint.
+    if t.kind == OpKind::Delete {
+        state.status = Some("A delete can't be paused — press d to cancel it".to_owned());
+        return Vec::new();
+    }
     let new_paused = !t.paused;
     t.paused = new_paused;
     let id = t.id;
@@ -2446,10 +2452,12 @@ fn apply_confirm_delete_action(state: &mut AppState, action: Action) -> Vec<AppE
     match action {
         Action::Confirm | Action::Enter => match state.overlay.take() {
             Some(Overlay::ConfirmDelete { conn, paths }) => {
-                state.status = Some(format!("Deleting {} item(s)…", paths.len()));
-                let focus = state.focus;
-                state.pane_mut(focus).marked.clear();
-                vec![AppEffect::Delete { conn, paths }]
+                // Arm a tracked delete op (progress + cancel, shown in the dialog) and carry its id
+                // into the effect. Marks are left in place here and cleared on the terminal
+                // `TransferDone` by `finish_op` (like copy/move), so the selection stays visible while
+                // the delete is in flight instead of vanishing the instant it's confirmed.
+                let id = arm_delete(state, paths.len());
+                vec![AppEffect::Delete { id, conn, paths }]
             }
             _ => Vec::new(),
         },
@@ -2650,8 +2658,9 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
         return Vec::new();
     }
     // Up to `concurrency_limit` transfers run at once: if every slot is busy, queue this one and
-    // start it (FIFO) when a slot frees. (`start_transfer` only runs with no overlay open.)
-    if state.active_transfers.len() >= state.concurrency_limit {
+    // start it (FIFO) when a slot frees. (`start_transfer` only runs with no overlay open.) Deletes
+    // don't occupy a byte-transfer slot, so they're excluded from the count.
+    if active_byte_ops(state) >= state.concurrency_limit {
         state.transfer_queue.push_back(QueuedTransfer {
             src_conn,
             dst_conn,
@@ -2712,7 +2721,7 @@ fn advance_queue(state: &mut AppState) -> Vec<AppEffect> {
         return Vec::new();
     }
     let mut effects = Vec::new();
-    while state.active_transfers.len() < state.concurrency_limit {
+    while active_byte_ops(state) < state.concurrency_limit {
         let Some(next) = state.transfer_queue.pop_front() else {
             break;
         };
@@ -3166,6 +3175,7 @@ fn arm_transfer(
     state.status = Some(label.clone());
     state.active_transfers.push(ActiveTransfer {
         id,
+        kind: if is_move { OpKind::Move } else { OpKind::Copy },
         label,
         phase: TransferPhase::Counting,
         scan_entries: 0,
@@ -3184,19 +3194,65 @@ fn arm_transfer(
     id
 }
 
+/// Mint an id and push a fresh delete [`ActiveTransfer`] (kind `Delete`, phase `Deleting`, no byte
+/// total — the bar is indeterminate). Deletes are **not** queued or bounded by the copy concurrency
+/// limit (they move no bytes and have no destination contention), so this arms and spawns
+/// immediately; N deletes run as N concurrent tasks in the shared dialog. Auto-opens the dialog like
+/// a transfer. Returns the id so the caller can carry it into the `Delete` effect (for cancel).
+fn arm_delete(state: &mut AppState, count: usize) -> TransferId {
+    let id = state.next_transfer_id;
+    state.next_transfer_id += 1;
+    let label = format!("Deleting {count} item(s)");
+    state.status = Some(label.clone());
+    state.active_transfers.push(ActiveTransfer {
+        id,
+        kind: OpKind::Delete,
+        label,
+        phase: TransferPhase::Deleting,
+        scan_entries: 0,
+        scan_path: String::new(),
+        bytes: 0,
+        rate: None,
+        total: None,
+        paused: false,
+    });
+    if state.overlay.is_none() {
+        state.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+    }
+    id
+}
+
+/// How many *byte* operations (copy/move) are currently active. Deletes also live in
+/// `active_transfers` but move no bytes and aren't queued, so they must not count against the
+/// copy/move `concurrency_limit` (or a new copy would wrongly queue behind running deletes).
+fn active_byte_ops(state: &AppState) -> usize {
+    state
+        .active_transfers
+        .iter()
+        .filter(|t| t.kind != OpKind::Delete)
+        .count()
+}
+
 /// Pause every active transfer if any is running, else resume all. No-op (with a status hint) when
 /// none is active. Shared by the global `p` binding (no overlay open) and the transfer-progress
 /// dialog's `p` binding (`apply_transfer_queue_action`) so the two paths can't drift.
 fn toggle_active_transfers_pause(state: &mut AppState) -> Vec<AppEffect> {
-    if !state.has_active_transfer() {
+    // Only copy/move (byte) transfers can pause — a half-deleted tree held "paused" is a confusing
+    // state with no real use, so deletes are skipped (cancel is their safety valve).
+    if active_byte_ops(state) == 0 {
         state.status = Some("No transfer to pause".to_owned());
         return Vec::new();
     }
-    let new_paused = state.active_transfers.iter().any(|t| !t.paused);
+    let new_paused = state
+        .active_transfers
+        .iter()
+        .any(|t| t.kind != OpKind::Delete && !t.paused);
     for t in &mut state.active_transfers {
-        t.paused = new_paused;
+        if t.kind != OpKind::Delete {
+            t.paused = new_paused;
+        }
     }
-    let n = state.active_transfers.len();
+    let n = active_byte_ops(state);
     state.status = Some(match (new_paused, n) {
         (true, 1) => "Transfer paused".to_owned(),
         (true, n) => format!("{n} transfers paused"),
@@ -3206,6 +3262,7 @@ fn toggle_active_transfers_pause(state: &mut AppState) -> Vec<AppEffect> {
     state
         .active_transfers
         .iter()
+        .filter(|t| t.kind != OpKind::Delete)
         .map(|t| AppEffect::SetTransferPaused {
             id: t.id,
             paused: new_paused,
@@ -3696,9 +3753,15 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             bytes,
             current,
         } => {
-            // Advisory display only; ignore an update for a transfer that already finished.
+            // Advisory display only; ignore an update for an op that already finished. The same event
+            // carries a copy/move's pre-flight scan and a delete's per-item progress — the phase
+            // depends on the op kind (a delete is `Deleting`, not the pre-flight `Counting`).
             if let Some(t) = state.active_transfers.iter_mut().find(|t| t.id == id) {
-                t.phase = TransferPhase::Counting;
+                t.phase = if t.kind == OpKind::Delete {
+                    TransferPhase::Deleting
+                } else {
+                    TransferPhase::Counting
+                };
                 t.scan_entries = entries;
                 t.scan_path = current;
                 t.bytes = bytes;
@@ -6736,12 +6799,63 @@ mod tests {
         // First Delete opens the confirm overlay, emits nothing.
         let fx = update(&mut s, Msg::Action(Action::Delete));
         assert!(fx.is_empty());
-        assert!(s.overlay.is_some());
-        // Confirm emits the Delete effect and closes the overlay.
+        assert!(matches!(s.overlay, Some(Overlay::ConfirmDelete { .. })));
+        // Confirm emits the Delete effect (carrying a tracked-op id) and arms a delete op that
+        // auto-opens the progress dialog (MC-style), like a transfer.
         let fx = update(&mut s, Msg::Action(Action::Confirm));
         assert_eq!(fx.len(), 1);
-        assert!(matches!(fx[0], AppEffect::Delete { .. }));
-        assert!(s.overlay.is_none());
+        let AppEffect::Delete { id, .. } = &fx[0] else {
+            panic!("expected a Delete effect, got {:?}", fx[0]);
+        };
+        assert!(matches!(s.overlay, Some(Overlay::TransferQueue { .. })));
+        let t = &s.active_transfers[0];
+        assert_eq!(t.id, *id, "the effect's id matches the armed op");
+        assert_eq!(t.kind, OpKind::Delete);
+        assert_eq!(t.phase, TransferPhase::Deleting);
+    }
+
+    #[test]
+    fn delete_op_does_not_occupy_a_copy_concurrency_slot() {
+        // Deletes live in `active_transfers` but must not count against the copy/move concurrency
+        // limit — a copy can start even while a delete runs.
+        let mut s = state();
+        s.concurrency_limit = 1;
+        let del_id = arm_delete(&mut s, 3);
+        assert_eq!(s.active_transfers.len(), 1);
+        // With limit 1 and one delete active, a copy should still START (not queue).
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        s.overlay = None; // start_transfer only runs with no overlay
+        let fx = update(&mut s, Msg::Action(Action::Copy));
+        assert!(
+            fx.iter().any(|e| matches!(e, AppEffect::Transfer { .. })),
+            "the copy starts despite the running delete: {fx:?}"
+        );
+        assert!(s.transfer_queue.is_empty(), "the copy was not queued");
+        // The delete is untouched.
+        assert!(s.active_transfers.iter().any(|t| t.id == del_id));
+    }
+
+    #[test]
+    fn transfer_scanning_sets_the_deleting_phase_for_a_delete_op() {
+        let mut s = state();
+        let id = arm_delete(&mut s, 5);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferScanning {
+                id,
+                entries: 2,
+                bytes: 0,
+                current: "/a/b".to_owned(),
+            }),
+        );
+        let t = &s.active_transfers[0];
+        assert_eq!(
+            t.phase,
+            TransferPhase::Deleting,
+            "a delete stays in Deleting"
+        );
+        assert_eq!(t.scan_entries, 2);
+        assert_eq!(t.scan_path, "/a/b");
     }
 
     #[test]
