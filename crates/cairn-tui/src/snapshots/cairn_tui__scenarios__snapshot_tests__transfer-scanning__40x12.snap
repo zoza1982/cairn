@@ -5,7 +5,7 @@ expression: frame
 ┌ / ───────────────┐┌ / ───────────────┐
 ┌ Transfer ────────────────────────────┐
 │> Copying project → dietpi6:/srv      │
-│  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ --%│
+│  ░░░░░░░███░░░░░░░░░░░░░░░░░░░░░░ --%│
 │  Scanning 1287 items · 42.0 MiB      │
 │  …project/node_modules/react/index.js│
 │                                      │

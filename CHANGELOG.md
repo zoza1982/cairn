@@ -169,6 +169,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The progress bar now animates for operations with no known total** (a delete, the pre-scan
+  "Counting" phase, or a copy without a pre-scan result) instead of sitting as a static empty
+  `--%` bar that looked frozen. A small block sweeps back and forth (MC-style marquee), driven by a
+  per-transfer tick that advances on every progress update, so the bar keeps moving while work is
+  flowing and freezes when the transfer is paused. A known-total transfer still shows a real
+  percentage bar.
+
 - **Going up a directory (`..`) now returns the cursor to the folder you came from** instead of
   snapping back to the top row. Scroll down to a subfolder, enter it, then step back out with
   `..`/Backspace/`h`/`←` (or `Enter` on the `..` row): the highlight lands on the subfolder you just

@@ -326,6 +326,7 @@ fn transfer_active() -> AppState {
         rate: Some(2 * 1024 * 1024),
         total: Some(8 * 1024 * 1024),
         paused: false,
+        pulse: 0, // determinate bar: pulse unused
     });
     s
 }
@@ -348,6 +349,7 @@ fn transfer_scanning() -> AppState {
         rate: None,
         total: None,
         paused: false,
+        pulse: 7, // indeterminate: places the marquee block mid-bar in the snapshot
     });
     s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
     s
@@ -370,6 +372,7 @@ fn transfer_finalizing() -> AppState {
         rate: Some(2 * 1024 * 1024),
         total: Some(8 * 1024 * 1024),
         paused: false,
+        pulse: 0, // determinate (honest 100%): pulse unused
     });
     s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
     s
@@ -392,6 +395,7 @@ fn delete_active() -> AppState {
         rate: None,
         total: None,
         paused: false,
+        pulse: 5, // indeterminate delete: marquee mid-bar
     });
     s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
     s
@@ -496,6 +500,7 @@ fn transfer_queue() -> AppState {
         rate: None,
         total: None,
         paused: true,
+        pulse: 4, // paused + unknown total: marquee frozen mid-bar (pulse stops advancing)
     });
     s.transfer_queue.push_back(cairn_core::QueuedTransfer {
         src_conn: ConnectionId(1),
