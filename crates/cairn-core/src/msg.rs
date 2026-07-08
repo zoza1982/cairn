@@ -928,6 +928,12 @@ pub enum AppEffect {
         /// The new hidden state to persist.
         hidden: bool,
     },
+    /// Persist the chosen color theme to `[ui] theme` in `cairn.toml` (so a live Shift-T switch
+    /// survives a restart). Fire-and-forget: a save failure is logged, not surfaced.
+    SaveTheme {
+        /// The preset name to write.
+        name: String,
+    },
     /// Drop the stdin sender for an exec session, signalling EOF to the remote process without
     /// cancelling the session. The overlay stays open to show remaining output; `SessionEnded`
     /// arrives when the process exits. Unlike `CloseSession`, this does NOT fire the cancel token.

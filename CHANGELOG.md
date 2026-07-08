@@ -150,8 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both panes on completion (even on cancel/partial). Delete can't be paused — cancel is its stop.
 
 - **Switch the color theme live with Shift-T.** Cycles through the built-in presets
-  (`dark → mc → nord → gruvbox → light → …`) without editing config; the status line shows the new
-  theme. The live choice is session-only — set `[ui] theme` for the default.
+  (`dark → mc → nord → gruvbox → light → …`); the status line shows the new theme. The choice is
+  **saved to `[ui] theme`**, so it survives a restart (other config settings are preserved).
 
 - **Selectable color themes.** Pick one with `[ui] theme = "..."`: `dark` (default, truecolor
   Tokyo-Night), **`mc`** (classic Midnight Commander — saturated VGA-blue panels, white folders,

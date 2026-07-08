@@ -68,7 +68,10 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     if matches!(action, Action::CycleTheme) {
         state.theme_name = next_theme(&state.theme_name).to_owned();
         state.status = Some(format!("Theme: {}", state.theme_name));
-        return Vec::new();
+        // Persist the choice so it survives a restart (fire-and-forget; failure is logged, not shown).
+        return vec![AppEffect::SaveTheme {
+            name: state.theme_name.clone(),
+        }];
     }
     if state.overlay.is_some() {
         return apply_overlay_action(state, action);
@@ -6580,9 +6583,13 @@ mod tests {
     fn cycle_theme_advances_the_preset_and_wraps() {
         let mut s = state();
         assert_eq!(s.theme_name, "dark"); // the default
-                                          // Each press advances to the next preset, with a status message and no effects (display-only).
+                                          // Each press advances to the next preset, sets a status message, and emits a persist effect
+                                          // carrying the new name (so it survives a restart) — no re-list.
         let fx = update(&mut s, Msg::Action(Action::CycleTheme));
-        assert!(fx.is_empty(), "theme change needs no effect (no re-list)");
+        assert!(
+            matches!(&fx[..], [AppEffect::SaveTheme { name }] if name == "mc"),
+            "theme change persists the new name: {fx:?}"
+        );
         assert_eq!(s.theme_name, "mc");
         assert_eq!(s.status.as_deref(), Some("Theme: mc"));
         for expected in ["nord", "gruvbox", "light", "dark"] {
