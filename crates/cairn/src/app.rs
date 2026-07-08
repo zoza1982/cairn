@@ -24,7 +24,7 @@ use cairn_core::{
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
 use cairn_types::SessionId;
-use cairn_types::{Caps, ConnectionId, UnixPerms, VfsPath};
+use cairn_types::{Caps, ConnectionId, EntryKind, UnixPerms, VfsPath};
 use cairn_vault::Vault;
 use cairn_vfs::{ByteRange, ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
@@ -1930,7 +1930,7 @@ fn dispatch(
             // directory (and the file within it) via `tempfile::TempDir`'s `Drop` impl.
             remote_edit_temps.remove(&id);
         }
-        AppEffect::CalculateSize { conn, path } => {
+        AppEffect::CalculateSize { id, conn, path } => {
             // Cancel any previous walk (only one folder-stats popup at a time), then start a fresh one.
             if let Some(prev) = size_calc_cancel.take() {
                 prev.cancel();
@@ -1940,7 +1940,10 @@ fn dispatch(
             let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                let ev = run_calculate_size_effect(&registry, conn, path, &event_tx, cancel).await;
+                // Every emitted event carries `id`; the reducer drops any that don't match the open
+                // popup, so a superseded walk's late/cancelled events can't settle a newer popup.
+                let ev =
+                    run_calculate_size_effect(&registry, id, conn, path, &event_tx, cancel).await;
                 let _ = event_tx.send(ev).await;
             });
         }
@@ -3383,17 +3386,24 @@ async fn run_delete_effect(
 /// lower bound rather than silently wrong.
 async fn run_calculate_size_effect(
     registry: &VfsRegistry,
+    id: u64,
     conn: ConnectionId,
     root: VfsPath,
     event_tx: &mpsc::Sender<AppEvent>,
     cancel: CancellationToken,
 ) -> AppEvent {
+    // Defensive recursion bound: no real directory tree is this deep, but a backend that stats
+    // *through* a symlink (reporting a symlinked/cyclic directory as a real one) could otherwise
+    // loop forever and grow `stack` without bound. Hitting the cap marks the result partial.
+    const MAX_DEPTH: u32 = 1024;
+
     let mut bytes = 0u64;
     let mut files = 0u64;
     let mut dirs = 0u64;
     let mut partial = false;
     let Some(vfs) = registry.get(conn).await else {
         return AppEvent::SizeDone {
+            id,
             bytes,
             files,
             dirs,
@@ -3406,13 +3416,19 @@ async fn run_calculate_size_effect(
         let now = std::time::Instant::now();
         if last_emit.is_none_or(|t| now.duration_since(t) >= TRANSFER_UI_MIN_INTERVAL) {
             last_emit = Some(now);
-            let _ = event_tx.try_send(AppEvent::SizeProgress { bytes, files, dirs });
+            let _ = event_tx.try_send(AppEvent::SizeProgress {
+                id,
+                bytes,
+                files,
+                dirs,
+            });
         }
     };
 
-    // BFS/DFS over directories; the root itself isn't counted (we measure its contents).
-    let mut stack: Vec<VfsPath> = vec![root];
-    while let Some(dir) = stack.pop() {
+    // DFS over directories; the root itself isn't counted (we measure its contents). Each frame
+    // carries its depth so we can cap recursion.
+    let mut stack: Vec<(VfsPath, u32)> = vec![(root, 0)];
+    while let Some((dir, depth)) = stack.pop() {
         if cancel.is_cancelled() {
             break;
         }
@@ -3428,16 +3444,24 @@ async fn run_calculate_size_effect(
                     for e in pg.entries {
                         if e.is_dir() {
                             dirs += 1;
-                            if let Ok(child) = dir.join(&e.name) {
-                                stack.push(child);
+                            if depth + 1 >= MAX_DEPTH {
+                                partial = true; // too deep (or a cycle) — stop descending, count as a lower bound
+                            } else if let Ok(child) = dir.join(&e.name) {
+                                stack.push((child, depth + 1));
+                            } else {
+                                partial = true; // couldn't form the child path — its contents are uncounted
                             }
-                        } else {
+                        } else if e.kind == EntryKind::File {
+                            // Only regular files contribute to the byte total and file count. A file
+                            // with no reported size makes the total a lower bound.
                             files += 1;
                             match e.size {
-                                Some(sz) => bytes += sz,
-                                None => partial = true, // size unknown for this file → lower bound
+                                Some(sz) => bytes = bytes.saturating_add(sz),
+                                None => partial = true,
                             }
                         }
+                        // Symlinks and special nodes (fifo/socket/device/stream) are neither counted
+                        // nor treated as unreadable — they legitimately have no byte size.
                     }
                     emit(bytes, files, dirs);
                 }
@@ -3450,6 +3474,7 @@ async fn run_calculate_size_effect(
     }
 
     AppEvent::SizeDone {
+        id,
         bytes,
         files,
         dirs,
@@ -5377,6 +5402,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(64);
         let ev = run_calculate_size_effect(
             &registry,
+            1,
             LEFT,
             VfsPath::parse("/d").unwrap(),
             &tx,
@@ -5389,11 +5415,52 @@ mod tests {
                 files,
                 dirs,
                 partial,
+                ..
             } => {
                 assert_eq!(bytes, 4 + 2 + 3 + 1, "sum of all file sizes incl. hidden");
                 assert_eq!(files, 4, "a.txt, b.txt, c.txt, secret");
                 assert_eq!(dirs, 3, "sub, deep, .hidden");
                 assert!(!partial, "every entry was readable");
+            }
+            _ => panic!("expected SizeDone"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn calculate_size_ignores_symlinks_and_stays_non_partial() {
+        // A symlink has no byte size but is perfectly readable: it must not count toward `files`,
+        // must not add bytes, and must NOT flip `partial` (which means "some entries unreadable").
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("real.txt"), b"hello").unwrap(); // 5 bytes, 1 file
+        std::os::unix::fs::symlink("real.txt", dir.path().join("link")).unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let ev = run_calculate_size_effect(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/").unwrap(),
+            &tx,
+            CancellationToken::new(),
+        )
+        .await;
+        match ev {
+            AppEvent::SizeDone {
+                bytes,
+                files,
+                partial,
+                ..
+            } => {
+                assert_eq!(bytes, 5);
+                assert_eq!(files, 1, "the symlink is not counted as a file");
+                assert!(
+                    !partial,
+                    "a symlink is readable — not a partial/unreadable result"
+                );
             }
             _ => panic!("expected SizeDone"),
         }
@@ -5412,9 +5479,15 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let (tx, _rx) = mpsc::channel(8);
-        let ev =
-            run_calculate_size_effect(&registry, LEFT, VfsPath::parse("/").unwrap(), &tx, cancel)
-                .await;
+        let ev = run_calculate_size_effect(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/").unwrap(),
+            &tx,
+            cancel,
+        )
+        .await;
         assert!(matches!(ev, AppEvent::SizeDone { files: 0, .. }));
     }
 

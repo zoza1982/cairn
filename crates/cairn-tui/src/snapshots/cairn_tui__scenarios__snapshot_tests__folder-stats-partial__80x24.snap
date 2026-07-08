@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│>  src/                               ││>  src/                               │
+│   docs/                              ││   docs/                              │
+│   Cargo.toml                         ││   Cargo.toml                         │
+│   README.md                          ││   README.md                          │
+│                                      ││                                      │
+│                ┌ Folder size ───────────────────────────────┐                │
+│                │/etc                                        │                │
+│                │                                            │                │
+│                │Total size (partial):                       │                │
+│                │  12.0 MiB  (12582912 bytes)                │                │
+│                │                                            │                │
+│                │  Files:   2310                             │                │
+│                │  Folders: 412                              │                │
+│                │  (some entries unreadable — lower bound)   │                │
+│                │                                            │                │
+│                │[Esc] close                                 │                │
+│                └────────────────────────────────────────────┘                │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move

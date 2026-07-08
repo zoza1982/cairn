@@ -399,6 +399,8 @@ mod tests {
         assert_eq!(action_for(ctrl_o), Some(Action::OpenConnections));
         let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
         assert_eq!(action_for(ctrl_u), Some(Action::VaultUnlock));
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(action_for(ctrl_s), Some(Action::CalculateSize));
         // Plain 'a'/'x' drive the plan overlay (no-ops elsewhere).
         assert_eq!(
             action_for(press(KeyCode::Char('a'))),

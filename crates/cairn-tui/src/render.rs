@@ -223,6 +223,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState, theme: &Theme) {
             files,
             dirs,
             partial,
+            .. // `id` is a correlation token, not rendered
         } => render_folder_stats(
             frame, name, *computing, *bytes, *files, *dirs, *partial, theme,
         ),
@@ -1163,16 +1164,21 @@ fn render_folder_stats(
     partial: bool,
     theme: &Theme,
 ) {
-    let width: u16 = 46;
-    let inner_w = usize::from(width) - 4; // borders + one-space padding each side
+    // Clamp the box to the real frame width *first*, then derive the interior width from that — so a
+    // long folder name is truncated to the actual content width on a narrow terminal instead of
+    // overflowing the right border.
+    let width: u16 = 46.min(frame.area().width);
+    let inner_w = usize::from(width).saturating_sub(2); // strip the two border columns
     let mut lines = vec![
         Line::from(truncate_to(name, inner_w)).style(Modifier::BOLD),
         Line::from(""),
     ];
+    // Keep the header within the content width; a `partial` walk is flagged with a short "(partial)"
+    // rather than a long sentence that would clip on the default box.
     lines.push(Line::from(if computing {
         "Calculating…".to_owned()
     } else if partial {
-        "Total size (partial — some entries unreadable):".to_owned()
+        "Total size (partial):".to_owned()
     } else {
         "Total size:".to_owned()
     }));
@@ -1182,6 +1188,9 @@ fn render_folder_stats(
     lines.push(Line::from(""));
     lines.push(Line::from(format!("  Files:   {files}")));
     lines.push(Line::from(format!("  Folders: {dirs}")));
+    if partial && !computing {
+        lines.push(Line::from("  (some entries unreadable — lower bound)"));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(if computing {
         "[Esc] cancel"

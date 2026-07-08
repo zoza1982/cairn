@@ -250,6 +250,8 @@ pub enum AppEvent {
     /// A live update from the [`AppEffect::CalculateSize`] walk: running totals for the folder-stats
     /// popup so a large/remote directory shows progress rather than a frozen "Calculating…".
     SizeProgress {
+        /// Correlation id of the walk (must match the open popup — see [`AppEffect::CalculateSize`]).
+        id: u64,
         /// Bytes summed so far.
         bytes: u64,
         /// Files counted so far.
@@ -260,13 +262,15 @@ pub enum AppEvent {
     /// The [`AppEffect::CalculateSize`] walk finished (or was cancelled): the final totals and
     /// whether any entries failed to stat (a partial count).
     SizeDone {
+        /// Correlation id of the walk (must match the open popup — see [`AppEffect::CalculateSize`]).
+        id: u64,
         /// Total bytes.
         bytes: u64,
         /// Total files.
         files: u64,
         /// Total subdirectories.
         dirs: u64,
-        /// Whether some entries couldn't be read (the totals are a lower bound).
+        /// Whether some entries couldn't be read or a depth cap was hit (the totals are a lower bound).
         partial: bool,
     },
     /// A requested transfer would overwrite existing destinations; carries the parameters needed to
@@ -773,6 +777,9 @@ pub enum AppEffect {
     /// updates back for the [`crate::Overlay::FolderStats`] popup. Cancelled by
     /// [`AppEffect::CancelCalculateSize`] (only one runs at a time — the open popup).
     CalculateSize {
+        /// Correlation id matching the popup this walk feeds, so a stale (cancelled) walk's late
+        /// events can't settle a newer popup for a different folder.
+        id: u64,
         /// The connection the directory lives on.
         conn: ConnectionId,
         /// The directory to measure.

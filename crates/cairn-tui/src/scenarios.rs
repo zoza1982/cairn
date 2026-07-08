@@ -107,6 +107,11 @@ pub fn all() -> Vec<Scenario> {
             build: folder_stats_done,
         },
         Scenario {
+            name: "folder-stats-partial",
+            description: "the Ctrl-S folder-size popup when some entries were unreadable (a lower-bound total)",
+            build: folder_stats_partial,
+        },
+        Scenario {
             name: "pager-text",
             description: "the read-only pager (F3) in text mode",
             build: pager_text,
@@ -368,6 +373,7 @@ fn transfer_scanning() -> AppState {
 fn folder_stats_computing() -> AppState {
     let mut s = dual_pane();
     s.overlay = Some(Overlay::FolderStats {
+        id: 1,
         name: "node_modules".to_owned(),
         computing: true,
         bytes: 84 * 1024 * 1024,
@@ -381,12 +387,29 @@ fn folder_stats_computing() -> AppState {
 fn folder_stats_done() -> AppState {
     let mut s = dual_pane();
     s.overlay = Some(Overlay::FolderStats {
+        id: 1,
         name: "project".to_owned(),
         computing: false,
         bytes: 1_610_612_736, // 1.5 GiB
         files: 48_120,
         dirs: 5_004,
         partial: false,
+    });
+    s
+}
+
+fn folder_stats_partial() -> AppState {
+    // A finished walk that couldn't read some entries (or hit the depth cap): the total is flagged
+    // as a lower bound.
+    let mut s = dual_pane();
+    s.overlay = Some(Overlay::FolderStats {
+        id: 1,
+        name: "/etc".to_owned(),
+        computing: false,
+        bytes: 12_582_912,
+        files: 2_310,
+        dirs: 412,
+        partial: true,
     });
     s
 }

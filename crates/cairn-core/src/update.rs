@@ -1777,6 +1777,9 @@ fn apply_vault_create_action(state: &mut AppState, action: Action) -> Vec<AppEff
 /// is harmless — the runtime just has no live task to stop.
 fn apply_folder_stats_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     match action {
+        // The popup is a passive read-out with nothing to confirm, so `Enter` (like `Esc`) just
+        // dismisses it — a small, deliberate divergence from the read-only Pager/LogViewer overlays,
+        // which close only on `Cancel`.
         Action::Cancel | Action::Confirm | Action::Enter => {
             state.overlay = None;
             vec![AppEffect::CancelCalculateSize]
@@ -3310,7 +3313,10 @@ fn calculate_size(state: &mut AppState) -> Vec<AppEffect> {
         return Vec::new();
     };
     let conn = pane.conn;
+    let id = state.next_size_calc_id;
+    state.next_size_calc_id = state.next_size_calc_id.wrapping_add(1);
     state.overlay = Some(Overlay::FolderStats {
+        id,
         name,
         computing: true,
         bytes: 0,
@@ -3318,7 +3324,7 @@ fn calculate_size(state: &mut AppState) -> Vec<AppEffect> {
         dirs: 0,
         partial: false,
     });
-    vec![AppEffect::CalculateSize { conn, path }]
+    vec![AppEffect::CalculateSize { id, conn, path }]
 }
 
 fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
@@ -3885,10 +3891,17 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             Vec::new()
         }
         AppEvent::OpDone { status, error } => finish_op(state, &status, error),
-        AppEvent::SizeProgress { bytes, files, dirs } => {
-            // Advisory: only apply while the folder-stats popup is still open (the user may have
-            // closed it, or another overlay took over).
+        AppEvent::SizeProgress {
+            id,
+            bytes,
+            files,
+            dirs,
+        } => {
+            // Advisory: only apply while the *matching* folder-stats popup is still open and
+            // computing — a stale (cancelled/superseded) walk's late event carries a different id
+            // and is dropped, so it can't corrupt a newer popup for a different folder.
             if let Some(Overlay::FolderStats {
+                id: open_id,
                 computing,
                 bytes: b,
                 files: f,
@@ -3896,19 +3909,21 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 ..
             }) = &mut state.overlay
             {
-                if *computing {
+                if *open_id == id && *computing {
                     (*b, *f, *d) = (bytes, files, dirs);
                 }
             }
             Vec::new()
         }
         AppEvent::SizeDone {
+            id,
             bytes,
             files,
             dirs,
             partial,
         } => {
             if let Some(Overlay::FolderStats {
+                id: open_id,
                 computing,
                 bytes: b,
                 files: f,
@@ -3917,8 +3932,10 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 ..
             }) = &mut state.overlay
             {
-                *computing = false;
-                (*b, *f, *d, *p) = (bytes, files, dirs, partial);
+                if *open_id == id {
+                    *computing = false;
+                    (*b, *f, *d, *p) = (bytes, files, dirs, partial);
+                }
             }
             Vec::new()
         }
@@ -7188,10 +7205,10 @@ mod tests {
         // Cursor on the folder → popup opens (computing) and a CalculateSize effect is emitted.
         s.pane_mut(Side::Left).cursor = 0;
         let fx = update(&mut s, Msg::Action(Action::CalculateSize));
-        assert!(
-            matches!(&fx[..], [AppEffect::CalculateSize { .. }]),
-            "expected a CalculateSize effect, got {fx:?}"
-        );
+        let [AppEffect::CalculateSize { id, .. }] = &fx[..] else {
+            panic!("expected a CalculateSize effect, got {fx:?}");
+        };
+        let id = *id;
         assert!(matches!(
             s.overlay,
             Some(Overlay::FolderStats {
@@ -7200,10 +7217,26 @@ mod tests {
             })
         ));
 
-        // Live progress updates the running totals…
+        // A *stale* event (wrong id) is ignored — it can't corrupt this popup.
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::SizeProgress {
+                id: id.wrapping_add(999),
+                bytes: 7,
+                files: 7,
+                dirs: 7,
+            }),
+        );
+        assert!(
+            matches!(s.overlay, Some(Overlay::FolderStats { bytes: 0, .. }),),
+            "a mismatched-id event must not update the popup"
+        );
+
+        // Live progress (matching id) updates the running totals…
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::SizeProgress {
+                id,
                 bytes: 100,
                 files: 3,
                 dirs: 1,
@@ -7222,6 +7255,7 @@ mod tests {
         let _ = update(
             &mut s,
             Msg::Event(AppEvent::SizeDone {
+                id,
                 bytes: 256,
                 files: 5,
                 dirs: 2,

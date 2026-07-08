@@ -855,6 +855,10 @@ pub enum Overlay {
     /// live "Calculating…" state and updates from [`crate::AppEvent::SizeProgress`], settling on the
     /// final totals at [`crate::AppEvent::SizeDone`]. `Esc` cancels the walk and closes it.
     FolderStats {
+        /// Correlation id for the in-flight walk feeding this popup; a `SizeProgress`/`SizeDone`
+        /// event is applied only when its id matches, so a cancelled walk's late event can't
+        /// overwrite a newer popup opened for a different folder.
+        id: u64,
         /// Display name of the directory being measured (leaf name, secret-free).
         name: String,
         /// Whether the walk is still running (drives the "Calculating…" vs final view).
@@ -1315,6 +1319,9 @@ pub struct AppState {
     /// Monotonic id source for [`active_transfers`](AppState::active_transfers). Minted by the pure
     /// reducer (no clock/RNG); starts at 1 so 0 is an obvious sentinel.
     pub next_transfer_id: TransferId,
+    /// Monotonic id source for folder-size walks (the `Ctrl-S` popup). Each `CalculateSize` stamps
+    /// the popup + its walk with the next value so a superseded walk's late events are ignored.
+    pub next_size_calc_id: u64,
     /// How many transfers may run at once. From config at startup; `1` reproduces strict FIFO.
     /// INVARIANT: must be `>= 1` — `0` would queue every transfer and never drain. Clamp at the
     /// config-load site when wiring this.
@@ -1686,6 +1693,7 @@ impl AppState {
             connections: Vec::new(),
             active_transfers: Vec::new(),
             next_transfer_id: 1,
+            next_size_calc_id: 1,
             concurrency_limit: 1,
             transfer_queue: VecDeque::new(),
             shell_actions: Vec::new(),
