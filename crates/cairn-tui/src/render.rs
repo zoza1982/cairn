@@ -25,14 +25,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // is a no-op there. Every downstream widget only sets `.fg()` (bar the explicit selection/
     // reversed styles), so ratatui's per-field style merge keeps this base without clobbering them.
     if theme.background.is_some() || theme.foreground.is_some() {
-        let mut base = Style::default();
-        if let Some(bg) = theme.background {
-            base = base.bg(bg);
-        }
-        if let Some(fg) = theme.foreground {
-            base = base.fg(fg);
-        }
-        frame.render_widget(Block::new().style(base), frame.area());
+        frame.render_widget(Block::new().style(overlay_base(theme)), frame.area());
     }
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
@@ -41,7 +34,22 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     render_pane(frame, left, state, Side::Left, theme);
     render_pane(frame, right, state, Side::Right, theme);
     render_status(frame, status, state, theme);
-    render_overlay(frame, state);
+    render_overlay(frame, state, theme);
+}
+
+/// The base style for an overlay/dialog: the theme's background/foreground, so a dialog matches the
+/// active theme instead of showing the terminal default that `Clear` leaves. Applied as each overlay
+/// block's `.style(...)` (a `Block`'s style fills its whole area, including the interior). Semantic
+/// border accents (red for delete, yellow for confirm, …) are kept on top for clarity.
+fn overlay_base(theme: &Theme) -> Style {
+    let mut s = Style::default();
+    if let Some(bg) = theme.background {
+        s = s.bg(bg);
+    }
+    if let Some(fg) = theme.foreground {
+        s = s.fg(fg);
+    }
+    s
 }
 
 /// Compute the display label for a connection choice in the switcher.
@@ -78,6 +86,7 @@ fn render_connections(
     connections: &[cairn_core::ConnectionChoice],
     cursor: usize,
     show_hidden: bool,
+    theme: &Theme,
 ) {
     let visible_indices = cairn_core::visible_connection_indices(connections, show_hidden);
     let visible: Vec<&cairn_core::ConnectionChoice> =
@@ -97,6 +106,7 @@ fn render_connections(
         " Open connection "
     };
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(title)
         .border_style(Style::default().fg(Color::Cyan));
     // Split the inner area: list rows above, one hint line below.
@@ -181,7 +191,7 @@ fn connections_hint(editable: bool, width: usize) -> String {
 
 /// Draw the active modal overlay (if any) centered over the screen. Takes `&AppState` so overlays
 /// that need extra state (the connection switcher's choice list) dispatch from a single site.
-fn render_overlay(frame: &mut Frame, state: &AppState) {
+fn render_overlay(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let Some(overlay) = &state.overlay else {
         return;
     };
@@ -189,11 +199,12 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
         Overlay::Connections {
             cursor,
             show_hidden,
-        } => render_connections(frame, &state.connections, *cursor, *show_hidden),
+        } => render_connections(frame, &state.connections, *cursor, *show_hidden, theme),
         Overlay::ConfirmDelete { paths, .. } => {
             let area = centered(frame.area(), 44, 6);
             frame.render_widget(Clear, area);
             let block = Block::bordered()
+                .style(overlay_base(theme))
                 .title(" Confirm delete ")
                 .border_style(Style::default().fg(Color::Red));
             let body = Paragraph::new(vec![
@@ -209,6 +220,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             let area = centered(frame.area(), 48, 6);
             frame.render_widget(Clear, area);
             let block = Block::bordered()
+                .style(overlay_base(theme))
                 .title(" Overwrite? ")
                 .border_style(Style::default().fg(Color::Yellow));
             let body = Paragraph::new(vec![
@@ -225,6 +237,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             let area = centered(frame.area(), 56, 7);
             frame.render_widget(Clear, area);
             let block = Block::bordered()
+                .style(overlay_base(theme))
                 .title(" Run shell action? ")
                 .border_style(Style::default().fg(Color::Yellow));
             let body = Paragraph::new(vec![
@@ -247,12 +260,12 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             reason,
             cursor,
             ..
-        } => render_confirm_writeback(frame, path, temp_path, *reason, *cursor),
-        Overlay::TransferQueue { cursor } => render_transfer_queue(frame, state, *cursor),
-        Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor),
-        Overlay::Prompt { kind, input } => render_prompt(frame, kind, input),
+        } => render_confirm_writeback(frame, path, temp_path, *reason, *cursor, theme),
+        Overlay::TransferQueue { cursor } => render_transfer_queue(frame, state, *cursor, theme),
+        Overlay::AiPlan { plan, cursor } => render_ai_plan(frame, plan, *cursor, theme),
+        Overlay::Prompt { kind, input } => render_prompt(frame, kind, input, theme),
         Overlay::VaultUnlock { input, error, .. } => {
-            render_vault_unlock(frame, input, error.as_deref(), state.vault_unlocking)
+            render_vault_unlock(frame, input, error.as_deref(), state.vault_unlocking, theme)
         }
         Overlay::VaultCreate {
             passphrase,
@@ -270,6 +283,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             *remember,
             error.as_deref(),
             *creating,
+            theme,
         ),
         Overlay::LogViewer {
             title,
@@ -278,7 +292,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             scroll,
             status,
             ..
-        } => render_log_viewer(frame, title, lines, *follow, *scroll, status),
+        } => render_log_viewer(frame, title, lines, *follow, *scroll, status, theme),
         Overlay::Pager {
             title,
             mode,
@@ -299,6 +313,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             *scroll,
             status,
             *wrap,
+            theme,
         ),
         Overlay::ExecPane {
             id,
@@ -307,16 +322,16 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             follow,
         } => {
             if let Some(rec) = state.sessions.get(id) {
-                render_exec_pane(frame, rec, input, *scroll, *follow);
+                render_exec_pane(frame, rec, input, *scroll, *follow, theme);
             }
         }
         Overlay::PortForwardStatus { id } => {
             if let Some(rec) = state.sessions.get(id) {
-                render_port_forward_status(frame, rec);
+                render_port_forward_status(frame, rec, theme);
             }
         }
         Overlay::ConfirmDeleteConnection { display_name, .. } => {
-            render_confirm_delete_connection(frame, display_name)
+            render_confirm_delete_connection(frame, display_name, theme)
         }
         Overlay::ConnectionForm {
             stage,
@@ -342,13 +357,14 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             cred_method.as_ref(),
             cred_fields,
             *cred_focus,
+            theme,
         ),
     }
 }
 
 /// Draw the confirm-delete-connection overlay: a red-bordered prompt asking the user to confirm
 /// before permanently removing a saved connection profile.
-fn render_confirm_delete_connection(frame: &mut Frame, display_name: &str) {
+fn render_confirm_delete_connection(frame: &mut Frame, display_name: &str, theme: &Theme) {
     let msg = format!("Delete connection '{display_name}'? This cannot be undone.");
     let h = 5u16;
     let w = u16::try_from(msg.len() + 6)
@@ -357,6 +373,7 @@ fn render_confirm_delete_connection(frame: &mut Frame, display_name: &str) {
     let area = centered(frame.area(), w, h);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(" Confirm delete ")
         .border_style(Style::default().fg(Color::Red));
     let inner = block.inner(area);
@@ -380,11 +397,13 @@ fn render_confirm_writeback(
     temp_path: &std::path::Path,
     reason: WritebackConflictReason,
     cursor: usize,
+    theme: &Theme,
 ) {
     // 2 borders + reason + path + temp path + blank + 4 choices + hint.
     let area = centered(frame.area(), 66, 12);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(" Write back? ")
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(area);
@@ -422,11 +441,18 @@ fn render_confirm_writeback(
 /// Draw the vault-unlock overlay: a masked passphrase field (one `•` per typed character — the
 /// passphrase itself is never rendered), a status/error line (an in-flight "Unlocking…" note or a
 /// failed-attempt error), and the action hint.
-fn render_vault_unlock(frame: &mut Frame, input: &MaskedInput, error: Option<&str>, busy: bool) {
+fn render_vault_unlock(
+    frame: &mut Frame,
+    input: &MaskedInput,
+    error: Option<&str>,
+    busy: bool,
+    theme: &Theme,
+) {
     // 7 rows: 2 borders + masked field + blank + error/spacer + hint + breathing room.
     let area = centered(frame.area(), 50, 7);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(" Unlock vault ")
         .border_style(Style::default().fg(Color::Cyan));
     // One bullet per entered character; a trailing block stands in for the cursor. Never the value.
@@ -458,6 +484,7 @@ fn render_vault_unlock(frame: &mut Frame, input: &MaskedInput, error: Option<&st
 ///
 /// **Security invariants:** only the *count* of typed characters is exposed (as `•` bullets) —
 /// the actual bytes are never rendered. The `MaskedInput` API provides only `len()` for this.
+#[allow(clippy::too_many_arguments)]
 fn render_vault_create(
     frame: &mut Frame,
     passphrase: &MaskedInput,
@@ -466,12 +493,14 @@ fn render_vault_create(
     remember: bool,
     error: Option<&str>,
     creating: bool,
+    theme: &Theme,
 ) {
     // 11 rows: 2 borders + 9 content rows (passphrase label + passphrase field + blank +
     // confirm label + confirm field + blank + remember toggle + error/status + hint).
     let area = centered(frame.area(), 54, 11);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(" Create vault ")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -574,23 +603,24 @@ fn render_connection_form(
     cred_method: Option<&CredentialMethod>,
     cred_fields: &std::collections::HashMap<String, FieldValue>,
     cred_focus: usize,
+    theme: &Theme,
 ) {
     match stage {
-        ConnectionFormStage::SchemePicker => render_scheme_picker(frame, focus),
+        ConnectionFormStage::SchemePicker => render_scheme_picker(frame, focus, theme),
         ConnectionFormStage::Fields => {
-            render_form_fields(frame, scheme, values, focus, field_errors, is_edit)
+            render_form_fields(frame, scheme, values, focus, field_errors, is_edit, theme)
         }
         ConnectionFormStage::CredentialMethodPicker => {
-            render_credential_method_picker(frame, scheme, is_edit, cred_method_cursor)
+            render_credential_method_picker(frame, scheme, is_edit, cred_method_cursor, theme)
         }
         ConnectionFormStage::CredentialFields => {
-            render_credential_fields(frame, cred_method, cred_fields, cred_focus)
+            render_credential_fields(frame, cred_method, cred_fields, cred_focus, theme)
         }
     }
 }
 
 /// Draw the scheme-picker stage: a scrollable list of known backend types.
-fn render_scheme_picker(frame: &mut Frame, focus: usize) {
+fn render_scheme_picker(frame: &mut Frame, focus: usize, theme: &Theme) {
     let h = u16::try_from(KNOWN_SCHEMES.len())
         .unwrap_or(u16::MAX)
         .saturating_add(5) // 2 borders + 1 blank + 1 hint + 1 breathing room
@@ -598,6 +628,7 @@ fn render_scheme_picker(frame: &mut Frame, focus: usize) {
     let area = centered(frame.area(), 50, h.max(5));
     frame.render_widget(Clear, area);
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(" New connection — choose backend ")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -634,6 +665,7 @@ fn render_form_fields(
     focus: usize,
     field_errors: &std::collections::HashMap<String, String>,
     is_edit: bool,
+    theme: &Theme,
 ) {
     let fields = scheme_fields(scheme);
     // +5 = 2 borders + 1 cred hint + 1 blank + 1 action hint line
@@ -650,6 +682,7 @@ fn render_form_fields(
         " New connection — fill in details "
     };
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(title)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -739,7 +772,13 @@ fn render_form_fields(
 }
 
 /// Draw the credential method picker stage: a list of auth methods for the chosen scheme.
-fn render_credential_method_picker(frame: &mut Frame, scheme: &str, is_edit: bool, cursor: usize) {
+fn render_credential_method_picker(
+    frame: &mut Frame,
+    scheme: &str,
+    is_edit: bool,
+    cursor: usize,
+    theme: &Theme,
+) {
     let methods = credential_methods(scheme, is_edit);
     let n = methods.len();
     if n == 0 {
@@ -752,6 +791,7 @@ fn render_credential_method_picker(frame: &mut Frame, scheme: &str, is_edit: boo
     let area = centered(frame.area(), 60, h.max(5));
     frame.render_widget(Clear, area);
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(" Choose authentication method ")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -795,6 +835,7 @@ fn render_credential_fields(
     cred_method: Option<&CredentialMethod>,
     cred_fields: &std::collections::HashMap<String, FieldValue>,
     cred_focus: usize,
+    theme: &Theme,
 ) {
     let Some(method) = cred_method else {
         return;
@@ -806,6 +847,7 @@ fn render_credential_fields(
         let area = centered(frame.area(), 60, 5);
         frame.render_widget(Clear, area);
         let block = Block::bordered()
+            .style(overlay_base(theme))
             .title(" Credentials ")
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(area);
@@ -836,6 +878,7 @@ fn render_credential_fields(
     frame.render_widget(Clear, area);
     let title = format!(" Credentials — {} ", method.label());
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(title)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -920,7 +963,7 @@ fn render_credential_fields(
 /// for the path being walked — followed by the pending queue with the reorder cursor, and hint lines.
 /// Auto-opened by the reducer whenever a transfer starts (`arm_transfer`); backgrounded with `b`,
 /// brought back with `Ctrl-T`.
-fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
+fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize, theme: &Theme) {
     let pending = &state.transfer_queue;
     let active = &state.active_transfers;
 
@@ -1084,6 +1127,7 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize) {
     let area = centered(frame_area, width, h.max(6));
     frame.render_widget(Clear, area);
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(" Transfer ")
         .border_style(Style::default().fg(Color::Cyan));
     let content = block.inner(area);
@@ -1136,11 +1180,12 @@ fn transfer_rate_eta(t: &cairn_core::ActiveTransfer) -> (Option<u64>, Option<u64
 }
 
 /// Draw a single-line text prompt (new directory, rename) with the entered text and a block cursor.
-fn render_prompt(frame: &mut Frame, kind: &PromptKind, input: &str) {
+fn render_prompt(frame: &mut Frame, kind: &PromptKind, input: &str, theme: &Theme) {
     // 6 rows: 2 borders + 3 content lines + 1 of breathing space (matches the ConfirmDelete box).
     let area = centered(frame.area(), 50, 6);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(format!(" {} ", kind.title()))
         .border_style(Style::default().fg(Color::Cyan));
     let body = Paragraph::new(vec![
@@ -1156,7 +1201,7 @@ fn render_prompt(frame: &mut Frame, kind: &PromptKind, input: &str) {
 
 /// Draw the AI plan → confirm overlay: the summary, each step with its approval status and
 /// reversibility, and the available actions (bulk-approve only when no step is irreversible).
-fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize) {
+fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize, theme: &Theme) {
     let h = u16::try_from(plan.steps.len())
         .unwrap_or(u16::MAX)
         .saturating_add(6)
@@ -1165,6 +1210,7 @@ fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize) {
     frame.render_widget(Clear, area);
 
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(" AI plan — review before running ")
         .border_style(Style::default().fg(Color::Magenta));
     // Lay content out within the block's interior so nothing overwrites the border.
@@ -1254,6 +1300,7 @@ fn render_log_viewer(
     follow: bool,
     scroll: usize,
     status: &LogViewerStatus,
+    theme: &Theme,
 ) {
     let area = centered(
         frame.area(),
@@ -1269,6 +1316,7 @@ fn render_log_viewer(
     };
     let follow_hint = if follow { " [follow] " } else { "" };
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(format!(" {} ", title))
         .title_bottom(Line::from(format!("{follow_hint}{status_label}")).right_aligned())
         .border_style(Style::default().fg(Color::Cyan));
@@ -1314,6 +1362,7 @@ fn render_pager(
     scroll: usize,
     status: &PagerStatus,
     wrap: bool,
+    theme: &Theme,
 ) {
     let area = centered(
         frame.area(),
@@ -1346,6 +1395,7 @@ fn render_pager(
         _ => format!(" {current_line}/{total_lines} "),
     };
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(format!(" {title} "))
         .title_bottom(Line::from(status_label).right_aligned())
         .title_bottom(Line::from(position).left_aligned())
@@ -1447,6 +1497,8 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
     // Bottom-right status: current sort mode, plus a `+hidden` flag when dotfiles are shown.
     let hidden = if pane.show_hidden { " +hidden" } else { "" };
     let status = format!(" sort: {}{hidden} ", pane.sort.label());
+    // No `overlay_base` here: a pane isn't an overlay — it already sits on the theme background painted
+    // over the whole frame at the top of `render()`, so it needs no fill of its own.
     let mut block = Block::bordered()
         .title(title)
         .title_bottom(Line::from(status).right_aligned())
@@ -1891,6 +1943,7 @@ fn render_exec_pane(
     input: &str,
     scroll: usize,
     follow: bool,
+    theme: &Theme,
 ) {
     let area = centered(
         frame.area(),
@@ -1920,6 +1973,7 @@ fn render_exec_pane(
         " [Esc] close "
     };
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(format!(" {} ", rec.title))
         .title_bottom(Line::from(format!("{follow_hint}{status_label}")).right_aligned())
         .title_bottom(Line::from(hint_bottom).left_aligned())
@@ -1979,12 +2033,13 @@ fn render_exec_pane(
 
 /// Draw the port-forward status overlay: shows the title, the bound local port (or "binding…"
 /// until [`AppEvent::PortForwardBound`] arrives), and the ended state if applicable.
-fn render_port_forward_status(frame: &mut Frame, rec: &SessionRecord) {
+fn render_port_forward_status(frame: &mut Frame, rec: &SessionRecord, theme: &Theme) {
     // 7 rows: 2 borders + title/port row + blank + status + blank + hint.
     let area = centered(frame.area(), 56, 7);
     frame.render_widget(Clear, area);
 
     let block = Block::bordered()
+        .style(overlay_base(theme))
         .title(format!(" {} ", rec.title))
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -2119,6 +2174,46 @@ mod tests {
             .zip(themed.content().iter())
             .any(|(p, t)| p.style().bg != t.style().bg);
         assert!(changed, "themed background must paint at least one cell");
+    }
+
+    #[test]
+    fn overlays_pick_up_the_theme_background() {
+        // A dialog must match the active theme, not the terminal default that its `Clear` would leave.
+        // The overlay's own block fills its interior with the theme background; assert a cell on the
+        // dialog's title row carries it.
+        let mut s = ready_state();
+        s.overlay = Some(cairn_core::Overlay::Prompt {
+            kind: cairn_core::PromptKind::MakeDir,
+            input: "x".to_owned(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    &s,
+                    &Theme {
+                        background: Some(Color::Blue),
+                        ..Theme::DARK
+                    },
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let width = usize::from(buf.area().width);
+        let cells: Vec<_> = buf.content().iter().collect();
+        let mut themed = false;
+        for row in cells.chunks(width) {
+            let text: String = row.iter().map(|c| c.symbol()).collect();
+            if text.contains("New directory") {
+                themed = row.iter().any(|c| c.style().bg == Some(Color::Blue));
+                break;
+            }
+        }
+        assert!(
+            themed,
+            "the overlay's interior must be painted with the theme background"
+        );
     }
 
     #[test]
