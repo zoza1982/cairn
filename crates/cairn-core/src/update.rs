@@ -3867,10 +3867,12 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             // byte/finalize update is also how a transfer *leaves* the Counting phase.
             if let Some(t) = state.active_transfers.iter_mut().find(|t| t.id == id) {
                 // A `finalizing` signal fires once per file (before its flush/verify). Only treat it
-                // as the transfer-wide Finalizing phase when the *whole* transfer is at its tail —
-                // all bytes written, or an unknown total — otherwise a directory copy would snap the
-                // bar to 100% at every file boundary. A mid-tree per-file finalize stays in Copying.
-                let whole_transfer_done = total.is_none_or(|tot| bytes >= tot);
+                // as the transfer-wide Finalizing phase when the *whole* transfer is at its tail: all
+                // bytes written against a KNOWN total. With an unknown total (`None`) we can't tell a
+                // mid-tree file boundary from the real end, so a per-file finalize must NOT flip the
+                // phase — otherwise every file would snap the bar to 100%. Such a transfer stays in
+                // Copying (indeterminate, animated) until it actually completes via `TransferDone`.
+                let whole_transfer_done = total.is_some_and(|tot| bytes >= tot);
                 t.phase = if finalizing && whole_transfer_done {
                     TransferPhase::Finalizing
                 } else {
@@ -5269,6 +5271,35 @@ mod tests {
             }),
         );
         assert_eq!(s.active_transfers[0].phase, TransferPhase::Finalizing);
+    }
+
+    #[test]
+    fn unknown_total_finalize_stays_copying_never_flashing_100() {
+        // With no pre-scan total (bounded/skipped scan, or a same-server move), a per-file
+        // `finalizing` signal must NOT flip the whole transfer to Finalizing — otherwise every file
+        // in a directory copy would snap the indeterminate bar to 100%. It stays Copying (animated)
+        // until the op actually completes.
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let id = s.active_transfers[0].id;
+        for bytes in [1024u64, 4096, 9000] {
+            let _ = update(
+                &mut s,
+                Msg::Event(AppEvent::TransferProgress {
+                    id,
+                    bytes,
+                    rate_bps: 512,
+                    total: None,      // unknown total
+                    finalizing: true, // a per-file finalize
+                }),
+            );
+            assert_eq!(
+                s.active_transfers[0].phase,
+                TransferPhase::Copying,
+                "an unknown-total finalize must stay Copying, not flash Finalizing/100%"
+            );
+        }
     }
 
     #[test]

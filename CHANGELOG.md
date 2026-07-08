@@ -175,6 +175,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A large copy/move no longer stalls on the pre-flight size scan.** The scan that sizes the source
+  tree for a percentage/ETA is now **time-boxed** (≤ 0.8 s) and **entry-capped** — so copying a huge
+  or remote (SFTP) folder starts almost immediately with an indeterminate, animated bar (MC-style)
+  instead of blocking on a full tree walk before a single byte moves. A quick scan still yields an
+  exact total and ETA as before; only oversized/slow scans fall back. The cap also bounds the scan's
+  memory on pathologically wide trees. Relatedly, an unknown-total transfer no longer flashes the bar
+  to 100% at every file boundary (a per-file finalize is no longer mistaken for the whole transfer
+  completing).
+
 - **The progress bar now animates for operations with no known total** (a delete, the pre-scan
   "Counting" phase, or a copy without a pre-scan result) instead of sitting as a static empty
   `--%` bar that looked frozen. A small block sweeps back and forth (MC-style marquee), driven by a
