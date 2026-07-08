@@ -257,6 +257,10 @@ pub struct PaneState {
     /// *inside* another mounted archive nests correctly. Empty for a pane that has never mounted
     /// an archive.
     pub mount_stack: Vec<MountFrame>,
+    /// Free/total space for the volume backing this pane's directory, shown in the pane frame.
+    /// `None` while loading or when the backend can't report it (object stores, containers, or an
+    /// SFTP server without the extension). Fetched alongside each listing; cleared on navigate.
+    pub space: Option<cairn_types::SpaceInfo>,
     /// When the next listing for this pane arrives, place the cursor on the entry with this name
     /// (instead of the default top row). Set by `leave_dir` to the name of the directory being
     /// exited, so going up (`..`) returns the cursor to the child you came from — MC behaviour —
@@ -290,6 +294,7 @@ impl PaneState {
             filter: None,
             filter_editing: false,
             mount_stack: Vec::new(),
+            space: None,
             select_after_load: None,
         }
     }

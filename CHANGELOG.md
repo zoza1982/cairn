@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Each pane's frame now shows the volume's free disk space** in the bottom-left corner (e.g.
+  `137.0 GiB free`), refreshed on every navigate. Available to the current user (respects
+  root-reserved blocks and quotas). Supported on the local backend on all platforms (via a
+  cross-platform statvfs); other backends that can't report it (object stores, containers) simply
+  omit it, and it yields to the filter label when a filter is active. (SSH/SFTP free space via
+  `statvfs@openssh.com` is a tracked follow-up.)
+
 - **`Ctrl-S` calculates a folder's size** (recursively) and shows it in a stats popup: total size
   (human-readable + exact bytes) plus file and subfolder counts. The walk runs in the background and
   the popup updates live, so a large or remote directory shows progress instead of blocking; `Esc`

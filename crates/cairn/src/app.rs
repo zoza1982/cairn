@@ -1287,6 +1287,39 @@ fn dispatch(
             dir,
             all,
         } => {
+            // Fetch the volume's free space alongside the listing (a decorative pane-frame indicator).
+            // A separate task so it never blocks or gates the listing; best-effort, so any error just
+            // yields `None`.
+            {
+                let registry = registry.clone();
+                let event_tx = event_tx.clone();
+                let dir = dir.clone();
+                tokio::spawn(async move {
+                    let Some(vfs) = registry.get(conn).await else {
+                        return;
+                    };
+                    // Skip backends that can't report space (object stores, containers) — the pane's
+                    // space is already `None` after navigate, so there's nothing to send.
+                    if !vfs.caps().contains(Caps::SPACE) {
+                        return;
+                    }
+                    let space = match vfs.space(&dir).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(error = %e.redacted(), "space() failed");
+                            None
+                        }
+                    };
+                    let _ = event_tx
+                        .send(AppEvent::SpaceFetched {
+                            pane,
+                            conn,
+                            dir,
+                            space,
+                        })
+                        .await;
+                });
+            }
             let registry = registry.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {

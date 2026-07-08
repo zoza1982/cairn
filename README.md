@@ -89,7 +89,9 @@ right-aligned MC-style; on a narrow pane the columns drop out responsively — p
 keeping the date as long as it fits — so the name keeps priority, and are blank for backends that
 don't expose that metadata. Dates are shown in UTC (`YYYY-MM-DD`). By default `s` cycles the active pane's sort order (name → size → modified →
 type) and `.` toggles whether hidden entries (dotfiles) are listed; the current sort mode and hidden
-state show in each pane's bottom-right corner. `Ctrl-R` reloads the active pane. `F7` creates a new
+state show in each pane's bottom-right corner, and the volume's **free disk space** (e.g.
+`137.0 GiB free`) shows in the bottom-left for backends that report it (local now; SSH is a
+follow-up). `Ctrl-R` reloads the active pane. `F7` creates a new
 directory and `r` renames the entry under the cursor (`F2` is an alias; both
 open a text prompt; `Enter` confirms, `Esc` cancels). `Ctrl-S` recursively calculates the size of
 the folder under the cursor and shows it in a stats popup (total size, file and subfolder counts);

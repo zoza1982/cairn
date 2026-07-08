@@ -3,7 +3,7 @@
 use crate::action::{ActionCtx, ActionDescriptor, ActionId, ActionOutcome};
 use crate::error::VfsError;
 use crate::handle::{ReadHandle, WriteHandle};
-use cairn_types::{Caps, ConnectionId, Entry, Scheme, VfsPath};
+use cairn_types::{Caps, ConnectionId, Entry, Scheme, SpaceInfo, VfsPath};
 use futures::stream::BoxStream;
 use smol_str::SmolStr;
 use std::path::PathBuf;
@@ -163,6 +163,16 @@ pub trait Vfs: CapabilityProvider + Send + Sync + 'static {
     /// makes the transfer engine fall back to a stream-through copy.
     async fn copy_within(&self, _from: &VfsPath, _to: &VfsPath) -> Result<(), VfsError> {
         Err(VfsError::Unsupported(Caps::COPY_SERVER))
+    }
+
+    /// Free/total space (statvfs-style) for the volume backing `path`, for a pane's disk-space
+    /// indicator. Path-scoped because a single backend instance can straddle mounts. Returns
+    /// `Ok(None)` when the backend can't report it — either it never can (object stores, containers:
+    /// they don't advertise [`Caps::SPACE`]) or it can't for this path/server (e.g. an SFTP server
+    /// without the `statvfs@openssh.com` extension). Advisory only; never gates a write. Defaults to
+    /// `Ok(None)`.
+    async fn space(&self, _path: &VfsPath) -> Result<Option<SpaceInfo>, VfsError> {
+        Ok(None)
     }
 
     /// The real, canonical OS path backing `path`, if this backend has a local filesystem identity a

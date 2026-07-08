@@ -19,7 +19,7 @@ use cairn_core::{
     AppState, ConnectionFormStage, Listing, MaskedInput, Overlay, PagerMode, PagerStatus,
     PromptKind,
 };
-use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, UnixPerms, VfsPath};
+use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, SpaceInfo, UnixPerms, VfsPath};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -55,6 +55,11 @@ pub fn all() -> Vec<Scenario> {
             name: "pane-columns",
             description: "pane rows with MC-style permission + date columns (and a metadata-less remote object)",
             build: pane_columns,
+        },
+        Scenario {
+            name: "pane-free-space",
+            description: "the free-disk-space indicator in each pane's bottom-left frame",
+            build: pane_free_space,
         },
         Scenario {
             name: "remote-pane",
@@ -298,6 +303,20 @@ fn pane_columns() -> AppState {
         Entry::new("docs", EntryKind::Dir),
         Entry::new("README.md", EntryKind::File),
     ]));
+    s
+}
+
+fn pane_free_space() -> AppState {
+    // Local panes show the volume's free space in the bottom-left of the frame.
+    let mut s = dual_pane();
+    s.panes[0].space = Some(SpaceInfo {
+        total: 500 * 1024 * 1024 * 1024,     // 500 GiB
+        available: 137 * 1024 * 1024 * 1024, // 137 GiB
+    });
+    s.panes[1].space = Some(SpaceInfo {
+        total: 1024 * 1024 * 1024 * 1024,   // 1 TiB
+        available: 12 * 1024 * 1024 * 1024, // 12 GiB
+    });
     s
 }
 
@@ -899,6 +918,22 @@ mod snapshot_tests {
     fn render_named_resolves_and_rejects() {
         assert!(render_named("dual-pane", 80, 24).is_some());
         assert!(render_named("does-not-exist", 80, 24).is_none());
+    }
+
+    /// The free-space label shows on a wide pane but is omitted (not clipped to a misleading unitless
+    /// number) when it wouldn't fit alongside the sort label on a narrow pane.
+    #[test]
+    fn free_space_label_shows_when_it_fits_and_hides_when_it_would_clip() {
+        let wide = render_named("pane-free-space", 80, 24).unwrap();
+        assert!(
+            wide.contains("GiB free"),
+            "wide pane shows the full label:\n{wide}"
+        );
+        let narrow = render_named("pane-free-space", 40, 12).unwrap();
+        assert!(
+            !narrow.contains("137.0"),
+            "a narrow pane must omit the label entirely, not clip it to a unitless number:\n{narrow}"
+        );
     }
 
     /// Every scenario renders `h` rows at both standard and narrow sizes — the frame is a real grid.

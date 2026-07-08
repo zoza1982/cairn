@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, UnixPerms, VfsPath};
+use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, SpaceInfo, UnixPerms, VfsPath};
 use cairn_vfs::{
     ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs, VfsError,
     WriteHandle, WriteOpts, WriteSink,
@@ -27,7 +27,8 @@ const fn platform_caps() -> Caps {
         .union(Caps::RENAME_ATOMIC)
         .union(Caps::RANDOM_READ)
         .union(Caps::APPEND)
-        .union(Caps::LOCAL_PATH);
+        .union(Caps::LOCAL_PATH)
+        .union(Caps::SPACE);
     #[cfg(unix)]
     {
         base.union(Caps::CHMOD).union(Caps::SYMLINK)
@@ -251,6 +252,26 @@ impl Vfs for LocalVfs {
     async fn set_perms(&self, path: &VfsPath, perms: UnixPerms) -> Result<(), VfsError> {
         set_perms_impl(&self.resolve(path), path, perms).await
     }
+
+    async fn space(&self, path: &VfsPath) -> Result<Option<SpaceInfo>, VfsError> {
+        // `fs4::{available_space,total_space}` are blocking syscalls (statvfs / GetDiskFreeSpaceEx),
+        // so run them off the async reactor. `resolve` (not the symlink-confined `local_path`) is
+        // fine here — this is read-only telemetry, not a shell-out containment boundary.
+        let full = self.resolve(path);
+        let res = tokio::task::spawn_blocking(move || -> std::io::Result<SpaceInfo> {
+            Ok(SpaceInfo {
+                total: fs4::total_space(&full)?,
+                available: fs4::available_space(&full)?,
+            })
+        })
+        .await;
+        match res {
+            Ok(Ok(info)) => Ok(Some(info)),
+            // A statvfs failure (path vanished, unusual FS) or a join failure degrades to "unknown"
+            // rather than surfacing an error for a decorative indicator.
+            _ => Ok(None),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -429,6 +450,29 @@ mod tests {
         std::fs::write(dir.path().join("exists"), b"x").unwrap();
         let res = vfs.open_write(&p("/exists"), WriteOpts::default()).await;
         assert!(matches!(res, Err(VfsError::AlreadyExists(_))));
+    }
+
+    #[tokio::test]
+    async fn space_reports_a_plausible_volume() {
+        let (_dir, vfs) = backend();
+        let info = vfs
+            .space(&p("/"))
+            .await
+            .expect("space call succeeds")
+            .expect("local backend reports space");
+        assert!(info.total > 0, "a real volume has non-zero capacity");
+        assert!(
+            info.available <= info.total,
+            "available ({}) must not exceed total ({})",
+            info.available,
+            info.total
+        );
+    }
+
+    #[test]
+    fn local_backend_advertises_the_space_cap() {
+        let (_dir, vfs) = backend();
+        assert!(vfs.caps().contains(Caps::SPACE));
     }
 
     #[test]

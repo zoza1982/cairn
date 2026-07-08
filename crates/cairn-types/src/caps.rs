@@ -48,6 +48,9 @@ bitflags! {
         /// Entries map to a real OS path that local processes can act on (local backend only). Gates
         /// features that shell out — see `Vfs::local_path` in `cairn-vfs`.
         const LOCAL_PATH = 1 << 17;
+        /// Reporting free/total space for the volume backing a path (statvfs-style) — see
+        /// `Vfs::space`. Present for local and SSH/SFTP; absent for object stores and containers.
+        const SPACE = 1 << 18;
     }
 }
 
