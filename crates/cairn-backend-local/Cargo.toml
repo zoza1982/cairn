@@ -17,8 +17,11 @@ cairn-types = { workspace = true }
 cairn-vfs = { workspace = true }
 async-trait = "0.1"
 bytes = "1"
+# Cross-platform free/total disk space (statvfs on Unix, GetDiskFreeSpaceEx on Windows) behind a
+# safe API — avoids hand-rolled Windows FFI (which would need `unsafe` + an ADR per the repo rules).
+fs4 = { version = "1", features = ["sync"] }
 futures = "0.3"
-tokio = { version = "1", features = ["fs", "io-util"] }
+tokio = { version = "1", features = ["fs", "io-util", "rt"] }
 
 [dev-dependencies]
 tempfile = "3"

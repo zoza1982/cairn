@@ -1611,10 +1611,21 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
         .title(title)
         .title_bottom(Line::from(status).right_aligned())
         .border_style(Style::default().fg(border));
-    // Bottom-left: the active filter (a trailing `_` marks live editing).
+    // Bottom-left: the active filter (a trailing `_` marks live editing), or — when not filtering —
+    // the free disk space of the volume backing this pane (backends that report it: local, and SSH
+    // once wired). The filter takes precedence since it's transient and interactive.
     if let Some(f) = &pane.filter {
         let cursor = if pane.filter_editing { "_" } else { "" };
         block = block.title_bottom(Line::from(format!(" filter: {f}{cursor} ")).left_aligned());
+    } else if let Some(space) = pane.space {
+        // Just the available free space, kept short so it doesn't collide with the right-aligned sort
+        // label on a narrow (half-width) pane.
+        let text = format!(" {} free ", human_bytes(space.available));
+        block = block.title_bottom(
+            Line::from(text)
+                .left_aligned()
+                .style(Style::default().fg(theme.status)),
+        );
     }
 
     match &pane.listing {

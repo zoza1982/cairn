@@ -19,7 +19,7 @@ use cairn_core::{
     AppState, ConnectionFormStage, Listing, MaskedInput, Overlay, PagerMode, PagerStatus,
     PromptKind,
 };
-use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, UnixPerms, VfsPath};
+use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, SpaceInfo, UnixPerms, VfsPath};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -55,6 +55,11 @@ pub fn all() -> Vec<Scenario> {
             name: "pane-columns",
             description: "pane rows with MC-style permission + date columns (and a metadata-less remote object)",
             build: pane_columns,
+        },
+        Scenario {
+            name: "pane-free-space",
+            description: "the free-disk-space indicator in each pane's bottom-left frame",
+            build: pane_free_space,
         },
         Scenario {
             name: "remote-pane",
@@ -298,6 +303,20 @@ fn pane_columns() -> AppState {
         Entry::new("docs", EntryKind::Dir),
         Entry::new("README.md", EntryKind::File),
     ]));
+    s
+}
+
+fn pane_free_space() -> AppState {
+    // Local panes show the volume's free space in the bottom-left of the frame.
+    let mut s = dual_pane();
+    s.panes[0].space = Some(SpaceInfo {
+        total: 500 * 1024 * 1024 * 1024,     // 500 GiB
+        available: 137 * 1024 * 1024 * 1024, // 137 GiB
+    });
+    s.panes[1].space = Some(SpaceInfo {
+        total: 1024 * 1024 * 1024 * 1024,   // 1 TiB
+        available: 12 * 1024 * 1024 * 1024, // 12 GiB
+    });
     s
 }
 

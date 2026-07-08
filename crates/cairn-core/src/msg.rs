@@ -198,6 +198,19 @@ pub enum AppEvent {
         /// The page result.
         result: Result<ListPage, VfsError>,
     },
+    /// Free/total disk space for a pane's directory. The runtime fetches it when it handles the
+    /// pane's [`AppEffect::List`] (a sibling of the listing), and delivers it here. Applied only if
+    /// the pane is still on the same `conn`/`dir`. `space` is `None` when unavailable.
+    SpaceFetched {
+        /// Which pane requested it.
+        pane: Side,
+        /// The connection it was measured on.
+        conn: ConnectionId,
+        /// The directory whose volume was measured.
+        dir: VfsPath,
+        /// The space totals, or `None` if the backend couldn't report them.
+        space: Option<cairn_types::SpaceInfo>,
+    },
     /// Pre-flight sizing progress for an in-flight transfer: the destination conflict-check and the
     /// recursive size scan walking the source tree, before any bytes move. Carries the running count
     /// of visited entries, the bytes discovered so far, and the path currently being visited so the

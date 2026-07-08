@@ -749,10 +749,11 @@ mod tests {
 
     #[test]
     fn map_caps_covers_every_wit_flag() {
-        // Every WIT `caps` flag must be translated; the host-only `LOCAL_PATH` has no WIT counterpart.
-        // This breaks if either side grows a flag without updating `map_caps`.
+        // Every WIT `caps` flag must be translated. Host-only caps have no WIT counterpart: a plugin
+        // backend can't currently advertise `LOCAL_PATH` (real OS path) or `SPACE` (statvfs) — both
+        // are host-implemented. This breaks if either side grows a flag without updating `map_caps`.
         let mapped = map_caps(Caps0::all());
-        assert_eq!(mapped, Caps::all() & !Caps::LOCAL_PATH);
+        assert_eq!(mapped, Caps::all() & !Caps::LOCAL_PATH & !Caps::SPACE);
     }
 
     #[test]

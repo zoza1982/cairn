@@ -3740,6 +3740,9 @@ fn navigate(state: &mut AppState, side: Side, dir: cairn_types::VfsPath) -> Vec<
     p.filter_editing = false;
     // Default to the top row; `leave_dir` overrides this after the call to land on the exited child.
     p.select_after_load = None;
+    // Clear the stale free-space figure; the runtime refills it (via a `SpaceFetched` event) when it
+    // handles the `List` effect below — so the reducer still emits a single effect here.
+    p.space = None;
     vec![AppEffect::List {
         pane: side,
         conn: p.conn,
@@ -3753,6 +3756,7 @@ fn reload(state: &mut AppState, side: Side) -> Vec<AppEffect> {
     let dir = p.cwd.clone();
     p.listing = Listing::Loading;
     p.marked.clear();
+    p.space = None;
     vec![AppEffect::List {
         pane: side,
         conn: p.conn,
@@ -3813,6 +3817,20 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 Err(e) => {
                     p.listing = Listing::Error(e.redacted().to_string());
                 }
+            }
+            Vec::new()
+        }
+        AppEvent::SpaceFetched {
+            pane,
+            conn,
+            dir,
+            space,
+        } => {
+            // Ignore a stale result for a directory/connection the pane has moved on from (same guard
+            // as `Listed`).
+            let p = state.pane_mut(pane);
+            if p.cwd == dir && p.conn == conn {
+                p.space = space;
             }
             Vec::new()
         }
@@ -7113,6 +7131,61 @@ mod tests {
         assert!(s.active().marked.contains(&0));
         let _ = update(&mut s, Msg::Action(Action::ToggleMark));
         assert!(!s.active().marked.contains(&0));
+    }
+
+    #[test]
+    fn space_fetched_stores_on_the_matching_pane_and_ignores_stale() {
+        let mut s = state();
+        let conn = s.pane(Side::Left).conn;
+        let dir = s.pane(Side::Left).cwd.clone();
+        let info = cairn_types::SpaceInfo {
+            total: 1000,
+            available: 250,
+        };
+        // A result for the pane's current conn/dir is stored.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::SpaceFetched {
+                pane: Side::Left,
+                conn,
+                dir: dir.clone(),
+                space: Some(info),
+            }),
+        );
+        assert_eq!(s.pane(Side::Left).space, Some(info));
+
+        // A stale result (different dir) is ignored — the pane keeps its value.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::SpaceFetched {
+                pane: Side::Left,
+                conn,
+                dir: VfsPath::parse("/elsewhere").unwrap(),
+                space: None,
+            }),
+        );
+        assert_eq!(
+            s.pane(Side::Left).space,
+            Some(info),
+            "a stale space result must not clobber the current one"
+        );
+    }
+
+    #[test]
+    fn navigate_clears_the_stale_free_space() {
+        let mut s = state();
+        s.pane_mut(Side::Left).space = Some(cairn_types::SpaceInfo {
+            total: 1000,
+            available: 250,
+        });
+        deliver(&mut s, Side::Left, vec![Entry::new("d", EntryKind::Dir)]);
+        s.pane_mut(Side::Left).cursor = 0;
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        assert_eq!(
+            s.pane(Side::Left).space,
+            None,
+            "navigating clears the previous volume's free-space figure"
+        );
     }
 
     #[test]

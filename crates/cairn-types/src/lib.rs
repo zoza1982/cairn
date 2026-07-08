@@ -13,9 +13,11 @@ mod creds;
 mod entry;
 mod ids;
 mod path;
+mod space;
 
 pub use caps::Caps;
 pub use creds::{CredentialKind, CredentialShape};
 pub use entry::{ContainerState, Entry, EntryExt, EntryKind, PodPhase, UnixPerms};
 pub use ids::{ConnectionId, CredentialId, Scheme, SessionId};
 pub use path::{PathError, VfsPath};
+pub use space::SpaceInfo;
