@@ -257,6 +257,12 @@ pub struct PaneState {
     /// *inside* another mounted archive nests correctly. Empty for a pane that has never mounted
     /// an archive.
     pub mount_stack: Vec<MountFrame>,
+    /// When the next listing for this pane arrives, place the cursor on the entry with this name
+    /// (instead of the default top row). Set by `leave_dir` to the name of the directory being
+    /// exited, so going up (`..`) returns the cursor to the child you came from — MC behaviour —
+    /// rather than snapping back to the top. Consumed (cleared) by the `Listed` handler, and reset
+    /// by any fresh `navigate` so it never leaks into an unrelated directory change.
+    pub select_after_load: Option<String>,
 }
 
 /// One entry in a pane's archive [`PaneState::mount_stack`]: where to return to when the user
@@ -284,6 +290,7 @@ impl PaneState {
             filter: None,
             filter_editing: false,
             mount_stack: Vec::new(),
+            select_after_load: None,
         }
     }
 

@@ -169,6 +169,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Going up a directory (`..`) now returns the cursor to the folder you came from** instead of
+  snapping back to the top row. Scroll down to a subfolder, enter it, then step back out with
+  `..`/Backspace/`h`/`←` (or `Enter` on the `..` row): the highlight lands on the subfolder you just
+  exited, matching Midnight Commander. Implemented as a one-shot "select this child after the next
+  listing" marker set when leaving a directory, so an unrelated navigation still starts at the top.
+
 - **Recursive delete over SSH/SFTP now fully removes directories on servers that omit type bits in
   directory listings.** Some SFTP servers (not OpenSSH) leave the type/permission attributes out of
   their READDIR responses, so every entry looked like a plain file. A recursive delete then never
