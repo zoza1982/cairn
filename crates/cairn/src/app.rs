@@ -69,6 +69,17 @@ const TRANSFER_UI_MIN_INTERVAL_MS: u64 = 120;
 /// [`TRANSFER_UI_MIN_INTERVAL_MS`] as a [`Duration`], for the scan's `Instant`-based throttle.
 const TRANSFER_UI_MIN_INTERVAL: Duration = Duration::from_millis(TRANSFER_UI_MIN_INTERVAL_MS);
 
+/// How long the pre-copy size scan is allowed to run before the copy starts anyway. The scan gives a
+/// percentage/ETA, but for a huge tree — especially over SFTP, where every directory is a round-trip
+/// — walking the whole source before moving a byte is a long, opaque stall. Time-box it: if the scan
+/// finishes within the budget we get an exact total, otherwise we abandon it and stream the copy
+/// MC-style with an indeterminate (animated) bar. Kept under the ~1 s "still feels responsive" mark.
+const SCAN_BUDGET: Duration = Duration::from_millis(800);
+/// Entry-count ceiling for the size scan, independent of the time budget. Bounds both the walk's
+/// memory (its pending-directory stack) and its cost on a pathologically wide/deep tree; exceeding it
+/// abandons the estimate (total `None`) exactly like the time box.
+const SCAN_ENTRY_CAP: u64 = 100_000;
+
 /// Whether a byte-progress UI update should be emitted now: on either enough new bytes
 /// ([`TRANSFER_PROGRESS_STEP`]) *or* enough elapsed wall-clock ([`TRANSFER_UI_MIN_INTERVAL_MS`]) since
 /// the last emit — the latter so a small/slow copy (total under one step) still ticks instead of
@@ -2788,12 +2799,21 @@ fn windowed_rate(samples: &mut VecDeque<(u64, u64)>, now_ms: u64, bytes: u64) ->
 async fn scan_total_bytes(
     src: &Arc<dyn Vfs>,
     items: &[(VfsPath, VfsPath)],
+    max_entries: u64,
     on_scan: &mut (dyn FnMut(u64, &str) + Send),
 ) -> Option<u64> {
     let mut total: u64 = 0;
+    let mut scanned: u64 = 0;
     for (from, _) in items {
         let mut stack = vec![from.clone()];
         while let Some(path) = stack.pop() {
+            // Abandon the estimate past the entry cap (a pathologically large tree). Returning `None`
+            // degrades to an indeterminate bar, and — crucially — stops the pending-directory `stack`
+            // from growing without bound.
+            scanned += 1;
+            if scanned > max_entries {
+                return None;
+            }
             on_scan(total, &path.as_str());
             let meta = src.stat(&path).await.ok()?;
             if meta.is_dir() {
@@ -2908,15 +2928,20 @@ async fn run_transfer_effect(
     };
     let verb = if is_move { "Moved" } else { "Copied" };
     // Pre-scan the source size for a percentage/ETA. Best-effort: `None` (a backend that can't be
-    // walked, an error, or cancellation) degrades to byte+rate display. Skipped for a same-connection
-    // move — that takes the engine's instant rename fast-path which writes no bytes, so a scan would
-    // be wasted work and the bar would sit at 0%. Cancellable so a big-tree scan doesn't block Esc.
+    // walked, an error, cancellation, or the scan exceeding its time/entry budget) degrades to a
+    // byte+rate display with an indeterminate (animated) bar, MC-style — the copy starts promptly
+    // instead of blocking on a huge/remote tree walk. Skipped for a same-connection move — that takes
+    // the engine's instant rename fast-path which writes no bytes, so a scan would be wasted work and
+    // the bar would sit at 0%. Cancellable so a big-tree scan doesn't block Esc.
     let total = if is_move && src_conn == dst_conn {
         None
     } else {
         tokio::select! {
-            t = scan_total_bytes(&src, &items, &mut on_scan) => t,
+            t = scan_total_bytes(&src, &items, SCAN_ENTRY_CAP, &mut on_scan) => t,
             () = cancel.cancelled() => None,
+            // Time box: if the scan hasn't finished within the budget, start copying anyway with an
+            // indeterminate bar. The scan future is dropped here (it's read-only, so nothing to undo).
+            () = tokio::time::sleep(SCAN_BUDGET) => None,
         }
     };
     // Emit coalesced, non-blocking progress: accumulate bytes and notify the UI at most every
@@ -5657,10 +5682,34 @@ mod tests {
         // can show the walk progressing — 3 visits for these two items.
         let mut visits = 0u32;
         assert_eq!(
-            scan_total_bytes(&src, &items, &mut |_b, _p| visits += 1).await,
+            scan_total_bytes(&src, &items, u64::MAX, &mut |_b, _p| visits += 1).await,
             Some(11)
         );
         assert_eq!(visits, 3, "on_scan fires once per visited node");
+    }
+
+    #[tokio::test]
+    async fn scan_total_bytes_abandons_the_estimate_past_the_entry_cap() {
+        // A tree bigger than the entry cap returns None (→ indeterminate bar) rather than walking it
+        // all — and, importantly, without the pending-directory stack growing unbounded.
+        let dir = tempfile_dir();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("d/f{i}.txt")), b"x").unwrap();
+        }
+        let src: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
+        let items = vec![(VfsPath::parse("/d").unwrap(), VfsPath::root())];
+        // Cap of 3 nodes → abandoned before finishing the 11-node walk.
+        assert_eq!(
+            scan_total_bytes(&src, &items, 3, &mut |_b, _p| {}).await,
+            None,
+            "exceeding the entry cap abandons the estimate"
+        );
+        // A generous cap still returns the real total.
+        assert_eq!(
+            scan_total_bytes(&src, &items, 1_000, &mut |_b, _p| {}).await,
+            Some(10)
+        );
     }
 
     #[tokio::test]
@@ -5675,6 +5724,7 @@ mod tests {
             scan_total_bytes(
                 &src,
                 &[(VfsPath::root(), VfsPath::root())],
+                u64::MAX,
                 &mut |_b, _p| {}
             )
             .await,
@@ -5683,7 +5733,7 @@ mod tests {
         // A missing source degrades to None (best-effort) rather than panicking.
         let missing = vec![(VfsPath::parse("/nope").unwrap(), VfsPath::root())];
         assert_eq!(
-            scan_total_bytes(&src, &missing, &mut |_b, _p| {}).await,
+            scan_total_bytes(&src, &missing, u64::MAX, &mut |_b, _p| {}).await,
             None
         );
     }
