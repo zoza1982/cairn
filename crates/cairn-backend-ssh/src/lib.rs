@@ -92,13 +92,15 @@ impl<O: SftpOps> SftpVfs<O> {
 
 impl<O: SftpOps> CapabilityProvider for SftpVfs<O> {
     fn caps(&self) -> Caps {
+        // Not `RENAME_ATOMIC`: SFTP's `SSH_FXP_RENAME` can't atomically overwrite an existing
+        // destination, so `SftpVfs::rename` emulates overwrite with a non-atomic move-aside +
+        // rename (+ restore-on-failure). Plain `RENAME` (no existing destination) is atomic.
         Caps::LIST
             | Caps::READ
             | Caps::WRITE
             | Caps::CREATE_DIR
             | Caps::DELETE
             | Caps::RENAME
-            | Caps::RENAME_ATOMIC
             | Caps::RANDOM_READ
             | Caps::SYMLINK
     }
@@ -173,7 +175,53 @@ impl<O: SftpOps> Vfs for SftpVfs<O> {
     }
 
     async fn rename(&self, from: &VfsPath, to: &VfsPath) -> Result<(), VfsError> {
-        self.ops.rename(&from.as_str(), &to.as_str()).await
+        // SFTP's `SSH_FXP_RENAME` fails when the destination already exists (OpenSSH's sftp-server),
+        // unlike POSIX rename — and every other Cairn backend — which overwrites. To overwrite a
+        // remote *file* safely, move the existing destination aside to a backup, then rename; on
+        // success delete the backup, on failure restore it. This never deletes the old content until
+        // the new rename has actually succeeded, so a mid-operation network drop can't leave *both*
+        // the original and the new content gone (a real risk with a naive remove-then-rename, since
+        // the edit → write-back caller deletes its staged temp when the final rename fails). Not
+        // atomic — SFTP has no portable atomic overwrite. A directory destination is left in place so
+        // the rename below rejects it (OpenSSH's SFTP refuses any existing destination).
+        let to_str = to.as_str();
+        let backup: Option<VfsPath> = match self.ops.stat(&to_str).await {
+            Ok(meta) if meta.kind != EntryKind::Dir => {
+                let bname = format!(".cairn-rename-bak-{}", to.file_name().unwrap_or("file"));
+                // A `join` failure (an invalid backup name) just skips the backup — the rename below
+                // then fails on the still-present destination, leaving it intact.
+                match to.parent().unwrap_or_else(VfsPath::root).join(&bname) {
+                    Ok(bpath) => {
+                        // Clear a stale backup (from a prior interrupted rename) so moving the
+                        // destination aside can't itself hit an existing-destination rejection.
+                        let _ = self.ops.remove_file(&bpath.as_str()).await;
+                        // If moving the destination aside fails, proceed with no backup.
+                        if self.ops.rename(&to_str, &bpath.as_str()).await.is_ok() {
+                            Some(bpath)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+        match self.ops.rename(&from.as_str(), &to_str).await {
+            Ok(()) => {
+                if let Some(b) = backup {
+                    let _ = self.ops.remove_file(&b.as_str()).await; // best-effort cleanup post-success
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(b) = backup {
+                    // Best-effort restore of the original (the destination slot is free again).
+                    let _ = self.ops.rename(&b.as_str(), &to_str).await;
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -272,6 +320,83 @@ mod tests {
             vfs.stat(&p("/d")).await.unwrap().perms.map(|p| p.mode),
             Some(0o040_755)
         );
+    }
+
+    #[tokio::test]
+    async fn rename_overwrites_an_existing_destination() {
+        // Regression: OpenSSH's plain SSH_FXP_RENAME refuses an existing destination, which broke
+        // overwriting a remote file (notably the edit → write-back flow, which renames a staged temp
+        // over the original). `SftpVfs::rename` must remove the existing file first and succeed.
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_file("/new.txt", b"new")
+                .with_file("/existing.txt", b"old"),
+        );
+        vfs.rename(&p("/new.txt"), &p("/existing.txt"))
+            .await
+            .expect("rename must overwrite an existing destination");
+        // The source is gone and the destination now holds the source's content.
+        assert!(matches!(
+            vfs.stat(&p("/new.txt")).await,
+            Err(VfsError::NotFound(_))
+        ));
+        let mut rh = vfs.open_read(&p("/existing.txt"), None).await.unwrap();
+        let mut out = String::new();
+        rh.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "new", "destination has the source's bytes");
+        // The move-aside backup was cleaned up on success (no debris left).
+        assert!(matches!(
+            vfs.stat(&p("/.cairn-rename-bak-existing.txt")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_restores_the_original_when_the_rename_fails() {
+        // Data-safety: if the rename fails *after* the existing destination was moved aside (a
+        // mid-operation drop), the original must be restored — never leaving both copies gone.
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_file("/new.txt", b"new")
+                .with_file("/existing.txt", b"old")
+                .with_failing_rename_to("/existing.txt"),
+        );
+        let err = vfs.rename(&p("/new.txt"), &p("/existing.txt")).await;
+        assert!(err.is_err(), "the injected failure must surface");
+        // The original content is restored at the destination (not lost)…
+        let mut rh = vfs.open_read(&p("/existing.txt"), None).await.unwrap();
+        let mut out = String::new();
+        rh.read_to_string(&mut out).await.unwrap();
+        assert_eq!(
+            out, "old",
+            "the original was restored after the failed rename"
+        );
+        // …the source is untouched, and no backup debris remains.
+        assert!(vfs.stat(&p("/new.txt")).await.is_ok(), "source preserved");
+        assert!(matches!(
+            vfs.stat(&p("/.cairn-rename-bak-existing.txt")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_onto_an_existing_directory_is_rejected_and_leaves_it() {
+        // A file must not overwrite (or delete the contents of) a directory: the dir is left in place
+        // and the rename is rejected (matching SFTP/POSIX).
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_file("/f.txt", b"f")
+                .with_dir("/d")
+                .with_file("/d/keep.txt", b"k"),
+        );
+        assert!(vfs.rename(&p("/f.txt"), &p("/d")).await.is_err());
+        // The directory and its contents are intact; the source is untouched.
+        assert!(vfs.stat(&p("/d")).await.unwrap().is_dir());
+        assert!(vfs.stat(&p("/d/keep.txt")).await.is_ok());
+        assert!(vfs.stat(&p("/f.txt")).await.is_ok());
     }
 
     #[tokio::test]
