@@ -3637,16 +3637,12 @@ fn apply_pager_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
 
 fn leave_dir(state: &mut AppState) -> Vec<AppEffect> {
     let side = state.focus;
-    // Remember the directory we're stepping out of, so the cursor can return to it in the parent
-    // listing (MC behaviour) instead of resetting to the top row.
-    let leaving = state
-        .pane(side)
-        .cwd
-        .file_name()
-        .map(std::string::ToString::to_string);
     let parent = state.pane(side).cwd.parent();
     match parent {
         Some(dir) => {
+            // Remember the directory we're stepping out of (before `navigate` mutates `cwd`), so the
+            // cursor can return to it in the parent listing (MC behaviour) instead of the top row.
+            let leaving = state.pane(side).cwd.file_name().map(str::to_owned);
             let effects = navigate(state, side, dir);
             // Set after `navigate` (which clears it); the `Listed` handler consumes it.
             state.pane_mut(side).select_after_load = leaving;
@@ -3658,6 +3654,8 @@ fn leave_dir(state: &mut AppState) -> Vec<AppEffect> {
         // level up. A pane that never mounted anything has an empty stack and this is still a no-op.
         None => match state.pane_mut(side).mount_stack.pop() {
             Some(frame) => {
+                // Note: this doesn't yet restore the cursor onto the archive file we came from —
+                // `MountFrame` carries only `{conn, cwd}`, not the archive's name (tracked: #162).
                 state.pane_mut(side).conn = frame.conn;
                 navigate(state, side, frame.cwd)
             }
@@ -3732,17 +3730,19 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                             cairn_types::Entry::new("..", cairn_types::EntryKind::Dir),
                         );
                     }
+                    p.listing = Listing::Ready(Arc::new(entries));
                     // Restore the cursor to a specific child if one was requested (e.g. `leave_dir`
-                    // returning to the directory we just exited). With no active filter — the case
-                    // after a navigate — the cursor indexes into these entries directly, so the
-                    // found position is the visible position. If the name isn't present (e.g. a
-                    // hidden dir with `show_hidden` off), fall through to the default top row.
+                    // returning to the directory we just exited). Search the *visible* view so the
+                    // index is in the same space as `cursor` even if a filter was started during the
+                    // load window (a name that the filter now hides simply isn't found). If the name
+                    // isn't present (filtered out, or a hidden dir with `show_hidden` off), fall
+                    // through to the default top row. First exact match wins.
                     if let Some(name) = p.select_after_load.take() {
-                        if let Some(idx) = entries.iter().position(|e| e.name.as_str() == name) {
+                        if let Some(idx) = p.visible().iter().position(|e| e.name.as_str() == name)
+                        {
                             p.cursor = idx;
                         }
                     }
-                    p.listing = Listing::Ready(Arc::new(entries));
                     p.clamp_cursor();
                 }
                 Err(e) => {
@@ -6788,6 +6788,100 @@ mod tests {
             0,
             "a fresh navigate must not restore a stale cursor target"
         );
+    }
+
+    #[test]
+    fn cursor_restore_falls_through_to_top_when_a_filter_hides_the_child() {
+        // If a filter is started during the async load window after leaving a directory, the restore
+        // must not mis-point: `cursor` indexes into the *visible* (filtered) view, so a child the
+        // filter now hides is simply not re-selected (we land at the top of the filtered view rather
+        // than at a stale raw index that could point at the wrong row).
+        let mut s = state();
+        // Descend one level so the parent listing carries a `..` sentinel (raw index 0), which makes
+        // a naive raw-index restore visibly wrong.
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("outer", EntryKind::Dir)],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("aaa", EntryKind::Dir),
+                Entry::new("mydir", EntryKind::Dir),
+                Entry::new("zzz", EntryKind::Dir),
+            ],
+        );
+        // Enter "mydir" (visible index 2: `..`, aaa, mydir, zzz).
+        s.pane_mut(Side::Left).cursor = 2;
+        assert_eq!(s.pane(Side::Left).current().unwrap().name.as_str(), "mydir");
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("child.txt", EntryKind::File)],
+        );
+
+        // Leave back to /outer, then a filter that hides "mydir" (keeps only "zzz") lands mid-load.
+        let _ = update(&mut s, Msg::Action(Action::Leave));
+        s.pane_mut(Side::Left).filter = Some("zzz".to_owned());
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("aaa", EntryKind::Dir),
+                Entry::new("mydir", EntryKind::Dir),
+                Entry::new("zzz", EntryKind::Dir),
+            ],
+        );
+        // The visible view is [`..`, zzz]; the cursor must be a valid visible index and must NOT have
+        // landed on "zzz" (which a raw-index restore would have selected).
+        let visible = s.pane(Side::Left).visible();
+        assert!(s.pane(Side::Left).cursor < visible.len());
+        assert_ne!(
+            s.pane(Side::Left).current().unwrap().name.as_str(),
+            "zzz",
+            "the restore must not point at the wrong entry when a filter is active"
+        );
+    }
+
+    #[test]
+    fn cursor_restore_falls_through_to_top_when_the_child_is_gone() {
+        // If the exited child no longer exists in the reloaded parent (e.g. deleted concurrently, or
+        // hidden with show_hidden off), the restore degrades gracefully to the top row.
+        let mut s = state();
+        let listing = |extra: bool| {
+            let mut v = vec![
+                Entry::new("alpha", EntryKind::Dir),
+                Entry::new("beta", EntryKind::Dir),
+            ];
+            if extra {
+                v.push(Entry::new("gamma", EntryKind::Dir));
+            }
+            v
+        };
+        deliver(&mut s, Side::Left, listing(true));
+        s.pane_mut(Side::Left).cursor = 1; // "beta"
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        deliver(&mut s, Side::Left, vec![Entry::new("x", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Leave));
+        // Parent reload no longer contains "beta".
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("alpha", EntryKind::Dir),
+                Entry::new("gamma", EntryKind::Dir),
+            ],
+        );
+        assert_eq!(
+            s.pane(Side::Left).cursor,
+            0,
+            "a missing child falls through to the top row"
+        );
+        assert_eq!(s.pane(Side::Left).current().unwrap().name.as_str(), "alpha");
     }
 
     #[test]
