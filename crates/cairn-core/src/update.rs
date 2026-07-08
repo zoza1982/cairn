@@ -260,6 +260,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             });
             Vec::new()
         }
+        Action::CalculateSize => calculate_size(state),
         // With no overlay, Cancel (Esc) aborts an executing AI plan, else an in-flight transfer.
         Action::Cancel if state.ai_executing => {
             state.status = Some("Cancelling plan…".to_owned());
@@ -1754,6 +1755,7 @@ fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> 
         // needs an action path (Ctrl-R is intercepted in `map_input` before `capturing_text` is
         // checked), so it has its own action handler.
         Some(Overlay::VaultCreate { .. }) => apply_vault_create_action(state, action),
+        Some(Overlay::FolderStats { .. }) => apply_folder_stats_action(state, action),
         Some(Overlay::Prompt { .. } | Overlay::VaultUnlock { .. }) | None => Vec::new(),
     }
 }
@@ -1768,6 +1770,22 @@ fn apply_vault_create_action(state: &mut AppState, action: Action) -> Vec<AppEff
         }
     }
     Vec::new()
+}
+
+/// Drive the folder-stats popup: `Esc`/`Cancel` (and `Enter`) close it and cancel the walk; every
+/// other key is ignored (the popup is a passive read-out). Cancelling a walk that already finished
+/// is harmless — the runtime just has no live task to stop.
+fn apply_folder_stats_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        // The popup is a passive read-out with nothing to confirm, so `Enter` (like `Esc`) just
+        // dismisses it — a small, deliberate divergence from the read-only Pager/LogViewer overlays,
+        // which close only on `Cancel`.
+        Action::Cancel | Action::Confirm | Action::Enter => {
+            state.overlay = None;
+            vec![AppEffect::CancelCalculateSize]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Drive the transfer progress dialog. The `cursor` indexes a single combined list: the active
@@ -3275,6 +3293,40 @@ fn toggle_active_transfers_pause(state: &mut AppState) -> Vec<AppEffect> {
         .collect()
 }
 
+/// Open the folder-stats popup and kick off a recursive size walk for the directory under the
+/// cursor. A no-op (with a hint) when the cursor isn't on a real directory — sizing a file is just
+/// its listed size, and `..` isn't a real path.
+fn calculate_size(state: &mut AppState) -> Vec<AppEffect> {
+    let side = state.focus;
+    let pane = state.pane(side);
+    let Some(entry) = pane.current() else {
+        state.status = Some("Nothing under the cursor".to_owned());
+        return Vec::new();
+    };
+    if entry.is_dotdot_sentinel() || !entry.is_dir() {
+        state.status = Some("Select a folder to calculate its size".to_owned());
+        return Vec::new();
+    }
+    let name = entry.name.to_string();
+    let Ok(path) = pane.cwd.join(&name) else {
+        state.status = Some("Cannot measure this entry".to_owned());
+        return Vec::new();
+    };
+    let conn = pane.conn;
+    let id = state.next_size_calc_id;
+    state.next_size_calc_id = state.next_size_calc_id.wrapping_add(1);
+    state.overlay = Some(Overlay::FolderStats {
+        id,
+        name,
+        computing: true,
+        bytes: 0,
+        files: 0,
+        dirs: 0,
+        partial: false,
+    });
+    vec![AppEffect::CalculateSize { id, conn, path }]
+}
+
 fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
     let side = state.focus;
     let targets = op_targets(state, side);
@@ -3839,6 +3891,54 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             Vec::new()
         }
         AppEvent::OpDone { status, error } => finish_op(state, &status, error),
+        AppEvent::SizeProgress {
+            id,
+            bytes,
+            files,
+            dirs,
+        } => {
+            // Advisory: only apply while the *matching* folder-stats popup is still open and
+            // computing — a stale (cancelled/superseded) walk's late event carries a different id
+            // and is dropped, so it can't corrupt a newer popup for a different folder.
+            if let Some(Overlay::FolderStats {
+                id: open_id,
+                computing,
+                bytes: b,
+                files: f,
+                dirs: d,
+                ..
+            }) = &mut state.overlay
+            {
+                if *open_id == id && *computing {
+                    (*b, *f, *d) = (bytes, files, dirs);
+                }
+            }
+            Vec::new()
+        }
+        AppEvent::SizeDone {
+            id,
+            bytes,
+            files,
+            dirs,
+            partial,
+        } => {
+            if let Some(Overlay::FolderStats {
+                id: open_id,
+                computing,
+                bytes: b,
+                files: f,
+                dirs: d,
+                partial: p,
+                ..
+            }) = &mut state.overlay
+            {
+                if *open_id == id {
+                    *computing = false;
+                    (*b, *f, *d, *p) = (bytes, files, dirs, partial);
+                }
+            }
+            Vec::new()
+        }
         AppEvent::TransferConflict {
             id,
             src_conn,
@@ -7089,6 +7189,120 @@ mod tests {
         assert_eq!(t.id, *id, "the effect's id matches the armed op");
         assert_eq!(t.kind, OpKind::Delete);
         assert_eq!(t.phase, TransferPhase::Deleting);
+    }
+
+    #[test]
+    fn calculate_size_on_a_folder_opens_the_popup_and_walks() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("a_folder", EntryKind::Dir),
+                Entry::new("a_file.txt", EntryKind::File),
+            ],
+        );
+        // Cursor on the folder → popup opens (computing) and a CalculateSize effect is emitted.
+        s.pane_mut(Side::Left).cursor = 0;
+        let fx = update(&mut s, Msg::Action(Action::CalculateSize));
+        let [AppEffect::CalculateSize { id, .. }] = &fx[..] else {
+            panic!("expected a CalculateSize effect, got {fx:?}");
+        };
+        let id = *id;
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::FolderStats {
+                computing: true,
+                ..
+            })
+        ));
+
+        // A *stale* event (wrong id) is ignored — it can't corrupt this popup.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::SizeProgress {
+                id: id.wrapping_add(999),
+                bytes: 7,
+                files: 7,
+                dirs: 7,
+            }),
+        );
+        assert!(
+            matches!(s.overlay, Some(Overlay::FolderStats { bytes: 0, .. }),),
+            "a mismatched-id event must not update the popup"
+        );
+
+        // Live progress (matching id) updates the running totals…
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::SizeProgress {
+                id,
+                bytes: 100,
+                files: 3,
+                dirs: 1,
+            }),
+        );
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::FolderStats {
+                computing: true,
+                bytes: 100,
+                files: 3,
+                ..
+            })
+        ));
+        // …and the final result settles it (computing = false).
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::SizeDone {
+                id,
+                bytes: 256,
+                files: 5,
+                dirs: 2,
+                partial: false,
+            }),
+        );
+        let Some(Overlay::FolderStats {
+            computing,
+            bytes,
+            files,
+            dirs,
+            ..
+        }) = s.overlay
+        else {
+            panic!("expected FolderStats overlay");
+        };
+        assert!(!computing);
+        assert_eq!((bytes, files, dirs), (256, 5, 2));
+    }
+
+    #[test]
+    fn calculate_size_on_a_file_is_a_no_op() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("f.txt", EntryKind::File)],
+        );
+        let fx = update(&mut s, Msg::Action(Action::CalculateSize));
+        assert!(fx.is_empty(), "no walk for a non-directory");
+        assert!(s.overlay.is_none(), "no popup for a non-directory");
+        assert!(s.status.is_some(), "a hint is shown");
+    }
+
+    #[test]
+    fn closing_the_stats_popup_cancels_the_walk() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("d", EntryKind::Dir)]);
+        let _ = update(&mut s, Msg::Action(Action::CalculateSize));
+        assert!(matches!(s.overlay, Some(Overlay::FolderStats { .. })));
+        // Esc closes the popup and cancels the in-flight walk.
+        let fx = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(s.overlay.is_none());
+        assert!(
+            matches!(&fx[..], [AppEffect::CancelCalculateSize]),
+            "expected a CancelCalculateSize effect, got {fx:?}"
+        );
     }
 
     #[test]

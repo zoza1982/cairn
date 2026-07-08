@@ -216,6 +216,17 @@ fn render_overlay(frame: &mut Frame, state: &AppState, theme: &Theme) {
             .alignment(Alignment::Center);
             frame.render_widget(body, area);
         }
+        Overlay::FolderStats {
+            name,
+            computing,
+            bytes,
+            files,
+            dirs,
+            partial,
+            .. // `id` is a correlation token, not rendered
+        } => render_folder_stats(
+            frame, name, *computing, *bytes, *files, *dirs, *partial, theme,
+        ),
         Overlay::ConfirmOverwrite { conflicts, .. } => {
             let area = centered(frame.area(), 48, 6);
             frame.render_widget(Clear, area);
@@ -1132,6 +1143,69 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize, the
     let block = Block::bordered()
         .style(overlay_base(theme))
         .title(" Transfer ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let content = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), content);
+}
+
+/// Render the recursive folder-size stats popup ([`Overlay::FolderStats`]). While `computing` it
+/// shows a "Calculating…" header with the running totals (so a large/remote walk shows progress);
+/// once done it shows the final size + file/subdirectory counts, with a note if the count is partial
+/// (some entries couldn't be read).
+#[allow(clippy::too_many_arguments)]
+fn render_folder_stats(
+    frame: &mut Frame,
+    name: &str,
+    computing: bool,
+    bytes: u64,
+    files: u64,
+    dirs: u64,
+    partial: bool,
+    theme: &Theme,
+) {
+    // Clamp the box to the real frame width *first*, then derive the interior width from that — so a
+    // long folder name is truncated to the actual content width on a narrow terminal instead of
+    // overflowing the right border.
+    let width: u16 = 46.min(frame.area().width);
+    let inner_w = usize::from(width).saturating_sub(2); // strip the two border columns
+    let mut lines = vec![
+        Line::from(truncate_to(name, inner_w)).style(Modifier::BOLD),
+        Line::from(""),
+    ];
+    // Keep the header within the content width; a `partial` walk is flagged with a short "(partial)"
+    // rather than a long sentence that would clip on the default box.
+    lines.push(Line::from(if computing {
+        "Calculating…".to_owned()
+    } else if partial {
+        "Total size (partial):".to_owned()
+    } else {
+        "Total size:".to_owned()
+    }));
+    lines.push(
+        Line::from(format!("  {}  ({} bytes)", human_bytes(bytes), bytes)).style(Modifier::BOLD),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("  Files:   {files}")));
+    lines.push(Line::from(format!("  Folders: {dirs}")));
+    if partial && !computing {
+        lines.push(Line::from("  (some entries unreadable — lower bound)"));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(if computing {
+        "[Esc] cancel"
+    } else {
+        "[Esc] close"
+    }));
+
+    let h = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let area = centered(frame.area(), width, h);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .style(overlay_base(theme))
+        .title(" Folder size ")
         .border_style(Style::default().fg(Color::Cyan));
     let content = block.inner(area);
     frame.render_widget(block, area);

@@ -24,7 +24,7 @@ use cairn_core::{
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
 use cairn_types::SessionId;
-use cairn_types::{Caps, ConnectionId, UnixPerms, VfsPath};
+use cairn_types::{Caps, ConnectionId, EntryKind, UnixPerms, VfsPath};
 use cairn_vault::Vault;
 use cairn_vfs::{ByteRange, ListOpts, ListPage, Recurse, Vfs, VfsError, VfsRegistry};
 use futures::StreamExt;
@@ -376,6 +376,7 @@ async fn run_async() -> anyhow::Result<()> {
             &mut startup_test_in_flight,
             &mut startup_next_archive_conn_id,
             &mut startup_remote_edit_temps,
+            &mut None,
         );
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme(&state)))?;
@@ -890,6 +891,8 @@ async fn event_loop(
     let mut ai_cancel: Option<CancellationToken> = None;
     let mut log_viewer_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
     let mut pager_controls: HashMap<PagerId, CancellationToken> = HashMap::new();
+    // The cancel token for the single in-flight folder-size walk (the open FolderStats popup), if any.
+    let mut size_calc_cancel: Option<CancellationToken> = None;
     let mut session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
     // Tracks which ConnectionIds currently have an open task in flight. A duplicate
     // OpenConnection effect for the same id (e.g. the user selects a NeedsOpen entry twice
@@ -1029,6 +1032,7 @@ async fn event_loop(
                 &mut test_connection_in_flight,
                 &mut next_archive_conn_id,
                 &mut remote_edit_temps,
+                &mut size_calc_cancel,
             );
         }
     }
@@ -1263,6 +1267,7 @@ fn dispatch(
     test_connection_in_flight: &mut HashSet<ConnectionId>,
     next_archive_conn_id: &mut u64,
     remote_edit_temps: &mut HashMap<RemoteEditId, tempfile::TempDir>,
+    size_calc_cancel: &mut Option<CancellationToken>,
 ) {
     match effect {
         AppEffect::List {
@@ -1924,6 +1929,28 @@ fn dispatch(
             // Synchronous, like `CancelTransfer`: dropping the map entry deletes the temp
             // directory (and the file within it) via `tempfile::TempDir`'s `Drop` impl.
             remote_edit_temps.remove(&id);
+        }
+        AppEffect::CalculateSize { id, conn, path } => {
+            // Cancel any previous walk (only one folder-stats popup at a time), then start a fresh one.
+            if let Some(prev) = size_calc_cancel.take() {
+                prev.cancel();
+            }
+            let cancel = CancellationToken::new();
+            *size_calc_cancel = Some(cancel.clone());
+            let registry = registry.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                // Every emitted event carries `id`; the reducer drops any that don't match the open
+                // popup, so a superseded walk's late/cancelled events can't settle a newer popup.
+                let ev =
+                    run_calculate_size_effect(&registry, id, conn, path, &event_tx, cancel).await;
+                let _ = event_tx.send(ev).await;
+            });
+        }
+        AppEffect::CancelCalculateSize => {
+            if let Some(cancel) = size_calc_cancel.take() {
+                cancel.cancel();
+            }
         }
         // `AppEffect` is non-exhaustive; future variants are wired up in later milestones.
         other => tracing::warn!(effect = ?other, "unhandled effect"),
@@ -3349,6 +3376,109 @@ async fn run_delete_effect(
         id,
         status,
         error: failures > 0,
+    }
+}
+
+/// Recursively walk `root` totalling its size and file/subdirectory counts for the folder-stats
+/// popup. Streams `SizeProgress` updates (throttled) so a large/remote directory shows progress, and
+/// returns a final `SizeDone`. Cancellable (the popup was closed): on cancel it returns the totals
+/// gathered so far. `partial` is set if any entry couldn't be listed/sized, so the totals are a
+/// lower bound rather than silently wrong.
+async fn run_calculate_size_effect(
+    registry: &VfsRegistry,
+    id: u64,
+    conn: ConnectionId,
+    root: VfsPath,
+    event_tx: &mpsc::Sender<AppEvent>,
+    cancel: CancellationToken,
+) -> AppEvent {
+    // Defensive recursion bound: no real directory tree is this deep, but a backend that stats
+    // *through* a symlink (reporting a symlinked/cyclic directory as a real one) could otherwise
+    // loop forever and grow `stack` without bound. Hitting the cap marks the result partial.
+    const MAX_DEPTH: u32 = 1024;
+
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let mut dirs = 0u64;
+    let mut partial = false;
+    let Some(vfs) = registry.get(conn).await else {
+        return AppEvent::SizeDone {
+            id,
+            bytes,
+            files,
+            dirs,
+            partial: true,
+        };
+    };
+
+    let mut last_emit: Option<std::time::Instant> = None;
+    let mut emit = |bytes: u64, files: u64, dirs: u64| {
+        let now = std::time::Instant::now();
+        if last_emit.is_none_or(|t| now.duration_since(t) >= TRANSFER_UI_MIN_INTERVAL) {
+            last_emit = Some(now);
+            let _ = event_tx.try_send(AppEvent::SizeProgress {
+                id,
+                bytes,
+                files,
+                dirs,
+            });
+        }
+    };
+
+    // DFS over directories; the root itself isn't counted (we measure its contents). Each frame
+    // carries its depth so we can cap recursion.
+    let mut stack: Vec<(VfsPath, u32)> = vec![(root, 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let mut stream = vfs.list(&dir, ListOpts { all: true });
+        loop {
+            let page = tokio::select! {
+                pg = stream.next() => pg,
+                () = cancel.cancelled() => break,
+            };
+            let Some(page) = page else { break };
+            match page {
+                Ok(pg) => {
+                    for e in pg.entries {
+                        if e.is_dir() {
+                            dirs += 1;
+                            if depth + 1 >= MAX_DEPTH {
+                                partial = true; // too deep (or a cycle) — stop descending, count as a lower bound
+                            } else if let Ok(child) = dir.join(&e.name) {
+                                stack.push((child, depth + 1));
+                            } else {
+                                partial = true; // couldn't form the child path — its contents are uncounted
+                            }
+                        } else if e.kind == EntryKind::File {
+                            // Only regular files contribute to the byte total and file count. A file
+                            // with no reported size makes the total a lower bound.
+                            files += 1;
+                            match e.size {
+                                Some(sz) => bytes = bytes.saturating_add(sz),
+                                None => partial = true,
+                            }
+                        }
+                        // Symlinks and special nodes (fifo/socket/device/stream) are neither counted
+                        // nor treated as unreadable — they legitimately have no byte size.
+                    }
+                    emit(bytes, files, dirs);
+                }
+                Err(_) => {
+                    partial = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    AppEvent::SizeDone {
+        id,
+        bytes,
+        files,
+        dirs,
+        partial,
     }
 }
 
@@ -5252,6 +5382,113 @@ mod tests {
         }
         // The file survives (the walk was cancelled before removing it).
         assert!(dir.path().join("keep.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn calculate_size_totals_bytes_files_and_dirs_recursively() {
+        // A nested tree (incl. hidden entries): the walk sums every file's bytes and counts files
+        // and subdirectories, and reports a final SizeDone with the totals.
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(dir.path().join("d/sub/deep")).unwrap();
+        std::fs::create_dir(dir.path().join("d/.hidden")).unwrap();
+        std::fs::write(dir.path().join("d/a.txt"), b"aaaa").unwrap(); // 4
+        std::fs::write(dir.path().join("d/sub/b.txt"), b"bb").unwrap(); // 2
+        std::fs::write(dir.path().join("d/sub/deep/c.txt"), b"ccc").unwrap(); // 3
+        std::fs::write(dir.path().join("d/.hidden/secret"), b"z").unwrap(); // 1
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let (tx, _rx) = mpsc::channel(64);
+        let ev = run_calculate_size_effect(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/d").unwrap(),
+            &tx,
+            CancellationToken::new(),
+        )
+        .await;
+        match ev {
+            AppEvent::SizeDone {
+                bytes,
+                files,
+                dirs,
+                partial,
+                ..
+            } => {
+                assert_eq!(bytes, 4 + 2 + 3 + 1, "sum of all file sizes incl. hidden");
+                assert_eq!(files, 4, "a.txt, b.txt, c.txt, secret");
+                assert_eq!(dirs, 3, "sub, deep, .hidden");
+                assert!(!partial, "every entry was readable");
+            }
+            _ => panic!("expected SizeDone"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn calculate_size_ignores_symlinks_and_stays_non_partial() {
+        // A symlink has no byte size but is perfectly readable: it must not count toward `files`,
+        // must not add bytes, and must NOT flip `partial` (which means "some entries unreadable").
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("real.txt"), b"hello").unwrap(); // 5 bytes, 1 file
+        std::os::unix::fs::symlink("real.txt", dir.path().join("link")).unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let (tx, _rx) = mpsc::channel(16);
+        let ev = run_calculate_size_effect(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/").unwrap(),
+            &tx,
+            CancellationToken::new(),
+        )
+        .await;
+        match ev {
+            AppEvent::SizeDone {
+                bytes,
+                files,
+                partial,
+                ..
+            } => {
+                assert_eq!(bytes, 5);
+                assert_eq!(files, 1, "the symlink is not counted as a file");
+                assert!(
+                    !partial,
+                    "a symlink is readable — not a partial/unreadable result"
+                );
+            }
+            _ => panic!("expected SizeDone"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_size_walk_returns_partial_totals() {
+        // A pre-cancelled token stops the walk immediately; it still returns a (zero) SizeDone so the
+        // popup isn't left hanging.
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("f.txt"), b"data").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (tx, _rx) = mpsc::channel(8);
+        let ev = run_calculate_size_effect(
+            &registry,
+            1,
+            LEFT,
+            VfsPath::parse("/").unwrap(),
+            &tx,
+            cancel,
+        )
+        .await;
+        assert!(matches!(ev, AppEvent::SizeDone { files: 0, .. }));
     }
 
     #[tokio::test]
