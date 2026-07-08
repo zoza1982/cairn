@@ -11,6 +11,6 @@ expression: frame
 │   file05001      ││                  │
 │   file05002      ││                  │
 │   file05003      ││                  │
-│   file05004      ││                  │
 └────── sort: name ┘└────── sort: name ┘
- 5001/10000   q quit · Tab · ↵ open · F3
+ 5001/10000   q quit · Tab · ↵ open
+              ^S size · F7 mkdir

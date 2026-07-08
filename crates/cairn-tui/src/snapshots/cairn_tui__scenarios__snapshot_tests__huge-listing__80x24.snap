@@ -23,6 +23,6 @@ expression: frame
 │   file05007                          ││                                      │
 │   file05008                          ││                                      │
 │   file05009                          ││                                      │
-│   file05010                          ││                                      │
 └────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
- 5001/10000   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy ·
+ 5001/10000   q quit · Tab · ↵ open · v view · e edit · r rename · c copy
+              ^S size · F7 mkdir · / filter · ^R refresh · p pause · s sort

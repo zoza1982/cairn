@@ -89,12 +89,13 @@ right-aligned MC-style; on a narrow pane the columns drop out responsively — p
 keeping the date as long as it fits — so the name keeps priority, and are blank for backends that
 don't expose that metadata. Dates are shown in UTC (`YYYY-MM-DD`). By default `s` cycles the active pane's sort order (name → size → modified →
 type) and `.` toggles whether hidden entries (dotfiles) are listed; the current sort mode and hidden
-state show in each pane's bottom-right corner. `F7` creates a new directory and `F2` renames the entry under the cursor (both
+state show in each pane's bottom-right corner. `Ctrl-R` reloads the active pane. `F7` creates a new
+directory and `r` renames the entry under the cursor (`F2` is an alias; both
 open a text prompt; `Enter` confirms, `Esc` cancels). `Ctrl-S` recursively calculates the size of
 the folder under the cursor and shows it in a stats popup (total size, file and subfolder counts);
-the walk runs in the background with live totals, and `Esc` cancels it and closes the popup. `F3` opens a read-only pager on the entry
-under the cursor, auto-detecting text vs. binary content and switching to a hex view for the
-latter. `F4` opens the entry under the cursor in an external editor — `$VISUAL`, then `$EDITOR`,
+the walk runs in the background with live totals, and `Esc` cancels it and closes the popup. `v` opens a read-only pager on the entry
+under the cursor (`F3` alias), auto-detecting text vs. binary content and switching to a hex view for the
+latter. `e` opens the entry under the cursor in an external editor (`F4` alias) — `$VISUAL`, then `$EDITOR`,
 then `vi` (Unix only; on Windows, set one of the two first); `Enter` on a text file opens the same
 editor, while `Enter` on a binary file still opens the read-only hex pager. Editing works on
 **every backend**, local or remote: a remote file is downloaded to a private temp copy, edited

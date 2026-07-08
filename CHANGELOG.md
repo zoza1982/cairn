@@ -137,6 +137,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Key bindings for view/edit/rename/refresh, and a two-row hint bar.** `v` now views and `e` edits
+  the file under the cursor (`F3`/`F4` are kept as aliases); `r` renames the entry (`F2` alias) and
+  reloading the pane moved to `Ctrl-R` (was `r`). The bottom menu bar is now **two rows** and lists
+  the folder-size shortcut (`Ctrl-S`) plus the new bindings, fitting whole hint tokens to the pane
+  width so nothing is cut mid-word. Inside the connection switcher, `e` still edits the selected
+  profile. All bindings remain remappable via `[ui.keybindings]`.
+
 - **`cairn.toml` writes are now atomic** (temp file in the same directory + rename, fsynced before
   the rename — mirroring `cairn-vault`'s `atomic_write`). Applies to every config save path
   (connection add/edit/delete, and the new pin/hide toggles), not just the new RFC-0011 P6 code.

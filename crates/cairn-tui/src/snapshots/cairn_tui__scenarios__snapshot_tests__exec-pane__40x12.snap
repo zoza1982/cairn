@@ -13,4 +13,4 @@ expression: frame
 │                                      │
 │> cat /etc/hostname▏                  │
 └ [Enter] send  [^D] [follow]  Running ┘
- 1/4   q quit · Tab · ↵ open · F3 view ·
+ 1/4   q quit · Tab · ↵ open · v view

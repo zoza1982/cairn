@@ -85,6 +85,10 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             Action::MakeDir
                 | Action::Rename
                 | Action::Delete
+                // View/Edit open a pager/editor overlay that the arriving plan would clobber (and
+                // Edit suspends the whole TUI mid-plan) — suppress them like the other openers.
+                | Action::View
+                | Action::Edit
                 | Action::OpenConnections
                 | Action::OpenQueue
                 | Action::RunShellAction(_)
@@ -109,6 +113,10 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
                 | Action::Delete
                 | Action::MakeDir
                 | Action::Rename
+                // Edit mutates a file (and suspends the TUI) while the plan runs; View opens an
+                // overlay the plan can't coexist with — block both, as with the other operations.
+                | Action::View
+                | Action::Edit
                 | Action::OpenConnections
                 | Action::OpenQueue
                 | Action::RunShellAction(_)
@@ -2303,7 +2311,10 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
             open_scheme_picker(state);
             Vec::new()
         }
-        Action::EditConnection => {
+        // `Action::Edit` is the key 'e' maps to; inside the switcher it means "edit this connection"
+        // (like 'd'/`Delete` doubling as delete-connection below). `Action::EditConnection` is the
+        // named action for explicit config remapping.
+        Action::Edit | Action::EditConnection => {
             // Copy the cursor value so the mutable borrow on state.overlay ends before we read
             // state.connections and then replace state.overlay.
             let cursor_val = *cursor;
@@ -7494,6 +7505,10 @@ mod tests {
             Action::Rename,
             Action::Delete,
             Action::OpenConnections,
+            // View/Edit ('v'/'e') must also be suppressed — a pager/editor overlay the arriving plan
+            // would clobber, and Edit suspends the whole TUI mid-plan.
+            Action::View,
+            Action::Edit,
         ] {
             let fx = update(&mut s, Msg::Action(action));
             assert!(fx.is_empty(), "{action:?} should be suppressed");
@@ -7563,6 +7578,19 @@ mod tests {
         let fx = update(&mut s, Msg::Action(Action::Copy));
         assert!(fx.is_empty(), "no competing transfer starts");
         assert!(t_bytes(&s).is_none());
+        // View/Edit ('v'/'e') are refused too — Edit would suspend the TUI and mutate a file while
+        // the plan runs; View would open a competing overlay.
+        for action in [Action::View, Action::Edit] {
+            let fx = update(&mut s, Msg::Action(action));
+            assert!(
+                fx.is_empty(),
+                "{action:?} must be refused while a plan executes"
+            );
+            assert!(
+                s.overlay.is_none(),
+                "{action:?} opens no overlay while executing"
+            );
+        }
     }
 
     #[test]
@@ -11535,6 +11563,19 @@ mod p4_form_tests {
         let effects = update(&mut s, Msg::Action(Action::Cancel));
         assert!(effects.is_empty());
         assert!(s.overlay.is_none(), "cancelling confirm must close overlay");
+    }
+
+    #[test]
+    fn edit_action_edits_the_selected_connection_in_the_switcher() {
+        // `e` maps to `Action::Edit` (file edit in the main view); inside the connection switcher it
+        // must edit the selected profile — the same as the dedicated `EditConnection` action.
+        let mut s = state_with_connections();
+        let effects = update(&mut s, Msg::Action(Action::Edit));
+        assert!(effects.is_empty());
+        assert!(
+            matches!(s.overlay, Some(Overlay::ConnectionForm { .. })),
+            "Edit in the switcher opens the edit-connection form"
+        );
     }
 
     #[test]
