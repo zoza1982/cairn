@@ -1,5 +1,10 @@
+#![cfg(unix)]
 //! Reproduction harness that drives the **real** OpenSSH `sftp-server` over a pipe (no SSH
 //! transport / auth needed — `sftp-server` speaks the SFTP protocol directly on stdin/stdout).
+//!
+//! Unix-only: it spawns the `sftp-server` binary, wires it over Unix stdio pipes, and creates
+//! symlinks with `std::os::unix::fs` — none of which exist on Windows — so the whole file is
+//! `#![cfg(unix)]` to keep `cargo test` compiling there (the suite is env-guarded at runtime too).
 //!
 //! This lets us exercise `SftpVfs` + `RealSftp` against a genuine server implementation, which is
 //! where readdir-attribute quirks live that mocks can't capture. Env-guarded like the other
