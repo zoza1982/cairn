@@ -1645,6 +1645,13 @@ fn dispatch(
                     .await;
             });
         }
+        AppEffect::SaveTheme { name } => {
+            // Fire-and-forget persist of the live theme choice (Shift-T) to `[ui] theme`. No event: a
+            // failure is logged inside the effect, and the in-memory theme already applied regardless.
+            tokio::spawn(async move {
+                let _ = run_save_theme_effect(&name).await;
+            });
+        }
         AppEffect::OpenLogViewer {
             id,
             conn,
@@ -2672,6 +2679,42 @@ fn set_discovery_flag_at_path(
     }
     if let Err(e) = config.save(config_path) {
         tracing::warn!(error = %e, "failed to save config after discovery-flag update");
+        return Err(format!("failed to save config: {e}"));
+    }
+    Ok(())
+}
+
+/// Persist the live color-theme choice to `[ui] theme` in the config file (so a Shift-T switch
+/// survives a restart). Modeled on [`run_set_discovery_flag_effect`]: load → mutate → save under the
+/// config write lock. Fire-and-forget — the caller ignores the result; a failure is logged here.
+async fn run_save_theme_effect(name: &str) -> Result<(), String> {
+    let Some(config_path) = cairn_config::default_config_path() else {
+        return Err("cannot determine config file path".to_owned());
+    };
+    save_theme_at_path_locked(&config_path, name).await
+}
+
+/// Locked core of [`run_save_theme_effect`]: holds [`CONFIG_WRITE_LOCK`] for the whole
+/// load→mutate→save cycle so rapid Shift-T presses (or a concurrent pin/hide save) can't lose an
+/// update. Split out with an explicit `&Path` so a test can exercise it against a temp file.
+async fn save_theme_at_path_locked(config_path: &Path, name: &str) -> Result<(), String> {
+    let _guard = config_write_lock().await;
+    save_theme_at_path(config_path, name)
+}
+
+/// Testable core of [`run_save_theme_effect`]: load the config, set `ui.theme`, save. Preserves every
+/// other setting (keybindings, colors, connections, …) since it round-trips the whole config.
+fn save_theme_at_path(config_path: &Path, name: &str) -> Result<(), String> {
+    let mut config = match cairn_config::Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load config for theme save");
+            return Err(format!("failed to load config: {e}"));
+        }
+    };
+    config.ui.theme = name.to_owned();
+    if let Err(e) = config.save(config_path) {
+        tracing::warn!(error = %e, "failed to save config after theme change");
         return Err(format!("failed to save config: {e}"));
     }
     Ok(())
@@ -7052,6 +7095,31 @@ mod tests {
     }
 
     #[test]
+    fn save_theme_at_path_persists_and_preserves_other_settings() {
+        let dir = tempfile_dir();
+        let path = dir.path().join("cairn.toml");
+        // Seed a config with an unrelated setting to confirm the round-trip leaves it untouched.
+        let mut seed = cairn_config::Config::default();
+        seed.connections
+            .push(cairn_config::ConnectionProfile::new("local", "work"));
+        seed.ui.theme = "dark".to_owned();
+        seed.save(&path).unwrap();
+
+        save_theme_at_path(&path, "mc").unwrap();
+        let after = cairn_config::Config::load(&path).unwrap();
+        assert_eq!(after.ui.theme, "mc", "the theme was persisted");
+        assert_eq!(
+            after.connections.len(),
+            1,
+            "an unrelated section must round-trip untouched"
+        );
+
+        // Switching again overwrites the previous value (not appended/duplicated).
+        save_theme_at_path(&path, "nord").unwrap();
+        assert_eq!(cairn_config::Config::load(&path).unwrap().ui.theme, "nord");
+    }
+
+    #[test]
     fn discovery_flag_at_path_sets_then_unsets_without_touching_unrelated_fields() {
         let dir = tempfile_dir();
         let path = dir.path().join("cairn.toml");
@@ -7149,6 +7217,33 @@ mod tests {
             loaded.discovery.hidden,
             vec!["kube:kubeconfig".to_owned()],
             "the second task's write must have survived the race too — neither may clobber the other"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_theme_and_discovery_writes_do_not_lose_an_update() {
+        // A theme save and a pin/hide save share `CONFIG_WRITE_LOCK`, so racing them must not clobber
+        // either — parity with `concurrent_discovery_flag_writes_do_not_lose_an_update`.
+        let dir = tempfile_dir();
+        let path = dir.path().join("cairn.toml");
+        cairn_config::Config::default().save(&path).unwrap();
+
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let a = tokio::spawn(async move { save_theme_at_path_locked(&path_a, "mc").await });
+        let b = tokio::spawn(async move {
+            set_discovery_flag_at_path_locked(&path_b, DiscoveryFlag::Pinned, "saved:x", true).await
+        });
+        let (ra, rb) = tokio::join!(a, b);
+        ra.unwrap().unwrap();
+        rb.unwrap().unwrap();
+
+        let loaded = cairn_config::Config::load(&path).unwrap();
+        assert_eq!(loaded.ui.theme, "mc", "the theme write survived the race");
+        assert_eq!(
+            loaded.discovery.pinned,
+            vec!["saved:x".to_owned()],
+            "the discovery-flag write survived the race too"
         );
     }
 }
