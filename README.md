@@ -128,7 +128,7 @@ Pick a **theme** with `[ui] theme = "..."`:
 | Preset | Look |
 |--------|------|
 | `dark` (default) | modern truecolor Tokyo-Night; leaves your terminal's own background |
-| `mc` | classic **Midnight Commander** — blue panels, cyan folders, black-on-cyan selection. Uses the 16 named ANSI colors, so it renders correctly even on a basic 16-color terminal |
+| `mc` | classic **Midnight Commander** — the iconic saturated VGA-blue panels, white folders, black-on-cyan selection |
 | `nord` | the arctic Nord palette |
 | `gruvbox` | warm retro Gruvbox (dark) |
 | `light` | a clean light scheme (forces its own light background) |
@@ -142,9 +142,8 @@ Or switch **live** in the TUI with **Shift-T**, which cycles through the presets
 (`dark → mc → nord → gruvbox → light → …`) — the status line shows the new theme. (The live choice is
 session-only; set `[ui] theme` to make it the default.)
 
-The truecolor presets (`dark`/`nord`/`gruvbox`/`light`) are best-effort on terminals without
-24-bit color; pick `mc` for a guaranteed-correct look on a limited terminal. `dark` leaves the
-terminal background untouched, while `mc`/`nord`/`gruvbox`/`light` paint their own.
+All presets use truecolor RGB, so they're best-effort on terminals without 24-bit color. `dark`
+leaves the terminal background untouched, while `mc`/`nord`/`gruvbox`/`light` paint their own.
 
 Every color role is themeable under `[ui.colors]` on top of the chosen preset — override individual
 roles (`background`, `foreground`, `focused_border`, `unfocused_border`, `dir`, `hidden_dir`,

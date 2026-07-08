@@ -170,6 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `mc` theme now uses the authentic Midnight Commander blue.** It previously used the terminal's
+  *named* ANSI `blue`, which many terminals render as a washed-out shade. It's now pinned to the
+  saturated VGA/DOS blue (`#0000AA`) as truecolor RGB, with the matching VGA palette (white folders,
+  light-gray files, black-on-cyan selection), so it reads like classic MC on any truecolor terminal.
+
 - **Editing a remote SSH/SFTP file now saves back to the original.** Overwriting an existing file over
   SFTP silently failed: SFTP's `SSH_FXP_RENAME` refuses an existing destination (OpenSSH), so the
   edit → write-back flow (which stages a temp then renames it over the original) rolled back and the
