@@ -3639,13 +3639,23 @@ fn leave_dir(state: &mut AppState) -> Vec<AppEffect> {
     let side = state.focus;
     let parent = state.pane(side).cwd.parent();
     match parent {
-        Some(dir) => navigate(state, side, dir),
+        Some(dir) => {
+            // Remember the directory we're stepping out of (before `navigate` mutates `cwd`), so the
+            // cursor can return to it in the parent listing (MC behaviour) instead of the top row.
+            let leaving = state.pane(side).cwd.file_name().map(str::to_owned);
+            let effects = navigate(state, side, dir);
+            // Set after `navigate` (which clears it); the `Listed` handler consumes it.
+            state.pane_mut(side).select_after_load = leaving;
+            effects
+        }
         // At the VFS root: if this pane descended into a mounted archive (RFC-0013), pop back to
         // the connection/directory it came from instead of the previous no-op. Generalizes to
         // nested archives — each mount pushed its own frame, so popping always returns exactly one
         // level up. A pane that never mounted anything has an empty stack and this is still a no-op.
         None => match state.pane_mut(side).mount_stack.pop() {
             Some(frame) => {
+                // Note: this doesn't yet restore the cursor onto the archive file we came from —
+                // `MountFrame` carries only `{conn, cwd}`, not the archive's name (tracked: #162).
                 state.pane_mut(side).conn = frame.conn;
                 navigate(state, side, frame.cwd)
             }
@@ -3663,6 +3673,8 @@ fn navigate(state: &mut AppState, side: Side, dir: cairn_types::VfsPath) -> Vec<
     // A new directory starts unfiltered.
     p.filter = None;
     p.filter_editing = false;
+    // Default to the top row; `leave_dir` overrides this after the call to land on the exited child.
+    p.select_after_load = None;
     vec![AppEffect::List {
         pane: side,
         conn: p.conn,
@@ -3719,6 +3731,18 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                         );
                     }
                     p.listing = Listing::Ready(Arc::new(entries));
+                    // Restore the cursor to a specific child if one was requested (e.g. `leave_dir`
+                    // returning to the directory we just exited). Search the *visible* view so the
+                    // index is in the same space as `cursor` even if a filter was started during the
+                    // load window (a name that the filter now hides simply isn't found). If the name
+                    // isn't present (filtered out, or a hidden dir with `show_hidden` off), fall
+                    // through to the default top row. First exact match wins.
+                    if let Some(name) = p.select_after_load.take() {
+                        if let Some(idx) = p.visible().iter().position(|e| e.name.as_str() == name)
+                        {
+                            p.cursor = idx;
+                        }
+                    }
                     p.clamp_cursor();
                 }
                 Err(e) => {
@@ -6688,6 +6712,176 @@ mod tests {
         let mut s = state();
         let fx = update(&mut s, Msg::Action(Action::Leave));
         assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn leaving_a_dir_restores_the_cursor_to_the_exited_child() {
+        // Scroll down to a subdir, enter it, then go back up: the cursor must land on the subdir we
+        // came from (MC behaviour), not snap back to the top row.
+        let mut s = state();
+        let dir_listing = || {
+            vec![
+                Entry::new("alpha", EntryKind::Dir),
+                Entry::new("beta", EntryKind::Dir),
+                Entry::new("gamma", EntryKind::Dir),
+            ]
+        };
+        deliver(&mut s, Side::Left, dir_listing());
+        // Put the cursor on "beta" (index 1) and enter it.
+        s.pane_mut(Side::Left).cursor = 1;
+        assert_eq!(s.pane(Side::Left).current().unwrap().name.as_str(), "beta");
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        assert_eq!(s.pane(Side::Left).cwd.as_str(), "/beta");
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("child.txt", EntryKind::File)],
+        );
+        // Cursor reset to the top (the `..` row) inside the subdir.
+        assert_eq!(s.pane(Side::Left).cursor, 0);
+
+        // Now leave — back to root, cursor should return to "beta".
+        let _ = update(&mut s, Msg::Action(Action::Leave));
+        assert_eq!(s.pane(Side::Left).cwd.as_str(), "/");
+        deliver(&mut s, Side::Left, dir_listing());
+        assert_eq!(
+            s.pane(Side::Left).current().unwrap().name.as_str(),
+            "beta",
+            "the cursor should return to the exited subdirectory"
+        );
+    }
+
+    #[test]
+    fn leaving_into_a_normal_directory_change_does_not_restore_a_stale_cursor() {
+        // The restore is a one-shot: after `leave_dir` consumes it, a subsequent unrelated navigate
+        // (Enter) starts at the top row, never re-selecting the previously-exited name.
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("beta", EntryKind::Dir),
+                Entry::new("later", EntryKind::Dir),
+            ],
+        );
+        // Enter "beta", then leave — cursor returns to "beta".
+        s.pane_mut(Side::Left).cursor = 0;
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        deliver(&mut s, Side::Left, vec![Entry::new("x", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Leave));
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("beta", EntryKind::Dir),
+                Entry::new("later", EntryKind::Dir),
+            ],
+        );
+        assert_eq!(s.pane(Side::Left).current().unwrap().name.as_str(), "beta");
+        // Now enter "later" then land inside it: the cursor is at the top (`..`), not re-seeking "beta".
+        s.pane_mut(Side::Left).cursor = 1;
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        assert_eq!(s.pane(Side::Left).cwd.as_str(), "/later");
+        deliver(&mut s, Side::Left, vec![Entry::new("y", EntryKind::File)]);
+        assert_eq!(
+            s.pane(Side::Left).cursor,
+            0,
+            "a fresh navigate must not restore a stale cursor target"
+        );
+    }
+
+    #[test]
+    fn cursor_restore_falls_through_to_top_when_a_filter_hides_the_child() {
+        // If a filter is started during the async load window after leaving a directory, the restore
+        // must not mis-point: `cursor` indexes into the *visible* (filtered) view, so a child the
+        // filter now hides is simply not re-selected (we land at the top of the filtered view rather
+        // than at a stale raw index that could point at the wrong row).
+        let mut s = state();
+        // Descend one level so the parent listing carries a `..` sentinel (raw index 0), which makes
+        // a naive raw-index restore visibly wrong.
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("outer", EntryKind::Dir)],
+        );
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("aaa", EntryKind::Dir),
+                Entry::new("mydir", EntryKind::Dir),
+                Entry::new("zzz", EntryKind::Dir),
+            ],
+        );
+        // Enter "mydir" (visible index 2: `..`, aaa, mydir, zzz).
+        s.pane_mut(Side::Left).cursor = 2;
+        assert_eq!(s.pane(Side::Left).current().unwrap().name.as_str(), "mydir");
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("child.txt", EntryKind::File)],
+        );
+
+        // Leave back to /outer, then a filter that hides "mydir" (keeps only "zzz") lands mid-load.
+        let _ = update(&mut s, Msg::Action(Action::Leave));
+        s.pane_mut(Side::Left).filter = Some("zzz".to_owned());
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("aaa", EntryKind::Dir),
+                Entry::new("mydir", EntryKind::Dir),
+                Entry::new("zzz", EntryKind::Dir),
+            ],
+        );
+        // The visible view is [`..`, zzz]; the cursor must be a valid visible index and must NOT have
+        // landed on "zzz" (which a raw-index restore would have selected).
+        let visible = s.pane(Side::Left).visible();
+        assert!(s.pane(Side::Left).cursor < visible.len());
+        assert_ne!(
+            s.pane(Side::Left).current().unwrap().name.as_str(),
+            "zzz",
+            "the restore must not point at the wrong entry when a filter is active"
+        );
+    }
+
+    #[test]
+    fn cursor_restore_falls_through_to_top_when_the_child_is_gone() {
+        // If the exited child no longer exists in the reloaded parent (e.g. deleted concurrently, or
+        // hidden with show_hidden off), the restore degrades gracefully to the top row.
+        let mut s = state();
+        let listing = |extra: bool| {
+            let mut v = vec![
+                Entry::new("alpha", EntryKind::Dir),
+                Entry::new("beta", EntryKind::Dir),
+            ];
+            if extra {
+                v.push(Entry::new("gamma", EntryKind::Dir));
+            }
+            v
+        };
+        deliver(&mut s, Side::Left, listing(true));
+        s.pane_mut(Side::Left).cursor = 1; // "beta"
+        let _ = update(&mut s, Msg::Action(Action::Enter));
+        deliver(&mut s, Side::Left, vec![Entry::new("x", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Leave));
+        // Parent reload no longer contains "beta".
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("alpha", EntryKind::Dir),
+                Entry::new("gamma", EntryKind::Dir),
+            ],
+        );
+        assert_eq!(
+            s.pane(Side::Left).cursor,
+            0,
+            "a missing child falls through to the top row"
+        );
+        assert_eq!(s.pane(Side::Left).current().unwrap().name.as_str(), "alpha");
     }
 
     #[test]
