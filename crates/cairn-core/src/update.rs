@@ -3187,6 +3187,7 @@ fn arm_transfer(
         rate: None,
         total: None,
         paused: false,
+        pulse: 0,
     });
     // Auto-open only for a *user-initiated* transfer (the initial `Copy`/`Move` or a post-confirm
     // re-issue), never for a queue drain: once the user backgrounds the dialog with `b`, it must
@@ -3218,6 +3219,7 @@ fn arm_delete(state: &mut AppState, count: usize) -> TransferId {
         rate: None,
         total: None,
         paused: false,
+        pulse: 0,
     });
     if state.overlay.is_none() {
         state.overlay = Some(Overlay::TransferQueue { cursor: 0 });
@@ -3792,6 +3794,9 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 t.scan_entries = entries;
                 t.scan_path = current;
                 t.bytes = bytes;
+                // Advance the animation clock so the indeterminate bar keeps moving even when the
+                // item count/path sit still (a slow remote listing).
+                t.pulse = t.pulse.wrapping_add(1);
             }
             Vec::new()
         }
@@ -3819,6 +3824,9 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 t.bytes = bytes;
                 t.rate = Some(rate_bps);
                 t.total = total;
+                // Keep the animation clock ticking; a copy with an unknown total (e.g. same-server
+                // move, or a bounded/skipped pre-scan) renders indeterminate and must still move.
+                t.pulse = t.pulse.wrapping_add(1);
             }
             Vec::new()
         }
@@ -5153,6 +5161,38 @@ mod tests {
             }),
         );
         assert_eq!(s.active_transfers[0].phase, TransferPhase::Finalizing);
+    }
+
+    #[test]
+    fn scan_pulse_advances_even_when_the_count_is_flat() {
+        // The indeterminate-bar animation clock (`pulse`) must advance on *every* advisory update,
+        // even when `scan_entries`/`scan_path` don't change — otherwise the marquee would freeze
+        // while a single slow remote listing/stat stalls the item count.
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let id = s.active_transfers[0].id;
+        let stalled_scan = || {
+            Msg::Event(AppEvent::TransferScanning {
+                id,
+                entries: 7, // same count…
+                bytes: 0,
+                current: "/same/path".to_owned(), // …and same path each time
+            })
+        };
+        let p0 = s.active_transfers[0].pulse;
+        let _ = update(&mut s, stalled_scan());
+        let p1 = s.active_transfers[0].pulse;
+        let _ = update(&mut s, stalled_scan());
+        let p2 = s.active_transfers[0].pulse;
+        assert!(
+            p1 > p0 && p2 > p1,
+            "pulse must strictly advance: {p0},{p1},{p2}"
+        );
+        assert_eq!(
+            s.active_transfers[0].scan_entries, 7,
+            "count really was flat"
+        );
     }
 
     #[test]

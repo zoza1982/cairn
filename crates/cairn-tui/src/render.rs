@@ -1029,7 +1029,10 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize, the
                     _ => None,
                 },
             };
-            lines.push(Line::from(format!("  {}", progress_bar(pct, bar_width))));
+            lines.push(Line::from(format!(
+                "  {}",
+                progress_bar(pct, bar_width, t.pulse)
+            )));
 
             match t.phase {
                 // Live pre-flight walk: a running item count + bytes found on one line, and the path
@@ -1135,11 +1138,17 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize, the
     frame.render_widget(Paragraph::new(lines), content);
 }
 
+/// Width of the sweeping block on an indeterminate (unknown-total) bar.
+const MARQUEE_BLOCK: usize = 3;
+
 /// Render one MC-style text progress bar spanning exactly `width` columns: `█` for the filled
-/// portion, `░` for the rest, followed by a right-aligned ` NN%` suffix. `pct` is `None` when the
-/// transfer's total size isn't known yet (no pre-scan result) — rendered as an all-empty bar with
-/// `--%` rather than a fabricated percentage.
-fn progress_bar(pct: Option<u64>, width: usize) -> String {
+/// portion, `░` for the rest, followed by a right-aligned ` NN%` suffix.
+///
+/// When `pct` is `None` (the total isn't known — a delete, the pre-scan `Counting` phase, or a copy
+/// with no pre-scan result) the bar is *indeterminate*: instead of sitting empty it renders a fixed
+/// block that sweeps back and forth, positioned by `pulse` (a monotonic per-transfer tick), so it
+/// visibly moves to signal activity. `pulse` is ignored for a determinate bar. The suffix is `--%`.
+fn progress_bar(pct: Option<u64>, width: usize, pulse: u64) -> String {
     let suffix = match pct {
         Some(p) => format!(" {}%", p.min(100)),
         None => " --%".to_owned(),
@@ -1147,14 +1156,40 @@ fn progress_bar(pct: Option<u64>, width: usize) -> String {
     // Reserve room for the suffix; always leave at least one column for the bar itself so a very
     // narrow dialog (e.g. 40-wide) still renders *something* rather than just the percentage.
     let bar_width = width.saturating_sub(suffix.chars().count()).max(1);
-    let filled = match pct {
-        Some(p) => ((p.min(100) as usize) * bar_width) / 100,
-        None => 0,
+    let bar = match pct {
+        Some(p) => {
+            let filled = ((p.min(100) as usize) * bar_width) / 100;
+            std::iter::repeat_n('█', filled)
+                .chain(std::iter::repeat_n('░', bar_width - filled))
+                .collect()
+        }
+        None => indeterminate_bar(bar_width, pulse),
     };
-    let bar: String = std::iter::repeat_n('█', filled)
-        .chain(std::iter::repeat_n('░', bar_width - filled))
-        .collect();
     format!("{bar}{suffix}")
+}
+
+/// The sweeping fill for an indeterminate bar: a `MARQUEE_BLOCK`-wide run of `█` that bounces left↔
+/// right across `bar_width`, its left edge placed by `pulse` (one cell per progress tick). The motion
+/// is a triangle wave (ping-pong), not a wrap, so the block never jump-cuts from the right edge back
+/// to the left. The count of `█` is always `min(MARQUEE_BLOCK, bar_width)` regardless of `pulse`.
+fn indeterminate_bar(bar_width: usize, pulse: u64) -> String {
+    let block = MARQUEE_BLOCK.min(bar_width);
+    let span = bar_width - block; // highest left-edge position (0..=span)
+    let pos = if span == 0 {
+        0 // bar too narrow to move: render a static block
+    } else {
+        let period = 2 * span;
+        let phase = (pulse % period as u64) as usize;
+        if phase <= span {
+            phase
+        } else {
+            period - phase
+        }
+    };
+    std::iter::repeat_n('░', pos)
+        .chain(std::iter::repeat_n('█', block))
+        .chain(std::iter::repeat_n('░', bar_width - pos - block))
+        .collect()
 }
 
 /// The throughput rate (bytes/sec) and ETA (whole seconds) worth *displaying* for one transfer, or
@@ -2115,6 +2150,7 @@ mod tests {
             rate,
             total,
             paused,
+            pulse: 0,
         });
     }
 
@@ -2404,30 +2440,62 @@ mod tests {
 
     #[test]
     fn progress_bar_renders_filled_empty_and_suffix() {
-        // Unknown total → all-empty bar with `--%`, never a fabricated percentage.
-        let none = progress_bar(None, 24);
+        // Unknown total → `--%` suffix and an indeterminate *marquee* (a fixed block), never a
+        // fabricated percentage. The bar is no longer all-empty — it shows motion.
+        let none = progress_bar(None, 24, 0);
         assert!(none.ends_with(" --%"), "unknown → --%: {none}");
-        assert!(!none.contains('█'), "unknown → no filled cells: {none}");
+        assert_eq!(
+            none.matches('█').count(),
+            MARQUEE_BLOCK,
+            "unknown → a marquee block of fixed width: {none}"
+        );
 
         // 0% → no filled cells; 100% → no empty cells; the suffix reflects the percentage.
-        let zero = progress_bar(Some(0), 24);
+        let zero = progress_bar(Some(0), 24, 0);
         assert!(zero.ends_with(" 0%") && !zero.contains('█'), "{zero}");
-        let full = progress_bar(Some(100), 24);
+        let full = progress_bar(Some(100), 24, 0);
         assert!(full.ends_with(" 100%") && !full.contains('░'), "{full}");
         // 50% of a 20-col bar (24 − 4 for " 50%") → 10 filled, 10 empty.
-        let half = progress_bar(Some(50), 24);
+        let half = progress_bar(Some(50), 24, 0);
         assert_eq!(half.matches('█').count(), 10, "{half}");
         assert_eq!(half.matches('░').count(), 10, "{half}");
 
         // Over-100 input is clamped (defensive) and the bar never overfills.
-        let over = progress_bar(Some(250), 24);
+        let over = progress_bar(Some(250), 24, 0);
         assert!(over.ends_with(" 100%") && !over.contains('░'), "{over}");
 
         // Degenerate widths never panic and always leave at least one bar cell.
         for w in [0usize, 1, 3, 5] {
-            let s = progress_bar(Some(50), w);
+            let s = progress_bar(Some(50), w, 0);
             assert!(s.contains('█') || s.contains('░'), "w={w}: {s}");
+            let ind = progress_bar(None, w, 3);
+            assert!(ind.contains('█') || ind.contains('░'), "w={w}: {ind}");
         }
+    }
+
+    #[test]
+    fn indeterminate_bar_sweeps_back_and_forth() {
+        // The marquee block bounces across the bar as `pulse` advances (triangle wave), and always
+        // has exactly `min(MARQUEE_BLOCK, bar_width)` filled cells so it never grows/shrinks.
+        let bar_width = 6; // span = 6 - 3 = 3, period = 6
+        let positions: Vec<usize> = (0..8)
+            .map(|pulse| {
+                let bar = indeterminate_bar(bar_width, pulse);
+                assert_eq!(bar.chars().count(), bar_width, "pulse={pulse}: {bar}");
+                assert_eq!(
+                    bar.matches('█').count(),
+                    MARQUEE_BLOCK,
+                    "pulse={pulse}: constant block width: {bar}"
+                );
+                bar.chars().position(|c| c == '█').unwrap()
+            })
+            .collect();
+        // 0→1→2→3 then bounce back 2→1→0, then climb again.
+        assert_eq!(positions, vec![0, 1, 2, 3, 2, 1, 0, 1]);
+
+        // A bar too narrow to move renders a static block without panicking.
+        let narrow = indeterminate_bar(2, 99);
+        assert_eq!(narrow.matches('█').count(), 2, "{narrow}");
     }
 
     #[test]
@@ -2444,6 +2512,7 @@ mod tests {
             rate,
             total,
             paused,
+            pulse: 0,
         };
         let with_phase = |mut a: ActiveTransfer, phase| {
             a.phase = phase;
@@ -2675,6 +2744,7 @@ mod tests {
             rate: None,
             total: None,
             paused: false,
+            pulse: 0,
         });
         let text = render_text(&s, 120, 24);
         assert!(

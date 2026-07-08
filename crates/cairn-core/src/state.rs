@@ -1626,6 +1626,13 @@ pub struct ActiveTransfer {
     pub total: Option<u64>,
     /// Whether the user has paused this transfer.
     pub paused: bool,
+    /// A monotonic counter bumped on every advisory progress update (scan or byte), used purely to
+    /// drive the *indeterminate* progress bar's animation. Because it advances once per throttled
+    /// update (~every 120 ms) regardless of whether the item count or byte total moved, the marquee
+    /// keeps sweeping even while a single slow remote `readdir`/`stat` stalls `scan_entries`. The
+    /// pure renderer reads it to place the marquee block; a fixed value renders a fixed frame, so
+    /// snapshots stay deterministic. Ignored for a determinate (known-total) bar.
+    pub pulse: u64,
 }
 
 /// The reducer's view of a shell action: just what it needs to validate and gate the run. The full
