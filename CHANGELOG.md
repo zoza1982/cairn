@@ -170,6 +170,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Editing a remote SSH/SFTP file now saves back to the original.** Overwriting an existing file over
+  SFTP silently failed: SFTP's `SSH_FXP_RENAME` refuses an existing destination (OpenSSH), so the
+  edit → write-back flow (which stages a temp then renames it over the original) rolled back and the
+  file looked unchanged. `SftpVfs::rename` now overwrites like POSIX rename (and every other backend):
+  it moves an existing file destination aside to a backup, renames, then deletes the backup on success
+  or restores it on failure — so a mid-operation network drop can never lose both the original and the
+  edit. Fixes edit write-back and a same-server move onto an existing name.
+
 - **Transfer dialog selection no longer looks like a rendering glitch.** The selected transfer's label
   was reverse-video, painting a solid background block over the text that looked just like the filled
   progress bar below it. It's now **bold** (with the `>` marker) instead, and each transfer's block is

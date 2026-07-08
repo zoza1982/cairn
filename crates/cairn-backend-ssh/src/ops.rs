@@ -77,6 +77,9 @@ pub(crate) mod mock {
     /// In-memory SFTP transport for tests.
     pub(crate) struct MockSftp {
         nodes: Mutex<BTreeMap<String, Node>>,
+        /// One-shot: the next `rename` whose destination equals this path fails (simulates a
+        /// mid-operation server/network error), so the overwrite restore-on-failure path is testable.
+        fail_rename_to: Mutex<Option<String>>,
     }
 
     impl MockSftp {
@@ -85,7 +88,15 @@ pub(crate) mod mock {
             nodes.insert("/".to_owned(), Node::Dir);
             Self {
                 nodes: Mutex::new(nodes),
+                fail_rename_to: Mutex::new(None),
             }
+        }
+
+        /// Make the next `rename` with the given destination fail once.
+        #[must_use]
+        pub(crate) fn with_failing_rename_to(self, path: &str) -> Self {
+            *self.fail_rename_to.lock().unwrap() = Some(path.to_owned());
+            self
         }
 
         #[must_use]
@@ -206,7 +217,30 @@ pub(crate) mod mock {
         }
 
         async fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
+            // Injected one-shot failure (a simulated mid-operation drop), checked before mutating any
+            // state so the destination is left untouched — exercises the overwrite restore path.
+            {
+                let mut fail = self.fail_rename_to.lock().unwrap();
+                if fail.as_deref() == Some(to) {
+                    *fail = None;
+                    return Err(VfsError::Backend {
+                        code: "sftp".to_owned(),
+                        msg: "rename: simulated failure".to_owned(),
+                        retryable: false,
+                    });
+                }
+            }
             let mut nodes = self.nodes.lock().unwrap();
+            // Faithfully model OpenSSH's sftp-server: a plain SSH_FXP_RENAME fails if the destination
+            // already exists (no overwrite). `SftpVfs::rename` works around this by moving an existing
+            // file destination aside first — this rejection is what proves that fix.
+            if nodes.contains_key(to) {
+                return Err(VfsError::Backend {
+                    code: "sftp".to_owned(),
+                    msg: "rename: destination already exists".to_owned(),
+                    retryable: false,
+                });
+            }
             let node = nodes.remove(from).ok_or_else(|| Self::not_found(from))?;
             nodes.insert(to.to_owned(), node);
             Ok(())
