@@ -174,10 +174,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their READDIR responses, so every entry looked like a plain file. A recursive delete then never
   descended into subdirectories (it tried to `remove_file` them, which fails), stranding any
   non-empty subtree — a hidden subfolder like `.git/` was a common trigger — and leaving the parent
-  behind too. `SftpVfs` now resolves an unknown entry kind with an explicit `stat` at the single
+  behind too. `SftpVfs` now resolves an unknown entry kind with an explicit `lstat` at the single
   listing choke point, so directories are classified correctly for both the delete walk and the
-  backend's own recursive remove. OpenSSH always sends the attributes, so this adds no extra calls
-  there. (Delete of hidden entries on local and OpenSSH backends already worked.)
+  backend's own recursive remove. The recovery (and `remove`'s own classification) uses `lstat`,
+  **not** a symlink-following `stat`, so a symlink-to-directory is unlinked rather than followed — a
+  recursive delete can never descend through a link and destroy data outside the requested tree, and
+  a symlink cycle can't loop forever. OpenSSH always sends the attributes, so this adds no extra
+  calls there. (Delete of hidden entries on local and OpenSSH backends already worked.)
 
 - **The `mc` theme now uses the authentic Midnight Commander blue.** It previously used the terminal's
   *named* ANSI `blue`, which many terminals render as a washed-out shade. It's now pinned to the

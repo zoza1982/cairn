@@ -41,4 +41,3 @@ zeroize = { version = "1", features = ["alloc"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net", "time", "process"] }
 tempfile = "3"
-russh-sftp = "2"

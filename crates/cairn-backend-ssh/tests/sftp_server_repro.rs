@@ -22,22 +22,24 @@ fn sftp_server_bin() -> Option<&'static str> {
         .find(|p| std::path::Path::new(p).exists())
 }
 
-async fn connect(root: &std::path::Path) -> SftpVfs<RealSftp> {
+/// The spawned server handle is returned so the caller keeps it alive for the test's duration and
+/// drops it at the end. `kill_on_drop` reaps the `sftp-server` child when the handle drops, so no
+/// zombie lingers.
+async fn connect(root: &std::path::Path) -> (SftpVfs<RealSftp>, tokio::process::Child) {
     let bin = sftp_server_bin().expect("sftp-server binary");
     let mut child = tokio::process::Command::new(bin)
         .current_dir(root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .expect("spawn sftp-server");
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    // Leak the child so it lives for the test; killed on process exit.
-    std::mem::forget(child);
     let stream = tokio::io::join(stdout, stdin);
     let session = SftpSession::new(stream).await.expect("sftp init");
-    SftpVfs::new(CONN, RealSftp::new(session))
+    (SftpVfs::new(CONN, RealSftp::new(session)), child)
 }
 
 /// Replicates the app-edge delete walk in `cairn::app::run_delete_effect` (DFS, files removed on
@@ -100,7 +102,7 @@ async fn real_sftp_lists_hidden_and_reports_kind() {
     std::fs::write(tmp.path().join("d/.dotfile"), b"d").unwrap();
     std::fs::write(tmp.path().join("d/visible.txt"), b"v").unwrap();
 
-    let vfs = connect(tmp.path()).await;
+    let (vfs, _server) = connect(tmp.path()).await;
     let root = VfsPath::parse(&format!("{}/d", tmp.path().to_str().unwrap())).unwrap();
 
     // 1) Does the real server's readdir surface the hidden dir, and with the right kind?
@@ -146,7 +148,7 @@ async fn real_sftp_recursive_remove_of_hidden_only_dir() {
     std::fs::write(tmp.path().join("d/.git/config"), b"c").unwrap();
     std::fs::write(tmp.path().join("d/.git/objects/x"), b"x").unwrap();
 
-    let vfs = connect(tmp.path()).await;
+    let (vfs, _server) = connect(tmp.path()).await;
     let root = VfsPath::parse(&format!("{}/d", tmp.path().to_str().unwrap())).unwrap();
 
     // The backend's own recursive remove (Recurse::Yes) — used by move/overwrite paths.
@@ -156,5 +158,36 @@ async fn real_sftp_recursive_remove_of_hidden_only_dir() {
     assert!(
         !tmp.path().join("d").exists(),
         "recursive remove stranded the hidden-only subtree"
+    );
+}
+
+#[tokio::test]
+async fn real_sftp_recursive_remove_spares_a_symlink_target() {
+    if std::env::var("CAIRN_IT_SFTP").is_err() {
+        eprintln!("skipping: set CAIRN_IT_SFTP=1 to run");
+        return;
+    }
+    if sftp_server_bin().is_none() {
+        eprintln!("skipping: no sftp-server binary found");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // `d/` contains a symlink to an external directory; deleting `d/` must unlink the symlink and
+    // leave the target (and its file) intact — never follow the link and delete outside the tree.
+    std::fs::create_dir_all(tmp.path().join("d")).unwrap();
+    std::fs::write(tmp.path().join("d/own.txt"), b"o").unwrap();
+    std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+    std::fs::write(tmp.path().join("outside/precious.txt"), b"p").unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("outside"), tmp.path().join("d/link")).unwrap();
+
+    let (vfs, _server) = connect(tmp.path()).await;
+    let root = VfsPath::parse(&format!("{}/d", tmp.path().to_str().unwrap())).unwrap();
+    vfs.remove(&root, Recurse::Yes)
+        .await
+        .expect("recursive remove");
+    assert!(!tmp.path().join("d").exists(), "the deleted tree is gone");
+    assert!(
+        tmp.path().join("outside/precious.txt").exists(),
+        "a recursive delete followed a symlink and destroyed data outside the tree"
     );
 }
