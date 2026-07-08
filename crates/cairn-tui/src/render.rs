@@ -1333,8 +1333,11 @@ fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize, theme: &Theme) 
         .steps
         .iter()
         .map(|s| {
+            // Approval/run status keeps its semantic colors (green approved, red rejected/failed,
+            // cyan done); a still-pending step uses the theme's status color so it doesn't clash on a
+            // non-default theme (it was a hardcoded gray).
             let (marker, color) = match s.status {
-                StepStatus::Pending => ('·', Color::Gray),
+                StepStatus::Pending => ('·', theme.status),
                 StepStatus::Approved => ('✓', Color::Green),
                 StepStatus::Rejected => ('✗', Color::Red),
                 StepStatus::Done => ('●', Color::Cyan),
@@ -1354,7 +1357,13 @@ fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize, theme: &Theme) 
         })
         .collect();
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::Magenta).fg(Color::Black))
+        // Use the theme's selection colors (like the panes) instead of a hardcoded magenta bar, so
+        // the highlighted step matches the active theme.
+        .highlight_style(
+            Style::default()
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg),
+        )
         .highlight_symbol("▶ ");
     let mut list_state = ListState::default();
     if !plan.steps.is_empty() {
@@ -1368,7 +1377,7 @@ fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize, theme: &Theme) 
         "↵ approve · x reject · esc abort · no bulk (irreversible)"
     };
     frame.render_widget(
-        Paragraph::new(Line::from(help)).style(Style::default().fg(Color::Gray)),
+        Paragraph::new(Line::from(help)).style(Style::default().fg(theme.status)),
         help_area,
     );
 }
@@ -2339,6 +2348,67 @@ mod tests {
             .zip(themed.content().iter())
             .any(|(p, t)| p.style().bg != t.style().bg);
         assert!(changed, "themed background must paint at least one cell");
+    }
+
+    #[test]
+    fn ai_plan_overlay_matches_the_theme() {
+        use cairn_ai::{capability_for, Plan, PlanState, PlanStep, StepStatus};
+        let steps = ["list", "copy"]
+            .iter()
+            .filter_map(|t| {
+                Some(PlanStep {
+                    tool: (*t).to_owned(),
+                    input: serde_json::Value::Null,
+                    description: format!("{t} the things"),
+                    capability: capability_for(t)?,
+                    status: StepStatus::Pending,
+                    error: None,
+                    output: None,
+                })
+            })
+            .collect();
+        let plan = Plan {
+            summary: "s".to_owned(),
+            steps,
+            state: PlanState::Proposed,
+        };
+        let mut s = ready_state();
+        s.overlay = Some(cairn_core::Overlay::AiPlan { plan, cursor: 0 });
+        let theme = Theme {
+            background: Some(Color::Blue),
+            selection_bg: Color::Green,
+            selection_fg: Color::Black,
+            ..Theme::DARK
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &s, &theme)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let width = usize::from(buf.area().width);
+        let mut saw_title_bg = false;
+        let mut highlight_is_theme = false;
+        let mut any_magenta = false;
+        for row in buf.content().chunks(width) {
+            let text: String = row.iter().map(|c| c.symbol()).collect();
+            if text.contains("AI plan") {
+                saw_title_bg = row.iter().any(|c| c.style().bg == Some(Color::Blue));
+            }
+            if text.contains("list the things") {
+                // The highlighted step must use the theme selection bg, never a hardcoded magenta.
+                highlight_is_theme = row.iter().any(|c| c.style().bg == Some(Color::Green));
+            }
+            if row.iter().any(|c| c.style().bg == Some(Color::Magenta)) {
+                any_magenta = true;
+            }
+        }
+        assert!(
+            saw_title_bg,
+            "the AI overlay's interior carries the theme background"
+        );
+        assert!(
+            highlight_is_theme,
+            "the highlighted step uses the theme selection colour"
+        );
+        assert!(!any_magenta, "no hardcoded magenta highlight remains");
     }
 
     #[test]
