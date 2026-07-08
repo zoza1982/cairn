@@ -2374,10 +2374,13 @@ mod tests {
         };
         let mut s = ready_state();
         s.overlay = Some(cairn_core::Overlay::AiPlan { plan, cursor: 0 });
+        // Distinctive theme colors so each role is distinguishable from the DARK defaults.
+        let status = Color::Rgb(1, 2, 3);
         let theme = Theme {
             background: Some(Color::Blue),
             selection_bg: Color::Green,
             selection_fg: Color::Black,
+            status,
             ..Theme::DARK
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2386,6 +2389,8 @@ mod tests {
         let width = usize::from(buf.area().width);
         let mut saw_title_bg = false;
         let mut highlight_is_theme = false;
+        let mut pending_is_status = false;
+        let mut help_is_status = false;
         let mut any_magenta = false;
         for row in buf.content().chunks(width) {
             let text: String = row.iter().map(|c| c.symbol()).collect();
@@ -2395,6 +2400,14 @@ mod tests {
             if text.contains("list the things") {
                 // The highlighted step must use the theme selection bg, never a hardcoded magenta.
                 highlight_is_theme = row.iter().any(|c| c.style().bg == Some(Color::Green));
+            }
+            if text.contains("copy the things") {
+                // A non-highlighted pending step's marker uses the theme status color (was gray).
+                pending_is_status = row.iter().any(|c| c.style().fg == Some(status));
+            }
+            if text.contains("approve") {
+                // The help line uses the theme status color (was gray).
+                help_is_status = row.iter().any(|c| c.style().fg == Some(status));
             }
             if row.iter().any(|c| c.style().bg == Some(Color::Magenta)) {
                 any_magenta = true;
@@ -2408,6 +2421,11 @@ mod tests {
             highlight_is_theme,
             "the highlighted step uses the theme selection colour"
         );
+        assert!(
+            pending_is_status,
+            "a pending step's marker uses the theme status colour"
+        );
+        assert!(help_is_status, "the help line uses the theme status colour");
         assert!(!any_magenta, "no hardcoded magenta highlight remains");
     }
 
