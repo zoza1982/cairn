@@ -125,6 +125,30 @@ impl SftpOps for RealSftp {
         .await
     }
 
+    async fn lstat(&self, path: &str) -> Result<RemoteMeta, VfsError> {
+        // Like `stat`, but `symlink_metadata` (SSH_FXP_LSTAT) does not follow symlinks, so a symlink
+        // reports as `EntryKind::Symlink` rather than its target's kind. Same idempotent-retry policy.
+        cairn_vfs::retry(RetryPolicy::default(), || async {
+            let md = self
+                .session
+                .symlink_metadata(path)
+                .await
+                .map_err(|e| map_err(e, path))?;
+            let kind = kind_of(&md);
+            Ok(RemoteMeta {
+                kind,
+                size: if kind == EntryKind::File {
+                    Some(md.len())
+                } else {
+                    None
+                },
+                modified: md.modified().ok(),
+                mode: md.permissions,
+            })
+        })
+        .await
+    }
+
     async fn read(&self, path: &str, range: Option<ByteRange>) -> Result<Vec<u8>, VfsError> {
         // Idempotent read: retried on a transient failure. A retry re-opens and re-reads the whole
         // range from the start (the returned bytes are correct; only the in-flight read is repeated).

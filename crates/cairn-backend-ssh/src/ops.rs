@@ -44,8 +44,13 @@ pub struct RemoteMeta {
 pub trait SftpOps: Send + Sync + 'static {
     /// List a directory's direct children.
     async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, VfsError>;
-    /// Fetch metadata for a path.
+    /// Fetch metadata for a path (follows symlinks, `SSH_FXP_STAT`).
     async fn stat(&self, path: &str) -> Result<RemoteMeta, VfsError>;
+    /// Fetch metadata for a path **without following symlinks** (`SSH_FXP_LSTAT`). Used to classify
+    /// entries for deletion: a symlink-to-directory must be treated as a symlink (and unlinked),
+    /// never followed into and recursed — otherwise a delete would destroy data *outside* the
+    /// requested tree, and a symlink cycle would loop forever.
+    async fn lstat(&self, path: &str) -> Result<RemoteMeta, VfsError>;
     /// Read a file's bytes, optionally a range.
     async fn read(&self, path: &str, range: Option<ByteRange>) -> Result<Vec<u8>, VfsError>;
     /// Write (create/truncate) a file.
@@ -72,6 +77,8 @@ pub(crate) mod mock {
     enum Node {
         Dir,
         File(Vec<u8>),
+        /// A symbolic link to another path (which may or may not exist / may itself be a link).
+        Symlink(String),
     }
 
     /// In-memory SFTP transport for tests.
@@ -80,6 +87,10 @@ pub(crate) mod mock {
         /// One-shot: the next `rename` whose destination equals this path fails (simulates a
         /// mid-operation server/network error), so the overwrite restore-on-failure path is testable.
         fail_rename_to: Mutex<Option<String>>,
+        /// When set, `read_dir` reports every entry as a plain file with no mode bits — mimicking
+        /// SFTP servers that omit the type/permission attrs in READDIR responses. `stat` still
+        /// returns the true kind, so the backend's stat-fallback can recover it.
+        hide_readdir_types: bool,
     }
 
     impl MockSftp {
@@ -89,7 +100,15 @@ pub(crate) mod mock {
             Self {
                 nodes: Mutex::new(nodes),
                 fail_rename_to: Mutex::new(None),
+                hide_readdir_types: false,
             }
+        }
+
+        /// Simulate a server that doesn't send type/permission bits in directory listings.
+        #[must_use]
+        pub(crate) fn hiding_readdir_types(mut self) -> Self {
+            self.hide_readdir_types = true;
+            self
         }
 
         /// Make the next `rename` with the given destination fail once.
@@ -117,8 +136,33 @@ pub(crate) mod mock {
             self
         }
 
+        /// Add a symlink at `path` pointing at `target` (an absolute path in this mock's namespace).
+        #[must_use]
+        pub(crate) fn with_symlink(self, path: &str, target: &str) -> Self {
+            self.nodes
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), Node::Symlink(target.to_owned()));
+            self
+        }
+
         fn not_found(path: &str) -> VfsError {
             VfsError::NotFound(VfsPath::parse(path).unwrap_or_else(|_| VfsPath::root()))
+        }
+
+        /// Follow symlinks from `path` to the final non-link node key, mimicking a server that
+        /// resolves links on `stat`/`opendir`/`open`. Returns `None` for a dangling or cyclic link
+        /// (a bounded hop count stands in for `ELOOP`), so callers surface not-found rather than spin.
+        fn resolve(nodes: &BTreeMap<String, Node>, path: &str) -> Option<String> {
+            let mut cur = path.to_owned();
+            for _ in 0..40 {
+                match nodes.get(&cur) {
+                    Some(Node::Symlink(target)) => cur = target.clone(),
+                    Some(_) => return Some(cur),
+                    None => return None,
+                }
+            }
+            None
         }
     }
 
@@ -126,13 +170,15 @@ pub(crate) mod mock {
     impl SftpOps for MockSftp {
         async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, VfsError> {
             let nodes = self.nodes.lock().unwrap();
-            if !matches!(nodes.get(path), Some(Node::Dir)) {
+            // Opening a directory follows symlinks (a symlink-to-dir lists the target's children).
+            let dir_key = Self::resolve(&nodes, path).ok_or_else(|| Self::not_found(path))?;
+            if !matches!(nodes.get(&dir_key), Some(Node::Dir)) {
                 return Err(Self::not_found(path));
             }
-            let prefix = if path == "/" {
+            let prefix = if dir_key == "/" {
                 "/".to_owned()
             } else {
-                format!("{path}/")
+                format!("{dir_key}/")
             };
             let mut out = Vec::new();
             for (key, node) in nodes.iter() {
@@ -145,9 +191,18 @@ pub(crate) mod mock {
                 if rest.is_empty() || rest.contains('/') {
                     continue;
                 }
+                // READDIR is lstat-like: an entry that is itself a symlink reports as a symlink, not
+                // its target's kind.
                 let (kind, size, mode) = match node {
                     Node::Dir => (EntryKind::Dir, None, Some(0o040_755)),
                     Node::File(b) => (EntryKind::File, Some(b.len() as u64), Some(0o100_644)),
+                    Node::Symlink(_) => (EntryKind::Symlink, None, Some(0o120_777)),
+                };
+                // A type-less server reports everything as a plain file with no mode bits.
+                let (kind, mode) = if self.hide_readdir_types {
+                    (EntryKind::File, None)
+                } else {
+                    (kind, mode)
                 };
                 out.push(RemoteEntry {
                     name: rest.to_owned(),
@@ -161,6 +216,29 @@ pub(crate) mod mock {
         }
 
         async fn stat(&self, path: &str) -> Result<RemoteMeta, VfsError> {
+            // `stat` follows symlinks: resolve to the final target, then report the target's kind.
+            let nodes = self.nodes.lock().unwrap();
+            let resolved = Self::resolve(&nodes, path).ok_or_else(|| Self::not_found(path))?;
+            match nodes.get(&resolved) {
+                Some(Node::Dir) => Ok(RemoteMeta {
+                    kind: EntryKind::Dir,
+                    size: None,
+                    modified: None,
+                    mode: Some(0o040_755),
+                }),
+                Some(Node::File(b)) => Ok(RemoteMeta {
+                    kind: EntryKind::File,
+                    size: Some(b.len() as u64),
+                    modified: None,
+                    mode: Some(0o100_644),
+                }),
+                // `resolve` only returns a non-symlink key; a missing target is not-found.
+                _ => Err(Self::not_found(path)),
+            }
+        }
+
+        async fn lstat(&self, path: &str) -> Result<RemoteMeta, VfsError> {
+            // `lstat` does not follow symlinks: a symlink reports as a symlink.
             let nodes = self.nodes.lock().unwrap();
             match nodes.get(path) {
                 Some(Node::Dir) => Ok(RemoteMeta {
@@ -175,13 +253,20 @@ pub(crate) mod mock {
                     modified: None,
                     mode: Some(0o100_644),
                 }),
+                Some(Node::Symlink(_)) => Ok(RemoteMeta {
+                    kind: EntryKind::Symlink,
+                    size: None,
+                    modified: None,
+                    mode: Some(0o120_777),
+                }),
                 None => Err(Self::not_found(path)),
             }
         }
 
         async fn read(&self, path: &str, range: Option<ByteRange>) -> Result<Vec<u8>, VfsError> {
             let nodes = self.nodes.lock().unwrap();
-            let Some(Node::File(b)) = nodes.get(path) else {
+            let resolved = Self::resolve(&nodes, path).ok_or_else(|| Self::not_found(path))?;
+            let Some(Node::File(b)) = nodes.get(&resolved) else {
                 return Err(Self::not_found(path));
             };
             Ok(match range {
@@ -199,12 +284,33 @@ pub(crate) mod mock {
         }
 
         async fn remove_file(&self, path: &str) -> Result<(), VfsError> {
-            self.nodes.lock().unwrap().remove(path);
-            Ok(())
+            let mut nodes = self.nodes.lock().unwrap();
+            match nodes.get(path) {
+                Some(Node::Dir) => Err(VfsError::Backend {
+                    code: "sftp".to_owned(),
+                    msg: "remove: is a directory".to_owned(),
+                    retryable: false,
+                }),
+                // A symlink is unlinked by name (its target is untouched), like SSH_FXP_REMOVE.
+                Some(Node::File(_) | Node::Symlink(_)) => {
+                    nodes.remove(path);
+                    Ok(())
+                }
+                None => Err(Self::not_found(path)),
+            }
         }
 
         async fn remove_dir(&self, path: &str) -> Result<(), VfsError> {
-            self.nodes.lock().unwrap().remove(path);
+            let mut nodes = self.nodes.lock().unwrap();
+            let prefix = format!("{path}/");
+            if nodes.keys().any(|k| k.starts_with(&prefix)) {
+                return Err(VfsError::Backend {
+                    code: "sftp".to_owned(),
+                    msg: "rmdir: directory not empty".to_owned(),
+                    retryable: false,
+                });
+            }
+            nodes.remove(path);
             Ok(())
         }
 

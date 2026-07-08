@@ -49,12 +49,36 @@ impl<O: SftpOps> SftpVfs<O> {
             if r.name == "." || r.name == ".." {
                 continue;
             }
-            let mut e = Entry::new(r.name, r.kind);
-            if r.kind == EntryKind::File {
-                e.size = r.size;
+            let mut kind = r.kind;
+            let mut size = r.size;
+            let mut modified = r.modified;
+            let mut mode = r.mode;
+            // Some SFTP servers omit the type/permission attrs in READDIR responses, so every entry
+            // arrives looking like a plain file (`mode == None`). Left unresolved, a directory would
+            // be misclassified — and a recursive delete driven by these kinds would never descend
+            // into it, stranding the directory (and its parent) instead of removing it. Recover the
+            // true kind with an `lstat` (not `stat`: it must NOT follow symlinks, or a symlink-to-dir
+            // would be reclassified as a directory and a recursive delete would follow it and destroy
+            // data outside the tree). Reuse the round-trip we're already paying to fill in the size,
+            // perms, and mtime the listing lacked. OpenSSH sends the attrs, so this never fires on the
+            // common path. NOTE: on a server that omits them, this is one `lstat` per entry — a real
+            // cost for very large remote directories, tracked as a follow-up (pipeline/cap the stats).
+            if kind == EntryKind::File && r.mode.is_none() {
+                if let Ok(child) = dir.join(&r.name) {
+                    if let Ok(m) = self.ops.lstat(&child.as_str()).await {
+                        kind = m.kind;
+                        size = m.size;
+                        modified = m.modified;
+                        mode = m.mode;
+                    }
+                }
             }
-            e.modified = r.modified;
-            e.perms = r.mode.map(UnixPerms::from_mode);
+            let mut e = Entry::new(r.name, kind);
+            if kind == EntryKind::File {
+                e.size = size;
+            }
+            e.modified = modified;
+            e.perms = mode.map(UnixPerms::from_mode);
             entries.push(e);
         }
         Ok(ListPage {
@@ -66,17 +90,16 @@ impl<O: SftpOps> SftpVfs<O> {
 
     async fn remove_recursive(&self, dir: &VfsPath) -> Result<(), VfsError> {
         // Post-order: discover the whole subtree, delete files as we go, then remove directories
-        // deepest-first.
+        // deepest-first. Enumerate via `list_dir` (not raw `read_dir`) so the stat-fallback for
+        // type-less servers applies here too — otherwise a misclassified subdirectory would be
+        // `remove_file`'d (and fail) instead of being recursed into.
         let mut to_visit = vec![dir.clone()];
         let mut dirs = Vec::new();
         while let Some(d) = to_visit.pop() {
             dirs.push(d.clone());
-            for r in self.ops.read_dir(&d.as_str()).await? {
-                if r.name == "." || r.name == ".." {
-                    continue;
-                }
-                let child = d.join(&r.name).map_err(|_| VfsError::NotFound(d.clone()))?;
-                if r.kind == EntryKind::Dir {
+            for e in self.list_dir(d.clone()).await?.entries {
+                let child = d.join(&e.name).map_err(|_| VfsError::NotFound(d.clone()))?;
+                if e.is_dir() {
                     to_visit.push(child);
                 } else {
                     self.ops.remove_file(&child.as_str()).await?;
@@ -166,7 +189,12 @@ impl<O: SftpOps> Vfs for SftpVfs<O> {
     }
 
     async fn remove(&self, path: &VfsPath, recurse: Recurse) -> Result<(), VfsError> {
-        let m = self.ops.stat(&path.as_str()).await?;
+        // `lstat`, not `stat`: removing a *symlink* must unlink the link itself, never follow it. A
+        // follow-`stat` on a symlink-to-directory would report `Dir` and route us into `remove_dir`
+        // /`remove_recursive` against the link's target — deleting data outside the requested path.
+        // With `lstat`, a symlink classifies as `Symlink` and falls to the `remove_file` arm (SFTP
+        // `SSH_FXP_REMOVE` unlinks the link, leaving the target intact).
+        let m = self.ops.lstat(&path.as_str()).await?;
         match (m.kind, recurse) {
             (EntryKind::Dir, Recurse::Yes) => self.remove_recursive(path).await,
             (EntryKind::Dir, Recurse::No) => self.ops.remove_dir(&path.as_str()).await,
@@ -467,6 +495,190 @@ mod tests {
             Err(VfsError::NotFound(_))
         ));
         assert_eq!(vfs.stat(&p("/top.txt")).await.unwrap().size, Some(3));
+    }
+
+    #[tokio::test]
+    async fn list_recovers_dir_kind_when_readdir_omits_types() {
+        // Some SFTP servers don't send type/permission attrs in READDIR, so every entry looks like a
+        // plain file. `list` must stat those back to their true kind — otherwise a directory renders
+        // (and, worse, deletes) as a file.
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_dir("/d")
+                .with_dir("/d/sub")
+                .with_file("/d/a.txt", b"a")
+                .hiding_readdir_types(),
+        );
+        let mut s = vfs.list(&p("/d"), ListOpts { all: true });
+        let page = s.next().await.unwrap().unwrap();
+        let kind = |n: &str| page.entries.iter().find(|e| e.name == n).unwrap().is_dir();
+        assert!(kind("sub"), "a subdir must be recovered as a directory");
+        assert!(!kind("a.txt"), "a file stays a file");
+    }
+
+    #[tokio::test]
+    async fn recursive_remove_survives_type_less_readdir() {
+        // Regression: against a server that omits READDIR type bits, a recursive delete used to
+        // `remove_file` its subdirectories (which fails), stranding the tree. It must now fully
+        // remove a nested, hidden-only subtree.
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_dir("/d")
+                .with_dir("/d/.git")
+                .with_dir("/d/.git/objects")
+                .with_file("/d/.git/config", b"c")
+                .with_file("/d/.git/objects/x", b"x")
+                .hiding_readdir_types(),
+        );
+        vfs.remove(&p("/d"), Recurse::Yes)
+            .await
+            .expect("recursive remove must clean a type-less tree");
+        assert!(matches!(
+            vfs.stat(&p("/d")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn walk_delete_survives_type_less_readdir() {
+        // The app-edge delete walk (list with `all: true`, then `remove(Recurse::No)` per entry,
+        // dirs deepest-first) must also fully remove a tree on a type-less server, since it drives
+        // recursion off the listing's kinds.
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_dir("/d")
+                .with_dir("/d/.hidden")
+                .with_file("/d/.hidden/deep", b"x")
+                .with_file("/d/visible.txt", b"v")
+                .hiding_readdir_types(),
+        );
+        // Replicate the walk: DFS, files popped-and-removed, dirs recorded and removed deepest-first.
+        let mut stack = vec![(p("/d"), vfs.stat(&p("/d")).await.unwrap().is_dir())];
+        let mut dirs_post = Vec::new();
+        while let Some((path, is_dir)) = stack.pop() {
+            if is_dir {
+                dirs_post.push(path.clone());
+                let mut s = vfs.list(&path, ListOpts { all: true });
+                while let Some(page) = s.next().await {
+                    for e in page.unwrap().entries {
+                        stack.push((path.join(&e.name).unwrap(), e.is_dir()));
+                    }
+                }
+            } else {
+                vfs.remove(&path, Recurse::No).await.unwrap();
+            }
+        }
+        for d in dirs_post.iter().rev() {
+            vfs.remove(d, Recurse::No).await.unwrap();
+        }
+        assert!(matches!(
+            vfs.stat(&p("/d")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_reports_symlink_kind_even_when_readdir_omits_types() {
+        // A symlink must never be recovered as its target's kind — otherwise the delete walk would
+        // follow it. Under type-less mode the recovery uses `lstat`, so a symlink-to-dir stays a
+        // symlink (and a recursive delete unlinks it instead of descending into the target).
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_dir("/d")
+                .with_dir("/target")
+                .with_file("/target/keep.txt", b"k")
+                .with_symlink("/d/link", "/target")
+                .hiding_readdir_types(),
+        );
+        let mut s = vfs.list(&p("/d"), ListOpts { all: true });
+        let page = s.next().await.unwrap().unwrap();
+        let link = page.entries.iter().find(|e| e.name == "link").unwrap();
+        assert_eq!(
+            link.kind,
+            EntryKind::Symlink,
+            "a symlink must not be recovered as a directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_remove_unlinks_symlink_to_dir_without_touching_target() {
+        // Data-safety: deleting a directory that contains a symlink-to-directory must unlink the
+        // symlink and leave the *target* (which lives outside the deleted tree) fully intact — even
+        // on a type-less server where the recovery stat runs. A follow-`stat` here would recurse into
+        // the target and destroy unrelated data.
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_dir("/d")
+                .with_file("/d/own.txt", b"o")
+                .with_symlink("/d/link", "/outside")
+                .with_dir("/outside")
+                .with_file("/outside/precious.txt", b"p")
+                .hiding_readdir_types(),
+        );
+        vfs.remove(&p("/d"), Recurse::Yes)
+            .await
+            .expect("recursive remove");
+        // The deleted tree is gone…
+        assert!(matches!(
+            vfs.stat(&p("/d")).await,
+            Err(VfsError::NotFound(_))
+        ));
+        // …but the symlink target and its contents — outside the tree — survive untouched.
+        assert!(vfs.stat(&p("/outside")).await.unwrap().is_dir());
+        assert_eq!(
+            vfs.stat(&p("/outside/precious.txt")).await.unwrap().size,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_remove_terminates_on_a_symlink_cycle() {
+        // A symlink pointing back at an ancestor must not send the recursive delete into an infinite
+        // loop: classified (via `lstat`) as a symlink, it is unlinked, never followed. The test
+        // completing at all is the assertion that matters.
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_dir("/d")
+                .with_dir("/d/sub")
+                .with_file("/d/sub/f.txt", b"f")
+                .with_symlink("/d/sub/loop", "/d")
+                .hiding_readdir_types(),
+        );
+        vfs.remove(&p("/d"), Recurse::Yes)
+            .await
+            .expect("recursive remove terminates and succeeds");
+        assert!(matches!(
+            vfs.stat(&p("/d")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn removing_a_symlink_to_dir_unlinks_it_and_spares_the_target() {
+        // Deleting a symlink-to-directory *directly* (the link is the delete root) must unlink the
+        // link, never the target — `remove` classifies the root with `lstat`, not follow-`stat`.
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_symlink("/link", "/target")
+                .with_dir("/target")
+                .with_file("/target/keep.txt", b"k"),
+        );
+        vfs.remove(&p("/link"), Recurse::Yes)
+            .await
+            .expect("unlink the symlink");
+        assert!(matches!(
+            vfs.stat(&p("/link")).await,
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(vfs.stat(&p("/target")).await.unwrap().is_dir());
+        assert!(vfs.stat(&p("/target/keep.txt")).await.is_ok());
     }
 
     #[tokio::test]
