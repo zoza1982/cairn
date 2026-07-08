@@ -87,30 +87,31 @@ impl Theme {
         selection_fg: Color::Rgb(0xc0, 0xca, 0xf5),
     };
 
-    /// Classic **Midnight Commander**: a blue panel background with cyan directories, bright-white
-    /// files, and a black-on-cyan selection bar. Uses the 16 **named ANSI colors** (not truecolor
-    /// `Rgb`) on purpose — MC's identity *is* the ANSI palette, and named colors map to standard SGR
-    /// codes every terminal understands, so this preset renders correctly even on a plain 16-color
-    /// console (unlike the truecolor presets, which are best-effort there).
+    /// Classic **Midnight Commander**: the iconic DOS/Norton blue panels with white directories,
+    /// light-gray files, and a black-on-cyan selection bar. Uses the authentic 16-color **VGA
+    /// palette as truecolor RGB** rather than the terminal's *named* ANSI colors — a terminal often
+    /// maps named `blue` to a washed-out shade, whereas MC's identity is the saturated VGA blue
+    /// `#0000AA`. Pinning the exact RGB makes the blue rich and consistent on every truecolor
+    /// terminal (best-effort on a 16-color console, like the other truecolor presets).
     pub const MC: Theme = Theme {
-        background: Some(Color::Blue),
-        foreground: Some(Color::White),
-        focused_border: Color::White,
-        unfocused_border: Color::Gray,
-        dir: Color::Cyan,
-        hidden_dir: Color::DarkGray,
-        file: Color::White,
-        hidden_file: Color::Gray,
-        archive: Color::Yellow,
-        executable: Color::LightGreen,
-        symlink: Color::LightCyan,
-        stream: Color::LightMagenta,
-        special: Color::LightRed,
-        error: Color::Red,
-        status: Color::Gray,
-        remote: Color::LightYellow,
-        selection_bg: Color::Cyan,
-        selection_fg: Color::Black,
+        background: Some(Color::Rgb(0x00, 0x00, 0xAA)), // VGA blue
+        foreground: Some(Color::Rgb(0xAA, 0xAA, 0xAA)), // VGA light gray
+        focused_border: Color::Rgb(0xFF, 0xFF, 0xFF),   // white
+        unfocused_border: Color::Rgb(0x6C, 0x6C, 0xB0), // dim blue-gray
+        dir: Color::Rgb(0xFF, 0xFF, 0xFF),              // bright white (MC dirs are bold white)
+        hidden_dir: Color::Rgb(0x8A, 0x8A, 0xD0),       // dimmed dir
+        file: Color::Rgb(0xC6, 0xC6, 0xC6),             // light gray
+        hidden_file: Color::Rgb(0x88, 0x88, 0xB8),      // dimmed file
+        archive: Color::Rgb(0xFF, 0xFF, 0x55),          // bright yellow
+        executable: Color::Rgb(0x55, 0xFF, 0x55),       // bright green
+        symlink: Color::Rgb(0x55, 0xFF, 0xFF),          // bright cyan
+        stream: Color::Rgb(0xFF, 0x55, 0xFF),           // bright magenta
+        special: Color::Rgb(0xFF, 0x55, 0x55),          // bright red
+        error: Color::Rgb(0xFF, 0x55, 0x55),
+        status: Color::Rgb(0xAA, 0xAA, 0xAA),
+        remote: Color::Rgb(0xFF, 0xFF, 0x55), // yellow accent
+        selection_bg: Color::Rgb(0x00, 0xAA, 0xAA), // cyan
+        selection_fg: Color::Rgb(0x00, 0x00, 0x00), // black
     };
 
     /// **Nord**: the arctic, bluish palette (truecolor).
@@ -312,7 +313,8 @@ mod tests {
         }
         // Only `mc` and `light` (and the other non-dark presets) force a background; `dark` leaves it.
         assert_eq!(Theme::DARK.background, None);
-        assert_eq!(Theme::MC.background, Some(Color::Blue));
+        // `mc` uses the saturated VGA blue as truecolor RGB (not the terminal's pale named `blue`).
+        assert_eq!(Theme::MC.background, Some(Color::Rgb(0x00, 0x00, 0xAA)));
     }
 
     #[test]
@@ -401,7 +403,7 @@ mod tests {
         let (t, w) = Theme::resolve("mc", [("background", "none")]);
         assert!(w.is_empty());
         assert_eq!(t.background, None, "mc's blue bg cleared");
-        assert_eq!(t.dir, Color::Cyan, "other mc roles untouched");
+        assert_eq!(t.dir, Theme::MC.dir, "other mc roles untouched");
     }
 
     #[test]
