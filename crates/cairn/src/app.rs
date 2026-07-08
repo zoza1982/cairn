@@ -2803,24 +2803,35 @@ async fn scan_total_bytes(
     on_scan: &mut (dyn FnMut(u64, &str) + Send),
 ) -> Option<u64> {
     let mut total: u64 = 0;
-    let mut scanned: u64 = 0;
+    // Count every node *enqueued* (roots + each discovered child), checked as it is pushed. Counting
+    // on enqueue rather than on visit is what actually bounds the pending-directory `stack`: a single
+    // ultra-wide directory (millions of children) is abandoned *mid-listing* instead of materializing
+    // its whole page-stream onto the stack before the next check. Returning `None` past the cap
+    // degrades to an indeterminate bar.
+    let mut enqueued: u64 = 0;
+    let mut push = |stack: &mut Vec<VfsPath>, p: VfsPath| -> bool {
+        enqueued += 1;
+        if enqueued > max_entries {
+            return false;
+        }
+        stack.push(p);
+        true
+    };
     for (from, _) in items {
-        let mut stack = vec![from.clone()];
+        let mut stack = Vec::new();
+        if !push(&mut stack, from.clone()) {
+            return None;
+        }
         while let Some(path) = stack.pop() {
-            // Abandon the estimate past the entry cap (a pathologically large tree). Returning `None`
-            // degrades to an indeterminate bar, and — crucially — stops the pending-directory `stack`
-            // from growing without bound.
-            scanned += 1;
-            if scanned > max_entries {
-                return None;
-            }
             on_scan(total, &path.as_str());
             let meta = src.stat(&path).await.ok()?;
             if meta.is_dir() {
                 let mut stream = src.list(&path, ListOpts { all: true });
                 while let Some(page) = stream.next().await {
                     for e in page.ok()?.entries {
-                        stack.push(path.join(&e.name).ok()?);
+                        if !push(&mut stack, path.join(&e.name).ok()?) {
+                            return None;
+                        }
                     }
                 }
             } else if let Some(sz) = meta.size {
@@ -5690,8 +5701,9 @@ mod tests {
 
     #[tokio::test]
     async fn scan_total_bytes_abandons_the_estimate_past_the_entry_cap() {
-        // A tree bigger than the entry cap returns None (→ indeterminate bar) rather than walking it
-        // all — and, importantly, without the pending-directory stack growing unbounded.
+        // A single *wide* directory (10 children) bigger than the cap returns None (→ indeterminate
+        // bar) — and, because the cap is checked per pushed entry, it's abandoned *mid-listing* so the
+        // pending-directory stack never materializes the whole directory at once.
         let dir = tempfile_dir();
         std::fs::create_dir(dir.path().join("d")).unwrap();
         for i in 0..10 {
@@ -5699,7 +5711,7 @@ mod tests {
         }
         let src: Arc<dyn Vfs> = Arc::new(LocalVfs::new(LEFT, dir.path()));
         let items = vec![(VfsPath::parse("/d").unwrap(), VfsPath::root())];
-        // Cap of 3 nodes → abandoned before finishing the 11-node walk.
+        // Cap of 3 enqueued nodes → abandoned partway through pushing `/d`'s 10 children.
         assert_eq!(
             scan_total_bytes(&src, &items, 3, &mut |_b, _p| {}).await,
             None,
