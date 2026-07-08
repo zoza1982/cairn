@@ -11,6 +11,6 @@ expression: frame
 │                  ││                  │
 │                  ││                  │
 │                  ││                  │
-└ 137.0 sort: name ┘└ 12.0  sort: name ┘
+└────── sort: name ┘└────── sort: name ┘
  1/4   q quit · Tab · ↵ open · v view
        ^S size · F7 mkdir · / filter

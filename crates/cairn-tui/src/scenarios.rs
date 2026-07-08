@@ -920,6 +920,22 @@ mod snapshot_tests {
         assert!(render_named("does-not-exist", 80, 24).is_none());
     }
 
+    /// The free-space label shows on a wide pane but is omitted (not clipped to a misleading unitless
+    /// number) when it wouldn't fit alongside the sort label on a narrow pane.
+    #[test]
+    fn free_space_label_shows_when_it_fits_and_hides_when_it_would_clip() {
+        let wide = render_named("pane-free-space", 80, 24).unwrap();
+        assert!(
+            wide.contains("GiB free"),
+            "wide pane shows the full label:\n{wide}"
+        );
+        let narrow = render_named("pane-free-space", 40, 12).unwrap();
+        assert!(
+            !narrow.contains("137.0"),
+            "a narrow pane must omit the label entirely, not clip it to a unitless number:\n{narrow}"
+        );
+    }
+
     /// Every scenario renders `h` rows at both standard and narrow sizes — the frame is a real grid.
     #[test]
     fn every_scenario_has_one_line_per_row() {

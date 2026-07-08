@@ -1605,8 +1605,9 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
     // Bottom-right status: current sort mode, plus a `+hidden` flag when dotfiles are shown.
     let hidden = if pane.show_hidden { " +hidden" } else { "" };
     let status = format!(" sort: {}{hidden} ", pane.sort.label());
-    // No `overlay_base` here: a pane isn't an overlay — it already sits on the theme background painted
-    // over the whole frame at the top of `render()`, so it needs no fill of its own.
+    let status_w = status.chars().count(); // captured before `status` is moved into the title below
+                                           // No `overlay_base` here: a pane isn't an overlay — it already sits on the theme background painted
+                                           // over the whole frame at the top of `render()`, so it needs no fill of its own.
     let mut block = Block::bordered()
         .title(title)
         .title_bottom(Line::from(status).right_aligned())
@@ -1618,14 +1619,19 @@ fn render_pane(frame: &mut Frame, area: Rect, state: &AppState, side: Side, them
         let cursor = if pane.filter_editing { "_" } else { "" };
         block = block.title_bottom(Line::from(format!(" filter: {f}{cursor} ")).left_aligned());
     } else if let Some(space) = pane.space {
-        // Just the available free space, kept short so it doesn't collide with the right-aligned sort
-        // label on a narrow (half-width) pane.
         let text = format!(" {} free ", human_bytes(space.available));
-        block = block.title_bottom(
-            Line::from(text)
-                .left_aligned()
-                .style(Style::default().fg(theme.status)),
-        );
+        // Only show it if it fits alongside the right-aligned sort label without the two colliding
+        // (ratatui would otherwise clip the left title mid-word, e.g. a misleading unitless `137.0`).
+        // Interior width is the pane minus its two border columns; leave a 1-col gap between them.
+        let interior = usize::from(area.width).saturating_sub(2);
+        // `<` (not `<=`) leaves at least a one-column gap between the two titles.
+        if text.chars().count() + status_w < interior {
+            block = block.title_bottom(
+                Line::from(text)
+                    .left_aligned()
+                    .style(Style::default().fg(theme.status)),
+            );
+        }
     }
 
     match &pane.listing {
