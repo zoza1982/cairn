@@ -97,6 +97,16 @@ pub fn all() -> Vec<Scenario> {
             build: delete_active,
         },
         Scenario {
+            name: "folder-stats-computing",
+            description: "the Ctrl-S folder-size popup while the recursive walk is still running (live running totals)",
+            build: folder_stats_computing,
+        },
+        Scenario {
+            name: "folder-stats-done",
+            description: "the Ctrl-S folder-size popup with the final size + file/folder counts",
+            build: folder_stats_done,
+        },
+        Scenario {
             name: "pager-text",
             description: "the read-only pager (F3) in text mode",
             build: pager_text,
@@ -352,6 +362,32 @@ fn transfer_scanning() -> AppState {
         pulse: 7, // indeterminate: places the marquee block mid-bar in the snapshot
     });
     s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+    s
+}
+
+fn folder_stats_computing() -> AppState {
+    let mut s = dual_pane();
+    s.overlay = Some(Overlay::FolderStats {
+        name: "node_modules".to_owned(),
+        computing: true,
+        bytes: 84 * 1024 * 1024,
+        files: 12_403,
+        dirs: 1_876,
+        partial: false,
+    });
+    s
+}
+
+fn folder_stats_done() -> AppState {
+    let mut s = dual_pane();
+    s.overlay = Some(Overlay::FolderStats {
+        name: "project".to_owned(),
+        computing: false,
+        bytes: 1_610_612_736, // 1.5 GiB
+        files: 48_120,
+        dirs: 5_004,
+        partial: false,
+    });
     s
 }
 

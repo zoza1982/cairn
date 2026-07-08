@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Ctrl-S` calculates a folder's size** (recursively) and shows it in a stats popup: total size
+  (human-readable + exact bytes) plus file and subfolder counts. The walk runs in the background and
+  the popup updates live, so a large or remote directory shows progress instead of blocking; `Esc`
+  cancels the walk and closes the popup. Hidden entries are included, and the total is flagged as a
+  lower bound if any entry couldn't be read. Remappable via the `calculate_size` action.
+
 - **The transfer dialog labels each transfer with what → where**, so concurrent transfers are
   distinguishable: instead of every row reading `Copying 1 item(s)…`, a transfer now shows the
   source item (a file's name, or `N items`) and its destination directory, tagged with the

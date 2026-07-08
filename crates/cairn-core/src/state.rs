@@ -851,6 +851,23 @@ pub enum Overlay {
         /// Selection cursor into [`WritebackChoice::ALL`].
         cursor: usize,
     },
+    /// Recursive folder-size stats popup ([`crate::Action::CalculateSize`], `Ctrl-S`). Opens in a
+    /// live "Calculating…" state and updates from [`crate::AppEvent::SizeProgress`], settling on the
+    /// final totals at [`crate::AppEvent::SizeDone`]. `Esc` cancels the walk and closes it.
+    FolderStats {
+        /// Display name of the directory being measured (leaf name, secret-free).
+        name: String,
+        /// Whether the walk is still running (drives the "Calculating…" vs final view).
+        computing: bool,
+        /// Bytes summed so far (or the final total).
+        bytes: u64,
+        /// Files counted so far (or the final total).
+        files: u64,
+        /// Subdirectories counted so far (or the final total).
+        dirs: u64,
+        /// Set once the walk finishes if some entries couldn't be read (totals are a lower bound).
+        partial: bool,
+    },
 }
 
 /// A stable identifier for an in-flight remote-edit session (RFC-0012 P3): download → edit →

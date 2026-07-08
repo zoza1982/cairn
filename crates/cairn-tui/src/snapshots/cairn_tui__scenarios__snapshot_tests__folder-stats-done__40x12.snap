@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ Folder size ─────────────────────────┐
+│project                               │
+│                                      │
+│Total size:                           │
+│  1.5 GiB  (1610612736 bytes)         │
+│                                      │
+│  Files:   48120                      │
+│  Folders: 5004                       │
+│                                      │
+│[Esc] close                           │
+└──────────────────────────────────────┘
+ 1/4   q quit · Tab · ↵ open · F3 view ·

@@ -78,6 +78,11 @@ pub enum Action {
     MakeDir,
     /// Open a prompt to rename the entry under the cursor.
     Rename,
+    /// Recursively calculate the size of the directory under the cursor and show it in a stats
+    /// popup ([`crate::Overlay::FolderStats`]). Bound to `Ctrl-S` ("Size"). A no-op (with a hint)
+    /// when the cursor isn't on a real directory. The walk runs async and updates the popup live;
+    /// `Esc` cancels it and closes the popup.
+    CalculateSize,
     /// Ask the AI assistant to propose a plan (opens the plan → confirm overlay when it arrives).
     AiPropose,
     /// In the plan overlay: approve every step at once (only honored when no step is irreversible).
@@ -241,6 +246,28 @@ pub enum AppEvent {
         status: String,
         /// Whether the transfer failed.
         error: bool,
+    },
+    /// A live update from the [`AppEffect::CalculateSize`] walk: running totals for the folder-stats
+    /// popup so a large/remote directory shows progress rather than a frozen "Calculating…".
+    SizeProgress {
+        /// Bytes summed so far.
+        bytes: u64,
+        /// Files counted so far.
+        files: u64,
+        /// Subdirectories counted so far.
+        dirs: u64,
+    },
+    /// The [`AppEffect::CalculateSize`] walk finished (or was cancelled): the final totals and
+    /// whether any entries failed to stat (a partial count).
+    SizeDone {
+        /// Total bytes.
+        bytes: u64,
+        /// Total files.
+        files: u64,
+        /// Total subdirectories.
+        dirs: u64,
+        /// Whether some entries couldn't be read (the totals are a lower bound).
+        partial: bool,
     },
     /// A requested transfer would overwrite existing destinations; carries the parameters needed to
     /// re-issue it (with `overwrite: true`) once the user confirms.
@@ -742,6 +769,17 @@ pub enum AppEffect {
         /// Paths to delete.
         paths: Vec<VfsPath>,
     },
+    /// Recursively walk a directory to total its size + file/subdirectory counts, streaming live
+    /// updates back for the [`crate::Overlay::FolderStats`] popup. Cancelled by
+    /// [`AppEffect::CancelCalculateSize`] (only one runs at a time — the open popup).
+    CalculateSize {
+        /// The connection the directory lives on.
+        conn: ConnectionId,
+        /// The directory to measure.
+        path: VfsPath,
+    },
+    /// Cancel the in-flight [`AppEffect::CalculateSize`] walk (the folder-stats popup was closed).
+    CancelCalculateSize,
     /// Create a directory on a connection.
     CreateDir {
         /// The connection.

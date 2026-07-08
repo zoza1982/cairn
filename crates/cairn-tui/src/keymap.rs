@@ -154,6 +154,7 @@ pub(crate) fn action_from_name(name: &str) -> Option<Action> {
         "background" => Action::Background,
         "make_dir" => Action::MakeDir,
         "rename" => Action::Rename,
+        "calculate_size" => Action::CalculateSize,
         "open_connections" => Action::OpenConnections,
         "vault_unlock" => Action::VaultUnlock,
         "ai_propose" => Action::AiPropose,
@@ -260,6 +261,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
             KeyCode::Char('u') => Some(Action::VaultUnlock),
             // Ctrl-N opens the add-connection form (new connection).
             KeyCode::Char('n') => Some(Action::NewConnection),
+            // Ctrl-S calculates the size of the directory under the cursor (stats popup).
+            KeyCode::Char('s') => Some(Action::CalculateSize),
             _ => None,
         };
     }
@@ -627,6 +630,7 @@ mod tests {
             "background",
             "make_dir",
             "rename",
+            "calculate_size",
             "open_connections",
             "vault_unlock",
             "ai_propose",
@@ -652,7 +656,7 @@ mod tests {
                 "missing mapping for {name}"
             );
         }
-        assert_eq!(names.len(), 43);
+        assert_eq!(names.len(), 44);
     }
 
     #[test]
