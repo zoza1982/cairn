@@ -13,4 +13,4 @@ expression: frame
 │                                      │
 │                                      │
 └ 1/2 (100%) ─────────────────── Ready ┘
-       ^S size · F7 mkdir · / filter
+ 1/4   q quit · Tab · ↵ open · v view

@@ -13,4 +13,4 @@ expression: frame
 │                                      │
 │[Esc] close                           │
 └──────────────────────────────────────┘
-       ^S size · F7 mkdir · / filter
+ 1/4   q quit · Tab · ↵ open · v view

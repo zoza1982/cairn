@@ -27,8 +27,14 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if theme.background.is_some() || theme.foreground.is_some() {
         frame.render_widget(Block::new().style(overlay_base(theme)), frame.area());
     }
+    // The menu/status bar is two rows in the plain browse view (so the full key hints fit), but
+    // collapses to one row whenever a modal overlay is open — every overlay centers against the full
+    // frame and the near-fullscreen ones (pager/log viewer/exec) size themselves to leave exactly one
+    // status row, so a second row here would be overwritten by (or overwrite) the overlay's bottom
+    // edge. With an overlay up the overlay owns the screen and shows its own hints anyway.
+    let status_h = if state.overlay.is_some() { 1 } else { 2 };
     let [body, status] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(1), Constraint::Length(status_h)]).areas(frame.area());
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
     render_pane(frame, left, state, Side::Left, theme);
@@ -170,23 +176,7 @@ fn connections_hint(editable: bool, width: usize) -> String {
         tokens.push("[d] Delete");
     }
     tokens.extend(["[t] Test", "[P] Pin", "[H] Hide", "[S] Show hidden"]);
-
-    let mut hint = String::new();
-    for tok in tokens {
-        let candidate_len = if hint.is_empty() {
-            tok.len()
-        } else {
-            hint.len() + 2 + tok.len()
-        };
-        if candidate_len > width {
-            break;
-        }
-        if !hint.is_empty() {
-            hint.push_str("  ");
-        }
-        hint.push_str(tok);
-    }
-    hint
+    fit_tokens(&tokens, width, "  ")
 }
 
 /// Draw the active modal overlay (if any) centered over the screen. Takes `&AppState` so overlays
@@ -1702,22 +1692,24 @@ fn list_window(cursor: usize, total: usize, rows: usize) -> usize {
     cursor.saturating_sub(half).min(total - rows)
 }
 
-/// Join `tokens` with ` · ` separators, stopping before the result would exceed `width` columns — so
-/// the hint bar truncates at whole-token boundaries rather than mid-word. (Same approach as
-/// [`connections_hint`].)
-fn fit_tokens(tokens: &[&str], width: usize) -> String {
+/// Join `tokens` with `sep`, stopping before the result would exceed `width` columns — so a hint bar
+/// truncates at whole-token boundaries rather than mid-word (a half-shown token is worse than a
+/// dropped one). Shared by the bottom menu bar (`sep = " · "`) and the connection switcher's hint
+/// line (`sep = "  "`).
+fn fit_tokens(tokens: &[&str], width: usize, sep: &str) -> String {
+    let sep_w = sep.chars().count();
     let mut out = String::new();
     for tok in tokens {
         let added = if out.is_empty() {
             tok.chars().count()
         } else {
-            out.chars().count() + 3 + tok.chars().count()
+            out.chars().count() + sep_w + tok.chars().count()
         };
         if added > width {
             break;
         }
         if !out.is_empty() {
-            out.push_str(" · ");
+            out.push_str(sep);
         }
         out.push_str(tok);
     }
@@ -1766,15 +1758,20 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     } else if let Some(msg) = &state.status {
         msg.clone()
     } else {
-        fit_tokens(HELP_1, avail)
+        fit_tokens(HELP_1, avail, " · ")
     };
-    let line1 = format!(" {count}   {row1_content}");
-    // Indent row 2's hints to line up under row 1's content.
-    let indent = " ".repeat(prefix_w);
-    let line2 = format!("{indent}{}", fit_tokens(HELP_2, avail));
+    let mut lines = vec![Line::from(format!(" {count}   {row1_content}"))];
+    // Row 2 (the second hint line) only when the bar has two rows — it collapses to one while an
+    // overlay is open (see `render`). Indent to line up under row 1's content.
+    if area.height >= 2 {
+        let indent = " ".repeat(prefix_w);
+        lines.push(Line::from(format!(
+            "{indent}{}",
+            fit_tokens(HELP_2, avail, " · ")
+        )));
+    }
     frame.render_widget(
-        Paragraph::new(vec![Line::from(line1), Line::from(line2)])
-            .style(Style::default().fg(theme.status)),
+        Paragraph::new(lines).style(Style::default().fg(theme.status)),
         area,
     );
 }
@@ -3055,6 +3052,24 @@ mod tests {
     /// P6 gate fix: `[Esc] Close` must survive on both a wide and a narrow terminal — it is the
     /// only way to discover how to leave the switcher, so it must never be the hint that a
     /// width-constrained, right-truncating `Paragraph` cuts off.
+    #[test]
+    fn fit_tokens_packs_whole_tokens_to_width() {
+        let toks = ["ab", "cd", "ef"];
+        // Exact fit for the first two ("ab · cd" = 7 cols).
+        assert_eq!(fit_tokens(&toks, 7, " · "), "ab · cd");
+        // One column short of the second token → only the first fits.
+        assert_eq!(fit_tokens(&toks, 6, " · "), "ab");
+        // Room for all three ("ab · cd · ef" = 12).
+        assert_eq!(fit_tokens(&toks, 12, " · "), "ab · cd · ef");
+        // Zero / sub-token width → empty (never a half token).
+        assert_eq!(fit_tokens(&toks, 0, " · "), "");
+        assert_eq!(fit_tokens(&toks, 1, " · "), "");
+        // A different separator width is accounted for.
+        assert_eq!(fit_tokens(&toks, 6, "  "), "ab  cd");
+        // Empty input.
+        assert_eq!(fit_tokens(&[], 100, " · "), "");
+    }
+
     #[test]
     fn connections_hint_always_shows_esc_close_first() {
         let wide = connections_hint(false, 54);

@@ -11,6 +11,6 @@ expression: frame
 │           [y] Yes    [n] No          │
 │                                      │
 └──────────────────────────────────────┘
+│                  ││                  │
 └────── sort: name ┘└────── sort: name ┘
  1/4   q quit · Tab · ↵ open · v view
-       ^S size · F7 mkdir · / filter

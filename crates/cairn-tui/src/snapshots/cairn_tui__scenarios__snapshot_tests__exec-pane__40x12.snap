@@ -13,4 +13,4 @@ expression: frame
 │                                      │
 │> cat /etc/hostname▏                  │
 └ [Enter] send  [^D] [follow]  Running ┘
-       ^S size · F7 mkdir · / filter
+ 1/4   q quit · Tab · ↵ open · v view

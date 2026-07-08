@@ -12,5 +12,5 @@ expression: frame
 │[b] background · [p] pause sel · [Esc]│
 │[↑↓] select · [d] cancel/drop · [K/J] │
 └──────────────────────────────────────┘
+└────── sort: name ┘└────── sort: name ┘
  1/4   ⇅ scanning… 1287 items
-       ^S size · F7 mkdir · / filter

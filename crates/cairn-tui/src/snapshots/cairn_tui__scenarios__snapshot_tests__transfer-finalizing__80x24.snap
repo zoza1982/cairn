@@ -23,6 +23,6 @@ expression: frame
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
+│                                      ││                                      │
 └────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
  1/4   ⇅ transferring… 8.0 MiB / 8.0 MiB (100%)
-       ^S size · F7 mkdir · / filter · ^R refresh · p pause · s sort · . hidden

@@ -25,4 +25,4 @@ expression: frame
 │                                                                              │
 │                                                                              │
 └ 1/2 (100%) ─────────────────────────────────────────────────────────── Ready ┘
-       ^S size · F7 mkdir · / filter · ^R refresh · p pause · s sort · . hidden
+ 1/4   q quit · Tab · ↵ open · v view · e edit · r rename · c copy · m move
