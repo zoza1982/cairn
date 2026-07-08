@@ -182,6 +182,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The AI plan popup now matches the active theme.** The overlay already used the theme background,
+  but the selected step was drawn with a hardcoded magenta bar and the help/pending markers with a
+  hardcoded gray — jarring on non-default themes. The highlighted step now uses the theme's selection
+  colors (like the panes), and the help line and pending markers use the theme's status color.
+  Approval/run status keeps its semantic colors (green approved, red rejected/failed, cyan done).
+
 - **A large copy/move no longer stalls on the pre-flight size scan.** The scan that sizes the source
   tree for a percentage/ETA is now **time-boxed** (≤ 0.8 s) and **entry-capped** — so copying a huge
   or remote (SFTP) folder starts almost immediately with an indeterminate, animated bar (MC-style)
