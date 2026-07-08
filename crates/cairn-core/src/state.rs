@@ -1626,12 +1626,17 @@ pub struct ActiveTransfer {
     pub total: Option<u64>,
     /// Whether the user has paused this transfer.
     pub paused: bool,
-    /// A monotonic counter bumped on every advisory progress update (scan or byte), used purely to
-    /// drive the *indeterminate* progress bar's animation. Because it advances once per throttled
-    /// update (~every 120 ms) regardless of whether the item count or byte total moved, the marquee
-    /// keeps sweeping even while a single slow remote `readdir`/`stat` stalls `scan_entries`. The
-    /// pure renderer reads it to place the marquee block; a fixed value renders a fixed frame, so
-    /// snapshots stay deterministic. Ignored for a determinate (known-total) bar.
+    /// A monotonic counter that drives the *indeterminate* progress bar's marquee animation. It is
+    /// bumped once per *delivered* advisory update (a `TransferScanning` scan tick or a
+    /// `TransferProgress` byte tick) while the transfer is **not paused** — so the bar keeps moving
+    /// as long as updates keep arriving (they're floored to ~120 ms by the emitter throttle, so
+    /// active work animates at a steady-ish rate), and freezes the moment the transfer is paused.
+    /// It is *not* a wall-clock timer: there is no independent tick source, so a fully stalled
+    /// backend (e.g. one slow remote `readdir`/`stat` in flight, emitting no callback) leaves the
+    /// marquee parked until the next update arrives — an accepted limitation, not a frozen-forever
+    /// bug, since real work resumes ticking. The pure renderer reads this to place the marquee
+    /// block; a fixed value renders a fixed frame, so snapshots stay deterministic. Ignored for a
+    /// determinate (known-total) bar.
     pub pulse: u64,
 }
 

@@ -3795,8 +3795,12 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 t.scan_path = current;
                 t.bytes = bytes;
                 // Advance the animation clock so the indeterminate bar keeps moving even when the
-                // item count/path sit still (a slow remote listing).
-                t.pulse = t.pulse.wrapping_add(1);
+                // item count/path repeat between updates — but not while paused, so a transfer
+                // paused mid pre-scan (the scan ignores pause) freezes its marquee to match the
+                // "paused" label instead of sweeping on.
+                if !t.paused {
+                    t.pulse = t.pulse.wrapping_add(1);
+                }
             }
             Vec::new()
         }
@@ -3826,7 +3830,11 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 t.total = total;
                 // Keep the animation clock ticking; a copy with an unknown total (e.g. same-server
                 // move, or a bounded/skipped pre-scan) renders indeterminate and must still move.
-                t.pulse = t.pulse.wrapping_add(1);
+                // Frozen while paused so the marquee matches the "paused" label. (Bumping this for a
+                // known-total copy is harmless — the determinate bar never reads `pulse`.)
+                if !t.paused {
+                    t.pulse = t.pulse.wrapping_add(1);
+                }
             }
             Vec::new()
         }
@@ -5193,6 +5201,34 @@ mod tests {
             s.active_transfers[0].scan_entries, 7,
             "count really was flat"
         );
+    }
+
+    #[test]
+    fn scan_pulse_freezes_while_paused() {
+        // The pre-scan ignores pause (it finishes walking), so `TransferScanning` events keep
+        // arriving while the transfer is marked paused. The marquee must still freeze: `pulse` must
+        // not advance while paused, so the animated bar matches the "paused" label.
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let id = s.active_transfers[0].id;
+        s.active_transfers[0].paused = true;
+        let before = s.active_transfers[0].pulse;
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferScanning {
+                id,
+                entries: 99,
+                bytes: 0,
+                current: "/still/scanning".to_owned(),
+            }),
+        );
+        assert_eq!(
+            s.active_transfers[0].pulse, before,
+            "pulse must not advance while paused"
+        );
+        // The scan data still updates (the walk is progressing); only the animation clock freezes.
+        assert_eq!(s.active_transfers[0].scan_entries, 99);
     }
 
     #[test]
