@@ -5182,6 +5182,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_removes_hidden_files_and_subdirectories() {
+        // Regression: a folder that contains a *hidden* (dot-prefixed) file or subdirectory must be
+        // fully removed — the recursive walk lists with `all: true`, so dotfiles aren't skipped and
+        // the parent isn't left behind non-empty.
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(dir.path().join("d/.hidden/deep")).unwrap();
+        std::fs::write(dir.path().join("d/.hidden/deep/.secret"), b"s").unwrap();
+        std::fs::write(dir.path().join("d/.dotfile"), b"d").unwrap();
+        std::fs::write(dir.path().join("d/visible.txt"), b"v").unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        let (tx, _rx) = mpsc::channel(64);
+        let ev = run_delete_effect(
+            &registry,
+            9,
+            LEFT,
+            vec![VfsPath::parse("/d").unwrap()],
+            &tx,
+            CancellationToken::new(),
+        )
+        .await;
+        match ev {
+            AppEvent::TransferDone { error, status, .. } => {
+                assert!(
+                    !error,
+                    "clean delete of a tree with hidden entries: {status}"
+                );
+            }
+            _ => panic!("expected TransferDone"),
+        }
+        // The whole tree — including the hidden subdir and dotfiles — is gone.
+        assert!(
+            !dir.path().join("d").exists(),
+            "hidden entries left the dir behind"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_delete_reports_a_non_error_completion() {
         // A pre-cancelled token stops the walk immediately; the op still reports completion (so the
         // dialog closes + panes refresh) as a non-error partial.

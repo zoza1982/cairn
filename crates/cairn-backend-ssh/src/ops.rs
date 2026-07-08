@@ -80,6 +80,10 @@ pub(crate) mod mock {
         /// One-shot: the next `rename` whose destination equals this path fails (simulates a
         /// mid-operation server/network error), so the overwrite restore-on-failure path is testable.
         fail_rename_to: Mutex<Option<String>>,
+        /// When set, `read_dir` reports every entry as a plain file with no mode bits — mimicking
+        /// SFTP servers that omit the type/permission attrs in READDIR responses. `stat` still
+        /// returns the true kind, so the backend's stat-fallback can recover it.
+        hide_readdir_types: bool,
     }
 
     impl MockSftp {
@@ -89,7 +93,15 @@ pub(crate) mod mock {
             Self {
                 nodes: Mutex::new(nodes),
                 fail_rename_to: Mutex::new(None),
+                hide_readdir_types: false,
             }
+        }
+
+        /// Simulate a server that doesn't send type/permission bits in directory listings.
+        #[must_use]
+        pub(crate) fn hiding_readdir_types(mut self) -> Self {
+            self.hide_readdir_types = true;
+            self
         }
 
         /// Make the next `rename` with the given destination fail once.
@@ -148,6 +160,12 @@ pub(crate) mod mock {
                 let (kind, size, mode) = match node {
                     Node::Dir => (EntryKind::Dir, None, Some(0o040_755)),
                     Node::File(b) => (EntryKind::File, Some(b.len() as u64), Some(0o100_644)),
+                };
+                // A type-less server reports everything as a plain file with no mode bits.
+                let (kind, mode) = if self.hide_readdir_types {
+                    (EntryKind::File, None)
+                } else {
+                    (kind, mode)
                 };
                 out.push(RemoteEntry {
                     name: rest.to_owned(),
