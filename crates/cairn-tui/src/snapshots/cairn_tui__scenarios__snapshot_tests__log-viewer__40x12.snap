@@ -13,4 +13,4 @@ expression: frame
 │                                      │
 │                                      │
 └──────────────── [follow]  Streaming… ┘
- 1/4   q quit · Tab · ↵ open · F3 view ·
+       ^S size · F7 mkdir · / filter

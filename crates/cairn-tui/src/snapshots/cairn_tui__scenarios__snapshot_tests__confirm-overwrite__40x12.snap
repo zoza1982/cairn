@@ -11,6 +11,6 @@ expression: frame
 │      [y] Overwrite    [n] Cancel     │
 │                                      │
 └──────────────────────────────────────┘
-│                  ││                  │
 └────── sort: name ┘└────── sort: name ┘
- 1/4   q quit · Tab · ↵ open · F3 view ·
+ 1/4   q quit · Tab · ↵ open · v view
+       ^S size · F7 mkdir · / filter

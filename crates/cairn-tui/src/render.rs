@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         frame.render_widget(Block::new().style(overlay_base(theme)), frame.area());
     }
     let [body, status] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(frame.area());
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
     render_pane(frame, left, state, Side::Left, theme);
@@ -1702,21 +1702,79 @@ fn list_window(cursor: usize, total: usize, rows: usize) -> usize {
     cursor.saturating_sub(half).min(total - rows)
 }
 
+/// Join `tokens` with ` · ` separators, stopping before the result would exceed `width` columns — so
+/// the hint bar truncates at whole-token boundaries rather than mid-word. (Same approach as
+/// [`connections_hint`].)
+fn fit_tokens(tokens: &[&str], width: usize) -> String {
+    let mut out = String::new();
+    for tok in tokens {
+        let added = if out.is_empty() {
+            tok.chars().count()
+        } else {
+            out.chars().count() + 3 + tok.chars().count()
+        };
+        if added > width {
+            break;
+        }
+        if !out.is_empty() {
+            out.push_str(" · ");
+        }
+        out.push_str(tok);
+    }
+    out
+}
+
+/// The bottom status/menu bar (two rows). Row 1 shows the entry count and, in priority order, a live
+/// transfer (single or aggregate), a transient status message, or the first line of key hints. Row 2
+/// always shows the second line of key hints — so the menu is always at least partly visible, and a
+/// full two-row key reference shows when idle. Each hint row fits whole tokens to the width.
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // Two rows of key hints (MC-style), kept in sync with `keymap::action_for`. Ordered by priority
+    // so the least-important tokens are the first to drop on a narrow terminal.
+    const HELP_1: &[&str] = &[
+        "q quit",
+        "Tab",
+        "↵ open",
+        "v view",
+        "e edit",
+        "r rename",
+        "c copy",
+        "m move",
+        "d del",
+        "Space mark",
+    ];
+    const HELP_2: &[&str] = &[
+        "^S size",
+        "F7 mkdir",
+        "/ filter",
+        "^R refresh",
+        "p pause",
+        "s sort",
+        ". hidden",
+        "T theme",
+        "^O conn",
+        "^T xfer",
+        "^A ai",
+    ];
+
     let pane = state.active();
     let count = pane_count_label(pane);
-    // Priority: a live transfer (single or aggregate) takes over the status line; otherwise the
-    // transient status message (if any); otherwise the key hints.
-    let line = if !state.active_transfers.is_empty() {
-        Line::from(format!(" {count}   {}", transfer_status(state)))
+    let prefix_w = 1 + count.chars().count() + 3; // ` {count}   `
+    let avail = usize::from(area.width).saturating_sub(prefix_w);
+    let row1_content = if !state.active_transfers.is_empty() {
+        transfer_status(state)
     } else if let Some(msg) = &state.status {
-        Line::from(format!(" {count}   {msg}"))
+        msg.clone()
     } else {
-        let help = "q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move · d del · p pause · r refresh · T theme · ^O conn · ^T transfer · ^A ai";
-        Line::from(format!(" {count}   {help}"))
+        fit_tokens(HELP_1, avail)
     };
+    let line1 = format!(" {count}   {row1_content}");
+    // Indent row 2's hints to line up under row 1's content.
+    let indent = " ".repeat(prefix_w);
+    let line2 = format!("{indent}{}", fit_tokens(HELP_2, avail));
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().fg(theme.status)),
+        Paragraph::new(vec![Line::from(line1), Line::from(line2)])
+            .style(Style::default().fg(theme.status)),
         area,
     );
 }

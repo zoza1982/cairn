@@ -12,5 +12,5 @@ expression: frame
 │                                      │
 │↵ approve · a approve all · x reject ·│
 └──────────────────────────────────────┘
-└────── sort: name ┘└────── sort: name ┘
- 1/4   q quit · Tab · ↵ open · F3 view ·
+ 1/4   q quit · Tab · ↵ open · v view
+       ^S size · F7 mkdir · / filter

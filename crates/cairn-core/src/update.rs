@@ -2303,7 +2303,10 @@ fn apply_connections_action(state: &mut AppState, action: Action) -> Vec<AppEffe
             open_scheme_picker(state);
             Vec::new()
         }
-        Action::EditConnection => {
+        // `Action::Edit` is the key 'e' maps to; inside the switcher it means "edit this connection"
+        // (like 'd'/`Delete` doubling as delete-connection below). `Action::EditConnection` is the
+        // named action for explicit config remapping.
+        Action::Edit | Action::EditConnection => {
             // Copy the cursor value so the mutable borrow on state.overlay ends before we read
             // state.connections and then replace state.overlay.
             let cursor_val = *cursor;
@@ -11535,6 +11538,19 @@ mod p4_form_tests {
         let effects = update(&mut s, Msg::Action(Action::Cancel));
         assert!(effects.is_empty());
         assert!(s.overlay.is_none(), "cancelling confirm must close overlay");
+    }
+
+    #[test]
+    fn edit_action_edits_the_selected_connection_in_the_switcher() {
+        // `e` maps to `Action::Edit` (file edit in the main view); inside the connection switcher it
+        // must edit the selected profile — the same as the dedicated `EditConnection` action.
+        let mut s = state_with_connections();
+        let effects = update(&mut s, Msg::Action(Action::Edit));
+        assert!(effects.is_empty());
+        assert!(
+            matches!(s.overlay, Some(Overlay::ConnectionForm { .. })),
+            "Edit in the switcher opens the edit-connection form"
+        );
     }
 
     #[test]

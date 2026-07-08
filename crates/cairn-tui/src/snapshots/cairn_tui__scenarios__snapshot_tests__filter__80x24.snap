@@ -23,6 +23,6 @@ expression: frame
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
-│                                      ││                                      │
 └ filter: src_ ──────────── sort: name ┘└────────────────────────── sort: name ┘
- 1/1   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move
+ 1/1   q quit · Tab · ↵ open · v view · e edit · r rename · c copy · m move
+       ^S size · F7 mkdir · / filter · ^R refresh · p pause · s sort · . hidden

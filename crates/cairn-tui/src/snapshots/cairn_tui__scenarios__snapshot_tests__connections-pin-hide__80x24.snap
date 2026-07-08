@@ -23,6 +23,6 @@ expression: frame
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
-│                                      ││                                      │
 └────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
  1/4   ssh: bastion — unreachable: connection failed
+       ^S size · F7 mkdir · / filter · ^R refresh · p pause · s sort · . hidden

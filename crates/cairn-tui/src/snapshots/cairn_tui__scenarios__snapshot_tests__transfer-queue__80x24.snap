@@ -23,6 +23,6 @@ expression: frame
 │    └────────────────────────────────────────────────────────────────────┘    │
 │                                      ││                                      │
 │                                      ││                                      │
-│                                      ││                                      │
 └────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
  1/4   ⇅ 2 active, 1 paused · 5.0 MiB at 2.0 MiB/s (+1 queued)
+       ^S size · F7 mkdir · / filter · ^R refresh · p pause · s sort · . hidden

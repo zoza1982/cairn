@@ -11,6 +11,6 @@ expression: frame
 │  [auto] docker: (default) [hidden]   │
 │[Esc] Close  [Ctrl-N] New  [t] Test   │
 └──────────────────────────────────────┘
-│                  ││                  │
 └────── sort: name ┘└────── sort: name ┘
  1/4   ssh: bastion — unreachable: conne
+       ^S size · F7 mkdir · / filter

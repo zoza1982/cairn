@@ -263,6 +263,9 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
             KeyCode::Char('n') => Some(Action::NewConnection),
             // Ctrl-S calculates the size of the directory under the cursor (stats popup).
             KeyCode::Char('s') => Some(Action::CalculateSize),
+            // Ctrl-R reloads the active pane (plain 'r' is rename). In the VaultCreate overlay Ctrl-R
+            // is intercepted upstream (as "remember passphrase") before this resolves, so no conflict.
+            KeyCode::Char('r') => Some(Action::Refresh),
             _ => None,
         };
     }
@@ -281,11 +284,13 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::F(8) | KeyCode::Delete | KeyCode::Char('d') => Some(Action::Delete),
         KeyCode::Char('y') => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
-        // 'e' opens the edit-connection form for the selected profile in the switcher.
-        // RFC-0012 P2 binds in-place file editing to F4 (`Action::Edit`) instead of 'e', so this
-        // global binding is unaffected — no conflict.
-        KeyCode::Char('e') => Some(Action::EditConnection),
-        KeyCode::Char('r') => Some(Action::Refresh),
+        // 'v' views and 'e' edits the file under the cursor (F3/F4 are kept as aliases below). In the
+        // connection switcher, 'e' edits the selected profile instead — `apply_connections_action`
+        // treats `Edit` as edit-connection there (like `d`/`Delete` doubles as delete-connection).
+        KeyCode::Char('v') => Some(Action::View),
+        KeyCode::Char('e') => Some(Action::Edit),
+        // 'r' renames the entry under the cursor (F2 is an alias); Ctrl-R refreshes the pane.
+        KeyCode::Char('r') => Some(Action::Rename),
         // Shift-K/J move the selected pending transfer up/down in the queue view (no-op elsewhere).
         KeyCode::Char('K') => Some(Action::QueueMoveUp),
         KeyCode::Char('J') => Some(Action::QueueMoveDown),
@@ -299,13 +304,13 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         // 'b' backgrounds the transfer progress dialog (MC-style): closes it but leaves any active
         // transfer running (no-op elsewhere — there is nothing to background with the dialog closed).
         KeyCode::Char('b') => Some(Action::Background),
-        // F7 = make directory, F2 = rename (Total Commander / Norton convention).
+        // F7 = make directory. F2 is a rename alias (primary is 'r').
         KeyCode::F(7) => Some(Action::MakeDir),
         KeyCode::F(2) => Some(Action::Rename),
-        // F3 = view (MC convention): opens the read-only pager on the entry under the cursor.
+        // F3/F4 are kept as MC-convention aliases for view/edit (primary is 'v'/'e'). F4/edit always
+        // opens $VISUAL/$EDITOR/vi regardless of text/binary content (no sniff); F3/view opens the
+        // read-only pager.
         KeyCode::F(3) => Some(Action::View),
-        // F4 = edit (MC convention): always opens $VISUAL/$EDITOR/vi on the entry under the
-        // cursor, regardless of text/binary content (no sniff — F3's is skipped intentionally).
         KeyCode::F(4) => Some(Action::Edit),
         // '/' starts filter-as-you-type (vim/less convention).
         KeyCode::Char('/') => Some(Action::Filter),
@@ -416,12 +421,25 @@ mod tests {
 
     #[test]
     fn view_key() {
+        // 'v' is the primary; F3 is a kept alias.
+        assert_eq!(action_for(press(KeyCode::Char('v'))), Some(Action::View));
         assert_eq!(action_for(press(KeyCode::F(3))), Some(Action::View));
     }
 
     #[test]
     fn edit_key() {
+        // 'e' is the primary; F4 is a kept alias.
+        assert_eq!(action_for(press(KeyCode::Char('e'))), Some(Action::Edit));
         assert_eq!(action_for(press(KeyCode::F(4))), Some(Action::Edit));
+    }
+
+    #[test]
+    fn rename_and_refresh_keys() {
+        // 'r' renames (F2 alias); Refresh moved to Ctrl-R.
+        assert_eq!(action_for(press(KeyCode::Char('r'))), Some(Action::Rename));
+        assert_eq!(action_for(press(KeyCode::F(2))), Some(Action::Rename));
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(action_for(ctrl_r), Some(Action::Refresh));
     }
 
     #[test]

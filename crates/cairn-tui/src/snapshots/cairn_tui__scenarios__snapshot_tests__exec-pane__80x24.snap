@@ -25,4 +25,4 @@ expression: frame
 │                                                                              │
 │> cat /etc/hostname▏                                                          │
 └ [Enter] send  [^D] close stdin  [^]] detach  [^C] quit ─── [follow]  Running ┘
- 1/4   q quit · Tab · ↵ open · F3 view · F4 edit · Space mark · c copy · m move
+       ^S size · F7 mkdir · / filter · ^R refresh · p pause · s sort · . hidden
