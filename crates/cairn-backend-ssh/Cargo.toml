@@ -39,5 +39,8 @@ tokio = { version = "1", features = ["io-util"] }
 zeroize = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net", "time", "process"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net", "time", "process", "sync"] }
 tempfile = "3"
+cairn-transfer = { workspace = true }
+cairn-backend-local = { workspace = true }
+tokio-util = "0.7"

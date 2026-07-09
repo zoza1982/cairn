@@ -185,7 +185,26 @@ impl<O: SftpOps> Vfs for SftpVfs<O> {
     }
 
     async fn create_dir(&self, path: &VfsPath) -> Result<(), VfsError> {
-        self.ops.create_dir(&path.as_str()).await
+        match self.ops.create_dir(&path.as_str()).await {
+            Ok(()) => Ok(()),
+            // OpenSSH's sftp-server reports `mkdir` on an existing path as a generic
+            // `SSH_FX_FAILURE` ("Failure"); other servers phrase the same condition differently
+            // (e.g. "not found"). The status code alone can't tell "already exists" apart from a real
+            // failure, so disambiguate by probing the path: if it is already a directory, report
+            // `AlreadyExists` (as the local backend does) — this is what lets a directory-merge copy
+            // proceed (the transfer engine tolerates `AlreadyExists`, but aborts on any other error).
+            //
+            // `lstat`, not `stat`: a *symlink* at the destination must NOT be treated as the directory
+            // it points to (that classifies as `Symlink`, so we fall through and abort), otherwise the
+            // copy would descend and write the source's children through the link into its target —
+            // possibly outside the destination tree. This mirrors the deliberate `lstat` caution in
+            // `remove`. Any non-directory outcome (a file, a symlink, or the path having vanished in
+            // the small window since `mkdir`) means the original failure stands; surface it unchanged.
+            Err(e) => match self.ops.lstat(&path.as_str()).await {
+                Ok(m) if m.kind == EntryKind::Dir => Err(VfsError::AlreadyExists(path.clone())),
+                _ => Err(e),
+            },
+        }
     }
 
     async fn remove(&self, path: &VfsPath, recurse: Recurse) -> Result<(), VfsError> {
@@ -347,6 +366,51 @@ mod tests {
         assert_eq!(
             vfs.stat(&p("/d")).await.unwrap().perms.map(|p| p.mode),
             Some(0o040_755)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_dir_on_existing_dir_reports_already_exists() {
+        // Regression: OpenSSH's sftp-server returns a generic SSH_FX_FAILURE for `mkdir` on an
+        // existing path, which the backend used to surface as an opaque `Backend` error. The transfer
+        // engine only tolerates `AlreadyExists`, so copying a directory onto an existing remote
+        // directory aborted the whole copy ("Copy failed: …"). `create_dir` must now map an existing
+        // *directory* to `AlreadyExists` so a dir-merge copy proceeds.
+        let vfs = backend();
+        assert!(
+            matches!(
+                vfs.create_dir(&p("/d")).await,
+                Err(VfsError::AlreadyExists(_))
+            ),
+            "mkdir on an existing dir must report AlreadyExists"
+        );
+        // A genuine failure on a path that is *not* an existing directory is surfaced unchanged: `/d`
+        // is a dir, but `/top.txt` is a file — mkdir over it must not be masked as AlreadyExists.
+        assert!(
+            matches!(
+                vfs.create_dir(&p("/top.txt")).await,
+                Err(VfsError::Backend { .. })
+            ),
+            "mkdir colliding with a file must surface the real error, not AlreadyExists"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_dir_on_a_symlink_to_a_dir_does_not_report_already_exists() {
+        // A symlink at the destination must NOT be resolved to the directory it targets: the recovery
+        // uses `lstat`, so a symlink classifies as `Symlink` (not `Dir`) and the original mkdir error
+        // is surfaced — the copy then aborts rather than writing the source's children through the
+        // link into its target (which could lie outside the destination tree).
+        let mock = MockSftp::new()
+            .with_dir("/target")
+            .with_symlink("/link", "/target");
+        let vfs = SftpVfs::new(ConnectionId(1), mock);
+        assert!(
+            matches!(
+                vfs.create_dir(&p("/link")).await,
+                Err(VfsError::Backend { .. })
+            ),
+            "mkdir on a symlink-to-dir must surface the real error, not AlreadyExists"
         );
     }
 

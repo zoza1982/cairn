@@ -1373,6 +1373,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "cairn-backend-local",
+ "cairn-transfer",
  "cairn-types",
  "cairn-vault",
  "cairn-vfs",
@@ -1381,6 +1383,7 @@ dependencies = [
  "russh-sftp",
  "tempfile",
  "tokio",
+ "tokio-util",
  "zeroize",
 ]
 
