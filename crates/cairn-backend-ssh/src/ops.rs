@@ -315,10 +315,18 @@ pub(crate) mod mock {
         }
 
         async fn create_dir(&self, path: &str) -> Result<(), VfsError> {
-            self.nodes
-                .lock()
-                .unwrap()
-                .insert(path.to_owned(), Node::Dir);
+            let mut nodes = self.nodes.lock().unwrap();
+            // Faithfully model OpenSSH's sftp-server: `mkdir` on an existing path fails with a generic
+            // SSH_FX_FAILURE (no dedicated "already exists" code). `SftpVfs::create_dir` recovers by
+            // stat-ing and reporting `AlreadyExists`, which is what this models for the merge-copy test.
+            if nodes.contains_key(path) {
+                return Err(VfsError::Backend {
+                    code: "sftp".to_owned(),
+                    msg: "Failure: Failure".to_owned(),
+                    retryable: false,
+                });
+            }
+            nodes.insert(path.to_owned(), Node::Dir);
             Ok(())
         }
 

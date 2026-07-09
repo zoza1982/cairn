@@ -185,7 +185,20 @@ impl<O: SftpOps> Vfs for SftpVfs<O> {
     }
 
     async fn create_dir(&self, path: &VfsPath) -> Result<(), VfsError> {
-        self.ops.create_dir(&path.as_str()).await
+        match self.ops.create_dir(&path.as_str()).await {
+            Ok(()) => Ok(()),
+            // OpenSSH's sftp-server reports `mkdir` on an existing path as a generic
+            // `SSH_FX_FAILURE` ("Failure"); other servers phrase the same condition differently
+            // (e.g. "not found"). The status code alone can't tell "already exists" apart from a real
+            // failure, so disambiguate by stat: if the path is already a directory, report
+            // `AlreadyExists` like every other backend — this is what lets a directory-merge copy
+            // proceed (the transfer engine tolerates `AlreadyExists`, but aborts on any other error).
+            // Any other stat outcome means the original failure was genuine; surface it unchanged.
+            Err(e) => match self.ops.stat(&path.as_str()).await {
+                Ok(m) if m.kind == EntryKind::Dir => Err(VfsError::AlreadyExists(path.clone())),
+                _ => Err(e),
+            },
+        }
     }
 
     async fn remove(&self, path: &VfsPath, recurse: Recurse) -> Result<(), VfsError> {
@@ -347,6 +360,32 @@ mod tests {
         assert_eq!(
             vfs.stat(&p("/d")).await.unwrap().perms.map(|p| p.mode),
             Some(0o040_755)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_dir_on_existing_dir_reports_already_exists() {
+        // Regression: OpenSSH's sftp-server returns a generic SSH_FX_FAILURE for `mkdir` on an
+        // existing path, which the backend used to surface as an opaque `Backend` error. The transfer
+        // engine only tolerates `AlreadyExists`, so copying a directory onto an existing remote
+        // directory aborted the whole copy ("Copy failed: …"). `create_dir` must now map an existing
+        // *directory* to `AlreadyExists` so a dir-merge copy proceeds.
+        let vfs = backend();
+        assert!(
+            matches!(
+                vfs.create_dir(&p("/d")).await,
+                Err(VfsError::AlreadyExists(_))
+            ),
+            "mkdir on an existing dir must report AlreadyExists"
+        );
+        // A genuine failure on a path that is *not* an existing directory is surfaced unchanged: `/d`
+        // is a dir, but `/top.txt` is a file — mkdir over it must not be masked as AlreadyExists.
+        assert!(
+            matches!(
+                vfs.create_dir(&p("/top.txt")).await,
+                Err(VfsError::Backend { .. })
+            ),
+            "mkdir colliding with a file must surface the real error, not AlreadyExists"
         );
     }
 

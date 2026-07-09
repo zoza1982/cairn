@@ -189,6 +189,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Copying a directory onto an existing remote (SFTP) directory no longer fails** with
+  `Copy failed: …`. OpenSSH's `sftp-server` reports `mkdir` on an existing path as a generic
+  `SSH_FX_FAILURE` (some servers phrase it "not found"), which the SSH backend surfaced as an opaque
+  error; the transfer engine only tolerates `AlreadyExists`, so the whole copy aborted. `create_dir`
+  now recognizes an existing directory (server-agnostically, by stat) and reports `AlreadyExists`
+  like every other backend, so a directory-merge copy proceeds.
+
 - **The AI plan popup now matches the active theme.** The overlay already used the theme background,
   but the selected step was drawn with a hardcoded magenta bar and the help/pending markers with a
   hardcoded gray — jarring on non-default themes. The highlighted step now uses the theme's selection
