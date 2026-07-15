@@ -10,8 +10,9 @@ name: release
 # ------------------------------
 # `all-backends` pulls the full backend stack: russh (SSH), aws-sdk-s3 (→ aws-lc-rs), google-cloud
 # (GCS), azure_storage (Azure Blob), bollard (Docker), kube-rs (Kubernetes). Everything rides the
-# rustls stack (no OpenSSL); the one component with native build prerequisites is **aws-lc-rs** (the
-# S3 backend's crypto):
+# rustls stack (no OpenSSL); the one component with native build prerequisites is **aws-lc-rs**,
+# pulled by BOTH the S3 backend (aws-sdk-s3) and the SSH backend (russh's default crypto provider) —
+# so any build with `ssh` or `s3`/`cloud` needs it:
 #   * Linux  — needs a C toolchain + CMake (installed below; also covers the musl static build).
 #   * macOS  — non-FIPS builds ship pre-generated bindings, so no extra toolchain is required.
 #   * Windows — NASM is mandatory for x86_64 aws-lc-rs builds (installed below).

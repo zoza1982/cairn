@@ -189,6 +189,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cairn now builds on Windows with the SSH and Docker backends.** Two backends called Unix-only
+  APIs unconditionally, so a full-feature (`all-backends`) Windows build failed to compile — meaning
+  there was no complete Windows binary. The SSH backend used russh's `AgentClient::connect_env`
+  (`$SSH_AUTH_SOCK`, Unix-only) for agent auth; it now connects to the OpenSSH named-pipe agent
+  (`\\.\pipe\openssh-ssh-agent`) with a Pageant fallback on Windows, sharing one generic auth path
+  with Unix. The Docker backend used bollard's Unix-only `connect_with_unix` for an explicit socket
+  path; it now uses the cross-platform `connect_with_socket` (Unix socket on Unix, named pipe on
+  Windows) — behavior on Unix is unchanged. CI was only building the lean feature set on Windows, so
+  this was never caught; a Windows compile gate for the transport backends (`ssh,containers`) is
+  added to prevent regressions.
+
 - **Copying a directory onto an existing remote (SFTP) directory no longer fails** with
   `Copy failed: …`. OpenSSH's `sftp-server` reports `mkdir` on an existing path as a generic
   `SSH_FX_FAILURE` (some servers phrase it "not found"), which the SSH backend surfaced as an opaque

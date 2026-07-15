@@ -16,9 +16,15 @@ env:
   RUST_BACKTRACE: 1
 
 # Backend SDKs (TLS-heavy: cloud, k8s, docker, ssh transport) live behind non-default Cargo
-# features (ADR-0006). The cross-platform `test` and `clippy-lean` jobs build the LEAN default so
-# Windows/macOS never compile the heavy/aws-lc stack; the Linux-only `*-full` jobs build
-# `--all-features`. NEVER add `--all-features` or a backend `--features` flag to a macOS/Windows job.
+# features (ADR-0006). The cross-platform `test`/`clippy` jobs build the LEAN default so
+# Windows/macOS never compile the cloud/aws-lc S3 stack; the Linux-only `*-full` jobs do
+# `--all-features`. Rule: NEVER run `cargo build`/`cargo test` with `--all-features` or the cloud
+# features (s3/gcs/azure/cloud) on a macOS/Windows job — that heavy stack stays Linux-only for fast
+# PR feedback and is verified cross-platform only in release.yml. The SOLE exception is the
+# `windows-portability` job below: a compile-only `cargo check` of the platform-sensitive transport
+# backends (`ssh,containers`) that guards against Unix-only API regressions the lean Windows build
+# cannot catch (it caught none before — russh/bollard Unix-only calls shipped unbuilt). It
+# deliberately excludes the cloud SDKs; keep it `check`, keep it transport-only.
 jobs:
   fmt:
     name: rustfmt
@@ -74,6 +80,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
+
+  windows-portability:
+    name: portability (transport backends, windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # russh's default crypto provider (aws-lc-rs) builds its native lib from source on Windows.
+      - name: Install NASM (required by aws-lc-rs via russh)
+        uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: win-transport
+      # Compile-only portability gate for the platform-sensitive transport backends (SSH + Docker/K8s),
+      # which call OS-specific APIs the lean Windows `test` job never compiles — this is what let the
+      # russh/bollard Unix-only calls ship unbuilt. `check` runs the full type/cfg pass but skips
+      # codegen/linking. The cloud/aws-lc S3 stack (s3/gcs/azure) is intentionally excluded: it is
+      # cross-platform and already built on Windows by release.yml. This is the ONE sanctioned
+      # backend-feature build on a non-Linux CI runner (see the policy note at the top of this file).
+      - run: cargo check -p cairn --features ssh,containers
 
   docs:
     name: rustdoc
