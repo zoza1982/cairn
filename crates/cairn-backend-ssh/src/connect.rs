@@ -309,11 +309,18 @@ async fn authenticate_agent(
     user: &str,
 ) -> Result<bool, VfsError> {
     use russh::keys::agent::client::AgentClient;
-    // OpenSSH's agent is the common case on modern Windows; try it first.
+    // OpenSSH's agent is the common case on modern Windows; try it first. Only a real success stops
+    // here: if the pipe is reachable but no key authenticates (`Ok(false)`) — or it errors mid-auth —
+    // fall through to Pageant, where the user's key may actually live. The OpenSSH agent service is
+    // often present but empty (auto-started by other tools), so returning on mere reachability would
+    // strand a Pageant-held key.
     if let Ok(agent) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
-        return agent_publickey_auth(handle, user, agent).await;
+        if let Ok(true) = agent_publickey_auth(handle, user, agent).await {
+            return Ok(true);
+        }
     }
-    // Otherwise fall back to a running Pageant instance.
+    // Pageant (PuTTY) as the fallback / terminal path. If no agent was reachable at all this surfaces
+    // as `VfsError::Auth`, matching the Unix arm when `$SSH_AUTH_SOCK` is unset.
     let agent = AgentClient::connect_pageant()
         .await
         .map_err(|_| VfsError::Auth)?;
