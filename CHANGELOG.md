@@ -196,8 +196,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`\\.\pipe\openssh-ssh-agent`) with a Pageant fallback on Windows, sharing one generic auth path
   with Unix. The Docker backend used bollard's Unix-only `connect_with_unix` for an explicit socket
   path; it now uses the cross-platform `connect_with_socket` (Unix socket on Unix, named pipe on
-  Windows). CI was only building the lean feature set on Windows, so this was never caught; a
-  Windows `all-backends` build gate is added to prevent regressions.
+  Windows) — behavior on Unix is unchanged. CI was only building the lean feature set on Windows, so
+  this was never caught; a Windows compile gate for the transport backends (`ssh,containers`) is
+  added to prevent regressions.
 
 - **Copying a directory onto an existing remote (SFTP) directory no longer fails** with
   `Copy failed: …`. OpenSSH's `sftp-server` reports `mkdir` on an existing path as a generic
