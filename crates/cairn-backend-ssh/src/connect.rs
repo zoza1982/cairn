@@ -284,17 +284,55 @@ async fn authenticate(
     }
 }
 
-/// Public-key auth via the platform SSH agent (`$SSH_AUTH_SOCK` on Unix, Pageant/named-pipe on
-/// Windows) — `connect_env` handles the platform lookup. No key material is held by Cairn.
+/// Public-key auth via the platform SSH agent. The agent connection is platform-specific — russh's
+/// `connect_env` (`$SSH_AUTH_SOCK`) is Unix-only — so we branch on target here and hand the concrete
+/// agent client to the generic [`agent_publickey_auth`]. No key material is held by Cairn.
+#[cfg(unix)]
 async fn authenticate_agent(
     handle: &mut Handle<CairnHandler>,
     user: &str,
 ) -> Result<bool, VfsError> {
     use russh::keys::agent::client::AgentClient;
-    use russh::keys::agent::AgentIdentity;
-    let mut agent = AgentClient::connect_env()
+    let agent = AgentClient::connect_env()
         .await
         .map_err(|_| VfsError::Auth)?;
+    agent_publickey_auth(handle, user, agent).await
+}
+
+/// Windows counterpart: connect to the OpenSSH named-pipe agent (Windows 10+'s built-in
+/// `ssh-agent` service at `\\.\pipe\openssh-ssh-agent`), falling back to Pageant (PuTTY). russh
+/// exposes these as separate constructors returning distinct stream types, so each arm dispatches
+/// to the same generic [`agent_publickey_auth`].
+#[cfg(windows)]
+async fn authenticate_agent(
+    handle: &mut Handle<CairnHandler>,
+    user: &str,
+) -> Result<bool, VfsError> {
+    use russh::keys::agent::client::AgentClient;
+    // OpenSSH's agent is the common case on modern Windows; try it first.
+    if let Ok(agent) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+        return agent_publickey_auth(handle, user, agent).await;
+    }
+    // Otherwise fall back to a running Pageant instance.
+    let agent = AgentClient::connect_pageant()
+        .await
+        .map_err(|_| VfsError::Auth)?;
+    agent_publickey_auth(handle, user, agent).await
+}
+
+/// Try every agent-held public key against the server, generic over the agent's transport stream
+/// (Unix socket, Windows named pipe, or Pageant) so the platform arms above share one implementation.
+/// The bound mirrors russh's `Signer for AgentClient<S>` impl (`AsyncRead + AsyncWrite + Unpin +
+/// Send`), which is also enough for `request_identities`.
+async fn agent_publickey_auth<S>(
+    handle: &mut Handle<CairnHandler>,
+    user: &str,
+    mut agent: russh::keys::agent::client::AgentClient<S>,
+) -> Result<bool, VfsError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    use russh::keys::agent::AgentIdentity;
     let identities = agent
         .request_identities()
         .await

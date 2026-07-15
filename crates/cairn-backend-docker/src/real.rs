@@ -119,15 +119,17 @@ impl BollardDocker {
             .map_err(|e| VfsError::Connection(Box::new(e)))
     }
 
-    /// Connect to a Docker daemon at an explicit Unix socket path.
+    /// Connect to a Docker daemon at an explicit socket path — a Unix socket on Unix (rootless
+    /// Docker or Podman sockets discovered via `$XDG_RUNTIME_DIR`) or a named pipe on Windows.
     ///
-    /// Use this for rootless-Docker or Podman sockets discovered via `$XDG_RUNTIME_DIR`.
-    /// The timeout passed to bollard is 120 seconds (the same default bollard uses internally);
-    /// individual operation timeouts are the caller's responsibility.
+    /// Uses bollard's cross-platform [`Docker::connect_with_socket`], which selects `connect_with_unix`
+    /// on Unix and `connect_with_named_pipe` on Windows (the Unix-only `connect_with_unix` does not
+    /// compile on Windows). The timeout passed to bollard is 120 seconds (the same default bollard
+    /// uses internally); individual operation timeouts are the caller's responsibility.
     ///
     /// # Errors
     /// [`VfsError::Connection`] if `path` is not valid UTF-8 (bollard requires a string address)
-    /// or if bollard cannot construct the client.
+    /// or if bollard cannot construct the client (including the socket/pipe not existing).
     pub fn connect_with_socket(path: &std::path::Path) -> Result<Self, VfsError> {
         let addr = path.to_str().ok_or_else(|| {
             VfsError::Connection(Box::new(std::io::Error::new(
@@ -135,7 +137,7 @@ impl BollardDocker {
                 "Docker socket path is not valid UTF-8",
             )))
         })?;
-        Docker::connect_with_unix(addr, 120, bollard::API_DEFAULT_VERSION)
+        Docker::connect_with_socket(addr, 120, bollard::API_DEFAULT_VERSION)
             .map(Self::from_docker)
             .map_err(|e| VfsError::Connection(Box::new(e)))
     }
