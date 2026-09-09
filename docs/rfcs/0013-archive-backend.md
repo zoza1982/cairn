@@ -165,8 +165,10 @@ object-store backend's approach, which makes sense there because it re-queries p
 whole member list is already in hand).
 
 **A deliberate simplification vs. true streaming:** `ArchiveOps::read_member` returns a `Vec<u8>` (a
-capped, in-memory buffer), the same shape `SftpVfs`/`ObjectStoreVfs` already use — `Vfs::open_read`
-wraps it in `std::io::Cursor`. This is not "stream a member's bytes lazily to the caller"; it reads
+capped, in-memory buffer), ~~the same shape `SftpVfs`/`ObjectStoreVfs` already use~~ (`SftpVfs` has
+since moved to true streaming — RFC-0003 "Streaming I/O"; `ObjectStoreVfs` still buffers, tracked in
+M5-4) — `Vfs::open_read` wraps it in `std::io::Cursor`. The archive backend's buffered read remains a
+deliberate simplification of its own, not parity with `SftpVfs`. This is not "stream a member's bytes lazily to the caller"; it reads
 up to the per-member cap (see below) and returns. This keeps the implementation aligned with the
 existing backend conventions and is safe *because* the security caps already bound how much a
 single read can decode — a genuinely zero-copy streaming reader for archive members is future work

@@ -17,10 +17,11 @@ offline; the real network transport is a thin `russh`/`russh-sftp` adapter.
   `create_dir`/`rename`, all returning `Result<_, VfsError>`. This is the seam: the bug-prone mapping
   logic depends only on this trait, so it is tested against an **in-memory `MockSftp`** with no
   network.
-- **`SftpVfs<O: SftpOps>`** implements `Vfs`: lists (streamed page), stats, ranged reads, buffered
-  writes, `create_dir`, `rename`, and **recursive remove** (post-order subtree walk — files first,
+- **`SftpVfs<O: SftpOps>`** implements `Vfs`: lists (streamed page), stats, **streaming** ranged reads and
+  writes (see "Streaming I/O" below), `create_dir`, `rename`, and **recursive remove** (post-order subtree walk — files first,
   then directories deepest-first). Capabilities: `LIST|READ|WRITE|CREATE_DIR|DELETE|RENAME|
-  RENAME_ATOMIC|RANDOM_READ|SYMLINK`.
+  RANDOM_READ|SYMLINK` (not `RENAME_ATOMIC`: SFTP has no portable atomic overwrite — see
+  `SftpVfs::caps`).
 - **`RealSftp`** implements `SftpOps` over a `russh_sftp::client::SftpSession` (any stream). It is
   compiled and type-checked against the real client API; errors are mapped to `VfsError`
   (not-found vs backend).
@@ -31,7 +32,8 @@ offline; the real network transport is a thin `russh`/`russh-sftp` adapter.
 
 ## Drawbacks / deferred
 
-- `open_read` reads the whole object into memory for now (streaming refinement later).
+- ~~`open_read` reads the whole object into memory for now (streaming refinement later).~~
+  Resolved — see "Streaming I/O".
 - `exec` actions (remote `grep` → `SEARCH_CONTENT`), bastion/jump-host chains, keepalive/retry
   resilience, and the live transport are deferred to the integration step.
 
@@ -50,5 +52,46 @@ verification and auth live in the transport layer. Errors avoid leaking secrets.
 
 ## Unresolved questions
 
-- Streaming reads/writes (vs buffer) over SFTP.
+- ~~Streaming reads/writes (vs buffer) over SFTP.~~ Resolved — see "Streaming I/O".
 - The exact russh auth/host-key flow and bastion chaining (transport integration).
+
+## Streaming I/O (resolved)
+
+The first cut buffered: `open_read` fetched the whole file into a `Vec` and replayed it from a
+`Cursor`, and the write sink accumulated every chunk in memory and uploaded it in `finish()`. That
+made the transfer engine's per-chunk progress a memcpy — a copy to SFTP raced to 100% and then sat
+under "Finalizing…" for the entire real upload — and held a whole file in RAM per transfer.
+
+`SftpOps` now hands out handles instead of buffers:
+
+- `open_read(path, range) -> Box<dyn AsyncRead + Send + Unpin>`: the `russh-sftp` `File`
+  (seeked, and wrapped in `Take` for a bounded range). `File::poll_read` issues one `SSH_FXP_READ`
+  per poll, so nothing is buffered beyond a packet. Only the open+seek is retried (idempotent);
+  a mid-stream failure fails that file — resuming is a ranged re-open, an engine-level concern.
+- `open_write(path) -> Box<dyn SftpWriteStream>`: a small purpose-built trait (`write_all` /
+  `finish` / `abort`) over the `File`'s `AsyncWrite`. `File::poll_write` pipelines `WRITE`s in a
+  bounded window (`max_concurrent_writes`, 8 × ≤ `max_packet_len`), so awaiting `write_all` *is* the
+  backpressure and the bytes the engine counts are bytes the server has been handed. `finish` runs
+  `flush` then `shutdown` and **surfaces the `CLOSE` status** (previously discarded — the last chance
+  to learn a commit failed). `abort` drops the handle and removes the file the open created, which
+  exists from the moment `open_write` returned (CREATE|TRUNCATE).
+- Not `AsyncWrite` directly: the mock stays a plain `async fn` impl, `finish` maps the close status
+  through the crate's error classifier, and `abort` owns the cleanup policy with the path it opened.
+- **Writes go to a hidden sibling temp** (`.<name>.cairn-<pid>-<seq>.part`) and `SftpVfs`'s write
+  sink renames it onto the target in `finish`, reusing the overwrite emulation `Vfs::rename` already
+  has (move aside → rename → restore on failure). Opening the *target* with CREATE|TRUNCATE would
+  destroy the user's existing file the instant an overwrite copy started, so a cancel or a mid-file
+  error — both of which abort the sink — would leave them with nothing. With the temp, the original
+  is untouched until the new content is fully committed; `abort`, a failed flush/`CLOSE`, and a
+  failed rename all remove only the temp. `WriteOpts::overwrite == false` is honored (`AlreadyExists`
+  at open, and again at commit if a file appeared in between).
+- `open_read` pays one extra `stat` round trip for `ReadHandle::len_hint` (the reader streams, so
+  nothing else knows the size). It is best-effort: a failed stat degrades the hint to `None`, never
+  the read. The transfer engine uses its own `stat`, not the hint.
+
+Throughput is unchanged or better: the old path serialized read-all then write-all; the new path
+overlaps the next source read with the in-flight `WRITE` window.
+
+`MockSftp` models the same shape (create-on-open, per-call log, reads served in 4 KiB pieces) so
+the unit tests assert *how* the mapping drives the transport, and the env-guarded
+`sftp_server_repro` suite round-trips 32 MiB against a real OpenSSH `sftp-server`.

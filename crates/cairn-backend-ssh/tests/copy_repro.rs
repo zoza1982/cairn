@@ -19,9 +19,15 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 fn sftp_server_bin() -> Option<&'static str> {
-    ["/usr/lib/openssh/sftp-server", "/usr/libexec/sftp-server"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
+    // Debian/Ubuntu, macOS/BSD, Arch/Fedora — keep in sync with `sftp_server_repro.rs`; a missing
+    // entry makes this suite silently skip on that distro.
+    [
+        "/usr/lib/openssh/sftp-server",
+        "/usr/libexec/sftp-server",
+        "/usr/lib/ssh/sftp-server",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
 }
 
 async fn connect(conn: ConnectionId) -> (SftpVfs<RealSftp>, tokio::process::Child) {

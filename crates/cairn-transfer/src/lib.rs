@@ -312,13 +312,24 @@ async fn copy_file(
             // real accumulated outcome; these private helpers never surface `Cancelled` to callers.
             return Err(TransferError::Cancelled(TransferOutcome::default()));
         }
-        let n = reader.read(&mut buf).await.map_err(VfsError::Io)?;
+        // On a mid-file error the destination must be aborted, not just dropped: a streaming sink
+        // (SFTP, or anything that opens the remote file at `open_write`) has already created — and
+        // partly written — the target, and only `abort` removes it. Without this the failed copy left
+        // an orphaned partial file that later looked like a complete one.
+        let n = match reader.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                writer.abort().await;
+                return Err(VfsError::Io(e).into());
+            }
+        };
         if n == 0 {
             break;
         }
-        writer
-            .write_chunk(Bytes::copy_from_slice(&buf[..n]))
-            .await?;
+        if let Err(e) = writer.write_chunk(Bytes::copy_from_slice(&buf[..n])).await {
+            writer.abort().await;
+            return Err(e.into());
+        }
         written += n as u64;
         progress(ProgressEvent::Bytes(n as u64));
     }
@@ -329,7 +340,15 @@ async fn copy_file(
     let entry: Entry = writer.finish().await?;
 
     if spec.verify == VerifyPolicy::Size {
-        let dst_size = entry.size.or(dst.stat(&to).await.ok().and_then(|e| e.size));
+        // Ask the *destination* what landed. The `Entry` a sink returns from `finish` typically
+        // carries its own byte counter (local, SFTP), which is the same number we just summed — a
+        // verify that compares it to `written` can never fail. Fall back to the sink's word only when
+        // the stat is unavailable. (The old `entry.size.or(dst.stat(..).await…)` also ran the stat
+        // eagerly on every file and then ignored it whenever `entry.size` was `Some`.)
+        let dst_size = match dst.stat(&to).await.ok().and_then(|e| e.size) {
+            Some(n) => Some(n),
+            None => entry.size,
+        };
         if let Some(ds) = dst_size {
             if ds != written {
                 return Err(TransferError::VerifyFailed(to.clone()));
@@ -458,6 +477,52 @@ mod tests {
                 .with_file("/a.txt", b"aaa")
                 .with_file("/b.txt", b"bbb"),
         )
+    }
+
+    /// Regression: a source read that fails mid-file must abort the destination sink, not merely
+    /// drop it. A streaming sink has already created (and partly written) the remote file at that
+    /// point, and only `abort` removes it — the old `?` left an orphaned partial file behind.
+    #[tokio::test]
+    async fn read_error_mid_file_aborts_the_destination() {
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_file("/big", &[1u8; 4096])
+                .with_read_fault("/big", 100),
+        );
+        let dst_mock = Arc::new(MockVfs::new(ConnectionId(2)));
+        let dst: Arc<dyn Vfs> = dst_mock.clone();
+        let res = run_transfer(
+            &src,
+            &dst,
+            &[(p("/big"), p("/big"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await;
+        assert!(matches!(res, Err(TransferError::Vfs(VfsError::Io(_)))));
+        assert_eq!(dst_mock.aborted_writes(), vec!["/big".to_owned()]);
+    }
+
+    /// Same for a destination that rejects a chunk: the sink is aborted before the error propagates.
+    #[tokio::test]
+    async fn write_error_mid_file_aborts_the_destination() {
+        let src: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(1)).with_file("/f", b"payload"));
+        let dst_mock = Arc::new(MockVfs::new(ConnectionId(2)).with_write_fault("/f"));
+        let dst: Arc<dyn Vfs> = dst_mock.clone();
+        let res = run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await;
+        assert!(matches!(res, Err(TransferError::Vfs(VfsError::Io(_)))));
+        assert_eq!(dst_mock.aborted_writes(), vec!["/f".to_owned()]);
     }
 
     #[tokio::test]

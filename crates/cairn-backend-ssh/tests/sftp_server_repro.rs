@@ -15,16 +15,23 @@
 
 use cairn_backend_ssh::{RealSftp, SftpVfs};
 use cairn_types::{ConnectionId, EntryKind, VfsPath};
-use cairn_vfs::{ListOpts, Recurse, Vfs};
+use cairn_vfs::{ListOpts, Recurse, Vfs, WriteOpts};
 use futures::StreamExt;
 use russh_sftp::client::SftpSession;
+use tokio::io::AsyncReadExt;
 
 const CONN: ConnectionId = ConnectionId(1);
 
 fn sftp_server_bin() -> Option<&'static str> {
-    ["/usr/lib/openssh/sftp-server", "/usr/libexec/sftp-server"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
+    // Debian/Ubuntu, macOS/BSD, Arch/Fedora respectively — a missing entry makes the whole suite
+    // silently skip on that distro, so add rather than replace.
+    [
+        "/usr/lib/openssh/sftp-server",
+        "/usr/libexec/sftp-server",
+        "/usr/lib/ssh/sftp-server",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
 }
 
 /// The spawned server handle is returned so the caller keeps it alive for the test's duration and
@@ -195,4 +202,166 @@ async fn real_sftp_recursive_remove_spares_a_symlink_target() {
         tmp.path().join("outside/precious.txt").exists(),
         "a recursive delete followed a symlink and destroyed data outside the tree"
     );
+}
+
+/// A large file must round-trip through the *streaming* read/write paths against a real server:
+/// many `write_chunk`s over `russh-sftp`'s pipelined `WRITE` window (32 MiB is well past several
+/// `max_concurrent_writes × max_packet_len` windows), a `CLOSE` whose status is now surfaced, and a
+/// read that is served packet by packet. The mock proves the *shape* of the calls; this proves the
+/// real transport agrees on the bytes.
+#[tokio::test]
+async fn real_sftp_streams_a_large_file_both_ways() {
+    if std::env::var("CAIRN_IT_SFTP").is_err() {
+        eprintln!("skipping: set CAIRN_IT_SFTP=1 to run");
+        return;
+    }
+    if sftp_server_bin().is_none() {
+        eprintln!("skipping: no sftp-server binary found");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (vfs, _server) = connect(tmp.path()).await;
+    let remote = VfsPath::parse(&format!("{}/big.bin", tmp.path().to_str().unwrap())).unwrap();
+
+    // 32 MiB of a cheap non-repeating pattern (so a misordered chunk would change the digest).
+    const CHUNK: usize = 1 << 20;
+    const CHUNKS: usize = 32;
+    let mut expect = std::collections::hash_map::DefaultHasher::new();
+    let mut wh = vfs.open_write(&remote, WriteOpts::default()).await.unwrap();
+    for i in 0..CHUNKS {
+        let chunk: Vec<u8> = (0..CHUNK).map(|j| ((i * 31 + j) % 253) as u8).collect();
+        std::hash::Hasher::write(&mut expect, &chunk);
+        wh.write_chunk(bytes::Bytes::from(chunk)).await.unwrap();
+    }
+    let entry = wh.finish().await.expect("finish surfaces the CLOSE status");
+    assert_eq!(entry.size, Some((CHUNK * CHUNKS) as u64));
+    assert_eq!(
+        std::fs::metadata(tmp.path().join("big.bin")).unwrap().len(),
+        (CHUNK * CHUNKS) as u64,
+        "the server-side file is complete once finish() returns"
+    );
+
+    let mut rh = vfs.open_read(&remote, None).await.unwrap();
+    assert_eq!(rh.len_hint(), Some((CHUNK * CHUNKS) as u64));
+    let mut got = std::collections::hash_map::DefaultHasher::new();
+    let mut buf = vec![0u8; CHUNK];
+    let mut total = 0usize;
+    loop {
+        let n = rh.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        std::hash::Hasher::write(&mut got, &buf[..n]);
+        total += n;
+    }
+    assert_eq!(total, CHUNK * CHUNKS);
+    assert_eq!(
+        std::hash::Hasher::finish(&got),
+        std::hash::Hasher::finish(&expect),
+        "bytes read back differ from bytes written"
+    );
+}
+
+/// Aborting a write mid-stream must leave nothing on a real server: the hidden `.part` temp is
+/// created at open, the handle is dropped (best-effort CLOSE) and the temp removed — confirms
+/// `sftp-server` accepts the REMOVE for a path whose handle was just released. The target itself is
+/// never created.
+#[tokio::test]
+async fn real_sftp_abort_mid_write_leaves_no_file() {
+    if std::env::var("CAIRN_IT_SFTP").is_err() {
+        eprintln!("skipping: set CAIRN_IT_SFTP=1 to run");
+        return;
+    }
+    if sftp_server_bin().is_none() {
+        eprintln!("skipping: no sftp-server binary found");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (vfs, _server) = connect(tmp.path()).await;
+    let remote = VfsPath::parse(&format!("{}/partial.bin", tmp.path().to_str().unwrap())).unwrap();
+
+    let names = |dir: &std::path::Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+
+    let mut wh = vfs
+        .open_write(
+            &remote,
+            WriteOpts {
+                overwrite: true,
+                size_hint: None,
+            },
+        )
+        .await
+        .unwrap();
+    let during = names(tmp.path());
+    assert_eq!(
+        during.len(),
+        1,
+        "exactly one temp during the write: {during:?}"
+    );
+    assert!(
+        during[0].starts_with(".partial.bin.cairn-") && during[0].ends_with(".part"),
+        "the real server creates the temp at open: {during:?}"
+    );
+    wh.write_chunk(bytes::Bytes::from(vec![9u8; 3 << 20]))
+        .await
+        .unwrap();
+    wh.abort().await;
+    assert!(
+        names(tmp.path()).is_empty(),
+        "abort left something behind: {:?}",
+        names(tmp.path())
+    );
+}
+
+/// Overwriting an existing remote file: the original must survive a cancel (abort) untouched, and a
+/// completed write must replace it — against the real server's rename-refuses-existing semantics.
+#[tokio::test]
+async fn real_sftp_overwrite_keeps_the_original_until_commit() {
+    if std::env::var("CAIRN_IT_SFTP").is_err() {
+        eprintln!("skipping: set CAIRN_IT_SFTP=1 to run");
+        return;
+    }
+    if sftp_server_bin().is_none() {
+        eprintln!("skipping: no sftp-server binary found");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("keep.txt"), b"original").unwrap();
+    let (vfs, _server) = connect(tmp.path()).await;
+    let remote = VfsPath::parse(&format!("{}/keep.txt", tmp.path().to_str().unwrap())).unwrap();
+    let opts = WriteOpts {
+        overwrite: true,
+        size_hint: None,
+    };
+
+    // Cancelled overwrite → original intact, no temp.
+    let mut wh = vfs.open_write(&remote, opts.clone()).await.unwrap();
+    wh.write_chunk(bytes::Bytes::from_static(b"new-"))
+        .await
+        .unwrap();
+    wh.abort().await;
+    assert_eq!(
+        std::fs::read(tmp.path().join("keep.txt")).unwrap(),
+        b"original"
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+
+    // Completed overwrite → replaced, no temp, no rename backup.
+    let mut wh = vfs.open_write(&remote, opts).await.unwrap();
+    wh.write_chunk(bytes::Bytes::from_static(b"replaced"))
+        .await
+        .unwrap();
+    assert_eq!(wh.finish().await.unwrap().size, Some(8));
+    assert_eq!(
+        std::fs::read(tmp.path().join("keep.txt")).unwrap(),
+        b"replaced"
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
 }

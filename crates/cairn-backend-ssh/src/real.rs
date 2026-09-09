@@ -5,24 +5,30 @@
 //! integration step wired up with a live-server test per the M4 CI design; this type accepts an
 //! already-opened [`SftpSession`].
 
-use crate::ops::{RemoteEntry, RemoteMeta, SftpOps};
+use crate::ops::{RemoteEntry, RemoteMeta, SftpOps, SftpWriteStream};
 use async_trait::async_trait;
 use cairn_types::{EntryKind, VfsPath};
 use cairn_vfs::{ByteRange, RetryPolicy, VfsError};
+use russh_sftp::client::fs::File;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// An [`SftpOps`] implementation backed by a live `russh-sftp` client session.
 pub struct RealSftp {
-    session: SftpSession,
+    /// Shared with the write streams handed out by `open_write`, which need the session again at
+    /// `abort` time to remove the partial file. `SftpSession` is not `Clone`, hence the `Arc`.
+    session: Arc<SftpSession>,
 }
 
 impl RealSftp {
     /// Wrap an already-connected SFTP session.
     #[must_use]
     pub fn new(session: SftpSession) -> Self {
-        Self { session }
+        Self {
+            session: Arc::new(session),
+        }
     }
 }
 
@@ -61,10 +67,6 @@ fn map_err(e: impl std::fmt::Display, path: &str) -> VfsError {
             retryable: transient,
         }
     }
-}
-
-fn io_err(e: std::io::Error) -> VfsError {
-    VfsError::Io(e)
 }
 
 #[async_trait]
@@ -149,41 +151,43 @@ impl SftpOps for RealSftp {
         .await
     }
 
-    async fn read(&self, path: &str, range: Option<ByteRange>) -> Result<Vec<u8>, VfsError> {
-        // Idempotent read: retried on a transient failure. A retry re-opens and re-reads the whole
-        // range from the start (the returned bytes are correct; only the in-flight read is repeated).
+    async fn open_read(
+        &self,
+        path: &str,
+        range: Option<ByteRange>,
+    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, VfsError> {
+        // Only the *open* (+ the local, round-trip-free seek) is retried: it is idempotent and cheap.
+        // Once the reader is handed back nothing retries mid-stream — a dropped connection surfaces
+        // as an `io::Error` from `poll_read` and fails that file, which the transfer engine handles.
+        // Resuming a broken stream is a ranged re-open, i.e. an engine-level concern, not this seam's.
         cairn_vfs::retry(RetryPolicy::default(), || async {
             let mut file = self
                 .session
                 .open_with_flags(path, OpenFlags::READ)
                 .await
                 .map_err(|e| map_err(e, path))?;
-            let mut buf = Vec::new();
             match range {
-                None => {
-                    file.read_to_end(&mut buf).await.map_err(io_err)?;
-                }
+                None => Ok(Box::new(file) as Box<dyn AsyncRead + Send + Unpin>),
                 Some(r) => {
                     file.seek(std::io::SeekFrom::Start(r.offset))
                         .await
-                        .map_err(io_err)?;
-                    match r.len {
-                        Some(l) => {
-                            file.take(l).read_to_end(&mut buf).await.map_err(io_err)?;
-                        }
-                        None => {
-                            file.read_to_end(&mut buf).await.map_err(io_err)?;
-                        }
-                    }
+                        .map_err(|e| map_err(e, path))?;
+                    Ok(match r.len {
+                        // `File::poll_read` issues one `SSH_FXP_READ` per poll (≤ the negotiated
+                        // packet size), so neither branch buffers beyond a single packet.
+                        Some(l) => Box::new(file.take(l)) as Box<dyn AsyncRead + Send + Unpin>,
+                        None => Box::new(file),
+                    })
                 }
             }
-            Ok(buf)
         })
         .await
     }
 
-    async fn write(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
-        let mut file = self
+    async fn open_write(&self, path: &str) -> Result<Box<dyn SftpWriteStream>, VfsError> {
+        // Not retried: like the other mutating ops (see `stat`), a retried open could truncate a
+        // file a previous attempt had already started writing.
+        let file = self
             .session
             .open_with_flags(
                 path,
@@ -191,10 +195,11 @@ impl SftpOps for RealSftp {
             )
             .await
             .map_err(|e| map_err(e, path))?;
-        file.write_all(data).await.map_err(io_err)?;
-        file.flush().await.map_err(io_err)?;
-        let _ = file.shutdown().await;
-        Ok(())
+        Ok(Box::new(RealSftpWriteStream {
+            file,
+            path: path.to_owned(),
+            session: self.session.clone(),
+        }))
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), VfsError> {
@@ -223,6 +228,54 @@ impl SftpOps for RealSftp {
             .rename(from, to)
             .await
             .map_err(|e| map_err(e, from))
+    }
+}
+
+/// An open remote file being streamed to, over `russh-sftp`'s [`File`] (`AsyncWrite`).
+///
+/// `File::poll_write` sends one `SSH_FXP_WRITE` per call and only blocks once
+/// `max_concurrent_writes` (8) acks are outstanding, so `write_all` on a 1 MiB chunk queues ~4
+/// packets and returns while the previous window drains — the wire stays busy while the engine reads
+/// the next source chunk, and progress tracks bytes the server has actually been handed.
+struct RealSftpWriteStream {
+    file: File,
+    path: String,
+    session: Arc<SftpSession>,
+}
+
+#[async_trait]
+impl SftpWriteStream for RealSftpWriteStream {
+    async fn write_all(&mut self, data: &[u8]) -> Result<(), VfsError> {
+        // A `WRITE`'s failure surfaces on a *later* poll (when its ack is drained), so an error here
+        // may belong to an earlier chunk — either way the file is bad and the caller aborts.
+        self.file
+            .write_all(data)
+            .await
+            .map_err(|e| map_err(e, &self.path))
+    }
+
+    async fn finish(self: Box<Self>) -> Result<(), VfsError> {
+        let Self { mut file, path, .. } = *self;
+        // `flush` drains every outstanding ack (and fsyncs where the server supports it); `shutdown`
+        // sends `CLOSE` and awaits its status. That status is the commit point — a server that fails
+        // the close has NOT durably written the file, so it must propagate, never be discarded. The
+        // caller (`SftpWriteSink::finish`) removes the temp on either error.
+        file.flush().await.map_err(|e| map_err(e, &path))?;
+        file.shutdown().await.map_err(|e| map_err(e, &path))
+    }
+
+    async fn abort(self: Box<Self>) {
+        let Self {
+            file,
+            path,
+            session,
+        } = *self;
+        // Dropping the handle sends a best-effort, unawaited `CLOSE`; then remove what the open
+        // created. The file exists (empty at minimum) from the moment `open_write` returned, so this
+        // must run even if no chunk was ever written. Best-effort: there is nothing useful to do
+        // with a failure here, and the caller is already on an error/cancel path.
+        drop(file);
+        let _ = session.remove_file(&path).await;
     }
 }
 

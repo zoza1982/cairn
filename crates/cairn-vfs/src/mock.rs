@@ -10,6 +10,7 @@ use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, VfsPath};
 use futures::stream::{self, BoxStream, StreamExt};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use tokio::io::AsyncReadExt as _;
 
 type Tree = Arc<Mutex<BTreeMap<String, Node>>>;
 
@@ -24,6 +25,13 @@ pub struct MockVfs {
     conn: ConnectionId,
     /// Map of canonical path string → node. Always contains the root `/`.
     nodes: Tree,
+    /// Fault injection: a read of this path yields `after` bytes and then an I/O error, so a caller's
+    /// mid-stream error handling (e.g. the transfer engine aborting the destination) is testable.
+    read_fault: Option<(String, usize)>,
+    /// Fault injection: every `write_chunk` to this path fails.
+    write_fault: Option<String>,
+    /// Paths whose write sink was `abort`ed, in order — the observable side of an error path.
+    aborted: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockVfs {
@@ -35,7 +43,35 @@ impl MockVfs {
         Self {
             conn,
             nodes: Arc::new(Mutex::new(nodes)),
+            read_fault: None,
+            write_fault: None,
+            aborted: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Builder: make reads of `path` fail with an I/O error after yielding `after` bytes.
+    #[must_use]
+    pub fn with_read_fault(mut self, path: &str, after: usize) -> Self {
+        let p = VfsPath::parse(path).expect("valid test path");
+        self.read_fault = Some((p.as_str(), after));
+        self
+    }
+
+    /// Builder: make every `write_chunk` to `path` fail.
+    #[must_use]
+    pub fn with_write_fault(mut self, path: &str) -> Self {
+        let p = VfsPath::parse(path).expect("valid test path");
+        self.write_fault = Some(p.as_str());
+        self
+    }
+
+    /// Paths whose write sink was aborted (see [`WriteSink::abort`]), in order.
+    #[must_use]
+    pub fn aborted_writes(&self) -> Vec<String> {
+        self.aborted
+            .lock()
+            .expect("mock vfs mutex poisoned")
+            .clone()
     }
 
     /// Builder: add a directory (and ensure it exists).
@@ -170,26 +206,28 @@ impl Vfs for MockVfs {
         let total = bytes.len() as u64;
         let sliced = match range {
             None => bytes,
-            Some(r) => {
-                let start = r.offset.min(total) as usize;
-                let end = match r.len {
-                    Some(l) => ((r.offset + l).min(total)) as usize,
-                    None => total as usize,
-                };
-                bytes[start..end].to_vec()
-            }
+            // Saturating clamp — the old open-coded `offset + len` overflowed on a hostile range.
+            Some(r) => crate::vfs::apply_byte_range(&bytes, r).to_vec(),
         };
-        Ok(ReadHandle::new(
-            Box::new(std::io::Cursor::new(sliced)),
-            Some(total),
-        ))
+        let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> = match &self.read_fault {
+            Some((fault_path, after)) if *fault_path == path.as_str() => {
+                // Serve the first `after` bytes, then fail: `Cursor` over the prefix chained with a
+                // reader that errors on its first poll.
+                let good = sliced[..(*after).min(sliced.len())].to_vec();
+                Box::new(std::io::Cursor::new(good).chain(FailingReader))
+            }
+            _ => Box::new(std::io::Cursor::new(sliced)),
+        };
+        Ok(ReadHandle::new(reader, Some(total)))
     }
 
     async fn open_write(&self, path: &VfsPath, _opts: WriteOpts) -> Result<WriteHandle, VfsError> {
         Ok(WriteHandle::new(Box::new(MockWriteSink {
+            fail_writes: self.write_fault.as_deref() == Some(&*path.as_str()),
             path: path.clone(),
             buf: Vec::new(),
             nodes: self.nodes.clone(),
+            aborted: self.aborted.clone(),
         })))
     }
 
@@ -234,16 +272,34 @@ impl Vfs for MockVfs {
     }
 }
 
+/// A reader that fails on its first poll — the tail of an injected mid-stream read fault.
+struct FailingReader;
+
+impl tokio::io::AsyncRead for FailingReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::other("injected read fault")))
+    }
+}
+
 /// A [`WriteSink`] that buffers bytes and commits them into the mock tree on `finish`.
 struct MockWriteSink {
     path: VfsPath,
     buf: Vec<u8>,
     nodes: Tree,
+    fail_writes: bool,
+    aborted: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
 impl WriteSink for MockWriteSink {
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), VfsError> {
+        if self.fail_writes {
+            return Err(VfsError::Io(std::io::Error::other("injected write fault")));
+        }
         self.buf.extend_from_slice(&chunk);
         Ok(())
     }
@@ -259,7 +315,12 @@ impl WriteSink for MockWriteSink {
         Ok(e)
     }
 
-    async fn abort(self: Box<Self>) {}
+    async fn abort(self: Box<Self>) {
+        self.aborted
+            .lock()
+            .expect("mock vfs mutex poisoned")
+            .push(self.path.as_str());
+    }
 }
 
 #[cfg(test)]
