@@ -258,6 +258,17 @@ pub trait CapabilityProvider {
 The UI queries capabilities to decide what to *offer*; backends return `Unsupported(Caps)` if asked
 anyway (a first-class, non-scary error — §12).
 
+**How the UI actually reads them.** `AppEvent::Listed` carries `caps_at(dir)` — the per-directory
+answer, since Docker and Kubernetes refine by depth — and `PaneState` keeps it. Copy, Move, Delete,
+MakeDir and Rename are refused up front when the relevant flag is absent, naming what the location
+cannot do; a copy checks the *destination* pane. The transfer engine reads `CREATE_DIR` the same way
+(§7) so a directory copy into an object store, which has no directories, no longer aborts.
+
+The gate is deliberately **one-directional**: it refuses only what a backend has explicitly said it
+cannot do. `PaneState::caps` is empty until the first listing arrives, so an unknown answer must
+never remove an operation that would have worked — being wrong permissively costs a late error
+message, being wrong strictly silently removes a working feature.
+
 ### 3.4 The trait — async dispatch decision
 
 **Decision (ADR-0001): `#[async_trait]` + `Arc<dyn Vfs>`.** We must hold heterogeneous backends
@@ -391,6 +402,24 @@ A known risk (rust-staff): some SDKs (`russh` historically) expose `!Send` futur
 **Decision: Elm/TEA `Model → Msg → update → effects`.** A pure reducer is trivially testable and
 cleanly separates "what changed" (`Msg`) from "go do I/O" (`AppEffect`) from "results arrived"
 (`AppEvent`). Components are used for *render* composition only (§6), not for holding state.
+
+**The runtime side of the loop** (`crates/cairn/src/app.rs`) owns what the pure core cannot: the
+live control handles for in-flight work. `Runtime` holds them — per-transfer cancel/pause pairs,
+log-viewer and pager tokens, session controls, the folder-size token, the two in-flight
+connection markers, the archive-connection id source, and the RAII temp directories of remote-edit
+sessions — and `RuntimeCtx` carries what effects read and never mutate. `dispatch(effect, &mut rt,
+&ctx)` is three arguments rather than the sixteen it grew to when each table was a separate local.
+
+`Runtime::reap(&msg)` releases the entry an event has just ended, and runs **before** `update`:
+a transfer's `Done`/`Conflict` must release its control entry before the reducer's tail-drain can
+start a queued transfer, or the fresh entry that transfer's dispatch inserts is wiped. The one
+event that deliberately does *not* reap is `WriteBackConflict` — that flow continues, and
+`KeepEditing`/`SaveAs` re-use the same temp file. These invariants leak real resources when wrong
+(a stuck concurrency slot, a permanently blocked reconnect, a temp file left on disk), so they live
+in a testable method rather than in the loop body, which needs a real terminal.
+
+The id families are deliberately not collapsed into one `TaskId`: a transfer, a log stream, a pager
+and a session are signalled differently and end differently.
 
 ```rust
 // cairn-core — holds NO service handles, NO Arc<dyn Vfs>; only plain data.

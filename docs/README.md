@@ -12,6 +12,9 @@
   once accepted. Start from [`0000-template.md`](adr/0000-template.md).
 - [`rfcs/`](rfcs/) — **Design proposals** for non-trivial work (new backends, vault crypto, AI
   layer). Write and review an RFC *before* large implementation.
+- [`reviews/`](reviews/) — **Dated quality reviews.** A record of what was found and what was done
+  about it, so findings nobody acted on stay visible instead of evaporating. Each report states its
+  method and marks which findings were adversarially verified and which were not.
 
 ## Documentation discipline
 

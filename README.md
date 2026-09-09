@@ -24,6 +24,8 @@ With a secure secrets vault and an agentic AI assistant.
 > **Backend mapping cores** for **SSH/SFTP**, **object stores** (S3/GCS/Azure-shaped), **Docker**, and
 > **Kubernetes** are implemented against a transport seam and fully unit-tested with in-memory mocks,
 > and the **WASM plugin host** (wasmtime, resource-limited, default-deny) runs sandboxed modules.
+> **SFTP reads and writes stream** (bounded memory, progress that tracks the wire), verified against
+> a real OpenSSH `sftp-server`; object stores still buffer whole objects until multipart lands.
 > **Still integration-bound** (need live services + heavy SDKs/TLS): the live SSH/cloud/cluster
 > transports, the HTTP LLM providers, and the WASM component-model bridge. See
 > [`docs/PRD.md`](docs/PRD.md), [`docs/LLD.md`](docs/LLD.md), and the live
@@ -61,6 +63,7 @@ credentials handled safely and an AI layer that turns intent into reviewed, exec
 | [Implementation Plan](docs/IMPLEMENTATION_PLAN.md) | Milestones, sequencing, and the living progress tracker |
 | [ADRs](docs/adr/) | Architecture Decision Records |
 | [RFCs](docs/rfcs/) | Design proposals for non-trivial work |
+| [Reviews](docs/reviews/) | Dated quality reviews — findings, what was fixed, what is still open |
 | [Contributing](CONTRIBUTING.md) | How to build, branch, and submit changes |
 
 ## Building
@@ -104,6 +107,11 @@ editor, while `Enter` on a binary file still opens the read-only hex pager. Edit
 there, and written back after a conflict check (has the remote file changed since you started
 editing?) — with size limits and a confirm prompt if the remote drifted or the local edit came
 back empty (see [RFC-0012](docs/rfcs/0012-file-open-view-edit.md)).
+`Space` (or `Insert`) marks the entry under the cursor, and copy/move/delete act on every marked
+entry rather than just the cursor. Marks are **positions in the current listing**, so they are
+cleared whenever the listing is replaced — a refresh, a completed operation, or a change to the
+filter. That is deliberate: after a refresh the old positions point at whatever now occupies them,
+and acting on them would touch files you never selected.
 `/` filters the listing as you type (`Enter` keeps the filter, `Esc` clears it). Copying or moving
 files auto-opens an MC-style transfer dialog — a progress bar, byte count, rate, and ETA per active
 transfer, plus the pending queue. `↑`/`↓` select a row (active transfer or pending item); `p`
@@ -113,6 +121,31 @@ background (transfers keep running, the status line keeps its compact summary) a
 it back to the foreground. For the pending queue, `K`/`J` reorder and `x` clears it. The dialog
 dismisses itself once the last transfer finishes and nothing remains queued. Up to two transfers
 run at once by default — set `[transfers] concurrency = N` in config to change it.
+
+**Quitting while a transfer is running asks first** — `q` sits one key from `p` and `b` on that
+dialog, and quitting tears the copy down mid-write. A second `q` confirms. A running *delete* has
+no half-written state to leave behind, so it does not prompt.
+
+What a copy does and does not carry:
+
+- **Only files and directories.** A symlink, socket, device or FIFO inside a copied tree is
+  **skipped** and counted as skipped, never opened — reading a FIFO blocks until something writes to
+  it, and a symlink pointing at a directory used to fail the whole transfer part-way. Recreating
+  links needs a VFS operation Cairn does not have yet.
+- **A move never deletes what it did not copy.** If any file under the source was skipped (a
+  conflict policy that keeps the destination, say), the source is left alone. Losing a move is
+  recoverable; losing the data is not.
+- **The destination is replaced atomically.** Local and SFTP writes go to a hidden
+  `.<name>.cairn-….part` sibling and are renamed into place on completion, so cancelling or losing
+  a copy leaves the original file untouched rather than truncated. If Cairn is killed outright
+  mid-copy you may find one of those `.part` files left behind.
+- **Both panes on the same directory** is refused rather than executed — copying a file onto itself
+  would empty it. Use `r`/`F6` to rename instead.
+
+**Operations a backend cannot do are refused before you commit to them.** Each backend declares
+what it supports for the directory you are in, so Delete, MakeDir, Rename and a copy into a
+read-only destination fail immediately with a message naming the limitation, rather than after the
+operation has started.
 
 ```toml
 [ui.keybindings]
@@ -173,6 +206,20 @@ Each pane's top border shows which backend it is browsing: a local pane shows ju
 while a remote pane shows a full `scheme://user@host:path` locator (e.g.
 `ssh://root@dietpi6:/home`) in the `remote` accent color, so the two are easy to tell apart.
 
+### AI assistant
+
+`Ctrl-A` asks the assistant for a plan. Nothing runs until you approve it: the overlay lists each
+step with its verb, whether it is reversible, and — beneath each one — **the actual call that will
+be made**, operands included.
+
+That second line matters more than it looks. A step's description is prose the model wrote about
+itself; the operands are what the executor consumes. Reviewing only the description means approving
+a *claim* rather than an *action*, so both are shown. `Enter` approves the highlighted step, `x`
+rejects it, `Esc` abandons the plan; a plan containing an irreversible step cannot be bulk-approved.
+
+The assistant never sees your credentials — it depends only on a secret-free view of the vault and
+can name a credential but never read one.
+
 ### Connections
 
 `Ctrl-O` opens the connection switcher — pick a backend to open in the active pane. Docker and
@@ -197,6 +244,36 @@ the display name, so renaming a profile never orphans its pin/hide state. Testin
 connection logic as a real open (so a real SSH/S3/GCS/Azure test performs genuine credential
 resolution) but never mounts the result or switches any pane; a connection that needs the secrets
 vault unlocked reports that directly rather than popping the vault-unlock prompt.
+
+### SSH host keys
+
+An SSH profile takes `host`, `user`, `port` (default `22`), `known_hosts` (default
+`~/.ssh/known_hosts`) and `host_key` — the policy Cairn applies to the server's key:
+
+| `host_key` | Behaviour |
+|-----------|-----------|
+| `accept-new` (default) | Trust-on-first-use: a host you hold **no** key for is recorded and accepted. A host you already have a key for must present a key that matches one of them. |
+| `strict` | Only a recorded, matching key is accepted. An unknown host is refused. |
+
+"A host you already have a key for" means exactly that, and it is worth spelling out because the
+naive reading is a real vulnerability: a server answering for a known host with a **different key
+algorithm** (ECDSA where you pinned Ed25519) is *not* a new host, and is refused rather than
+learned. Cairn reads `known_hosts` itself for this, so `@revoked` and `@cert-authority` markers,
+`host1,host2` lists, `*.example.com` patterns and mixed-case hostnames are all understood — a
+revoked key is refused under **both** policies. Hashed (`ssh-keygen -H`) entries work too.
+
+Cairn also asks for the algorithms a host is already pinned under **first** during key exchange, the
+way OpenSSH's `order_hostkeyalgs()` does, so a host pinned under an older algorithm still connects
+when its server has since added a newer one.
+
+`~/.ssh` and `known_hosts` are created `0700`/`0600` when Cairn creates them; existing permissions
+are left alone. A `known_hosts` that exists but cannot be read is treated as "this host may be
+pinned" — Cairn refuses to learn rather than gamble that you have no pins. A read-only shared file
+(`/etc/ssh/ssh_known_hosts`) works normally.
+
+> A rejected host key currently surfaces as a generic `connection failed`, the same message as an
+> unreachable host. That is a known gap — if a host you have connected to before suddenly fails,
+> check `known_hosts` before assuming the network.
 
 ### Shell-command actions
 
