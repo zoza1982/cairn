@@ -17,7 +17,8 @@
 
 | Field | Value |
 |---|---|
-| **Phase** | **"Finish the project" (2026-06-29):** hold lifted — building every remaining milestone in order, network backends feature-gated + emulator-tested in CI |
+| **Phase** | **Quality run (2026-09-09):** a whole-workspace review (9 reviewers + adversarial verification, `docs/reviews/2026-09-09-quality-review.md`) found 15 confirmed-high defects — most of them data loss in the transfer engine. All 15 are closed (PRs #193–#207) along with the confirmed mediums; every fix carries a mutation-checked regression test. Resuming milestone work from here. |
+| **Previous phase** | **"Finish the project" (2026-06-29):** hold lifted — building every remaining milestone in order, network backends feature-gated + emulator-tested in CI |
 | **Design docs** | ✅ PRD · ✅ LLD · ✅ ADR-0001..0013 · ✅ RFC-0001..0008 · 🟡 RFC-0010 (plugin sandbox + brokered host fns, Draft) · ✅ RFC-0012 (file open/view/edit — P1+P2+P3 landed) · 🟡 RFC-0013 (archive backend — P4+P5 landed) |
 | **Current milestone** | **Foundation: feature-gated backends + lean/full CI split (ADR-0006, PR-0). Next: M3-4 credentials → M4 SSH** |
 | **v0.1 target** | Deep on local + SSH + S3; functional GCS/Azure; Docker/K8s/AI/plugins behind feature flags |
@@ -25,6 +26,7 @@
 | **Work items ✅ / 🟡 / ☐ / ⛔ / ⏭** | 34 / 20 / 0 / 0 / 19 |
 | **Cross-platform CI green** | ✅ Linux · ✅ macOS · ✅ Windows |
 | **Long-pole items** | cloud/container/plugin backends (need live services + heavy SDKs) |
+| **Known gaps (from the review)** | A host-key rejection reports as a generic `connection failed`, indistinguishable from an unreachable host — needs a `VfsError` variant, touches every backend's error mapping. Object stores and the container backends still buffer whole files (#189). Plugin sinks cannot declare a commit mode across the WIT ABI (#191). Symlinks are skipped by a tree copy rather than recreated (needs `Vfs::symlink`). The remaining ⬜ unverified findings in the review report are unexamined, not cleared. |
 
 > **Unblocked (2026-06-29).** The "env-deferred" hold is lifted. Network backends now build behind
 > non-default Cargo features (ADR-0006) so the default cross-platform CI stays lean/hermetic and the
