@@ -37,6 +37,20 @@ ignore = [
     # Revisit on a move to the 1.0 Azure SDK (tracked with the other azure_core 0.21 advisories above).
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # `azure_core` 0.21 writes the `authorization` header *value* (shared key / SAS token) into its
+    # request log. Pulled by `azure_storage` 0.21 behind the non-default `azure` feature. The advisory
+    # asks for azure_core >= 0.22, which the 0.21 line cannot accept: `azure_storage` 0.21.0 pins
+    # `azure_core ^0.21` and is the LAST release of that line — the fix only exists in the 1.0 SDK
+    # rewrite (`azure_storage_blob`), which is AAD-only (no shared-key/SAS, cannot talk to Azurite),
+    # so taking it is an ADR-level change to the Azure backend, not a version bump. Tracked for the
+    # 1.0 migration with the other azure_core 0.21 entries above — issue #187.
+    #
+    # Exposure while this is ignored: the SDK emits that line at DEBUG, and Cairn's default filter is
+    # `warn` (see `crates/cairn/src/logging.rs`), so a default run never writes it. A user who sets
+    # `CAIRN_LOG=debug` on an `azure`-featured build WOULD get an Azure key/SAS token in stderr —
+    # Cairn does not yet install the redaction layer that LLD §9.5 specifies. Do not treat this
+    # ignore as "no exposure".
+    "RUSTSEC-2026-0275",
 ]
 
 [licenses]
