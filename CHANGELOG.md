@@ -219,6 +219,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Manifest values are now clamped to a host ceiling (`Limits::HOST_CEILING`, 4–6× the defaults), as
   is `[network].max_response_bytes`, which bounds what a guest can make the host buffer. A plugin
   may still declare *lower* limits than the ceiling.
+- **The vault no longer spends unbounded work on an unauthenticated header.** Argon2id's cost
+  parameters live in the vault file's cleartext header, and that header is only authenticated *as
+  associated data by the decryption the derived key feeds* — so opening a tampered vault acted on
+  attacker-controlled numbers before anything had been verified. argon2 imposes almost no ceiling of
+  its own (`MAX_T_COST` is `u32::MAX`), and `t_cost` allocates nothing, so there is no failing
+  allocation to stop it: four billion passes simply never return. Costs are now bounded (~50× the
+  recommended settings) before the derivation is attempted.
+
+- **A plugin can no longer be handed a credential the user did not grant it.** Plugins name a
+  credential by label, labels are not unique — nothing in `Vault::add` enforces it — and resolution
+  took the first match, so which secret a plugin received depended on vault ordering. An ambiguous
+  handle is now refused outright.
 
 
 

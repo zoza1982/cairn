@@ -74,6 +74,27 @@ impl KdfParams {
         }
     }
 
+    /// The most work a vault header may ask for before we refuse to attempt the derivation.
+    ///
+    /// The header is cleartext and is only authenticated *as AAD by the decryption that follows the
+    /// derivation* — so these numbers are read from an attacker-controllable file and acted on
+    /// before anything has been verified. Unbounded, `m_cost` alone is a pre-authentication
+    /// allocation of up to 4 TiB: opening a tampered vault would hang or be OOM-killed long before
+    /// it could report the tampering. The ceilings are ~50x the recommended settings, so a future
+    /// hardening of the defaults, or a vault written by a much beefier machine, still opens.
+    const MAX_M_COST: u32 = 1024 * 1024; // 1 GiB of KiB units
+    const MAX_T_COST: u32 = 64;
+    const MAX_P_COST: u32 = 16;
+
+    /// Whether these parameters are within what we are willing to spend on one unlock attempt.
+    #[must_use]
+    fn is_plausible(&self) -> bool {
+        // Lower bounds are argon2's own (`Params::new` rejects below them); we only add ceilings.
+        self.m_cost <= Self::MAX_M_COST
+            && self.t_cost <= Self::MAX_T_COST
+            && self.p_cost <= Self::MAX_P_COST
+    }
+
     /// Deliberately weak parameters for fast tests. Never use outside tests.
     #[must_use]
     pub fn fast_for_tests() -> Self {
@@ -337,6 +358,11 @@ fn derive_kek(
 ) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
     use argon2::{Algorithm, Argon2, Params, Version};
     use cairn_secrets::ExposeSecret;
+    // Refuse absurd work *before* allocating for it: these parameters come from the file's cleartext
+    // header, which is not authenticated until the decrypt that this derivation feeds.
+    if !params.is_plausible() {
+        return Err(VaultError::Kdf);
+    }
     let p = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(KEY_LEN))
         .map_err(|_| VaultError::Kdf)?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
@@ -482,6 +508,71 @@ mod tests {
     /// An SSH password credential, for tests.
     fn ssh_pw(s: &str) -> CredentialSecret {
         CredentialSecret::Ssh(SshCredential::Password(SecretString::from(s.to_owned())))
+    }
+
+    /// Regression: the KDF parameters live in the vault's **cleartext** header, and that header is
+    /// only authenticated as AAD by the decryption that the derived key feeds — so `open` acted on
+    /// attacker-controllable numbers before anything had been verified.
+    ///
+    /// argon2 itself imposes almost no ceiling (`MAX_M_COST` and `MAX_T_COST` are both `u32::MAX`),
+    /// so the dangerous value is `t_cost`: it allocates nothing, so there is no failing allocation
+    /// to save you — `u32::MAX` is four billion passes and simply never returns. A large `m_cost` is
+    /// milder in practice (a 4 TiB allocation is refused outright) but will happily thrash a machine
+    /// at, say, 8 GiB. Neither should be attempted on the say-so of an unauthenticated header.
+    #[test]
+    fn implausible_kdf_costs_are_rejected_before_they_are_spent() {
+        let sample = |m, t, p| KdfParams {
+            m_cost: m,
+            t_cost: t,
+            p_cost: p,
+            salt: [0u8; SALT_LEN],
+        };
+        // Values argon2 accepts and would faithfully attempt.
+        assert!(!sample(u32::MAX, 2, 1).is_plausible(), "4 TiB of memory");
+        assert!(
+            !sample(8 * 1024 * 1024, 2, 1).is_plausible(),
+            "8 GiB of memory"
+        );
+        assert!(!sample(19 * 1024, u32::MAX, 1).is_plausible(), "4e9 passes");
+        assert!(!sample(19 * 1024, 2, 0xFF_FFFF).is_plausible(), "16M lanes");
+    }
+
+    /// …and the bound is actually wired into `open`, not merely available: a header asking for more
+    /// work than we allow fails as `Kdf` rather than being attempted (which would reach the decrypt
+    /// and fail as `Decrypt` — the tampered header is AAD — after doing the work first).
+    #[test]
+    fn open_refuses_a_header_whose_cost_exceeds_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.cvlt");
+        Vault::create_with_params(&path, &pass("hunter2"), KdfParams::fast_for_tests())
+            .unwrap()
+            .save()
+            .unwrap();
+
+        // t_cost = 200: above our ceiling of 64, but deliberately small enough that this test stays
+        // fast even when the guard is removed — what it asserts is *which* error comes back.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[14..18].copy_from_slice(&200u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            Vault::open(&path, &pass("hunter2")),
+            Err(VaultError::Kdf)
+        ));
+    }
+
+    /// The ceilings must not reject a vault written with the recommended settings, nor one written
+    /// by a machine tuned considerably higher.
+    #[test]
+    fn plausible_kdf_costs_are_accepted() {
+        assert!(KdfParams::recommended().is_plausible());
+        assert!(KdfParams::fast_for_tests().is_plausible());
+        let beefy = KdfParams {
+            m_cost: 512 * 1024, // 512 MiB — 27x the recommendation
+            t_cost: 10,
+            p_cost: 8,
+            salt: [0u8; SALT_LEN],
+        };
+        assert!(beefy.is_plausible());
     }
 
     #[test]
