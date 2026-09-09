@@ -167,6 +167,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error — then removed what was left, leaving neither the old file nor the new one. Writes now go to
   a hidden `.<name>.cairn-….part` sibling and are renamed onto the target on completion, which also
   makes the replacement atomic: a reader sees the old file or the new one, never a half-written one.
+- **Moving a folder out of an S3/GCS/Azure pane no longer reports success while leaving everything
+  in the bucket.** A "directory" in an object store is a prefix, not an object, and `remove` deleted
+  a single key and ignored `Recurse` — deleting a key that does not exist is success for every
+  provider, so the removal was a silent no-op. The transfer engine takes that as proof a Move's
+  source is gone, so the UI said "Moved N files" with every object still in place. `remove` now
+  resolves the path: an object is deleted by key, a prefix is listed flat and deleted, a
+  non-recursive remove refuses a non-empty prefix, and a path that is neither is `NotFound`.
 
 
 ### Security
