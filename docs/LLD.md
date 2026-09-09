@@ -592,6 +592,13 @@ Decisions:
 - **Concurrency**: global + per-backend semaphores; reorderable queue; retryable `VfsError`s retried
   with exponential backoff + jitter, cancel/pause honored during backoff.
 - **Progress** is coalesced (100 ms window, EMA rate) before hitting the UI event channel.
+- **Progress is only ever bytes that landed.** `WriteSink::commit_mode()` tells the engine whether a
+  sink streams (`Streamed`: SFTP, local, plugin) or stages bytes and transfers them in `finish()`
+  (`Buffered`: the object stores' single-shot PUT until multipart lands, §8.3). A buffered file is
+  reported as staged → `Uploading` → one catch-up `Bytes` after `finish()` + verify, and the TUI
+  renders those phases as the committed percentage plus a marquee in the remainder with an
+  "N buffered · Buffering…/Uploading…" label — never a bar already at 100%. The engine heartbeats through any `finish()` so the marquee
+  moves. See RFC-0002 "Honest progress vs. buffering sinks".
 
 ---
 

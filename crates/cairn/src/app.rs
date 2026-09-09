@@ -17,9 +17,9 @@ use cairn_backend_local::LocalVfs;
 use cairn_broker::{Actor, Broker};
 use cairn_config::Config;
 use cairn_core::{
-    initial_effects, update, Action, AppEffect, AppEvent, AppState, ChoiceStatus, ConnectionChoice,
-    ContentHash, LogViewerId, Msg, Overlay, PagerId, RemoteEditId, RemoteVersion, ShellActionMeta,
-    Side, TransferId, WriteBackMode, REMOTE_EDIT_MAX_BYTES,
+    initial_effects, update, Action, AppEffect, AppEvent, AppState, BufferedStage, ChoiceStatus,
+    ConnectionChoice, ContentHash, LogViewerId, Msg, Overlay, PagerId, RemoteEditId, RemoteVersion,
+    ShellActionMeta, Side, TransferId, WriteBackMode, REMOTE_EDIT_MAX_BYTES,
 };
 use cairn_transfer::{ConflictPolicy, TransferOp, TransferSpec, VerifyPolicy};
 use cairn_tui::{text_edit_for, Keymap, Theme};
@@ -2825,6 +2825,51 @@ fn windowed_rate(samples: &mut VecDeque<(u64, u64)>, now_ms: u64, bytes: u64) ->
     avg_rate(bytes.saturating_sub(b0), secs)
 }
 
+/// The non-byte phase the current file is in: the engine's `Finalizing` (a streamed file's
+/// flush/CLOSE), or a buffered file's `Staging(n)` (being read into memory, `n` so far) /
+/// `Uploading(n)` (its real transfer). Remembered so an engine heartbeat can re-signal it — the
+/// reducer bumps its animation clock per delivered event, and these phases emit no bytes of their
+/// own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferTail {
+    Finalizing,
+    Staging(u64),
+    Uploading(u64),
+}
+
+/// The UI event for a tail phase. Pure so the mapping is unit-testable: `Finalizing` keeps the last
+/// windowed rate (the bar shows 100%, the rate is still meaningful history); the buffered stages
+/// report no rate — their bytes moved at memcpy speed and the reducer hides the rate for them anyway.
+fn tail_event(
+    tail: TransferTail,
+    id: TransferId,
+    bytes: u64,
+    last_rate: u64,
+    total: Option<u64>,
+) -> AppEvent {
+    let (finalizing, buffered, rate_bps) = match tail {
+        TransferTail::Finalizing => (true, None, last_rate),
+        TransferTail::Staging(n) => (false, Some(BufferedStage::Staging(n)), 0),
+        TransferTail::Uploading(n) => (false, Some(BufferedStage::Uploading(n)), 0),
+    };
+    AppEvent::TransferProgress {
+        id,
+        bytes,
+        rate_bps,
+        total,
+        finalizing,
+        buffered,
+    }
+}
+
+/// Throughput to report for a buffered file that just landed as one `Bytes(n)` jump: `n` over the
+/// file's whole wall time (staging *and* upload — what the user experiences as "how fast is this
+/// going"), not the sliding window, which would read the instantaneous jump as a spike or, after a
+/// long upload, as nothing at all.
+fn buffered_file_rate(staged: u64, file_ms: u64) -> u64 {
+    avg_rate(staged, file_ms as f64 / 1000.0)
+}
+
 /// Recursively sum the byte size of `items` for the percentage/ETA total. `on_scan(bytes_so_far,
 /// current_path)` is called for each node visited so the caller can surface a live "Counting" phase
 /// (it throttles its own emission). Best-effort: any stat/list error returns `None` (degrades to a
@@ -3015,37 +3060,107 @@ async fn run_transfer_effect(
     // `TRANSFER_PROGRESS_STEP` bytes. Without this a copy whose *total* is under one step (many tiny
     // files, or a slow trickle) sits at "0 B / … (0%)" until it completes.
     let mut last_sent_ms = 0u64;
+    // The tail phase the current file is in (see `TransferTail`); for a buffered file, how much is
+    // staged so far and when its staging began (the rate it lands with is over the whole file).
+    let mut tail: Option<TransferTail> = None;
+    let mut staged_so_far = 0u64;
+    let mut buffered_started_ms: Option<u64> = None;
     let mut on_progress = {
         let last_rate = last_rate.clone();
         move |ev: cairn_transfer::ProgressEvent| {
-            // `Finalizing` marks the flush/verify tail of a file — no bytes, but it must reach the UI
-            // immediately (unthrottled, once per file) so the bar reads an honest 100% + "Finalizing…"
-            // instead of appearing stuck; it never shares the byte throttle counter.
-            if matches!(ev, cairn_transfer::ProgressEvent::Finalizing) {
-                let _ = event_tx.try_send(AppEvent::TransferProgress {
-                    id,
-                    bytes,
-                    rate_bps: last_rate.load(Ordering::Relaxed),
-                    total,
-                    finalizing: true,
-                });
-                return;
-            }
-            let cairn_transfer::ProgressEvent::Bytes(b) = ev else {
-                return;
+            use cairn_transfer::ProgressEvent as Ev;
+            let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let b = match ev {
+                // The tail phases carry no bytes but must reach the UI immediately (unthrottled, once
+                // per file) so the bar reads an honest "Finalizing…" / "Uploading…" instead of appearing
+                // stuck; they never share the byte throttle counter.
+                Ev::Finalizing => {
+                    tail = Some(TransferTail::Finalizing);
+                    let ev = tail_event(
+                        TransferTail::Finalizing,
+                        id,
+                        bytes,
+                        last_rate.load(Ordering::Relaxed),
+                        total,
+                    );
+                    let _ = event_tx.try_send(ev);
+                    return;
+                }
+                Ev::Uploading(staged) => {
+                    tail = Some(TransferTail::Uploading(staged));
+                    staged_so_far = 0;
+                    buffered_started_ms.get_or_insert(now_ms);
+                    let _ = event_tx.try_send(tail_event(
+                        TransferTail::Uploading(staged),
+                        id,
+                        bytes,
+                        0,
+                        total,
+                    ));
+                    return;
+                }
+                // A heartbeat only re-signals the tail we are already in (a delivered event is what
+                // advances the reducer's marquee clock); outside a tail it means nothing.
+                Ev::Heartbeat => {
+                    if let Some(t) = tail {
+                        let _ = event_tx.try_send(tail_event(
+                            t,
+                            id,
+                            bytes,
+                            last_rate.load(Ordering::Relaxed),
+                            total,
+                        ));
+                    }
+                    return;
+                }
+                // Staged bytes sit in a buffering sink's memory: not transferred, not throughput —
+                // but the UI must still see the file being read (the staging of a big file is its
+                // whole source read; dropping these left the dialog frozen in "Scanning…"). Time-
+                // throttled like byte ticks, shown as a growing "N buffered".
+                Ev::Staged(n) => {
+                    staged_so_far += n;
+                    buffered_started_ms.get_or_insert(now_ms);
+                    tail = Some(TransferTail::Staging(staged_so_far));
+                    if now_ms.saturating_sub(last_sent_ms) >= TRANSFER_UI_MIN_INTERVAL_MS {
+                        last_sent_ms = now_ms;
+                        let _ = event_tx.try_send(tail_event(
+                            TransferTail::Staging(staged_so_far),
+                            id,
+                            bytes,
+                            0,
+                            total,
+                        ));
+                    }
+                    return;
+                }
+                Ev::Bytes(b) => b,
             };
+            let was_upload = matches!(tail, Some(TransferTail::Uploading(_)));
+            tail = None;
             bytes += b;
             debug_assert!(bytes >= last_sent, "progress bytes must be cumulative");
             // Update the window on *every* progress call (cheap, amortized O(1)) so `last_rate` is
             // always current — including for a transfer that completes in a single sub-step callback
             // (e.g. the same-connection server-copy fast path), which the final flush relies on.
             // Only the UI *event* is throttled to every `TRANSFER_PROGRESS_STEP` bytes.
-            let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let rate = windowed_rate(&mut rate_samples, now_ms, bytes);
+            //
+            // A buffered file lands as one jump after its upload: measure it over the upload's own
+            // wall time and restart the window from here, so neither this file nor the next one reads
+            // the jump as a spike (or, after a long upload, as a stall).
+            let rate = if was_upload {
+                let file_ms = now_ms.saturating_sub(buffered_started_ms.take().unwrap_or(now_ms));
+                rate_samples.clear();
+                rate_samples.push_back((now_ms, bytes));
+                buffered_file_rate(b, file_ms)
+            } else {
+                windowed_rate(&mut rate_samples, now_ms, bytes)
+            };
             last_rate.store(rate, Ordering::Relaxed);
             // Emit on either enough bytes *or* enough elapsed time, so both a fast big-file copy
-            // (byte-driven) and a slow/many-small-file copy (time-driven) tick smoothly.
-            if progress_emit_due(bytes, last_sent, now_ms, last_sent_ms) {
+            // (byte-driven) and a slow/many-small-file copy (time-driven) tick smoothly. The catch-up
+            // after an upload is never throttled: it is the event that takes the UI *out* of
+            // `Uploading`, and a small file's jump would otherwise fall under both thresholds.
+            if was_upload || progress_emit_due(bytes, last_sent, now_ms, last_sent_ms) {
                 last_sent = bytes;
                 last_sent_ms = now_ms;
                 let _ = event_tx.try_send(AppEvent::TransferProgress {
@@ -3054,6 +3169,7 @@ async fn run_transfer_effect(
                     rate_bps: rate,
                     total,
                     finalizing: false,
+                    buffered: None,
                 });
             }
         }
@@ -3072,6 +3188,7 @@ async fn run_transfer_effect(
                 rate_bps: last_rate.load(Ordering::Relaxed),
                 total,
                 finalizing: false,
+                buffered: None,
             });
             AppEvent::TransferDone {
                 id,
@@ -5697,6 +5814,129 @@ mod tests {
             saw_finalizing,
             "expected a finalizing TransferProgress before completion"
         );
+    }
+
+    /// A buffering destination (object-store shape): the runner must never report a staged byte as
+    /// transferred. Expect `uploading: Some(size)` while its `finish` runs, then one catch-up event
+    /// with `bytes == size` — and no byte progress before it.
+    #[tokio::test]
+    async fn buffered_destination_reports_uploading_then_one_catch_up() {
+        let dir = tempfile_dir();
+        std::fs::write(dir.path().join("src.bin"), vec![1u8; 300_000]).unwrap();
+        let registry = VfsRegistry::new();
+        registry
+            .insert(LEFT, Arc::new(LocalVfs::new(LEFT, dir.path())))
+            .await;
+        registry
+            .insert(
+                RIGHT,
+                Arc::new(cairn_vfs::mock::MockVfs::new(RIGHT).with_buffered_writes()),
+            )
+            .await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let ev = run_transfer_effect(
+            &registry,
+            1,
+            LEFT,
+            RIGHT,
+            vec![(
+                VfsPath::parse("/src.bin").unwrap(),
+                VfsPath::parse("/dst.bin").unwrap(),
+            )],
+            false,
+            true,
+            &tx,
+            CancellationToken::new(),
+            watch::channel(false).1,
+        )
+        .await;
+        assert!(matches!(ev, AppEvent::TransferDone { error: false, .. }));
+
+        let mut progress = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let AppEvent::TransferProgress {
+                bytes,
+                buffered,
+                finalizing,
+                ..
+            } = msg
+            {
+                progress.push((bytes, buffered, finalizing));
+            }
+        }
+        let first_upload = progress
+            .iter()
+            .position(|(_, b, _)| matches!(b, Some(BufferedStage::Uploading(_))))
+            .expect("an `Uploading` event for the buffered file");
+        assert!(
+            progress[..first_upload]
+                .iter()
+                .all(|(b, s, _)| *b == 0 && matches!(s, Some(BufferedStage::Staging(_)))),
+            "before the upload only zero-byte staging ticks may appear: {progress:?}"
+        );
+        assert_eq!(
+            progress[first_upload],
+            (0, Some(BufferedStage::Uploading(300_000)), false)
+        );
+        assert!(
+            progress.iter().all(|(_, _, f)| !f),
+            "a buffered sink never finalizes: {progress:?}"
+        );
+        // After the upload every event carries the full size and no buffered stage.
+        let after = &progress[first_upload + 1..];
+        assert!(!after.is_empty(), "expected the catch-up event");
+        assert!(
+            after.iter().all(|(b, s, _)| *b == 300_000 && s.is_none()),
+            "{progress:?}"
+        );
+    }
+
+    #[test]
+    fn tail_event_maps_finalizing_staging_and_uploading() {
+        let fin = tail_event(TransferTail::Finalizing, 7, 500, 1234, Some(500));
+        assert!(matches!(
+            fin,
+            AppEvent::TransferProgress {
+                id: 7,
+                bytes: 500,
+                rate_bps: 1234,
+                total: Some(500),
+                finalizing: true,
+                buffered: None,
+            }
+        ));
+        // The buffered stages carry the staged count and never a rate — memcpy speed.
+        let up = tail_event(TransferTail::Uploading(4096), 7, 100, 1234, None);
+        assert!(matches!(
+            up,
+            AppEvent::TransferProgress {
+                id: 7,
+                bytes: 100,
+                rate_bps: 0,
+                total: None,
+                finalizing: false,
+                buffered: Some(BufferedStage::Uploading(4096)),
+            }
+        ));
+        let st = tail_event(TransferTail::Staging(512), 7, 100, 1234, None);
+        assert!(matches!(
+            st,
+            AppEvent::TransferProgress {
+                rate_bps: 0,
+                finalizing: false,
+                buffered: Some(BufferedStage::Staging(512)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn buffered_file_rate_is_measured_over_the_file_not_the_window() {
+        // 8 MiB landing 4 s after staging began is 2 MiB/s — not the instantaneous jump a sliding
+        // window would read as an absurd spike.
+        assert_eq!(buffered_file_rate(8 << 20, 4_000), 2 << 20);
+        // A sub-50 ms file is floored like every other rate (no one-frame spike).
+        assert_eq!(buffered_file_rate(1_000, 1), avg_rate(1_000, 0.001));
     }
 
     #[tokio::test]

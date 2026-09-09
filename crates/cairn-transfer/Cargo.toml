@@ -18,9 +18,11 @@ cairn-vfs = { workspace = true }
 bytes = "1"
 futures = "0.3"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "sync", "macros"] }
+# `time` is for the heartbeat the engine emits while awaiting an opaque `finish()` (see
+# `await_with_heartbeat`), so the UI's marquee keeps moving through a long fsync/upload.
+tokio = { version = "1", features = ["io-util", "sync", "macros", "time"] }
 tokio-util = "0.7"
 
 [dev-dependencies]
 cairn-vfs = { workspace = true, features = ["test-utils"] }
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time", "test-util"] }

@@ -1,6 +1,6 @@
 //! The pure reducer: `update(&mut AppState, Msg) -> Vec<AppEffect>`. No I/O, no `.await`.
 
-use crate::msg::{Action, AppEffect, AppEvent, Msg, TextEdit, WriteBackMode};
+use crate::msg::{Action, AppEffect, AppEvent, BufferedStage, Msg, TextEdit, WriteBackMode};
 use crate::state::{
     next_theme, ActiveTransfer, AppState, ChoiceProvenance, ChoiceStatus, ConnectionFormStage,
     ConnectionKind, FieldValue, FileKind, Listing, LogViewerStatus, MaskedInput, MountFrame,
@@ -3213,6 +3213,7 @@ fn arm_transfer(
         scan_entries: 0,
         scan_path: String::new(),
         bytes: 0,
+        staged: 0,
         rate: None,
         total: None,
         paused: false,
@@ -3245,6 +3246,7 @@ fn arm_delete(state: &mut AppState, count: usize) -> TransferId {
         scan_entries: 0,
         scan_path: String::new(),
         bytes: 0,
+        staged: 0,
         rate: None,
         total: None,
         paused: false,
@@ -3891,6 +3893,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             rate_bps,
             total,
             finalizing,
+            buffered,
         } => {
             // Advisory display only; ignore an update for a transfer that already finished. The first
             // byte/finalize update is also how a transfer *leaves* the Counting phase.
@@ -3902,14 +3905,32 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                 // phase — otherwise every file would snap the bar to 100%. Such a transfer stays in
                 // Copying (indeterminate, animated) until it actually completes via `TransferDone`.
                 let whole_transfer_done = total.is_some_and(|tot| bytes >= tot);
-                t.phase = if finalizing && whole_transfer_done {
-                    TransferPhase::Finalizing
-                } else {
-                    TransferPhase::Copying
-                };
+                // A buffering backend's file wins outright: `bytes` will not move until it lands, so
+                // the bar must not claim otherwise regardless of total, and the rate (memcpy speed)
+                // is hidden rather than shown.
+                match buffered {
+                    Some(BufferedStage::Staging(staged)) => {
+                        t.phase = TransferPhase::Buffering;
+                        t.staged = staged;
+                        t.rate = None;
+                    }
+                    Some(BufferedStage::Uploading(staged)) => {
+                        t.phase = TransferPhase::Uploading;
+                        t.staged = staged;
+                        t.rate = None;
+                    }
+                    None => {
+                        t.phase = if finalizing && whole_transfer_done {
+                            TransferPhase::Finalizing
+                        } else {
+                            TransferPhase::Copying
+                        };
+                        t.staged = 0;
+                        t.rate = Some(rate_bps);
+                    }
+                }
                 t.scan_path = String::new();
                 t.bytes = bytes;
-                t.rate = Some(rate_bps);
                 t.total = total;
                 // Keep the animation clock ticking; a copy with an unknown total (e.g. same-server
                 // move, or a bounded/skipped pre-scan) renders indeterminate and must still move.
@@ -5214,6 +5235,7 @@ mod tests {
                 rate_bps: 2048,
                 total: None,
                 finalizing: false,
+                buffered: None,
             }),
         );
         assert_eq!(t_bytes(&s), Some(4096));
@@ -5263,6 +5285,7 @@ mod tests {
                 rate_bps: 512,
                 total: Some(4096),
                 finalizing: false,
+                buffered: None,
             }),
         );
         assert_eq!(s.active_transfers[0].phase, TransferPhase::Copying);
@@ -5280,6 +5303,7 @@ mod tests {
                 rate_bps: 512,
                 total: Some(4096),
                 finalizing: true,
+                buffered: None,
             }),
         );
         assert_eq!(
@@ -5297,6 +5321,7 @@ mod tests {
                 rate_bps: 512,
                 total: Some(4096),
                 finalizing: true,
+                buffered: None,
             }),
         );
         assert_eq!(s.active_transfers[0].phase, TransferPhase::Finalizing);
@@ -5321,6 +5346,7 @@ mod tests {
                     rate_bps: 512,
                     total: None,      // unknown total
                     finalizing: true, // a per-file finalize
+                    buffered: None,
                 }),
             );
             assert_eq!(
@@ -5329,6 +5355,121 @@ mod tests {
                 "an unknown-total finalize must stay Copying, not flash Finalizing/100%"
             );
         }
+    }
+
+    /// A buffering backend's file in flight: `uploading: Some(n)` flips the transfer to `Uploading`,
+    /// records the staged count, hides the rate (memcpy speed), and leaves `bytes` where it was —
+    /// regardless of whether the total is known. The catch-up `Bytes` afterwards returns it to
+    /// `Copying` with the jump applied, and the marquee clock ticks on every delivered event
+    /// (heartbeats re-send the same `uploading` event) except while paused.
+    #[test]
+    fn uploading_phase_tracks_staged_hides_rate_and_pulses_on_heartbeats() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let id = s.active_transfers[0].id;
+        let uploading = |bytes| {
+            Msg::Event(AppEvent::TransferProgress {
+                id,
+                bytes,
+                rate_bps: 0,
+                total: Some(10_000),
+                finalizing: false,
+                buffered: Some(BufferedStage::Uploading(4_000)),
+            })
+        };
+        let _ = update(&mut s, uploading(0));
+        let t = &s.active_transfers[0];
+        assert_eq!(t.phase, TransferPhase::Uploading);
+        assert_eq!(t.staged, 4_000);
+        assert_eq!(t.bytes, 0);
+        assert_eq!(
+            t.rate, None,
+            "a buffered file's rate is memcpy speed — hidden"
+        );
+        let p0 = t.pulse;
+
+        // Heartbeats: identical events, but the clock must advance…
+        let _ = update(&mut s, uploading(0));
+        let _ = update(&mut s, uploading(0));
+        assert_eq!(s.active_transfers[0].pulse, p0 + 2);
+        // …except while paused.
+        s.active_transfers[0].paused = true;
+        let _ = update(&mut s, uploading(0));
+        assert_eq!(s.active_transfers[0].pulse, p0 + 2);
+        s.active_transfers[0].paused = false;
+
+        // The upload lands: one jump, back to Copying, staged cleared, rate shown again.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress {
+                id,
+                bytes: 4_000,
+                rate_bps: 800,
+                total: Some(10_000),
+                finalizing: false,
+                buffered: None,
+            }),
+        );
+        let t = &s.active_transfers[0];
+        assert_eq!(t.phase, TransferPhase::Copying);
+        assert_eq!(t.bytes, 4_000);
+        assert_eq!(t.staged, 0);
+        assert_eq!(t.rate, Some(800));
+    }
+
+    /// Per-file staircase for a multi-file tree onto a buffering backend: `bytes` is flat while a file
+    /// stages and uploads, jumps when it lands, and the last file's completion — not any per-file
+    /// event — is what reaches 100%. `uploading` beats `finalizing` if both were ever set.
+    #[test]
+    fn uploading_staircase_over_a_multi_file_tree() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("d", EntryKind::Dir)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let id = s.active_transfers[0].id;
+        let ev = |bytes, uploading| {
+            Msg::Event(AppEvent::TransferProgress {
+                id,
+                bytes,
+                rate_bps: 100,
+                total: Some(300),
+                finalizing: false,
+                buffered: uploading,
+            })
+        };
+        let mut landed = 0;
+        for file in [100u64, 100, 100] {
+            // Staging ticks first (the source read), then the upload announcement.
+            let _ = update(&mut s, ev(landed, Some(BufferedStage::Staging(file / 2))));
+            assert_eq!(s.active_transfers[0].phase, TransferPhase::Buffering);
+            assert_eq!(s.active_transfers[0].staged, file / 2);
+            assert_eq!(s.active_transfers[0].rate, None);
+            let _ = update(&mut s, ev(landed, Some(BufferedStage::Uploading(file))));
+            assert_eq!(s.active_transfers[0].phase, TransferPhase::Uploading);
+            assert_eq!(s.active_transfers[0].bytes, landed, "flat while uploading");
+            landed += file;
+            let _ = update(&mut s, ev(landed, None));
+            assert_eq!(s.active_transfers[0].phase, TransferPhase::Copying);
+            assert_eq!(
+                s.active_transfers[0].bytes, landed,
+                "jumps when the file lands"
+            );
+        }
+        assert_eq!(s.active_transfers[0].bytes, 300);
+
+        // `uploading` wins even with `finalizing: true` and bytes >= total.
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::TransferProgress {
+                id,
+                bytes: 300,
+                rate_bps: 0,
+                total: Some(300),
+                finalizing: true,
+                buffered: Some(BufferedStage::Uploading(50)),
+            }),
+        );
+        assert_eq!(s.active_transfers[0].phase, TransferPhase::Uploading);
     }
 
     #[test]
@@ -5403,6 +5544,7 @@ mod tests {
                 rate_bps: 0,
                 total: None,
                 finalizing: false,
+                buffered: None,
             }),
         );
         assert_eq!(t_bytes(&s), None);
@@ -5432,6 +5574,7 @@ mod tests {
                 rate_bps: 0,
                 total: None,
                 finalizing: false,
+                buffered: None,
             }),
         );
         assert_eq!(t_bytes(&s), Some(8192));
@@ -5532,6 +5675,7 @@ mod tests {
                 rate_bps: 1024,
                 total: None,
                 finalizing: false,
+                buffered: None,
             }),
         );
         assert_eq!(s.active_transfers[0].bytes, 0, "id 1 untouched");

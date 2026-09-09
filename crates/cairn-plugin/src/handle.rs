@@ -14,7 +14,7 @@ use crate::component::WitVfsError;
 use crate::PluginError;
 use bytes::Bytes;
 use cairn_types::Entry;
-use cairn_vfs::{VfsError, WriteSink};
+use cairn_vfs::{CommitMode, VfsError, WriteSink};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -177,6 +177,12 @@ impl PluginWriteHandle {
 
 #[async_trait::async_trait]
 impl WriteSink for PluginWriteHandle {
+    fn commit_mode(&self) -> CommitMode {
+        // Each chunk round-trips to the guest and awaits its reply before returning; the host holds
+        // nothing back. Whether the *guest* then buffers is its own contract with its backend.
+        CommitMode::Streamed
+    }
+
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), VfsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx

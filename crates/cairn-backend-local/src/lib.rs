@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, SpaceInfo, UnixPerms, VfsPath};
 use cairn_vfs::{
-    ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs, VfsError,
-    WriteHandle, WriteOpts, WriteSink,
+    ByteRange, CapabilityProvider, CommitMode, ListOpts, ListPage, ReadHandle, Recurse, Vfs,
+    VfsError, WriteHandle, WriteOpts, WriteSink,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use std::path::{Path, PathBuf};
@@ -322,6 +322,12 @@ struct LocalWriteSink {
 
 #[async_trait]
 impl WriteSink for LocalWriteSink {
+    fn commit_mode(&self) -> CommitMode {
+        // `write_all` hands the bytes to the kernel (page cache) with the OS's own backpressure;
+        // `finish` only fsyncs. Counting them as transferred is what every local tool does.
+        CommitMode::Streamed
+    }
+
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), VfsError> {
         self.file
             .write_all(&chunk)

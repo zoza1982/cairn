@@ -3,7 +3,7 @@
 
 use crate::action::{ActionCtx, ActionId, ActionOutcome};
 use crate::error::VfsError;
-use crate::handle::{ReadHandle, WriteHandle, WriteSink};
+use crate::handle::{CommitMode, ReadHandle, WriteHandle, WriteSink};
 use crate::vfs::{ByteRange, CapabilityProvider, ListOpts, ListPage, Recurse, Vfs, WriteOpts};
 use bytes::Bytes;
 use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, VfsPath};
@@ -32,6 +32,14 @@ pub struct MockVfs {
     write_fault: Option<String>,
     /// Paths whose write sink was `abort`ed, in order — the observable side of an error path.
     aborted: Arc<Mutex<Vec<String>>>,
+    /// Fault injection: run this when a reader of `path` reports EOF — i.e. *during* the final
+    /// `read()` that returns 0, the one await point a caller cannot observe from between chunks.
+    on_eof: Option<(String, Arc<dyn Fn() + Send + Sync>)>,
+    /// What the write sinks declare (default `Streamed`); `Buffered` models an object store.
+    commit_mode: CommitMode,
+    /// Artificial delay inside `finish`, so a test can observe what a caller does while a slow
+    /// commit (a big single-shot upload, a remote fsync) is in flight.
+    finish_delay: Option<std::time::Duration>,
 }
 
 impl MockVfs {
@@ -46,7 +54,34 @@ impl MockVfs {
             read_fault: None,
             write_fault: None,
             aborted: Arc::new(Mutex::new(Vec::new())),
+            on_eof: None,
+            commit_mode: CommitMode::Streamed,
+            finish_delay: None,
         }
+    }
+
+    /// Builder: run `f` when a reader of `path` reports EOF — i.e. *during* the final `read()` that
+    /// returns 0, the one await point a caller cannot observe from between chunks.
+    #[must_use]
+    pub fn with_on_eof(mut self, path: &str, f: impl Fn() + Send + Sync + 'static) -> Self {
+        let p = VfsPath::parse(path).expect("valid test path");
+        self.on_eof = Some((p.as_str(), Arc::new(f)));
+        self
+    }
+
+    /// Builder: make write sinks declare [`CommitMode::Buffered`] (the object-store shape: chunks
+    /// are staged and the real transfer happens in `finish`).
+    #[must_use]
+    pub fn with_buffered_writes(mut self) -> Self {
+        self.commit_mode = CommitMode::Buffered;
+        self
+    }
+
+    /// Builder: make every write sink's `finish` sleep for `delay` before committing.
+    #[must_use]
+    pub fn with_finish_delay(mut self, delay: std::time::Duration) -> Self {
+        self.finish_delay = Some(delay);
+        self
     }
 
     /// Builder: make reads of `path` fail with an I/O error after yielding `after` bytes.
@@ -218,6 +253,13 @@ impl Vfs for MockVfs {
             }
             _ => Box::new(std::io::Cursor::new(sliced)),
         };
+        let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> = match &self.on_eof {
+            Some((hook_path, hook)) if *hook_path == path.as_str() => Box::new(EofHook {
+                inner: reader,
+                hook: hook.clone(),
+            }),
+            _ => reader,
+        };
         Ok(ReadHandle::new(reader, Some(total)))
     }
 
@@ -228,6 +270,8 @@ impl Vfs for MockVfs {
             buf: Vec::new(),
             nodes: self.nodes.clone(),
             aborted: self.aborted.clone(),
+            commit_mode: self.commit_mode,
+            finish_delay: self.finish_delay,
         })))
     }
 
@@ -272,6 +316,27 @@ impl Vfs for MockVfs {
     }
 }
 
+/// A reader that runs a hook the moment the inner reader reports EOF (a poll that fills 0 bytes).
+struct EofHook {
+    inner: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    hook: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl tokio::io::AsyncRead for EofHook {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before {
+            (self.hook)();
+        }
+        poll
+    }
+}
+
 /// A reader that fails on its first poll — the tail of an injected mid-stream read fault.
 struct FailingReader;
 
@@ -292,10 +357,16 @@ struct MockWriteSink {
     nodes: Tree,
     fail_writes: bool,
     aborted: Arc<Mutex<Vec<String>>>,
+    commit_mode: CommitMode,
+    finish_delay: Option<std::time::Duration>,
 }
 
 #[async_trait::async_trait]
 impl WriteSink for MockWriteSink {
+    fn commit_mode(&self) -> CommitMode {
+        self.commit_mode
+    }
+
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), VfsError> {
         if self.fail_writes {
             return Err(VfsError::Io(std::io::Error::other("injected write fault")));
@@ -305,6 +376,9 @@ impl WriteSink for MockWriteSink {
     }
 
     async fn finish(self: Box<Self>) -> Result<Entry, VfsError> {
+        if let Some(d) = self.finish_delay {
+            tokio::time::sleep(d).await;
+        }
         let len = self.buf.len() as u64;
         self.nodes
             .lock()
