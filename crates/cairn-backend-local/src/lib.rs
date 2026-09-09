@@ -205,16 +205,26 @@ impl Vfs for LocalVfs {
 
     async fn open_write(&self, path: &VfsPath, opts: WriteOpts) -> Result<WriteHandle, VfsError> {
         let full = self.resolve(path);
+        // Refuse an existing destination up front when the caller asked us to; below we write to a
+        // temp, so `create_new` on the real path can no longer do it for us.
+        if !opts.overwrite && tokio::fs::symlink_metadata(&full).await.is_ok() {
+            return Err(VfsError::AlreadyExists(path.clone()));
+        }
+        // Write to a hidden sibling and rename onto the target in `finish`. Opening the target with
+        // `truncate` destroyed the user's existing file the moment the copy *started*, so cancelling
+        // it — or any mid-copy error, both of which abort the sink — left them with neither the old
+        // file nor the new one. The temp also makes the replacement atomic: a reader sees the old
+        // file or the new one, never a half-written one. (Same shape as the SFTP backend.)
+        let temp = temp_sibling(&full, path)?;
         let file = tokio::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .create_new(!opts.overwrite)
-            .truncate(opts.overwrite)
-            .open(&full)
+            .create_new(true)
+            .open(&temp)
             .await
             .map_err(|e| map_io(e, path))?;
         Ok(WriteHandle::new(Box::new(LocalWriteSink {
             file,
+            temp,
             full,
             path: path.clone(),
             written: 0,
@@ -312,12 +322,38 @@ async fn read_dir_page(base: &Path, dir: &VfsPath, all: bool) -> Result<ListPage
 }
 
 /// A [`WriteSink`] that writes directly to a local file, syncing on `finish` and removing the
-/// partial file on `abort`.
+/// hidden sibling and renamed onto the target by `finish`, so the destination is replaced atomically
+/// and an aborted write leaves the existing file untouched.
 struct LocalWriteSink {
     file: tokio::fs::File,
+    /// Where the bytes actually go until `finish` commits them.
+    temp: PathBuf,
+    /// The real destination.
     full: PathBuf,
     path: VfsPath,
     written: u64,
+}
+
+/// The hidden sibling a write goes to before being renamed onto `full`. Unique per process and per
+/// open, so concurrent writes to one target — or a temp left by a killed run — cannot collide.
+fn temp_sibling(full: &Path, path: &VfsPath) -> Result<PathBuf, VfsError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = full
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_owned();
+    let parent = full.parent().ok_or_else(|| VfsError::Backend {
+        code: "local".to_owned(),
+        msg: format!("{path} has no parent directory"),
+        retryable: false,
+    })?;
+    Ok(parent.join(format!(
+        ".{name}.cairn-{}-{}.part",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )))
 }
 
 #[async_trait]
@@ -338,19 +374,26 @@ impl WriteSink for LocalWriteSink {
     }
 
     async fn finish(mut self: Box<Self>) -> Result<Entry, VfsError> {
-        self.file.flush().await.map_err(|e| map_io(e, &self.path))?;
-        self.file
-            .sync_all()
-            .await
-            .map_err(|e| map_io(e, &self.path))?;
+        // On any failure here the temp is removed: once `finish` has returned an error the handle is
+        // gone and nobody else can clean up. The destination is only touched by the final rename.
+        if let Err(e) = self.file.flush().await.and(self.file.sync_all().await) {
+            let _ = tokio::fs::remove_file(&self.temp).await;
+            return Err(map_io(e, &self.path));
+        }
+        drop(self.file);
+        if let Err(e) = tokio::fs::rename(&self.temp, &self.full).await {
+            let _ = tokio::fs::remove_file(&self.temp).await;
+            return Err(map_io(e, &self.path));
+        }
         let mut entry = Entry::new(self.path.file_name().unwrap_or(""), EntryKind::File);
         entry.size = Some(self.written);
         Ok(entry)
     }
 
     async fn abort(self: Box<Self>) {
+        // Removes the temp; the destination was never opened, so an existing file survives intact.
         drop(self.file);
-        let _ = tokio::fs::remove_file(&self.full).await;
+        let _ = tokio::fs::remove_file(&self.temp).await;
     }
 }
 
@@ -367,6 +410,96 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vfs = LocalVfs::new(ConnectionId(1), dir.path());
         (dir, vfs)
+    }
+
+    /// Regression: an overwriting write opened the destination with `truncate`, so the user's
+    /// existing file was destroyed the moment the copy *started* — and `abort` (which the transfer
+    /// engine calls on cancel and on any mid-copy error) then removed what was left. Pressing `Esc`
+    /// during a copy over an existing file left neither the old file nor the new one.
+    #[tokio::test]
+    async fn aborting_an_overwrite_leaves_the_existing_file_intact() {
+        let (dir, vfs) = backend();
+        std::fs::write(dir.path().join("keep.txt"), b"original").unwrap();
+
+        let mut wh = vfs
+            .open_write(
+                &p("/keep.txt"),
+                WriteOpts {
+                    overwrite: true,
+                    size_hint: None,
+                },
+            )
+            .await
+            .unwrap();
+        wh.write_chunk(Bytes::from_static(b"new-")).await.unwrap();
+        // Still the original while the write is in flight — the new bytes are in the temp.
+        assert_eq!(
+            std::fs::read(dir.path().join("keep.txt")).unwrap(),
+            b"original"
+        );
+        wh.abort().await;
+
+        assert_eq!(
+            std::fs::read(dir.path().join("keep.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "abort left a temp behind"
+        );
+    }
+
+    /// The replacement is atomic: a completed write swaps the file in one rename, and no temp
+    /// survives it.
+    #[tokio::test]
+    async fn a_completed_overwrite_replaces_the_file_and_leaves_no_temp() {
+        let (dir, vfs) = backend();
+        std::fs::write(dir.path().join("keep.txt"), b"original").unwrap();
+
+        let mut wh = vfs
+            .open_write(
+                &p("/keep.txt"),
+                WriteOpts {
+                    overwrite: true,
+                    size_hint: None,
+                },
+            )
+            .await
+            .unwrap();
+        wh.write_chunk(Bytes::from_static(b"replaced"))
+            .await
+            .unwrap();
+        assert_eq!(wh.finish().await.unwrap().size, Some(8));
+
+        assert_eq!(
+            std::fs::read(dir.path().join("keep.txt")).unwrap(),
+            b"replaced"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// `overwrite: false` still refuses an existing destination (it used to fall out of
+    /// `create_new` on the real path, which the temp no longer exercises), and leaves it untouched.
+    #[tokio::test]
+    async fn open_write_without_overwrite_rejects_an_existing_file() {
+        let (dir, vfs) = backend();
+        std::fs::write(dir.path().join("exists.txt"), b"mine").unwrap();
+        let res = vfs
+            .open_write(
+                &p("/exists.txt"),
+                WriteOpts {
+                    overwrite: false,
+                    size_hint: None,
+                },
+            )
+            .await;
+        assert!(matches!(res, Err(VfsError::AlreadyExists(_))));
+        assert_eq!(
+            std::fs::read(dir.path().join("exists.txt")).unwrap(),
+            b"mine"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]
