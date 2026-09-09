@@ -117,7 +117,7 @@ tempfile = "3"
 # check), so no interop constraint drove the choice — `sha2` is already resolved in the workspace
 # dependency tree (pulled transitively by `wasmtime`/`cranelift` for `cairn-plugin`), so naming it
 # directly here adds no new crate, just a new consumer of one already being built.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Safe process-group kill for shell-action timeouts (no `unsafe`). Already in the dependency tree.
 [target.'cfg(unix)'.dependencies]
