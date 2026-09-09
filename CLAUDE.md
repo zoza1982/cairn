@@ -11,6 +11,56 @@ product scope and `docs/` for design docs.
 
 ---
 
+## 0. Orientation — architecture & code map
+
+A Cargo workspace (`crates/*`), ~71k lines of Rust, one binary (`cairn`) + 19 libraries.
+`docs/LLD.md` is the architecture reference and its section numbers are cited from crate-level
+rustdoc (`//!`) — **read the crate's `lib.rs` header first; it names the LLD §, ADR, and RFC that
+govern it.** Decisions live in `docs/adr/`, designs in `docs/rfcs/`, status in
+`docs/IMPLEMENTATION_PLAN.md`.
+
+**The control loop (Elm/TEA).** This shape explains most of the codebase:
+
+- `cairn-core` — `AppState` + `Msg` + a **pure `update` reducer** that does no I/O and never
+  `.await`s; it mutates state and returns `AppEffect`s. (`update.rs` is the largest file in the
+  repo; `state.rs` holds the model, `msg.rs` the messages/effects.)
+- `crates/cairn/src/app.rs` — the event loop and **effect runner**: runs each `AppEffect` as a tokio
+  task and feeds results back as `AppEvent`s over a bounded channel. This is the only layer that
+  touches the terminal, the runtime, and real backends.
+- `cairn-tui` — `render(&AppState, &Theme) -> Buffer` plus the keymap. Pure and side-effect-free.
+
+So: **keys → `Msg` → reducer (sync, testable) → `AppEffect` → runner (async) → `AppEvent` → reducer.**
+New behavior almost always means a new `Msg`/`AppEffect` pair plus its runner arm.
+
+**The VFS spine.**
+
+- `cairn-types` is the leaf crate — `VfsPath` (normalized, rejects `..` at parse time), `Entry`,
+  `Caps`, ids. It depends on no other Cairn crate; everything depends on it.
+- `cairn-vfs` defines the `Vfs` trait, held as `Arc<dyn Vfs>`, plus `VfsRegistry`
+  (`ConnectionId` → backend). `Caps` bitflags declare what a backend can do so the UI only offers
+  valid operations; backend-specific operations (exec, logs, port-forward, archive mount) go
+  through the uniform `invoke()` / `ActionDescriptor` / `ActionOutcome` interface rather than
+  widening the trait.
+- Each backend crate maps its protocol onto `Vfs` over a **mockable transport seam**
+  (`SftpOps`, `ContainerOps`, `KubeOps`, `ObjectStore`, `ArchiveOps`) — the mapping logic is unit
+  tested hermetically against an in-memory mock, and the real SDK adapter is a thin `real.rs`
+  behind a Cargo feature. Follow that pattern when adding a backend.
+- `cairn-transfer` composes two `Arc<dyn Vfs>`, so "pod → S3" is the same code as "local → local".
+  It is the **only** place cross-backend logic belongs.
+
+**The secret boundary (do not weaken).** `cairn-ai` and `cairn-plugin` depend only on
+`cairn-broker-api` — a secret-free credential vocabulary — never on `cairn-broker` or `cairn-vault`,
+so they cannot even *name* a secret-returning API. `crates/cairn-broker-api/tests/isolation.rs` is a
+dependency-closure test that fails the build if a vault dependency reaches those crates (RFC-0008).
+The AI proposes a plan; approval and execution happen outside the model (`plan`→confirm→execute).
+
+**Feature-gated backends (ADR-0006).** The default build has **no** backends and pulls no SDK
+(russh / AWS / GCS / Azure / kube / bollard / wasmtime); each backend is an optional dependency
+behind a feature on the `cairn` binary (`ssh`, `s3`, `gcs`, `azure`, `docker`, `k8s`, `archive`,
+`keychain`; umbrellas `cloud`, `containers`, `all-backends`). Keep new SDK weight behind a feature.
+
+---
+
 ## 1. Golden rules (non-negotiable)
 
 1. **Never commit or push directly to `main`.** `main` is protected. All changes land via pull
@@ -154,13 +204,50 @@ These are gates, not formalities — a PR with unaddressed high-severity finding
 
 ```
 cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo doc --no-deps        # rustdoc must build without warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+cargo deny check                       # licenses + advisories (deny.toml)
 ```
 
-CI runs the same on Linux, macOS, and Windows. If a check is intentionally skipped, say so
-explicitly in the PR — never silently.
+`RUSTDOCFLAGS="-D warnings"` matters: CI's rustdoc job sets it, so a broken intra-doc link fails
+there but not under a bare `cargo doc`.
+
+Narrower loops while iterating:
+
+```
+cargo test -p cairn-core                                   # one crate
+cargo test -p cairn-core update::tests::<name>             # one test (substring filter)
+cargo test -p cairn-core -- --nocapture                    # see stdout
+cargo run -p cairn --features all-backends                 # run with every backend on
+```
+
+**Feature/platform rule (ADR-0006, enforced by CI's job split):** the cross-platform jobs build the
+**lean default** (no backends); `--all-features` and the cloud features (`s3`/`gcs`/`azure`/`cloud`)
+are **Linux-only**, so never add them to a macOS/Windows job. The one sanctioned exception is the
+compile-only Windows portability gate — reproduce it locally with
+`cargo check -p cairn --features ssh,containers` when touching SSH/Docker/K8s code, since the lean
+Windows build never compiles those and Unix-only API regressions have shipped that way before.
+
+### TUI-specific commands (see §8 for the rules)
+
+```
+cargo run -p cairn -- --frame-dump-list                    # list every named scenario
+cargo run -p cairn -- --frame-dump dual-pane 80x24         # print one rendered frame to stdout
+INSTA_UPDATE=always cargo test -p cairn-tui                # regenerate .snap after an intentional change
+cargo insta accept                                         # same, if cargo-insta is installed
+CAIRN_IT_TMUX=1 cargo test -p cairn --test tmux_e2e        # real-terminal e2e (needs tmux)
+```
+
+### Integration tests (env-guarded, off by default)
+
+Live/emulator tests only run when their `CAIRN_IT_*` guard is set — `CAIRN_IT_SFTP`,
+`CAIRN_IT_S3` (+ `_ENDPOINT`/`_BUCKET`/`_ACCESS_KEY`/`_SECRET_KEY`/`_REGION`), `CAIRN_IT_AZURE`
+(+ `_ACCOUNT`/`_KEY`/`_CONTAINER`/`_ENDPOINT`), `CAIRN_IT_DOCKER`, `CAIRN_IT_K8S`, `CAIRN_IT_AI`,
+`CAIRN_IT_TMUX`. `.github/workflows/integration.yml` runs them against MinIO / Azurite / dind /
+kind. Keep the default `cargo test` hermetic and offline.
+
+If a check is intentionally skipped, say so explicitly in the PR — never silently.
 
 ## 8. Testing standards
 
