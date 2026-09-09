@@ -190,6 +190,25 @@ fn render_overlay(frame: &mut Frame, state: &AppState, theme: &Theme) {
             cursor,
             show_hidden,
         } => render_connections(frame, &state.connections, *cursor, *show_hidden, theme),
+        Overlay::ConfirmQuit { active } => {
+            let area = centered(frame.area(), 52, 7);
+            frame.render_widget(Clear, area);
+            let block = Block::bordered()
+                .style(overlay_base(theme))
+                .title(" Quit ")
+                .border_style(Style::default().fg(Color::Red));
+            let body = Paragraph::new(vec![
+                Line::from(format!(
+                    "{active} transfer(s) still running.",
+                )),
+                Line::from("Quitting now leaves partial files behind."),
+                Line::from(""),
+                Line::from("[y] Quit anyway    [n] Keep going"),
+            ])
+            .block(block)
+            .alignment(Alignment::Center);
+            frame.render_widget(body, area);
+        }
         Overlay::ConfirmDelete { paths, .. } => {
             let area = centered(frame.area(), 44, 6);
             frame.render_widget(Clear, area);

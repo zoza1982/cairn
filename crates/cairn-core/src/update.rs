@@ -372,7 +372,7 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         // arm is never reached at runtime — it exists only to keep the match exhaustive.
         Action::CycleTheme => Vec::new(),
         Action::Quit => {
-            state.should_quit = true;
+            quit_or_confirm(state);
             Vec::new()
         }
         Action::NewConnection => {
@@ -1735,14 +1735,16 @@ fn submit_connection_form(state: &mut AppState) -> Vec<AppEffect> {
 
 /// Handle an action while a modal overlay is open. Routes to the handler for the open overlay.
 fn apply_overlay_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
-    // Quit (q / Ctrl-C) always quits immediately, even from within an overlay — close it first so
-    // the terminal is restored cleanly. Esc/Cancel only dismisses the overlay.
-    if action == Action::Quit {
+    // Quit (q / Ctrl-C) from within an overlay closes it first so the terminal is restored cleanly.
+    // Esc/Cancel only dismisses the overlay. A second `q` at the quit confirmation must not
+    // re-prompt, so that overlay answers for itself below.
+    if action == Action::Quit && !matches!(state.overlay, Some(Overlay::ConfirmQuit { .. })) {
         state.overlay = None;
-        state.should_quit = true;
+        quit_or_confirm(state);
         return Vec::new();
     }
     match &state.overlay {
+        Some(Overlay::ConfirmQuit { .. }) => apply_confirm_quit_action(state, action),
         Some(Overlay::ConfirmDelete { .. }) => apply_confirm_delete_action(state, action),
         Some(Overlay::ConfirmOverwrite { .. }) => apply_confirm_overwrite_action(state, action),
         Some(Overlay::ConfirmWriteback { .. }) => apply_confirm_writeback_action(state, action),
@@ -2480,6 +2482,35 @@ fn navigate_to_conn(
     navigate(state, side, VfsPath::root())
 }
 
+/// Quit, or ask first when transfers are still running.
+///
+/// Quitting tears the process down mid-write: the destination file is left truncated or partial and
+/// the source is still there, with nothing to say what happened. `q` is a single unmodified
+/// keystroke next to `p` and `b` on the transfer dialog, so this is easy to hit by accident during
+/// the long operation it destroys. Deletes are excluded — they have no half-written state to leave.
+fn quit_or_confirm(state: &mut AppState) {
+    let active = active_byte_ops(state);
+    if active > 0 {
+        state.overlay = Some(Overlay::ConfirmQuit { active });
+    } else {
+        state.should_quit = true;
+    }
+}
+
+/// Drive the quit confirmation. `y`/Enter quits and abandons the transfers; anything else returns to
+/// them.
+fn apply_confirm_quit_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
+    match action {
+        Action::Confirm | Action::Enter | Action::Quit => {
+            state.overlay = None;
+            state.should_quit = true;
+        }
+        Action::Cancel => state.overlay = None,
+        _ => {}
+    }
+    Vec::new()
+}
+
 fn apply_confirm_delete_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
     match action {
         Action::Confirm | Action::Enter => match state.overlay.take() {
@@ -2745,7 +2776,8 @@ fn overlay_blocks_transfer_work(overlay: &Option<Overlay>) -> bool {
     matches!(
         overlay,
         Some(
-            Overlay::ConfirmDelete { .. }
+            Overlay::ConfirmQuit { .. }
+                | Overlay::ConfirmDelete { .. }
                 | Overlay::ConfirmOverwrite { .. }
                 | Overlay::ConfirmWriteback { .. }
                 | Overlay::ConfirmShellAction { .. }
@@ -3817,6 +3849,12 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                         );
                     }
                     p.listing = Listing::Ready(Arc::new(entries));
+                    // Marks are *positional* — indices into the visible view — so they mean nothing
+                    // once the view is replaced. A refresh after a delete, a rename, or an external
+                    // change re-indexes every row, and the surviving marks silently pointed at
+                    // whatever now occupied those positions: the next F5/F8 acted on files the user
+                    // never selected. Marks belong to the listing they were made in.
+                    p.marked.clear();
                     // Restore the cursor to a specific child if one was requested (e.g. `leave_dir`
                     // returning to the directory we just exited). Search the *visible* view so the
                     // index is in the same space as `cursor` even if a filter was started during the
@@ -5291,6 +5329,96 @@ mod tests {
             .expect("a same-connection copy into another directory must still run");
         assert_eq!(items.len(), 1);
         assert_ne!(items[0].0, items[0].1);
+    }
+
+    /// Regression: `q` quit instantly from anywhere, including the transfer dialog where it sits
+    /// one key away from `p` and `b`. The process tore down mid-write, leaving a truncated
+    /// destination and no record of what happened. It now asks — once — while bytes are moving.
+    #[test]
+    fn quitting_during_a_transfer_asks_first() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        assert!(!s.active_transfers.is_empty());
+
+        let _ = update(&mut s, Msg::Action(Action::Quit));
+        assert!(!s.should_quit, "q killed a running transfer without asking");
+        assert!(matches!(
+            s.overlay,
+            Some(Overlay::ConfirmQuit { active: 1 })
+        ));
+
+        // Declining returns to the transfer, which is still running.
+        let _ = update(&mut s, Msg::Action(Action::Cancel));
+        assert!(!s.should_quit);
+        assert!(s.overlay.is_none());
+        assert_eq!(s.active_transfers.len(), 1);
+
+        // Confirming quits.
+        let _ = update(&mut s, Msg::Action(Action::Quit));
+        let _ = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(s.should_quit);
+    }
+
+    /// A second `q` at the prompt means "yes" rather than re-prompting, so the impatient
+    /// double-tap still works — and with nothing running, `q` is immediate as before.
+    #[test]
+    fn quit_is_immediate_without_transfers_and_a_second_q_confirms() {
+        let mut s = state();
+        let _ = update(&mut s, Msg::Action(Action::Quit));
+        assert!(s.should_quit, "q must not prompt when nothing is running");
+
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Copy));
+        let _ = update(&mut s, Msg::Action(Action::Quit));
+        let _ = update(&mut s, Msg::Action(Action::Quit));
+        assert!(s.should_quit);
+    }
+
+    /// A delete has no half-written state to leave behind, so it must not gate quitting.
+    #[test]
+    fn a_running_delete_does_not_gate_quitting() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let _ = update(&mut s, Msg::Action(Action::Delete));
+        let _ = update(&mut s, Msg::Action(Action::Confirm));
+        assert!(!s.active_transfers.is_empty());
+        let _ = update(&mut s, Msg::Action(Action::Quit));
+        assert!(s.should_quit);
+    }
+
+    /// Regression: marks are *positional* — indices into the visible view — so a listing refresh
+    /// re-indexes every row and the surviving marks silently pointed at whatever now occupied those
+    /// positions. The next F5/F8 then acted on files the user never selected.
+    #[test]
+    fn marks_do_not_survive_a_listing_replacement() {
+        let mut s = state();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("keep.txt", EntryKind::File),
+                Entry::new("target.txt", EntryKind::File),
+            ],
+        );
+        s.pane_mut(Side::Left).cursor = 1;
+        let _ = update(&mut s, Msg::Action(Action::ToggleMark));
+        assert_eq!(s.pane(Side::Left).marked.len(), 1);
+
+        // The directory changes underneath: the marked file is gone and another takes its index.
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![
+                Entry::new("keep.txt", EntryKind::File),
+                Entry::new("innocent.txt", EntryKind::File),
+            ],
+        );
+        assert!(
+            s.pane(Side::Left).marked.is_empty(),
+            "a stale mark now points at innocent.txt"
+        );
     }
 
     #[test]
