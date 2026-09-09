@@ -49,20 +49,39 @@ pub struct ByteRange {
     pub len: Option<u64>,
 }
 
+impl ByteRange {
+    /// The `[start, end)` this range selects out of `total` bytes, clamped to `total`.
+    ///
+    /// Saturating, so an arbitrary caller-controlled `offset`/`len` (e.g. `u64::MAX`) clamps to an
+    /// empty span instead of overflowing. `end >= start` always holds.
+    #[must_use]
+    pub fn clamp_to(self, total: u64) -> (u64, u64) {
+        let start = self.offset.min(total);
+        let end = match self.len {
+            Some(l) => self.offset.saturating_add(l).min(total),
+            None => total,
+        };
+        (start, end)
+    }
+
+    /// How many bytes this range yields out of `total` — the honest `len_hint` for a streaming read
+    /// whose transport knows the file size but not the range.
+    #[must_use]
+    pub fn clamped_len(self, total: u64) -> u64 {
+        let (start, end) = self.clamp_to(total);
+        end - start
+    }
+}
+
 /// Apply a [`ByteRange`] to an in-memory buffer, clamping to the buffer's bounds.
 ///
 /// Used by backends that buffer a whole object and slice in memory (no transport-level seek).
-/// The arithmetic is saturating, so an arbitrary caller-controlled `offset`/`len` (e.g. `u64::MAX`)
-/// clamps to an empty slice instead of overflowing or panicking.
+/// The arithmetic is saturating (see [`ByteRange::clamp_to`]), so an arbitrary caller-controlled
+/// `offset`/`len` (e.g. `u64::MAX`) clamps to an empty slice instead of overflowing or panicking.
 #[must_use]
 pub fn apply_byte_range(data: &[u8], range: ByteRange) -> &[u8] {
-    let total = data.len() as u64;
-    let start = range.offset.min(total) as usize;
-    let end = match range.len {
-        Some(l) => range.offset.saturating_add(l).min(total) as usize,
-        None => data.len(),
-    };
-    &data[start..end]
+    let (start, end) = range.clamp_to(data.len() as u64);
+    &data[start as usize..end as usize]
 }
 
 /// Build an absolute path from VFS path segments below some root (e.g. a container/pod filesystem).

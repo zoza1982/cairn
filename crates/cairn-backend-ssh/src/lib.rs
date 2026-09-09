@@ -14,7 +14,7 @@ mod real;
 
 #[cfg(feature = "ssh")]
 pub use connect::{ssh_connect, HostKeyPolicy, SshConnectParams};
-pub use ops::{RemoteEntry, RemoteMeta, SftpOps};
+pub use ops::{RemoteEntry, RemoteMeta, SftpOps, SftpWriteStream};
 pub use real::RealSftp;
 
 use async_trait::async_trait;
@@ -167,20 +167,43 @@ impl<O: SftpOps> Vfs for SftpVfs<O> {
         path: &VfsPath,
         range: Option<ByteRange>,
     ) -> Result<ReadHandle, VfsError> {
-        let data = self.ops.read(&path.as_str(), range).await?;
-        let len = data.len() as u64;
-        Ok(ReadHandle::new(
-            Box::new(std::io::Cursor::new(data)),
-            Some(len),
-        ))
+        // The length hint comes from a `stat`, not from reading the file: the reader streams, so
+        // nothing knows the size up front otherwise. Best-effort — the hint is advisory (a display
+        // aid for the pager/sniff), so a failed stat must not fail a read that would succeed. Clamped
+        // to the requested range so `len_hint` matches what the stream will yield.
+        let remote = path.as_str();
+        let len_hint = self
+            .ops
+            .stat(&remote)
+            .await
+            .ok()
+            .and_then(|m| m.size)
+            .map(|total| range.map_or(total, |r| r.clamped_len(total)));
+        let reader = self.ops.open_read(&remote, range).await?;
+        Ok(ReadHandle::new(reader, len_hint))
     }
 
-    async fn open_write(&self, path: &VfsPath, _opts: WriteOpts) -> Result<WriteHandle, VfsError> {
+    async fn open_write(&self, path: &VfsPath, opts: WriteOpts) -> Result<WriteHandle, VfsError> {
+        // Honor `overwrite: false` up front (SFTP would happily truncate). A racing creator between
+        // this check and the final rename is caught again there — the server rejects a rename onto
+        // an existing destination, which `SftpWriteSink::finish` maps back to `AlreadyExists`.
+        if !opts.overwrite && self.ops.lstat(&path.as_str()).await.is_ok() {
+            return Err(VfsError::AlreadyExists(path.clone()));
+        }
+        // Stream into a hidden sibling temp and rename onto the target in `finish`. Opening the
+        // target itself (CREATE|TRUNCATE) would destroy the user's existing file the moment the copy
+        // *started* — so a cancel or a mid-file error, both of which `abort` the sink, would leave
+        // them with nothing. With the temp, the original is untouched until the new content is fully
+        // committed, and `abort`/a failed `finish` only ever remove the temp.
+        let temp = temp_sibling(path)?;
+        let stream = self.ops.open_write(&temp.as_str()).await?;
         Ok(WriteHandle::new(Box::new(SftpWriteSink {
             ops: self.ops.clone(),
-            path: path.as_str(),
-            name: path.file_name().unwrap_or("").to_owned(),
-            buf: Vec::new(),
+            stream,
+            target: path.clone(),
+            temp,
+            overwrite: opts.overwrite,
+            written: 0,
         })))
     }
 
@@ -222,84 +245,161 @@ impl<O: SftpOps> Vfs for SftpVfs<O> {
     }
 
     async fn rename(&self, from: &VfsPath, to: &VfsPath) -> Result<(), VfsError> {
-        // SFTP's `SSH_FXP_RENAME` fails when the destination already exists (OpenSSH's sftp-server),
-        // unlike POSIX rename — and every other Cairn backend — which overwrites. To overwrite a
-        // remote *file* safely, move the existing destination aside to a backup, then rename; on
-        // success delete the backup, on failure restore it. This never deletes the old content until
-        // the new rename has actually succeeded, so a mid-operation network drop can't leave *both*
-        // the original and the new content gone (a real risk with a naive remove-then-rename, since
-        // the edit → write-back caller deletes its staged temp when the final rename fails). Not
-        // atomic — SFTP has no portable atomic overwrite. A directory destination is left in place so
-        // the rename below rejects it (OpenSSH's SFTP refuses any existing destination).
-        let to_str = to.as_str();
-        let backup: Option<VfsPath> = match self.ops.stat(&to_str).await {
-            Ok(meta) if meta.kind != EntryKind::Dir => {
-                let bname = format!(".cairn-rename-bak-{}", to.file_name().unwrap_or("file"));
-                // A `join` failure (an invalid backup name) just skips the backup — the rename below
-                // then fails on the still-present destination, leaving it intact.
-                match to.parent().unwrap_or_else(VfsPath::root).join(&bname) {
-                    Ok(bpath) => {
-                        // Clear a stale backup (from a prior interrupted rename) so moving the
-                        // destination aside can't itself hit an existing-destination rejection.
-                        let _ = self.ops.remove_file(&bpath.as_str()).await;
-                        // If moving the destination aside fails, proceed with no backup.
-                        if self.ops.rename(&to_str, &bpath.as_str()).await.is_ok() {
-                            Some(bpath)
-                        } else {
-                            None
-                        }
+        rename_overwriting(&*self.ops, from, to).await
+    }
+}
+
+/// Rename `from` onto `to`, overwriting an existing *file* at `to` the way POSIX (and every other
+/// Cairn backend) does. Shared by [`Vfs::rename`] and the write sink's commit step.
+async fn rename_overwriting<O: SftpOps>(
+    ops: &O,
+    from: &VfsPath,
+    to: &VfsPath,
+) -> Result<(), VfsError> {
+    // SFTP's `SSH_FXP_RENAME` fails when the destination already exists (OpenSSH's sftp-server),
+    // unlike POSIX rename — and every other Cairn backend — which overwrites. To overwrite a
+    // remote *file* safely, move the existing destination aside to a backup, then rename; on
+    // success delete the backup, on failure restore it. This never deletes the old content until
+    // the new rename has actually succeeded, so a mid-operation network drop can't leave *both*
+    // the original and the new content gone (a real risk with a naive remove-then-rename, since
+    // the edit → write-back caller deletes its staged temp when the final rename fails). Not
+    // atomic — SFTP has no portable atomic overwrite. A directory destination is left in place so
+    // the rename below rejects it (OpenSSH's SFTP refuses any existing destination).
+    let to_str = to.as_str();
+    let backup: Option<VfsPath> = match ops.stat(&to_str).await {
+        Ok(meta) if meta.kind != EntryKind::Dir => {
+            let bname = format!(".cairn-rename-bak-{}", to.file_name().unwrap_or("file"));
+            // A `join` failure (an invalid backup name) just skips the backup — the rename below
+            // then fails on the still-present destination, leaving it intact.
+            match to.parent().unwrap_or_else(VfsPath::root).join(&bname) {
+                Ok(bpath) => {
+                    // Clear a stale backup (from a prior interrupted rename) so moving the
+                    // destination aside can't itself hit an existing-destination rejection.
+                    let _ = ops.remove_file(&bpath.as_str()).await;
+                    // If moving the destination aside fails, proceed with no backup.
+                    if ops.rename(&to_str, &bpath.as_str()).await.is_ok() {
+                        Some(bpath)
+                    } else {
+                        None
                     }
-                    Err(_) => None,
                 }
+                Err(_) => None,
             }
-            _ => None,
-        };
-        match self.ops.rename(&from.as_str(), &to_str).await {
-            Ok(()) => {
-                if let Some(b) = backup {
-                    let _ = self.ops.remove_file(&b.as_str()).await; // best-effort cleanup post-success
-                }
-                Ok(())
+        }
+        _ => None,
+    };
+    match ops.rename(&from.as_str(), &to_str).await {
+        Ok(()) => {
+            if let Some(b) = backup {
+                let _ = ops.remove_file(&b.as_str()).await; // best-effort cleanup post-success
             }
-            Err(e) => {
-                if let Some(b) = backup {
-                    // Best-effort restore of the original (the destination slot is free again).
-                    let _ = self.ops.rename(&b.as_str(), &to_str).await;
-                }
-                Err(e)
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(b) = backup {
+                // Best-effort restore of the original (the destination slot is free again).
+                let _ = ops.rename(&b.as_str(), &to_str).await;
             }
+            Err(e)
         }
     }
 }
 
+/// The hidden sibling a write streams into before being renamed onto `target`. Unique per process
+/// and per open, so two concurrent writes to the same target (or a stale temp from a crashed run)
+/// can't collide.
+fn temp_sibling(target: &VfsPath) -> Result<VfsPath, VfsError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        ".{}.cairn-{}-{}.part",
+        target.file_name().unwrap_or("file"),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    target
+        .parent()
+        .unwrap_or_else(VfsPath::root)
+        .join(&name)
+        .map_err(|e| VfsError::Backend {
+            code: "sftp".to_owned(),
+            msg: format!("cannot derive a temp name for {target}: {e}"),
+            retryable: false,
+        })
+}
+
+/// The [`WriteSink`] over an open [`SftpWriteStream`]. Every chunk goes straight to the transport;
+/// nothing is buffered here, so the bytes the engine counts after `write_chunk` returns are bytes the
+/// server has been handed (bounded by `russh-sftp`'s in-flight `WRITE` window), not a memcpy.
+///
+/// Writes land in `temp` and are renamed onto `target` by `finish`; `abort` and every failure path
+/// in `finish` remove only `temp`, so the pre-existing target survives anything short of a
+/// successful commit.
 struct SftpWriteSink<O: SftpOps> {
     ops: Arc<O>,
-    path: String,
-    name: String,
-    buf: Vec<u8>,
+    stream: Box<dyn SftpWriteStream>,
+    target: VfsPath,
+    temp: VfsPath,
+    overwrite: bool,
+    written: u64,
 }
 
 #[async_trait]
 impl<O: SftpOps> WriteSink for SftpWriteSink<O> {
     async fn write_chunk(&mut self, chunk: bytes::Bytes) -> Result<(), VfsError> {
-        self.buf.extend_from_slice(&chunk);
+        self.stream.write_all(&chunk).await?;
+        self.written += chunk.len() as u64;
         Ok(())
     }
 
     async fn finish(self: Box<Self>) -> Result<Entry, VfsError> {
-        self.ops.write(&self.path, &self.buf).await?;
-        let mut e = Entry::new(self.name, EntryKind::File);
-        e.size = Some(self.buf.len() as u64);
+        let Self {
+            ops,
+            stream,
+            target,
+            temp,
+            overwrite,
+            written,
+        } = *self;
+        // A failed flush/CLOSE means the temp is not what we wrote; a failed rename means it never
+        // reached the target. Either way remove the temp — once `finish` has returned an error the
+        // handle is gone and nobody else can clean up.
+        if let Err(e) = stream.finish().await {
+            let _ = ops.remove_file(&temp.as_str()).await;
+            return Err(e);
+        }
+        let committed = if overwrite {
+            rename_overwriting(&*ops, &temp, &target).await
+        } else {
+            // A plain rename: the server rejects an existing destination, which here means a file
+            // appeared under us since the `open_write` check — report it as such, not as a generic
+            // transport failure.
+            match ops.rename(&temp.as_str(), &target.as_str()).await {
+                Err(_) if ops.lstat(&target.as_str()).await.is_ok() => {
+                    Err(VfsError::AlreadyExists(target.clone()))
+                }
+                other => other,
+            }
+        };
+        if let Err(e) = committed {
+            let _ = ops.remove_file(&temp.as_str()).await;
+            return Err(e);
+        }
+        let mut e = Entry::new(target.file_name().unwrap_or(""), EntryKind::File);
+        e.size = Some(written);
         Ok(e)
     }
 
-    async fn abort(self: Box<Self>) {}
+    async fn abort(self: Box<Self>) {
+        // Removes the temp (created at open); the target was never touched.
+        self.stream.abort().await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ops::mock::MockSftp;
+    use ops::mock::{MockCall, MockSftp, MOCK_READ_CHUNK};
     use tokio::io::AsyncReadExt;
 
     fn p(s: &str) -> VfsPath {
@@ -523,6 +623,237 @@ mod tests {
             Err(VfsError::NotFound(_))
         ));
         assert_eq!(vfs.stat(&p("/renamed.txt")).await.unwrap().size, Some(2));
+    }
+
+    /// A download must be served as it arrives, not fetched whole and then replayed: the read handle
+    /// yields many transport-sized pieces even when the consumer offers a 1 MiB buffer (the transfer
+    /// engine's real chunk). The mock caps each poll at `MOCK_READ_CHUNK`, so a whole-file buffer
+    /// would show up here as a single oversized read.
+    #[tokio::test]
+    async fn open_read_streams_in_transport_sized_pieces() {
+        let data: Vec<u8> = (0..(3 * MOCK_READ_CHUNK + 100))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let vfs = SftpVfs::new(ConnectionId(1), MockSftp::new().with_file("/big", &data));
+        let mut rh = vfs.open_read(&p("/big"), None).await.unwrap();
+        assert_eq!(rh.len_hint(), Some(data.len() as u64));
+
+        let mut buf = vec![0u8; 1 << 20];
+        let mut out = Vec::new();
+        let mut reads = 0;
+        loop {
+            let n = rh.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            assert!(n <= MOCK_READ_CHUNK, "a single read returned {n} bytes");
+            out.extend_from_slice(&buf[..n]);
+            reads += 1;
+        }
+        assert!(reads > 1, "the file was served in one read — not streaming");
+        assert_eq!(out, data);
+    }
+
+    /// Every `write_chunk` reaches the transport *before* `finish` — that is what makes the bytes the
+    /// engine counts after each chunk real. The mock logs each transport call in order. The stream
+    /// targets a hidden `.part` sibling, which `finish` renames onto the real name.
+    #[tokio::test]
+    async fn open_write_streams_each_chunk_before_finish() {
+        let vfs = SftpVfs::new(ConnectionId(1), MockSftp::new());
+        let mut wh = vfs
+            .open_write(&p("/out.bin"), WriteOpts::default())
+            .await
+            .unwrap();
+        for chunk in [&b"aaaa"[..], &b"bb"[..], &b"cccccc"[..]] {
+            wh.write_chunk(bytes::Bytes::copy_from_slice(chunk))
+                .await
+                .unwrap();
+        }
+        // Three transport writes, in order, all to the same temp, and no commit yet.
+        let calls = vfs.ops.calls();
+        let lens: Vec<usize> = calls
+            .iter()
+            .map(|c| match c {
+                MockCall::Write { path, len } => {
+                    assert!(
+                        path.starts_with("/.out.bin.cairn-") && path.ends_with(".part"),
+                        "{path}"
+                    );
+                    *len
+                }
+                other => panic!("unexpected {other:?} before finish"),
+            })
+            .collect();
+        assert_eq!(lens, vec![4, 2, 6]);
+        // Nothing at the target until commit.
+        assert!(matches!(
+            vfs.stat(&p("/out.bin")).await,
+            Err(VfsError::NotFound(_))
+        ));
+
+        assert_eq!(wh.finish().await.unwrap().size, Some(12));
+        assert!(matches!(
+            vfs.ops.calls().last(),
+            Some(MockCall::Finished(t)) if t.ends_with(".part")
+        ));
+        // Bytes landed in write order, at the target, and the temp is gone.
+        let mut rh = vfs.open_read(&p("/out.bin"), None).await.unwrap();
+        let mut out = Vec::new();
+        rh.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"aaaabbcccccc");
+        assert_eq!(vfs.ops.paths(), vec!["/".to_owned(), "/out.bin".to_owned()]);
+    }
+
+    /// The temp exists from the moment the write is opened (create/truncate), so an abort — even
+    /// after some chunks went out — must leave nothing behind, and must never have touched the target.
+    #[tokio::test]
+    async fn abort_removes_the_partially_written_temp() {
+        let vfs = SftpVfs::new(ConnectionId(1), MockSftp::new());
+        let mut wh = vfs
+            .open_write(&p("/partial"), WriteOpts::default())
+            .await
+            .unwrap();
+        // The temp exists (empty) right after open — the case a lazy abort would miss.
+        assert!(vfs.ops.paths().iter().any(|q| q.ends_with(".part")));
+        wh.write_chunk(bytes::Bytes::from_static(b"half"))
+            .await
+            .unwrap();
+        wh.abort().await;
+        assert_eq!(vfs.ops.paths(), vec!["/".to_owned()]);
+        assert!(matches!(
+            vfs.ops.calls().last(),
+            Some(MockCall::Aborted(t)) if t.ends_with(".part")
+        ));
+    }
+
+    /// Regression (found in review): opening the *target* with CREATE|TRUNCATE destroyed the user's
+    /// existing file the instant an overwrite copy started, so cancelling it (which aborts the sink)
+    /// left them with nothing. The original must survive until the new content is fully committed.
+    #[tokio::test]
+    async fn cancelled_overwrite_preserves_the_existing_file() {
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new().with_file("/keep.txt", b"original"),
+        );
+        let mut wh = vfs
+            .open_write(
+                &p("/keep.txt"),
+                WriteOpts {
+                    overwrite: true, // what the engine passes for an overwrite copy
+                    size_hint: None,
+                },
+            )
+            .await
+            .unwrap();
+        wh.write_chunk(bytes::Bytes::from_static(b"new-"))
+            .await
+            .unwrap();
+        wh.abort().await; // what a cancel or a mid-file read error does
+        let mut rh = vfs.open_read(&p("/keep.txt"), None).await.unwrap();
+        let mut out = String::new();
+        rh.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "original");
+        assert_eq!(
+            vfs.ops.paths(),
+            vec!["/".to_owned(), "/keep.txt".to_owned()]
+        );
+    }
+
+    /// A failed flush/`CLOSE` (now surfaced instead of discarded) must not orphan the temp — the
+    /// handle is consumed by `finish`, so nobody else could ever clean it up — and the original at
+    /// the target is untouched.
+    #[tokio::test]
+    async fn failed_finish_removes_the_temp_and_keeps_the_original() {
+        let vfs = SftpVfs::new(
+            ConnectionId(1),
+            MockSftp::new()
+                .with_file("/keep.txt", b"original")
+                .with_failing_finish_for("keep.txt"),
+        );
+        let mut wh = vfs
+            .open_write(
+                &p("/keep.txt"),
+                WriteOpts {
+                    overwrite: true, // what the engine passes for an overwrite copy
+                    size_hint: None,
+                },
+            )
+            .await
+            .unwrap();
+        wh.write_chunk(bytes::Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            wh.finish().await,
+            Err(VfsError::Backend { code, .. }) if code == "sftp"
+        ));
+        assert_eq!(
+            vfs.ops.paths(),
+            vec!["/".to_owned(), "/keep.txt".to_owned()]
+        );
+        assert_eq!(vfs.stat(&p("/keep.txt")).await.unwrap().size, Some(8));
+    }
+
+    /// `WriteOpts::overwrite == false` is honored (SFTP itself would truncate): an existing target is
+    /// `AlreadyExists` at open, with no temp created.
+    #[tokio::test]
+    async fn open_write_without_overwrite_rejects_an_existing_target() {
+        let vfs = SftpVfs::new(ConnectionId(1), MockSftp::new().with_file("/exists", b"x"));
+        let res = vfs
+            .open_write(
+                &p("/exists"),
+                WriteOpts {
+                    overwrite: false,
+                    size_hint: None,
+                },
+            )
+            .await;
+        assert!(matches!(res, Err(VfsError::AlreadyExists(_))));
+        assert_eq!(vfs.ops.paths(), vec!["/".to_owned(), "/exists".to_owned()]);
+        // …and a fresh path works without overwrite.
+        let wh = vfs
+            .open_write(
+                &p("/fresh"),
+                WriteOpts {
+                    overwrite: false,
+                    size_hint: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(wh.finish().await.unwrap().size, Some(0));
+        assert_eq!(vfs.stat(&p("/fresh")).await.unwrap().size, Some(0));
+    }
+
+    /// Zero chunks then `finish` is a legitimate empty file (CREATE|TRUNCATE semantics), not an error.
+    #[tokio::test]
+    async fn finish_with_no_chunks_commits_an_empty_file() {
+        let vfs = SftpVfs::new(ConnectionId(1), MockSftp::new());
+        let wh = vfs
+            .open_write(&p("/empty"), WriteOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(wh.finish().await.unwrap().size, Some(0));
+        assert_eq!(vfs.stat(&p("/empty")).await.unwrap().size, Some(0));
+    }
+
+    /// A ranged read is still streamed, and its length hint is the *clamped* range, not the file size.
+    #[tokio::test]
+    async fn ranged_read_streams_and_hints_the_clamped_length() {
+        let data = vec![7u8; 2 * MOCK_READ_CHUNK];
+        let vfs = SftpVfs::new(ConnectionId(1), MockSftp::new().with_file("/f", &data));
+        let rh = vfs
+            .open_read(
+                &p("/f"),
+                Some(ByteRange {
+                    offset: MOCK_READ_CHUNK as u64,
+                    // Overshoots the file: the hint must clamp to what will actually be yielded.
+                    len: Some(10 * MOCK_READ_CHUNK as u64),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rh.len_hint(), Some(MOCK_READ_CHUNK as u64));
     }
 
     #[tokio::test]

@@ -13,6 +13,8 @@ on:
     # Validate the job on changes to the object backend or this workflow itself.
     paths:
       - "crates/cairn-backend-object/**"
+      - "crates/cairn-backend-ssh/**"
+      - "crates/cairn-transfer/**"
       - "crates/cairn-backend-docker/**"
       - "crates/cairn-backend-k8s/**"
       - "crates/cairn-vault/**"
@@ -105,6 +107,25 @@ jobs:
           CAIRN_IT_AZURE_CONTAINER: cairn-it
           CAIRN_IT_AZURE_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
         run: cargo test -p cairn-backend-object --features azure --test azure_azurite -- --nocapture
+
+  sftp-server:
+    name: SFTP contract (OpenSSH sftp-server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # No SSH transport or container needed: `sftp-server` speaks SFTP on stdin/stdout, and the
+      # suite spawns `/usr/lib/openssh/sftp-server` (shipped with the runner's openssh-client
+      # package) over a pipe. This is the only coverage of the *real* streaming write path — the
+      # pipelined WRITE window, the surfaced CLOSE status, the temp→rename commit and the
+      # CLOSE→REMOVE ordering on abort — which the in-memory mock can only model.
+      - name: Confirm the sftp-server binary is present
+        run: test -x /usr/lib/openssh/sftp-server || (sudo apt-get update && sudo apt-get install -y openssh-client)
+      - name: Run the SFTP round-trips against the real sftp-server
+        env:
+          CAIRN_IT_SFTP: "1"
+        run: cargo test -p cairn-backend-ssh --test sftp_server_repro --test copy_repro -- --nocapture
 
   docker-dind:
     name: Docker contract (dind)

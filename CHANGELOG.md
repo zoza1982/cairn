@@ -187,6 +187,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency that logs a secret itself).
 
 
+### Fixed
+
+- **Copying to or from an SSH/SFTP connection now reports real progress.** The SFTP backend used to
+  buffer an entire file in memory and upload it in one go during `finish()` (and, for downloads,
+  fetch the whole file before yielding the first byte), so the transfer bar raced to 100% at memcpy
+  speed and then sat under "Finalizing…" while the actual transfer happened — with a throughput
+  number that was fiction and a whole file's worth of RAM per copy. Reads and writes now stream
+  through `russh-sftp`'s file handle: each 1 MiB chunk goes to the server as it is read (bounded by
+  the transport's in-flight write window), memory per file is one chunk, and the bar, rate, and ETA
+  track the wire. The SFTP `CLOSE` status — the server's word that the file committed — is now
+  surfaced from `finish()` instead of being discarded.
+
+- **Cancelling or failing a copy onto an existing SFTP file no longer destroys the original.** SFTP
+  writes now stream into a hidden `.<name>.cairn-….part` sibling and are renamed onto the target
+  only once fully committed; a cancel, a mid-file error, a failed flush/`CLOSE`, or a failed rename
+  removes just the temp. Previously the destination was truncated the moment the copy started. The
+  backend also honors "don't overwrite" (`AlreadyExists`) instead of always truncating.
+
+- **A copy that fails mid-file now aborts the destination instead of leaving a partial file.** The
+  transfer engine only called the sink's `abort()` on cancellation; a source read error or a
+  destination write error propagated without it. Harmless while sinks buffered (nothing had reached
+  the destination yet), but with streaming writes it left an orphaned, truncated file that later
+  looked complete.
+
+- **Size verification (`VerifyPolicy::Size`) now asks the destination what landed.** It compared the
+  byte count the sink itself reported — the same number the engine had just summed — so it could never
+  fail; it also ran the destination `stat` eagerly on every file and then ignored it. It now stats
+  the destination once and falls back to the sink's count only if that is unavailable.
+
+
 ### Added
 
 - **Delete now runs as a tracked operation, like copy/move** — with live progress, cancellation, and

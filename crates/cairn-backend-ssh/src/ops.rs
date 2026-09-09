@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use cairn_types::EntryKind;
 use cairn_vfs::{ByteRange, VfsError};
 use std::time::SystemTime;
+use tokio::io::AsyncRead;
 
 /// One remote directory entry (transport-level, before mapping to a `Vfs` [`Entry`](cairn_types::Entry)).
 #[derive(Debug, Clone)]
@@ -51,10 +52,20 @@ pub trait SftpOps: Send + Sync + 'static {
     /// never followed into and recursed — otherwise a delete would destroy data *outside* the
     /// requested tree, and a symlink cycle would loop forever.
     async fn lstat(&self, path: &str) -> Result<RemoteMeta, VfsError>;
-    /// Read a file's bytes, optionally a range.
-    async fn read(&self, path: &str, range: Option<ByteRange>) -> Result<Vec<u8>, VfsError>;
-    /// Write (create/truncate) a file.
-    async fn write(&self, path: &str, data: &[u8]) -> Result<(), VfsError>;
+    /// Open a file for a **streaming** read, already positioned and bounded per `range`. The
+    /// returned reader must yield bytes as they arrive from the server (one `SSH_FXP_READ` per
+    /// poll, or thereabouts) — never a whole-file buffer — so a download's progress reflects the
+    /// wire, not a memcpy. `range.len == None` reads to end.
+    async fn open_read(
+        &self,
+        path: &str,
+        range: Option<ByteRange>,
+    ) -> Result<Box<dyn AsyncRead + Send + Unpin>, VfsError>;
+    /// Open a file for a **streaming** write (create/truncate is issued here, so the remote file
+    /// exists — empty — once this returns). Each [`SftpWriteStream::write_all`] must hand its bytes
+    /// to the transport before returning (the transport's own ack window is the backpressure);
+    /// buffering the file to upload in `finish` is exactly the lie this seam exists to prevent.
+    async fn open_write(&self, path: &str) -> Result<Box<dyn SftpWriteStream>, VfsError>;
     /// Remove a file.
     async fn remove_file(&self, path: &str) -> Result<(), VfsError>;
     /// Remove an empty directory.
@@ -65,14 +76,52 @@ pub trait SftpOps: Send + Sync + 'static {
     async fn rename(&self, from: &str, to: &str) -> Result<(), VfsError>;
 }
 
+/// One open remote file being written through [`SftpOps::open_write`].
+///
+/// A small purpose-built trait rather than raw [`tokio::io::AsyncWrite`]: the mock stays a plain
+/// `async fn` impl, `finish` can surface the SFTP `CLOSE` status (the commit point — a failed close is
+/// a failed write), and `abort` owns the "remove the partial remote file" policy using the path it
+/// was opened with, so the `Vfs` mapping never has to reach back into the transport to clean up.
+#[async_trait]
+pub trait SftpWriteStream: Send {
+    /// Send one chunk. Returns once the bytes are queued on the transport — under `russh-sftp` that
+    /// is a bounded window of in-flight `WRITE`s, so awaiting here *is* the backpressure.
+    async fn write_all(&mut self, data: &[u8]) -> Result<(), VfsError>;
+    /// Flush every outstanding write and `CLOSE` the handle, surfacing the server's status.
+    async fn finish(self: Box<Self>) -> Result<(), VfsError>;
+    /// Drop the handle uncommitted and best-effort remove the partial remote file. Never fails
+    /// outward (mirrors [`cairn_vfs::WriteSink::abort`]).
+    async fn abort(self: Box<Self>);
+}
+
 #[cfg(test)]
 pub(crate) mod mock {
-    use super::{RemoteEntry, RemoteMeta, SftpOps};
+    use super::{RemoteEntry, RemoteMeta, SftpOps, SftpWriteStream};
     use async_trait::async_trait;
     use cairn_types::{EntryKind, VfsPath};
     use cairn_vfs::{ByteRange, VfsError};
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    /// The largest slice [`MockReader`] hands out per `poll_read`, regardless of the caller's
+    /// buffer. Small on purpose: a test that reads a multi-KiB file through a 1 MiB buffer (the
+    /// transfer engine's real chunk) can prove the mock never served the file as one buffer.
+    pub(crate) const MOCK_READ_CHUNK: usize = 4096;
+
+    /// A transport call the mock observed, in order. Lets tests assert *how* the `Vfs` mapping drove
+    /// the transport (chunk-by-chunk, before `finish`), not just the end state.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum MockCall {
+        /// One `write_all` on an open write stream.
+        Write { path: String, len: usize },
+        /// `finish` committed the stream.
+        Finished(String),
+        /// `abort` discarded the stream.
+        Aborted(String),
+    }
 
     enum Node {
         Dir,
@@ -83,7 +132,12 @@ pub(crate) mod mock {
 
     /// In-memory SFTP transport for tests.
     pub(crate) struct MockSftp {
-        nodes: Mutex<BTreeMap<String, Node>>,
+        /// Shared with the write streams handed out by `open_write`, which outlive the borrow.
+        nodes: Arc<Mutex<BTreeMap<String, Node>>>,
+        /// Ordered log of write-stream calls (see [`MockCall`]).
+        calls: Arc<Mutex<Vec<MockCall>>>,
+        /// Paths whose write stream's `finish` fails (simulates a failed flush / `CLOSE` status).
+        fail_finish: Mutex<Vec<String>>,
         /// One-shot: the next `rename` whose destination equals this path fails (simulates a
         /// mid-operation server/network error), so the overwrite restore-on-failure path is testable.
         fail_rename_to: Mutex<Option<String>>,
@@ -98,10 +152,33 @@ pub(crate) mod mock {
             let mut nodes = BTreeMap::new();
             nodes.insert("/".to_owned(), Node::Dir);
             Self {
-                nodes: Mutex::new(nodes),
+                nodes: Arc::new(Mutex::new(nodes)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail_finish: Mutex::new(Vec::new()),
                 fail_rename_to: Mutex::new(None),
                 hide_readdir_types: false,
             }
+        }
+
+        /// Every write-stream call observed so far, in order.
+        pub(crate) fn calls(&self) -> Vec<MockCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Make `finish` fail for any write stream opened on a path with this suffix (the write
+        /// sink streams into a generated temp name, so tests match on the target's file name).
+        #[must_use]
+        pub(crate) fn with_failing_finish_for(self, name_suffix: &str) -> Self {
+            self.fail_finish
+                .lock()
+                .unwrap()
+                .push(name_suffix.to_owned());
+            self
+        }
+
+        /// Every path currently in the tree (for asserting no temp was left behind).
+        pub(crate) fn paths(&self) -> Vec<String> {
+            self.nodes.lock().unwrap().keys().cloned().collect()
         }
 
         /// Simulate a server that doesn't send type/permission bits in directory listings.
@@ -263,24 +340,49 @@ pub(crate) mod mock {
             }
         }
 
-        async fn read(&self, path: &str, range: Option<ByteRange>) -> Result<Vec<u8>, VfsError> {
+        async fn open_read(
+            &self,
+            path: &str,
+            range: Option<ByteRange>,
+        ) -> Result<Box<dyn AsyncRead + Send + Unpin>, VfsError> {
             let nodes = self.nodes.lock().unwrap();
             let resolved = Self::resolve(&nodes, path).ok_or_else(|| Self::not_found(path))?;
             let Some(Node::File(b)) = nodes.get(&resolved) else {
                 return Err(Self::not_found(path));
             };
-            Ok(match range {
+            let data = match range {
                 None => b.clone(),
                 Some(r) => cairn_vfs::apply_byte_range(b, r).to_vec(),
-            })
+            };
+            Ok(Box::new(MockReader { data, pos: 0 }))
         }
 
-        async fn write(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
-            self.nodes
+        async fn open_write(&self, path: &str) -> Result<Box<dyn SftpWriteStream>, VfsError> {
+            let fail_finish = self
+                .fail_finish
                 .lock()
                 .unwrap()
-                .insert(path.to_owned(), Node::File(data.to_vec()));
-            Ok(())
+                .iter()
+                .any(|suffix| path.contains(suffix.as_str()));
+            let mut nodes = self.nodes.lock().unwrap();
+            // Opening a directory for write is a server failure, not a silent replace.
+            if matches!(nodes.get(path), Some(Node::Dir)) {
+                return Err(VfsError::Backend {
+                    code: "sftp".to_owned(),
+                    msg: "open: is a directory".to_owned(),
+                    retryable: false,
+                });
+            }
+            // Model create-on-open: the real server creates (and truncates) the file when the handle
+            // is opened, before any bytes arrive — which is why `abort` must always remove it.
+            nodes.insert(path.to_owned(), Node::File(Vec::new()));
+            Ok(Box::new(MockWriteStream {
+                path: path.to_owned(),
+                nodes: self.nodes.clone(),
+                calls: self.calls.clone(),
+                pending: Vec::new(),
+                fail_finish,
+            }))
         }
 
         async fn remove_file(&self, path: &str) -> Result<(), VfsError> {
@@ -358,6 +460,79 @@ pub(crate) mod mock {
             let node = nodes.remove(from).ok_or_else(|| Self::not_found(from))?;
             nodes.insert(to.to_owned(), node);
             Ok(())
+        }
+    }
+    /// A reader that serves at most [`MOCK_READ_CHUNK`] bytes per poll, so tests can observe that a
+    /// consumer really streams (many small reads) rather than receiving the file in one call.
+    struct MockReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for MockReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let n = (self.data.len() - self.pos)
+                .min(MOCK_READ_CHUNK)
+                .min(buf.remaining());
+            let start = self.pos;
+            buf.put_slice(&self.data[start..start + n]);
+            self.pos += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The mock's open write stream: appends to `pending`, logs every call, and only commits the
+    /// bytes to the node map on `finish` (or removes the pre-created node on `abort`).
+    struct MockWriteStream {
+        path: String,
+        nodes: Arc<Mutex<BTreeMap<String, Node>>>,
+        calls: Arc<Mutex<Vec<MockCall>>>,
+        pending: Vec<u8>,
+        fail_finish: bool,
+    }
+
+    #[async_trait]
+    impl SftpWriteStream for MockWriteStream {
+        async fn write_all(&mut self, data: &[u8]) -> Result<(), VfsError> {
+            self.pending.extend_from_slice(data);
+            self.calls.lock().unwrap().push(MockCall::Write {
+                path: self.path.clone(),
+                len: data.len(),
+            });
+            Ok(())
+        }
+
+        async fn finish(self: Box<Self>) -> Result<(), VfsError> {
+            if self.fail_finish {
+                // Like the real transport: the handle is gone, and what the server holds is suspect.
+                // (The node stays — it is the caller's job to remove the temp.)
+                return Err(VfsError::Backend {
+                    code: "sftp".to_owned(),
+                    msg: "close: simulated failure".to_owned(),
+                    retryable: false,
+                });
+            }
+            self.nodes
+                .lock()
+                .unwrap()
+                .insert(self.path.clone(), Node::File(self.pending));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(MockCall::Finished(self.path));
+            Ok(())
+        }
+
+        async fn abort(self: Box<Self>) {
+            self.nodes.lock().unwrap().remove(&self.path);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(MockCall::Aborted(self.path));
         }
     }
 }
