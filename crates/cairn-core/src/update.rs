@@ -2686,7 +2686,22 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
             items.push((from.clone(), to));
         }
     }
+    // Copying a file onto itself destroys it: the engine opens the source for reading and the same
+    // path for writing, and the write truncates it before the read has seen a byte. Both panes on
+    // the same directory of the same connection is an ordinary thing to have on screen, and F5 there
+    // is almost always a slip — so refuse the self-targeted items rather than eat the file. A
+    // rename is what the user wants here, and `F6`/`r` already do it.
+    let self_targeted = src_conn == dst_conn;
+    if self_targeted {
+        items.retain(|(from, to)| from != to);
+    }
     if items.is_empty() {
+        if self_targeted && !targets.is_empty() {
+            state.status = Some(format!(
+                "Cannot {} onto itself — the panes are in the same directory",
+                if is_move { "move" } else { "copy" }
+            ));
+        }
         return Vec::new();
     }
     // Up to `concurrency_limit` transfers run at once: if every slot is busy, queue this one and
@@ -5216,6 +5231,66 @@ mod tests {
         let fx = update(&mut s, Msg::Text(TextEdit::Insert('x')));
         assert!(fx.is_empty());
         assert!(matches!(s.overlay, Some(Overlay::ConfirmDelete { .. })));
+    }
+
+    /// Regression: with both panes on the same directory of the same connection, `F5` handed the
+    /// engine `(from, to)` where `from == to`. The destination is opened for writing (truncating
+    /// it) while the source is being read, so the file was destroyed. Both panes on one directory
+    /// is an ordinary thing to have on screen, and this is almost always a slip.
+    #[test]
+    fn copying_onto_the_same_directory_is_refused_not_destructive() {
+        let mut s = AppState::new(ConnectionId(1), ConnectionId(1), VfsPath::root());
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("notes.md", EntryKind::File)],
+        );
+        deliver(
+            &mut s,
+            Side::Right,
+            vec![Entry::new("notes.md", EntryKind::File)],
+        );
+
+        for (action, word) in [(Action::Copy, "copy"), (Action::Move, "move")] {
+            let effects = update(&mut s, Msg::Action(action));
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, AppEffect::Transfer { .. })),
+                "{word} onto itself was dispatched to the engine"
+            );
+            assert!(s.active_transfers.is_empty());
+            let status = s.status.clone().unwrap_or_default();
+            assert!(
+                status.contains(word) && status.contains("itself"),
+                "{status}"
+            );
+        }
+    }
+
+    /// The guard is about the *path*, not the connection: two panes on one connection in different
+    /// directories still transfer, and only the self-targeted item is dropped from a mixed batch.
+    #[test]
+    fn same_connection_different_directory_still_transfers() {
+        let mut s = AppState::new(ConnectionId(1), ConnectionId(1), VfsPath::root());
+        s.pane_mut(Side::Right).cwd = VfsPath::parse("/elsewhere").unwrap();
+        deliver(
+            &mut s,
+            Side::Left,
+            vec![Entry::new("notes.md", EntryKind::File)],
+        );
+        deliver(&mut s, Side::Right, vec![]);
+
+        let effects = update(&mut s, Msg::Action(Action::Copy));
+        let items = effects
+            .iter()
+            .find_map(|e| match e {
+                AppEffect::Transfer { items, .. } => Some(items.clone()),
+                _ => None,
+            })
+            .expect("a same-connection copy into another directory must still run");
+        assert_eq!(items.len(), 1);
+        assert_ne!(items[0].0, items[0].1);
     }
 
     #[test]

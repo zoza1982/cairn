@@ -174,6 +174,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source is gone, so the UI said "Moved N files" with every object still in place. `remove` now
   resolves the path: an object is deleted by key, a prefix is listed flat and deleted, a
   non-recursive remove refuses a non-empty prefix, and a path that is neither is `NotFound`.
+- **`F5`/`F6` with both panes in the same directory no longer destroys the file.** The engine was
+  handed a copy whose source and destination were the same path; the destination is opened for
+  writing — truncating it — while the source is still being read, so the file ended up empty. Both
+  panes on one directory is an ordinary thing to have on screen, so this is now refused with a
+  status message rather than executed. Copies and moves between different directories of the same
+  connection are unaffected, and a mixed selection only drops the self-targeted entries.
 
 
 ### Security
