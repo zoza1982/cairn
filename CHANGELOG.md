@@ -206,6 +206,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A container path is passed to `tar` as an operand, not a possible flag** (`--` before it), so a
   file whose name begins with `-` can no longer be interpreted as an argument.
+- **Ordinary `.tar.bz2` and `.tar.zst` archives are no longer refused as "multi-stream".** The guard
+  that protects against silently truncating a concatenated archive matched bzip2's bare 3-byte `BZh`
+  magic anywhere in the file. Three bytes recur by chance roughly every 16 MB of compressed entropy,
+  so a ~16 MB `.tar.bz2` was rejected about 60% of the time and a 100 MB one essentially always —
+  telling the user their archive was multi-stream when it was not. bzip2 now requires a full 10-byte
+  stream header (magic, level digit, and the block or end-of-stream magic), and zstd is answered
+  exactly by asking the decoder whether any input remains rather than by scanning bytes at all.
 
 
 ### Security

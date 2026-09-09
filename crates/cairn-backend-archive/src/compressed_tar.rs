@@ -82,16 +82,6 @@ pub(crate) enum Compression {
 }
 
 impl Compression {
-    /// This format's magic bytes, as checked by [`sniff`].
-    fn magic(self) -> &'static [u8] {
-        match self {
-            Self::Gzip => GZIP_MAGIC,
-            Self::Bzip2 => BZIP2_MAGIC,
-            Self::Xz => XZ_MAGIC,
-            Self::Zstd => ZSTD_MAGIC,
-        }
-    }
-
     /// A human-readable name for error messages.
     fn label(self) -> &'static str {
         match self {
@@ -299,25 +289,35 @@ fn multi_stream_err(label: &str) -> VfsError {
     }
 }
 
-/// Scan `path`'s own bytes (read once, streamed in fixed-size chunks — never the decoder's
-/// interpretation of them) for a second occurrence of `magic` starting at any byte offset at or
-/// after 1 (offset 0 is the file's own leading magic, already established by [`sniff`]).
+/// Whether a second **bzip2 stream header** appears after the start of `path`.
 ///
-/// This is the multi-stream/multi-frame guard described in the module docs: it is deliberately
-/// independent of anything a decoder reports about how much of its input it "consumed", because
-/// that signal was found to be unreliable for at least one decoder in this module (`bzip2-rs`
-/// reads its entire input into an internal buffer regardless of stream count). A hit is a
-/// conservative, fail-closed signal — an extremely rare false positive (the magic bytes
-/// coincidentally recurring within genuine compressed entropy) costs a refused mount, never a
-/// silently truncated one, which is the correct trade-off for a file manager.
-fn contains_magic_after_start(path: &Path, magic: &[u8]) -> Result<bool, VfsError> {
-    debug_assert!(!magic.is_empty());
+/// `bzip2-rs` reads its entire input regardless of stream count, so it cannot tell us whether it
+/// decoded everything — the only signal left is the compressed bytes themselves. Matching the
+/// 3-byte `BZh` magic alone is far too weak: three bytes recur by chance roughly every 16 MB of
+/// compressed entropy, so an ordinary ~16 MB `.tar.bz2` was refused about 60% of the time and a
+/// 100 MB one essentially always, with a message wrongly blaming the *archive* for being
+/// multi-stream. A real concatenated stream begins with the full 10-byte header — `BZh`, a level
+/// digit `1`–`9`, and then the 48-bit block magic (pi) or end-of-stream magic (sqrt pi) — which
+/// makes a chance match about 2^-72. Concatenated streams are whole files, so byte alignment holds.
+fn contains_second_bzip2_stream(path: &Path) -> Result<bool, VfsError> {
+    /// Start of every bzip2 block, big-endian digits of pi.
+    const BLOCK_MAGIC: [u8; 6] = [0x31, 0x41, 0x59, 0x26, 0x53, 0x59];
+    /// Start of every bzip2 end-of-stream footer, digits of sqrt(pi).
+    const EOS_MAGIC: [u8; 6] = [0x17, 0x72, 0x45, 0x38, 0x50, 0x90];
+
+    let looks_like_stream_header = |w: &[u8]| {
+        w[0..3] == *BZIP2_MAGIC
+            && w[3].is_ascii_digit()
+            && w[3] != b'0'
+            && (w[4..10] == BLOCK_MAGIC || w[4..10] == EOS_MAGIC)
+    };
+
+    const SIG_LEN: usize = 10;
     let file = File::open(path).map_err(VfsError::Io)?;
     let mut reader = io::BufReader::new(file);
-    // `overlap` carries the trailing `magic.len() - 1` bytes of each chunk into the next one, so a
-    // match straddling a chunk boundary is never missed. `base` is the absolute file offset of
-    // `window[0]`, updated every time the window is trimmed back down to the overlap.
-    let overlap = magic.len().saturating_sub(1);
+    // `overlap` carries the trailing `SIG_LEN - 1` bytes of each chunk into the next one, so a match
+    // straddling a chunk boundary is never missed. `base` is the absolute file offset of `window[0]`.
+    let overlap = SIG_LEN - 1;
     let mut window: Vec<u8> = Vec::with_capacity(overlap + 64 * 1024);
     let mut base: u64 = 0;
     let mut chunk = [0u8; 64 * 1024];
@@ -327,11 +327,11 @@ fn contains_magic_after_start(path: &Path, magic: &[u8]) -> Result<bool, VfsErro
             return Ok(false);
         }
         window.extend_from_slice(&chunk[..n]);
-        if window.len() >= magic.len() {
-            for (i, w) in window.windows(magic.len()).enumerate() {
-                // Offset 0 is the file's own leading magic (already established by `sniff`) — only
-                // a match starting at offset >= 1 indicates a *second* occurrence.
-                if w == magic && base + i as u64 >= 1 {
+        if window.len() >= SIG_LEN {
+            for (i, w) in window.windows(SIG_LEN).enumerate() {
+                // Offset 0 is the file's own header (already established by `sniff`) — only a match
+                // at offset >= 1 is a *second* stream.
+                if base + i as u64 >= 1 && looks_like_stream_header(w) {
                     return Ok(true);
                 }
             }
@@ -389,6 +389,8 @@ fn decompress_to_temp(
     let source = File::open(path).map_err(VfsError::Io)?;
     let mut temp = new_temp_file()?;
 
+    // Set when a decoder that stops at one stream/frame leaves undecoded input behind.
+    let mut multi_frame = false;
     let mut capped = CappedWriter::new(temp.as_file_mut(), compressed_len, max_decompressed_bytes);
     let copy_result: io::Result<()> = match compression {
         Compression::Gzip => {
@@ -402,7 +404,20 @@ fn decompress_to_temp(
             io::copy(&mut decoder, &mut capped).map(|_| ())
         }
         Compression::Zstd => match ruzstd::decoding::StreamingDecoder::new(source) {
-            Ok(mut decoder) => io::copy(&mut decoder, &mut capped).map(|_| ()),
+            Ok(mut decoder) => {
+                let r = io::copy(&mut decoder, &mut capped).map(|_| ());
+                // `StreamingDecoder` stops after one frame, so anything still readable behind it is
+                // a second frame. That is an exact answer — unlike scanning the compressed bytes for
+                // a recurring magic, which for a 4-byte magic false-positives on ordinary archives.
+                if r.is_ok() {
+                    let mut rest = decoder.into_inner();
+                    let mut probe = [0u8; 1];
+                    if matches!(rest.read(&mut probe), Ok(1)) {
+                        multi_frame = true;
+                    }
+                }
+                r
+            }
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
         },
         Compression::Xz => unreachable!("handled above"),
@@ -415,11 +430,15 @@ fn decompress_to_temp(
         // (possibly confusing, generic "broken pipe"-style) wrapping of our forced I/O error.
         (_, Some(kind)) => Err(bomb_err(kind)),
         (Ok(()), None) => {
-            // gzip's `MultiGzDecoder` already handles concatenation correctly; bzip2/zstd don't,
-            // so guard those two explicitly (see `contains_magic_after_start`'s doc comment).
-            if matches!(compression, Compression::Bzip2 | Compression::Zstd)
-                && contains_magic_after_start(path, compression.magic())?
-            {
+            // gzip's `MultiGzDecoder` already handles concatenation correctly; bzip2 and zstd don't.
+            // zstd answers exactly (undecoded input left behind); bzip2-rs consumes its whole input
+            // regardless, so its streams are found by scanning for a second stream header.
+            let multi = match compression {
+                Compression::Zstd => multi_frame,
+                Compression::Bzip2 => contains_second_bzip2_stream(path)?,
+                Compression::Gzip | Compression::Xz => false,
+            };
+            if multi {
                 return Err(multi_stream_err(compression.label()));
             }
             Ok((temp, total))
@@ -837,6 +856,50 @@ mod tests {
             .read_member(&VfsPath::parse("hello.txt").unwrap(), 1024)
             .unwrap();
         assert_eq!(data, b"hello, zstd archive");
+    }
+
+    /// Regression: the multi-stream guard matched the bare 3-byte `BZh` magic anywhere in the file.
+    /// Three bytes recur by chance roughly every 16 MB of compressed entropy, so an ordinary
+    /// `.tar.bz2` was refused about 60% of the time at ~16 MB and essentially always at 100 MB —
+    /// with a message wrongly telling the user their archive was multi-stream. A real second stream
+    /// starts with the full 10-byte header, which does not occur by accident.
+    #[test]
+    fn a_bare_bzh_inside_the_compressed_body_is_not_a_second_stream() {
+        // A real single stream, with the bare magic spliced into its compressed body — the scan
+        // never decodes, so corrupting the payload is irrelevant and this isolates exactly the
+        // discrimination the guard has to make.
+        // Incompressible-ish payload, so the encoded stream is long enough to splice into.
+        let payload: Vec<u8> = (0..16_384u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let mut bytes = bzip2_bytes(&payload);
+        assert!(bytes.len() > 64, "fixture too small to splice into");
+        let mid = bytes.len() / 2;
+        bytes[mid..mid + 3].copy_from_slice(b"BZh");
+        // …and the magic followed by a level digit but no block/end-of-stream magic, which is what a
+        // naive tightening to four bytes would still trip on.
+        bytes[mid + 8..mid + 12].copy_from_slice(b"BZh9");
+        let tmp = write_temp(&bytes);
+        assert!(
+            !contains_second_bzip2_stream(tmp.path()).unwrap(),
+            "a stray BZh in the compressed body was mistaken for a second stream"
+        );
+    }
+
+    /// The tightened signature still finds a real second stream — both its block and end-of-stream
+    /// forms — which is what the guard exists for.
+    #[test]
+    fn a_real_second_bzip2_stream_is_still_found() {
+        let mut combined = bzip2_bytes(b"first");
+        combined.extend_from_slice(&bzip2_bytes(b"second"));
+        let tmp = write_temp(&combined);
+        assert!(contains_second_bzip2_stream(tmp.path()).unwrap());
+
+        // An empty second stream is header + end-of-stream footer, with no block magic at all.
+        let mut combined = bzip2_bytes(b"first");
+        combined.extend_from_slice(&bzip2_bytes(b""));
+        let tmp = write_temp(&combined);
+        assert!(contains_second_bzip2_stream(tmp.path()).unwrap());
     }
 
     /// THE regression test: two independently-encoded bzip2 streams concatenated. `DecoderReader`
