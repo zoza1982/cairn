@@ -358,37 +358,20 @@ async fn run_async() -> anyhow::Result<()> {
             .all(|e| matches!(e, AppEffect::List { .. } | AppEffect::DetectOsSources)),
         "initial_effects may only emit List and DetectOsSources effects at startup"
     );
-    let mut startup_controls = HashMap::new();
-    let mut startup_log_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
-    let mut startup_pager_controls: HashMap<PagerId, CancellationToken> = HashMap::new();
-    let mut startup_session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
-    // Initial effects are List effects only (asserted above); empty descriptor map and an
-    // empty in-flight set are safe here because OpenConnection is never emitted before the
-    // event loop starts.
+    // Startup effects run before the loop owns a `Runtime`, so give them their own: nothing
+    // started here can be signalled yet, and the tables are rebuilt when the loop begins.
+    // No descriptors yet: nothing dispatched at startup opens a profile connection.
     let empty_descriptors: HashMap<ConnectionId, ConnectionDescriptor> = HashMap::new();
-    let mut startup_in_flight: HashSet<ConnectionId> = HashSet::new();
-    let mut startup_test_in_flight: HashSet<ConnectionId> = HashSet::new();
-    let mut startup_next_archive_conn_id: u64 = ARCHIVE_CONN_ID_BASE;
-    let mut startup_remote_edit_temps: HashMap<RemoteEditId, tempfile::TempDir> = HashMap::new();
+    let mut startup_rt = Runtime::new();
+    let startup_ctx = RuntimeCtx {
+        registry: &registry,
+        event_tx: &event_tx,
+        shell_action_defs: &shell_action_defs,
+        vault_ctx: &vault_ctx,
+        descriptor_map: &empty_descriptors,
+    };
     for effect in initial {
-        dispatch(
-            effect,
-            &registry,
-            &event_tx,
-            &mut startup_controls,
-            &mut None,
-            &mut startup_log_controls,
-            &mut startup_pager_controls,
-            &mut startup_session_controls,
-            &shell_action_defs,
-            &vault_ctx,
-            &empty_descriptors,
-            &mut startup_in_flight,
-            &mut startup_test_in_flight,
-            &mut startup_next_archive_conn_id,
-            &mut startup_remote_edit_temps,
-            &mut None,
-        );
+        dispatch(effect, &mut startup_rt, &startup_ctx);
     }
     terminal.draw(|f| cairn_tui::render(f, &state, &ui.theme(&state)))?;
 
@@ -893,38 +876,14 @@ async fn event_loop(
     // `descriptor_map` is looked up by the OpenConnection effect runner to find what to open.
     // P3: needs Arc<RwLock<_>> or a re-enumeration message to swap this map without restarting
     // the loop (RFC-0011 §3: live config reload while panes are browsing connections).
-    // Control channels of the in-flight transfer / AI plan (if any), held runtime-side so the
-    // matching effect can signal them. Each is cleared when its Done event arrives.
-    // Per-transfer control, keyed by `TransferId`: the cancel token + pause sender form a *control
-    // pair* created together (in `AppEffect::Transfer`) and removed together (on that transfer's
-    // `TransferDone`/`TransferConflict`). Multiple transfers run concurrently, so this is a map.
-    let mut transfer_controls: HashMap<TransferId, TransferControls> = HashMap::new();
-    let mut ai_cancel: Option<CancellationToken> = None;
-    let mut log_viewer_controls: HashMap<LogViewerId, CancellationToken> = HashMap::new();
-    let mut pager_controls: HashMap<PagerId, CancellationToken> = HashMap::new();
-    // The cancel token for the single in-flight folder-size walk (the open FolderStats popup), if any.
-    let mut size_calc_cancel: Option<CancellationToken> = None;
-    let mut session_controls: HashMap<SessionId, SessionControls> = HashMap::new();
-    // Tracks which ConnectionIds currently have an open task in flight. A duplicate
-    // OpenConnection effect for the same id (e.g. the user selects a NeedsOpen entry twice
-    // before the first open completes) is dropped here so only one backend connection is
-    // established. The id is removed when the matching ConnectionOpened event arrives.
-    let mut open_connection_in_flight: HashSet<ConnectionId> = HashSet::new();
-    // Same idea as `open_connection_in_flight`, but for `AppEffect::TestConnection` (RFC-0011 P6):
-    // a duplicate probe for the same id (repeated `t` presses before the first completes) is
-    // dropped so only one probe runs at a time. Removed when `ConnectionTested` arrives.
-    let mut test_connection_in_flight: HashSet<ConnectionId> = HashSet::new();
-    // Monotonic id source for ephemeral archive-mount connections (RFC-0013). Lives for the whole
-    // event-loop lifetime (unlike the per-transfer/session maps above) because, unlike those, there
-    // is no "done" event that could reclaim an id for reuse — each mount is a genuinely new,
-    // permanently-registered (for the session) connection. See `ARCHIVE_CONN_ID_BASE`.
-    let mut next_archive_conn_id: u64 = ARCHIVE_CONN_ID_BASE;
-    // Owns the RAII temp directory for each in-flight remote-edit session (RFC-0012 P3), keyed by
-    // `RemoteEditId`. Created in `dispatch`'s `DownloadForEdit` arm; removed (deleting the temp
-    // file) on every terminal outcome below, on an explicit `CancelRemoteEdit` (`dispatch`), and —
-    // as a last-resort safety net — when the whole event loop exits (dropping this map along with
-    // every other local here), so a session left open when the app quits is still cleaned up.
-    let mut remote_edit_temps: HashMap<RemoteEditId, tempfile::TempDir> = HashMap::new();
+    let mut rt = Runtime::new();
+    let ctx = RuntimeCtx {
+        registry,
+        event_tx,
+        shell_action_defs,
+        vault_ctx,
+        descriptor_map: &descriptor_map,
+    };
     loop {
         let msg = tokio::select! {
             Some(ev) = event_rx.recv() => Some(Msg::Event(ev)),
@@ -933,54 +892,9 @@ async fn event_loop(
         };
         let Some(msg) = msg else { continue };
 
-        // Clear before `update`: a transfer's Done/Conflict releases its control entry *before*
-        // `update` (which may start a queued transfer via the tail-drain) so the fresh entry the new
-        // transfer's dispatch inserts isn't wiped.
-        if let Msg::Event(
-            AppEvent::TransferDone { id, .. } | AppEvent::TransferConflict { id, .. },
-        ) = &msg
-        {
-            transfer_controls.remove(id);
-        }
-        if matches!(msg, Msg::Event(AppEvent::AiPlanExecuted { .. })) {
-            ai_cancel = None;
-        }
-        if let Msg::Event(AppEvent::LogStreamEnded { id, .. }) = &msg {
-            log_viewer_controls.remove(id);
-        }
-        // The reducer's own cap-hit path (`AppEvent::PagerChunk` reaching `PAGER_MAX_BYTES`)
-        // fires `AppEffect::ClosePager` itself (handled in `dispatch`, below) rather than waiting
-        // for `PagerDone` — so this only needs to clean up the natural EOF/error/cancel paths.
-        if let Msg::Event(AppEvent::PagerDone { id, .. }) = &msg {
-            pager_controls.remove(id);
-        }
-        // Session cleanup: remove the controls entry when the session ends so the oneshot/mpsc
-        // senders are dropped (closing stdin and signalling the relay task) if they haven't been
-        // consumed already. The session record in `AppState::sessions` is cleaned up by the reducer.
-        if let Msg::Event(AppEvent::SessionEnded { id, .. }) = &msg {
-            session_controls.remove(id);
-        }
-        // Remove the in-flight marker when the open result arrives so duplicate effects
-        // for the same id are unblocked (the first open is done; a retry is now allowed).
-        if let Msg::Event(AppEvent::ConnectionOpened { conn, .. }) = &msg {
-            open_connection_in_flight.remove(conn);
-        }
-        // Same for `ConnectionTested` (RFC-0011 P6): unblock a future probe of the same id.
-        if let Msg::Event(AppEvent::ConnectionTested { conn, .. }) = &msg {
-            test_connection_in_flight.remove(conn);
-        }
-        // RFC-0012 P3: every terminal outcome of a remote-edit session drops (and thus deletes)
-        // its held temp directory. `WriteBackConflict` is deliberately excluded — the flow
-        // continues (the overlay is open, or `KeepEditing`/`SaveAs` will re-use the same temp
-        // file), so cleanup must not run yet.
-        if let Msg::Event(
-            AppEvent::RemoteEditNoChange { id, .. }
-            | AppEvent::RemoteEditFailed { id, .. }
-            | AppEvent::WriteBackDone { id, .. },
-        ) = &msg
-        {
-            remote_edit_temps.remove(id);
-        }
+        // Release what this event has ended, before `update` — see `Runtime::reap` for why the
+        // order matters.
+        rt.reap(&msg);
         let effects = update(state, msg);
         if state.should_quit {
             break;
@@ -1027,24 +941,7 @@ async fn event_loop(
                 .await;
                 continue;
             }
-            dispatch(
-                effect,
-                registry,
-                event_tx,
-                &mut transfer_controls,
-                &mut ai_cancel,
-                &mut log_viewer_controls,
-                &mut pager_controls,
-                &mut session_controls,
-                shell_action_defs,
-                vault_ctx,
-                &descriptor_map,
-                &mut open_connection_in_flight,
-                &mut test_connection_in_flight,
-                &mut next_archive_conn_id,
-                &mut remote_edit_temps,
-                &mut size_calc_cancel,
-            );
+            dispatch(effect, &mut rt, &ctx);
         }
     }
     Ok(())
@@ -1256,30 +1153,128 @@ fn map_input(input: Event, keymap: &Keymap, state: &AppState) -> Option<Msg> {
     }
 }
 
-/// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s. `transfer_controls`
-/// maps each [`TransferId`] to its cancel token + pause sender, so [`AppEffect::CancelTransfer`] and
-/// [`AppEffect::SetTransferPaused`] can target the right transfer task. `descriptor_map` is looked
-/// up by [`AppEffect::OpenConnection`] to find the [`ConnectionDescriptor`] for a selected id.
-/// `open_connection_in_flight` prevents duplicate concurrent backend connections for the same id.
-#[allow(clippy::too_many_arguments)]
-fn dispatch(
-    effect: AppEffect,
-    registry: &VfsRegistry,
-    event_tx: &mpsc::Sender<AppEvent>,
-    transfer_controls: &mut HashMap<TransferId, TransferControls>,
-    ai_cancel: &mut Option<CancellationToken>,
-    log_viewer_controls: &mut HashMap<LogViewerId, CancellationToken>,
-    pager_controls: &mut HashMap<PagerId, CancellationToken>,
-    session_controls: &mut HashMap<SessionId, SessionControls>,
-    shell_action_defs: &Arc<[cairn_config::ShellActionDef]>,
-    vault_ctx: &VaultContext,
-    descriptor_map: &HashMap<ConnectionId, ConnectionDescriptor>,
-    open_connection_in_flight: &mut HashSet<ConnectionId>,
-    test_connection_in_flight: &mut HashSet<ConnectionId>,
-    next_archive_conn_id: &mut u64,
-    remote_edit_temps: &mut HashMap<RemoteEditId, tempfile::TempDir>,
-    size_calc_cancel: &mut Option<CancellationToken>,
-) {
+/// The runtime's live control tables: everything an in-flight effect can be signalled through, plus
+/// the two in-flight markers and the archive-connection id source.
+///
+/// These were ten loose locals in `event_loop`, threaded through a sixteen-argument `dispatch`.
+/// Grouping them is not only tidiness: their *lifecycle* — which event releases which entry, and in
+/// what order relative to `update` — was a hand-maintained chain in the loop body, which needs a
+/// real terminal to run and so could not be tested at all. As a type with a [`reap`](Self::reap)
+/// method, that chain is ordinary code with ordinary tests.
+///
+/// The id families are deliberately **not** collapsed into one `TaskId`: a transfer, a log stream, a
+/// pager and a session are signalled differently and end differently, and separate keys keep that
+/// honest.
+#[derive(Default)]
+struct Runtime {
+    /// Per-transfer cancel token + pause sender, created and removed together.
+    transfer_controls: HashMap<TransferId, TransferControls>,
+    ai_cancel: Option<CancellationToken>,
+    log_viewer_controls: HashMap<LogViewerId, CancellationToken>,
+    pager_controls: HashMap<PagerId, CancellationToken>,
+    session_controls: HashMap<SessionId, SessionControls>,
+    /// The single in-flight folder-size walk (the open `FolderStats` popup), if any.
+    size_calc_cancel: Option<CancellationToken>,
+    /// Connections with an open in progress, so a duplicate `OpenConnection` is dropped rather than
+    /// establishing a second backend connection.
+    open_connection_in_flight: HashSet<ConnectionId>,
+    /// The same, for `TestConnection` probes.
+    test_connection_in_flight: HashSet<ConnectionId>,
+    /// Monotonic id source for ephemeral archive-mount connections. Unlike the maps above there is
+    /// no "done" event that could reclaim an id, so it only ever grows.
+    next_archive_conn_id: u64,
+    /// RAII temp directories for in-flight remote-edit sessions; dropping an entry deletes the file.
+    remote_edit_temps: HashMap<RemoteEditId, tempfile::TempDir>,
+}
+
+impl Runtime {
+    fn new() -> Self {
+        Self {
+            next_archive_conn_id: ARCHIVE_CONN_ID_BASE,
+            ..Self::default()
+        }
+    }
+
+    /// Release the control entry an event has just ended, **before** `update` runs.
+    ///
+    /// Ordering matters and is the reason this runs first: a transfer's `Done`/`Conflict` releases
+    /// its entry before `update`, which may start a queued transfer via the tail-drain — reaping
+    /// afterwards would wipe the fresh entry that transfer's dispatch had just inserted.
+    fn reap(&mut self, msg: &Msg) {
+        let Msg::Event(event) = msg else { return };
+        match event {
+            AppEvent::TransferDone { id, .. } | AppEvent::TransferConflict { id, .. } => {
+                self.transfer_controls.remove(id);
+            }
+            AppEvent::AiPlanExecuted { .. } => self.ai_cancel = None,
+            AppEvent::LogStreamEnded { id, .. } => {
+                self.log_viewer_controls.remove(id);
+            }
+            // The reducer's own cap-hit path (`PagerChunk` reaching `PAGER_MAX_BYTES`) fires
+            // `AppEffect::ClosePager` itself rather than waiting for `PagerDone`, so this only
+            // covers the natural EOF/error/cancel paths.
+            AppEvent::PagerDone { id, .. } => {
+                self.pager_controls.remove(id);
+            }
+            // Dropping the entry closes stdin and signals the relay task, if the senders were not
+            // consumed already. The session record in `AppState` is the reducer's business.
+            AppEvent::SessionEnded { id, .. } => {
+                self.session_controls.remove(id);
+            }
+            // Unblock a retry now the first attempt has finished, either way.
+            AppEvent::ConnectionOpened { conn, .. } => {
+                self.open_connection_in_flight.remove(conn);
+            }
+            AppEvent::ConnectionTested { conn, .. } => {
+                self.test_connection_in_flight.remove(conn);
+            }
+            // Every terminal outcome of a remote-edit session drops (and so deletes) its temp
+            // directory. `WriteBackConflict` is deliberately absent: that flow continues — the
+            // overlay is open, and `KeepEditing`/`SaveAs` re-use the same temp file.
+            AppEvent::RemoteEditNoChange { id, .. }
+            | AppEvent::RemoteEditFailed { id, .. }
+            | AppEvent::WriteBackDone { id, .. } => {
+                self.remote_edit_temps.remove(id);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What every effect runner needs and none of them mutate.
+struct RuntimeCtx<'a> {
+    registry: &'a VfsRegistry,
+    event_tx: &'a mpsc::Sender<AppEvent>,
+    shell_action_defs: &'a Arc<[cairn_config::ShellActionDef]>,
+    vault_ctx: &'a VaultContext,
+    descriptor_map: &'a HashMap<ConnectionId, ConnectionDescriptor>,
+}
+
+/// Execute an effect on the tokio runtime; results flow back as [`AppEvent`]s.
+///
+/// Everything an effect can signal lives in [`Runtime`] and everything it reads in [`RuntimeCtx`],
+/// so this takes three arguments rather than the sixteen it grew to when each table was a separate
+/// local threaded down from `event_loop`.
+fn dispatch(effect: AppEffect, rt: &mut Runtime, ctx: &RuntimeCtx<'_>) {
+    let RuntimeCtx {
+        registry,
+        event_tx,
+        shell_action_defs,
+        vault_ctx,
+        descriptor_map,
+    } = *ctx;
+    let Runtime {
+        transfer_controls,
+        ai_cancel,
+        log_viewer_controls,
+        pager_controls,
+        session_controls,
+        size_calc_cancel,
+        open_connection_in_flight,
+        test_connection_in_flight,
+        next_archive_conn_id,
+        remote_edit_temps,
+    } = rt;
     match effect {
         AppEffect::List {
             pane,
@@ -6021,6 +6016,91 @@ mod tests {
             std::env::split_paths(&sanitized).collect::<Vec<_>>(),
             vec![std::path::PathBuf::from(keep[0])]
         );
+    }
+
+    /// The runtime's lifecycle invariants — which event releases which control entry — lived only
+    /// inside `event_loop`, which needs a real terminal and so could never be tested. Each one
+    /// leaks something real when it is wrong: a transfer entry that is never removed holds a
+    /// concurrency slot forever; an in-flight marker that is never cleared blocks every later open
+    /// of that connection; a remote-edit temp that is never dropped leaves the file on disk.
+    #[test]
+    fn every_terminal_event_releases_its_control_entry() {
+        let token = || CancellationToken::new();
+        let mut rt = Runtime::new();
+
+        rt.ai_cancel = Some(token());
+        rt.log_viewer_controls.insert(1, token());
+        rt.pager_controls.insert(1, token());
+        rt.open_connection_in_flight.insert(ConnectionId(9));
+        rt.test_connection_in_flight.insert(ConnectionId(9));
+
+        rt.reap(&Msg::Event(AppEvent::AiPlanExecuted {
+            status: String::new(),
+            error: false,
+        }));
+        assert!(rt.ai_cancel.is_none());
+
+        rt.reap(&Msg::Event(AppEvent::LogStreamEnded { id: 1, error: None }));
+        assert!(rt.log_viewer_controls.is_empty());
+
+        rt.reap(&Msg::Event(AppEvent::PagerDone {
+            id: 1,
+            error: None,
+            truncated: false,
+        }));
+        assert!(rt.pager_controls.is_empty());
+
+        rt.reap(&Msg::Event(AppEvent::ConnectionOpened {
+            conn: ConnectionId(9),
+            result: Ok(()),
+        }));
+        assert!(rt.open_connection_in_flight.is_empty());
+
+        rt.reap(&Msg::Event(AppEvent::ConnectionTested {
+            conn: ConnectionId(9),
+            result: Ok(()),
+        }));
+        assert!(rt.test_connection_in_flight.is_empty());
+    }
+
+    /// `WriteBackConflict` is deliberately *not* a terminal outcome: the flow continues (the overlay
+    /// is open, and `KeepEditing`/`SaveAs` re-use the same temp file), so reaping it would delete
+    /// the file out from under the user's next choice.
+    #[test]
+    fn a_writeback_conflict_keeps_the_remote_edit_temp() {
+        let mut rt = Runtime::new();
+        let id: RemoteEditId = 1;
+        rt.remote_edit_temps.insert(id, tempfile_dir());
+        rt.reap(&Msg::Event(AppEvent::WriteBackConflict {
+            id,
+            conn: ConnectionId(1),
+            path: VfsPath::parse("/f").unwrap(),
+            temp_path: PathBuf::from("/tmp/f"),
+            v0: cairn_core::RemoteVersion::ETag("v1".to_owned()),
+            orig_size: 1,
+            orig_perms: None,
+            download_hash: [0u8; 32],
+            hash: [0u8; 32],
+            reason: cairn_core::WritebackConflictReason::RemoteChanged,
+        }));
+        assert!(
+            rt.remote_edit_temps.contains_key(&id),
+            "the temp was deleted while the conflict overlay still needs it"
+        );
+
+        rt.reap(&Msg::Event(AppEvent::WriteBackDone {
+            id,
+            name: "f".to_owned(),
+        }));
+        assert!(rt.remote_edit_temps.is_empty());
+    }
+
+    /// Archive-mount ids only ever grow: unlike the per-transfer and per-session tables there is no
+    /// "done" event that could reclaim one, because each mount is a genuinely new connection
+    /// registered for the rest of the session.
+    #[test]
+    fn the_archive_connection_id_source_starts_at_its_base() {
+        assert_eq!(Runtime::new().next_archive_conn_id, ARCHIVE_CONN_ID_BASE);
     }
 
     #[tokio::test]
