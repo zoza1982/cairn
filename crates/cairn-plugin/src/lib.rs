@@ -147,6 +147,35 @@ pub struct Limits {
     pub max_call_ticks: u64,
 }
 
+impl Limits {
+    /// The ceilings the **host** enforces, whatever a plugin's manifest asks for.
+    ///
+    /// A manifest is written by the plugin author, i.e. by the untrusted party: letting it choose
+    /// its own `fuel` and `max_call_ticks` means the sandbox's resource bounds are set by the code
+    /// they are meant to bound. A plugin may still ask for *less* than these — declaring modest
+    /// needs is useful and safe — but never for more. Deliberately generous (4×–6× the defaults) so
+    /// an honest large plugin is unaffected; they exist to stop `u64::MAX`, not to tune.
+    pub const HOST_CEILING: Self = Self {
+        max_memory_bytes: 512 * 1024 * 1024,
+        fuel: 10_000_000_000,
+        max_stream_bytes: 16 * 1024 * 1024 * 1024,
+        max_call_ticks: 300, // ≈ 30 s per call
+    };
+
+    /// This, clamped to what the host permits. Applied to every manifest-derived value.
+    #[must_use]
+    pub fn clamped_to_host(self) -> Self {
+        let c = Self::HOST_CEILING;
+        Self {
+            max_memory_bytes: self.max_memory_bytes.min(c.max_memory_bytes),
+            fuel: self.fuel.min(c.fuel),
+            max_stream_bytes: self.max_stream_bytes.min(c.max_stream_bytes),
+            // Clamped to ≥ 1: zero would trap every call immediately.
+            max_call_ticks: self.max_call_ticks.clamp(1, c.max_call_ticks),
+        }
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {

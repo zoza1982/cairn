@@ -100,6 +100,14 @@ max_call_ticks   = 50         # 50 × 100 ms epoch interval ≈ 5 s per call
 max_response_bytes = 8388608  # 8 MiB max http-fetch response body
 ```
 
+**These are requests, not settings.** The manifest ships with the plugin, so its author is the
+untrusted party: a value taken at face value would let the guest choose the bounds meant to contain
+it (`fuel = u64::MAX` and `max_call_ticks = u64::MAX` together disable both the instruction and the
+wall-clock guard). Every `[limits]` value is clamped host-side to `Limits::HOST_CEILING` — 512 MiB
+memory, 10^10 fuel, 300 ticks (≈30 s), 16 GiB stream, 64 MiB response body — which is 4–8× the
+defaults, so an honest large plugin is unaffected. A plugin asking for *less* gets what it asked
+for; `max_call_ticks = 0` is floored at 1 rather than trapping every call.
+
 The install flow:
 
 ```
