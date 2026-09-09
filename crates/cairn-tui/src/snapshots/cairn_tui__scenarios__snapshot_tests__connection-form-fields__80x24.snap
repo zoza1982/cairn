@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│>  src/                               ││>  src/                               │
+│   docs/                              ││   docs/                              │
+│   Cargo.toml                         ││   Cargo.toml                         │
+│   README.md                          ││   README.md                          │
+│                                      ││                                      │
+│         ┌ New connection — fill in details ────────────────────────┐         │
+│         │> Name: My SSH server                                     │         │
+│         │  Host: dietpi6.local                                     │         │
+│         │  User: admin                                             │         │
+│         │  Port: notaport  ⚠ must be a number between 1 and 65535  │         │
+│         │  Known-hosts file: ~/.ssh/known_hosts                    │         │
+│         │  Host key check: strict|accept-new|off                   │         │
+│         │  Next: choose authentication method →                    │         │
+│         │                                                          │         │
+│         │[Tab/↑↓] Navigate fields  [Enter] Next  [Esc] Back        │         │
+│         └──────────────────────────────────────────────────────────┘         │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 1/4   q quit · Tab · ↵ open · v view · e edit · r rename · c copy · m move

@@ -3391,6 +3391,43 @@ mod tests {
         }
     }
 
+    /// The credential-fields stage is the only screen in the app that echoes a secret the user has
+    /// typed, and it had no render coverage at all — no scenario, no snapshot, no unit test — in a
+    /// tool whose own rules set "the highest bar" for secret handling. A snapshot would catch a
+    /// changed *layout*; this asserts the property that actually matters: the characters never reach
+    /// the frame buffer.
+    #[test]
+    fn a_typed_passphrase_never_reaches_the_frame_buffer() {
+        const SECRET: &str = "Zq7Xv2Kw9Pb4Nm5Tj8Rd1";
+        let s = crate::scenarios::all()
+            .into_iter()
+            .find(|sc| sc.name == "connection-form-credential-fields")
+            .expect("scenario exists")
+            .render(80, 24);
+
+        assert!(
+            !s.contains(SECRET),
+            "the typed passphrase was rendered verbatim"
+        );
+        // Not just the whole string: no run of it may survive either. Six characters of a
+        // distinctive secret cannot collide with the dialog's own chrome (a shorter window does —
+        // four characters of an English passphrase matches "[Enter]").
+        for window in SECRET.as_bytes().windows(6) {
+            let frag = std::str::from_utf8(window).unwrap();
+            assert!(
+                !s.contains(frag),
+                "a fragment of the passphrase ({frag}) reached the buffer"
+            );
+        }
+        // It is masked, not simply absent — one bullet per character.
+        assert!(
+            s.contains(&"•".repeat(SECRET.chars().count())),
+            "expected the passphrase to render as bullets"
+        );
+        // The non-secret field beside it stays legible.
+        assert!(s.contains("~/.ssh/id_ed25519"));
+    }
+
     #[test]
     fn ai_plan_overlay_hides_bulk_approve_for_irreversible_plan() {
         let mut s = ready_state();
