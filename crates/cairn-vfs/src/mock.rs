@@ -18,6 +18,12 @@ type Tree = Arc<Mutex<BTreeMap<String, Node>>>;
 enum Node {
     Dir,
     File(Vec<u8>),
+    /// A symlink, carrying its target. Present so the transfer engine's symlink handling is
+    /// testable — a real backend reports these from an `lstat`-style call, never following them.
+    Symlink(String),
+    /// A socket / device / FIFO. A backend that opens one of these blocks forever, which is
+    /// precisely the case the engine must refuse to reach.
+    Special,
 }
 
 /// An in-memory [`Vfs`] implementation for tests.
@@ -37,6 +43,14 @@ pub struct MockVfs {
     on_eof: Option<(String, Arc<dyn Fn() + Send + Sync>)>,
     /// What the write sinks declare (default `Streamed`); `Buffered` models an object store.
     commit_mode: CommitMode,
+    /// Modification times, for conflict policies that compare them.
+    modified: BTreeMap<String, std::time::SystemTime>,
+    /// Sizes `stat` reports instead of the real content length, for verify-mismatch tests.
+    reported_size: BTreeMap<String, u64>,
+    /// Whether this backend advertises (and implements) a server-side copy.
+    copy_server: bool,
+    /// Whether this backend can make directories. Object stores cannot — they have no directories.
+    can_create_dir: bool,
     /// Artificial delay inside `finish`, so a test can observe what a caller does while a slow
     /// commit (a big single-shot upload, a remote fsync) is in flight.
     finish_delay: Option<std::time::Duration>,
@@ -56,6 +70,10 @@ impl MockVfs {
             aborted: Arc::new(Mutex::new(Vec::new())),
             on_eof: None,
             commit_mode: CommitMode::Streamed,
+            modified: BTreeMap::new(),
+            reported_size: BTreeMap::new(),
+            copy_server: false,
+            can_create_dir: true,
             finish_delay: None,
         }
     }
@@ -126,6 +144,60 @@ impl MockVfs {
         self
     }
 
+    /// Builder: add a symlink at `path` pointing at `target`. `stat` reports it as
+    /// [`EntryKind::Symlink`] (it does not follow, like a real backend's `lstat`).
+    #[must_use]
+    pub fn with_symlink(self, path: &str, target: &str) -> Self {
+        let p = VfsPath::parse(path).expect("valid test path");
+        self.lock()
+            .insert(p.as_str(), Node::Symlink(target.to_owned()));
+        self
+    }
+
+    /// Builder: add a special node (socket/device/FIFO) at `path`.
+    #[must_use]
+    pub fn with_special(self, path: &str) -> Self {
+        let p = VfsPath::parse(path).expect("valid test path");
+        self.lock().insert(p.as_str(), Node::Special);
+        self
+    }
+
+    /// Builder: give `path` a modification time, so conflict policies that compare timestamps
+    /// (`cairn-transfer`'s `ConflictPolicy::NewerWins`) can actually resolve. Without
+    /// one, every comparison falls through to "skip" and the branch is untestable.
+    #[must_use]
+    pub fn with_modified(mut self, path: &str, at: std::time::SystemTime) -> Self {
+        let p = VfsPath::parse(path).expect("valid test path");
+        self.modified.insert(p.as_str(), at);
+        self
+    }
+
+    /// Builder: advertise [`Caps::COPY_SERVER`] and implement `copy_within` as a node clone, so the
+    /// engine's same-connection server-side copy fast path is reachable.
+    #[must_use]
+    pub fn with_copy_server(mut self) -> Self {
+        self.copy_server = true;
+        self
+    }
+
+    /// Builder: model a backend with no directories (an object store): `CREATE_DIR` is not
+    /// advertised and `create_dir` reports `Unsupported`, as `ObjectStoreVfs` does.
+    #[must_use]
+    pub fn without_create_dir(mut self) -> Self {
+        self.can_create_dir = false;
+        self
+    }
+
+    /// Builder: make `stat` report `size` for `path` regardless of its real contents — the only way
+    /// to reach `cairn-transfer`'s `VerifyPolicy::Size` mismatch arm, since a faithful
+    /// mock always agrees with the bytes it was handed.
+    #[must_use]
+    pub fn with_reported_size(mut self, path: &str, size: u64) -> Self {
+        let p = VfsPath::parse(path).expect("valid test path");
+        self.reported_size.insert(p.as_str(), size);
+        self
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Node>> {
         self.nodes.lock().expect("mock vfs mutex poisoned")
     }
@@ -148,13 +220,11 @@ impl MockVfs {
             if rest.is_empty() || rest.contains('/') {
                 continue; // not a direct child
             }
-            let kind = match node {
-                Node::Dir => EntryKind::Dir,
-                Node::File(_) => EntryKind::File,
-            };
-            let size = match node {
-                Node::File(b) => Some(b.len() as u64),
-                Node::Dir => None,
+            let (kind, size) = match node {
+                Node::Dir => (EntryKind::Dir, None),
+                Node::File(b) => (EntryKind::File, Some(b.len() as u64)),
+                Node::Symlink(_) => (EntryKind::Symlink, None),
+                Node::Special => (EntryKind::Special, None),
             };
             let mut entry = Entry::new(rest, kind);
             entry.size = size;
@@ -166,14 +236,16 @@ impl MockVfs {
 
 impl CapabilityProvider for MockVfs {
     fn caps(&self) -> Caps {
-        Caps::LIST
+        let mut caps = Caps::LIST
             | Caps::READ
             | Caps::WRITE
-            | Caps::CREATE_DIR
             | Caps::DELETE
             | Caps::RENAME
             | Caps::RENAME_ATOMIC
-            | Caps::RANDOM_READ
+            | Caps::RANDOM_READ;
+        caps.set(Caps::CREATE_DIR, self.can_create_dir);
+        caps.set(Caps::COPY_SERVER, self.copy_server);
+        caps
     }
 }
 
@@ -213,16 +285,31 @@ impl Vfs for MockVfs {
         if path.is_root() {
             return Ok(Entry::new("", EntryKind::Dir));
         }
+        let key = path.as_str();
+        let name = path.file_name().unwrap_or("");
         let nodes = self.lock();
-        match nodes.get(&path.as_str()) {
-            Some(Node::Dir) => Ok(Entry::new(path.file_name().unwrap_or(""), EntryKind::Dir)),
+        let mut e = match nodes.get(&key) {
+            Some(Node::Dir) => Entry::new(name, EntryKind::Dir),
             Some(Node::File(b)) => {
-                let mut e = Entry::new(path.file_name().unwrap_or(""), EntryKind::File);
-                e.size = Some(b.len() as u64);
-                Ok(e)
+                let mut e = Entry::new(name, EntryKind::File);
+                e.size = Some(
+                    self.reported_size
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(b.len() as u64),
+                );
+                e
             }
-            None => Err(VfsError::NotFound(path.clone())),
-        }
+            Some(Node::Symlink(target)) => {
+                let mut e = Entry::new(name, EntryKind::Symlink);
+                e.symlink_target = VfsPath::parse(target).ok();
+                e
+            }
+            Some(Node::Special) => Entry::new(name, EntryKind::Special),
+            None => return Err(VfsError::NotFound(path.clone())),
+        };
+        e.modified = self.modified.get(&key).copied();
+        Ok(e)
     }
 
     async fn open_read(
@@ -234,7 +321,11 @@ impl Vfs for MockVfs {
             let nodes = self.lock();
             match nodes.get(&path.as_str()) {
                 Some(Node::File(b)) => b.clone(),
-                Some(Node::Dir) => return Err(VfsError::Unsupported(Caps::READ)),
+                // A real backend blocks forever opening a FIFO and errors on a directory; the
+                // engine must never reach either, so make both loud rather than plausible.
+                Some(Node::Dir | Node::Symlink(_) | Node::Special) => {
+                    return Err(VfsError::Unsupported(Caps::READ))
+                }
                 None => return Err(VfsError::NotFound(path.clone())),
             }
         };
@@ -276,7 +367,29 @@ impl Vfs for MockVfs {
     }
 
     async fn create_dir(&self, path: &VfsPath) -> Result<(), VfsError> {
-        self.lock().insert(path.as_str(), Node::Dir);
+        // Report `AlreadyExists` like the real backends do — the engine's directory-merge path
+        // depends on it, and a mock that silently succeeded left that branch untested.
+        if !self.can_create_dir {
+            return Err(VfsError::Unsupported(Caps::CREATE_DIR));
+        }
+        let mut nodes = self.lock();
+        if nodes.contains_key(&path.as_str()) {
+            return Err(VfsError::AlreadyExists(path.clone()));
+        }
+        nodes.insert(path.as_str(), Node::Dir);
+        Ok(())
+    }
+
+    async fn copy_within(&self, from: &VfsPath, to: &VfsPath) -> Result<(), VfsError> {
+        if !self.copy_server {
+            return Err(VfsError::Unsupported(Caps::COPY_SERVER));
+        }
+        let mut nodes = self.lock();
+        let node = nodes
+            .get(&from.as_str())
+            .cloned()
+            .ok_or_else(|| VfsError::NotFound(from.clone()))?;
+        nodes.insert(to.as_str(), node);
         Ok(())
     }
 

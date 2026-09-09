@@ -7,7 +7,7 @@
 //! RFC-0002.
 
 use bytes::Bytes;
-use cairn_types::{Caps, Entry, VfsPath};
+use cairn_types::{Caps, Entry, EntryKind, VfsPath};
 use cairn_vfs::{CommitMode, ListOpts, Recurse, Vfs, VfsError, WriteOpts};
 use futures::StreamExt;
 use std::collections::VecDeque;
@@ -247,19 +247,32 @@ async fn transfer_one(
     progress: &mut (dyn FnMut(ProgressEvent) + Send),
     outcome: &mut TransferOutcome,
 ) -> Result<(), TransferError> {
-    // Same-connection move with rename support: a single atomic rename.
+    // Same-connection move with rename support: a single atomic rename. The conflict policy still
+    // decides the destination — `rename(2)` replaces an existing file, so taking this path without
+    // resolving first silently overwrote what `Skip`/`Prompt`/`Rename` were asked to protect.
     if spec.op == TransferOp::Move
         && src.connection() == dst.connection()
         && src.caps_at(from).contains(Caps::RENAME)
     {
-        src.rename(from, to).await?;
+        let to = match resolve_conflict(src, dst, from, to, spec.conflict).await? {
+            Resolution::Write { path, .. } => path,
+            Resolution::Skip => {
+                outcome.skipped += 1;
+                return Ok(());
+            }
+        };
+        src.rename(from, &to).await?;
         outcome.files += 1;
         return Ok(());
     }
 
+    // A skip is not a copy: deleting the source afterwards would destroy the only remaining copy of
+    // data the destination never received. One skipped leaf spares the whole source tree — losing a
+    // move the user asked for is recoverable (repeat it), losing their data is not.
+    let skipped_before = outcome.skipped;
     copy_tree(src, dst, from, to, spec, cancel, paused, progress, outcome).await?;
 
-    if spec.op == TransferOp::Move {
+    if spec.op == TransferOp::Move && outcome.skipped == skipped_before {
         src.remove(from, Recurse::Yes).await?;
     }
     Ok(())
@@ -287,20 +300,36 @@ async fn copy_tree(
             return Err(TransferError::Cancelled(TransferOutcome::default()));
         }
         let meta = src.stat(&f).await?;
-        if meta.is_dir() {
-            match dst.create_dir(&t).await {
-                Ok(()) => outcome.dirs += 1,
-                Err(VfsError::AlreadyExists(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
-            let mut stream = src.list(&f, ListOpts { all: true });
-            while let Some(page) = stream.next().await {
-                for entry in page?.entries {
-                    stack.push_back((f.join(&entry.name)?, t.join(&entry.name)?));
+        match meta.kind {
+            EntryKind::Dir => {
+                // Object stores have no directories: creating one is `Unsupported`, which used to
+                // abort the whole transfer before a single byte moved. Ask the backend first.
+                if dst.caps_at(&t).contains(Caps::CREATE_DIR) {
+                    match dst.create_dir(&t).await {
+                        Ok(()) => outcome.dirs += 1,
+                        Err(VfsError::AlreadyExists(_)) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                let mut stream = src.list(&f, ListOpts { all: true });
+                while let Some(page) = stream.next().await {
+                    for entry in page?.entries {
+                        stack.push_back((f.join(&entry.name)?, t.join(&entry.name)?));
+                    }
                 }
             }
-        } else {
-            copy_file(src, dst, &f, &t, spec, cancel, paused, progress, outcome).await?;
+            EntryKind::File => {
+                copy_file(src, dst, &f, &t, spec, cancel, paused, progress, outcome).await?;
+            }
+            // Anything that is not a file or a directory is skipped, never opened. Reading a FIFO
+            // blocks in the OS until a writer appears — with no cancellation point, so the transfer
+            // hung and `Esc` did nothing; a symlink is reported by `stat` (not followed), and
+            // opening one that points at a directory failed the whole transfer half-way through.
+            // Recreating links needs a `Vfs::symlink` the trait does not have yet, so for now the
+            // honest outcome is "skipped", which the summary already reports.
+            EntryKind::Symlink | EntryKind::Special | EntryKind::Stream => {
+                outcome.skipped += 1;
+            }
         }
     }
     Ok(())
@@ -725,6 +754,376 @@ mod tests {
             dst.stat(&p("/f")).await,
             Err(VfsError::NotFound(_))
         ));
+    }
+
+    /// Regression: `Move` + a policy that skips must not delete the source. `copy_file` returns
+    /// `Ok` for a skipped file, so the unconditional `remove` afterwards destroyed the only copy of
+    /// data the destination never received.
+    #[tokio::test]
+    async fn move_never_deletes_a_source_it_skipped() {
+        let src: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(1)).with_file("/f", b"source"));
+        let dst: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(2)).with_file("/f", b"dest"));
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            TransferSpec {
+                op: TransferOp::Move,
+                conflict: ConflictPolicy::Skip,
+                ..TransferSpec::default()
+            },
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.skipped, 1);
+        assert_eq!(
+            read_file(&src, "/f").await,
+            "source",
+            "the source was destroyed"
+        );
+        assert_eq!(read_file(&dst, "/f").await, "dest");
+    }
+
+    /// One skipped leaf spares the whole source tree: a recursive delete would take the files that
+    /// *did* copy along with the one that did not.
+    #[tokio::test]
+    async fn move_of_a_tree_spares_the_source_when_any_leaf_is_skipped() {
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_dir("/d")
+                .with_file("/d/a.txt", b"aaa")
+                .with_file("/d/b.txt", b"bbb"),
+        );
+        let dst: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(2))
+                .with_dir("/d")
+                .with_file("/d/b.txt", b"existing"),
+        );
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/d"), p("/d"))],
+            TransferSpec {
+                op: TransferOp::Move,
+                conflict: ConflictPolicy::Skip,
+                ..TransferSpec::default()
+            },
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.skipped, 1);
+        assert_eq!(read_file(&src, "/d/a.txt").await, "aaa");
+        assert_eq!(read_file(&src, "/d/b.txt").await, "bbb");
+    }
+
+    /// The same-connection rename fast path must resolve the conflict first: `rename(2)` replaces an
+    /// existing destination, so it silently overwrote what every non-`Overwrite` policy protects.
+    #[tokio::test]
+    async fn same_connection_move_honours_the_conflict_policy() {
+        // Skip: the destination keeps its content and the source stays put.
+        let vfs: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(7))
+                .with_file("/a.txt", b"new")
+                .with_file("/b.txt", b"old"),
+        );
+        let out = run_transfer(
+            &vfs,
+            &vfs,
+            &[(p("/a.txt"), p("/b.txt"))],
+            TransferSpec {
+                op: TransferOp::Move,
+                conflict: ConflictPolicy::Skip,
+                ..TransferSpec::default()
+            },
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.skipped, 1);
+        assert_eq!(
+            read_file(&vfs, "/b.txt").await,
+            "old",
+            "the destination was clobbered"
+        );
+        assert_eq!(read_file(&vfs, "/a.txt").await, "new");
+
+        // Prompt: the caller is asked, not overruled.
+        let res = run_transfer(
+            &vfs,
+            &vfs,
+            &[(p("/a.txt"), p("/b.txt"))],
+            TransferSpec {
+                op: TransferOp::Move,
+                conflict: ConflictPolicy::Prompt,
+                ..TransferSpec::default()
+            },
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await;
+        assert!(matches!(res, Err(TransferError::Conflict(_))));
+
+        // Rename: the move lands beside the existing file instead of on top of it.
+        let out = run_transfer(
+            &vfs,
+            &vfs,
+            &[(p("/a.txt"), p("/b.txt"))],
+            TransferSpec {
+                op: TransferOp::Move,
+                conflict: ConflictPolicy::Rename,
+                ..TransferSpec::default()
+            },
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.files, 1);
+        assert_eq!(read_file(&vfs, "/b.txt").await, "old");
+        assert_eq!(read_file(&vfs, "/b.txt (1)").await, "new");
+    }
+
+    /// A FIFO/socket/device in the tree must be skipped, never opened: `open_read` on one blocks in
+    /// the OS until a writer appears, and the engine has no cancellation point there — the transfer
+    /// hung with `Esc` dead. The mock errors on such a read, so reaching it fails this test.
+    #[tokio::test]
+    async fn a_special_node_is_skipped_not_opened() {
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_dir("/d")
+                .with_file("/d/real.txt", b"data")
+                .with_special("/d/pipe"),
+        );
+        let dst: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(2)));
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/d"), p("/d"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.files, out.skipped), (1, 1));
+        assert_eq!(read_file(&dst, "/d/real.txt").await, "data");
+        assert!(matches!(
+            dst.stat(&p("/d/pipe")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    /// A symlink is reported by `stat`, not followed — so one pointing at a directory used to reach
+    /// `copy_file`, whose first read failed and aborted the whole transfer, leaving the destination
+    /// half-written. It is skipped, and the rest of the tree still lands.
+    #[tokio::test]
+    async fn a_symlink_is_skipped_and_the_rest_of_the_tree_still_copies() {
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_dir("/d")
+                .with_symlink("/d/link", "/d/sub")
+                .with_dir("/d/sub")
+                .with_file("/d/sub/inner.txt", b"inner")
+                .with_file("/d/z.txt", b"zzz"),
+        );
+        let dst: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(2)));
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/d"), p("/d"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.files, out.skipped), (2, 1));
+        assert_eq!(read_file(&dst, "/d/z.txt").await, "zzz");
+        assert_eq!(read_file(&dst, "/d/sub/inner.txt").await, "inner");
+    }
+
+    /// A destination without `CREATE_DIR` (every object store — they have no directories) must not
+    /// abort the transfer: the tree is walked and the files land under their prefixes.
+    #[tokio::test]
+    async fn a_tree_copies_into_a_backend_that_cannot_create_directories() {
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_dir("/d")
+                .with_dir("/d/sub")
+                .with_file("/d/sub/f.txt", b"payload"),
+        );
+        let dst: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(2)).without_create_dir());
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/d"), p("/d"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.files, out.dirs), (1, 0), "no directories are created");
+        assert_eq!(read_file(&dst, "/d/sub/f.txt").await, "payload");
+    }
+
+    /// The server-side copy fast path (`Caps::COPY_SERVER`) was unreachable from the tests, so its
+    /// byte accounting and its `Finalizing`-before-the-copy signal were never checked.
+    #[tokio::test]
+    async fn same_connection_copy_uses_the_server_side_fast_path() {
+        let vfs: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(3))
+                .with_copy_server()
+                .with_file("/a.txt", b"payload"),
+        );
+        let mut events = Vec::new();
+        let out = run_transfer(
+            &vfs,
+            &vfs,
+            &[(p("/a.txt"), p("/b.txt"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut |e| events.push(e),
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.files, out.bytes), (1, 7));
+        assert_eq!(read_file(&vfs, "/b.txt").await, "payload");
+        // Announced before the copy runs, so a slow same-bucket copy is not invisible.
+        assert_eq!(events.first(), Some(&ProgressEvent::Finalizing));
+        assert!(events.contains(&ProgressEvent::Bytes(7)));
+    }
+
+    /// `VerifyPolicy::Size` compares what the destination reports against what was written; the
+    /// mismatch arm was unreachable while the mock always agreed with itself.
+    #[tokio::test]
+    async fn size_verify_fails_when_the_destination_disagrees() {
+        let src: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(1)).with_file("/f", b"12345"));
+        let dst: Arc<dyn Vfs> =
+            Arc::new(MockVfs::new(ConnectionId(2)).with_reported_size("/f", 99));
+        let res = run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            TransferSpec {
+                verify: VerifyPolicy::Size,
+                ..TransferSpec::default()
+            },
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await;
+        assert!(matches!(res, Err(TransferError::VerifyFailed(_))));
+    }
+
+    /// `NewerWins` needs timestamps on both sides; without them every comparison fell through to
+    /// "skip" and the policy's whole point went untested.
+    #[tokio::test]
+    async fn newer_wins_overwrites_only_when_the_source_is_newer() {
+        let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let newer = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        let spec = TransferSpec {
+            conflict: ConflictPolicy::NewerWins,
+            ..TransferSpec::default()
+        };
+
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_file("/f", b"fresh")
+                .with_modified("/f", newer),
+        );
+        let dst: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(2))
+                .with_file("/f", b"stale")
+                .with_modified("/f", older),
+        );
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            spec,
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.files, out.skipped), (1, 0));
+        assert_eq!(read_file(&dst, "/f").await, "fresh");
+
+        // The other way round: the destination is newer, so it is kept.
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_file("/f", b"stale")
+                .with_modified("/f", older),
+        );
+        let dst: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(2))
+                .with_file("/f", b"fresh")
+                .with_modified("/f", newer),
+        );
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            spec,
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.files, out.skipped), (0, 1));
+        assert_eq!(read_file(&dst, "/f").await, "fresh");
+    }
+
+    /// Merging into an existing destination directory: the backend reports `AlreadyExists` and the
+    /// walk continues. The mock used to succeed silently, leaving this branch unexercised.
+    #[tokio::test]
+    async fn copying_a_tree_onto_an_existing_directory_merges_into_it() {
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_dir("/d")
+                .with_file("/d/new.txt", b"new"),
+        );
+        let dst: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(2))
+                .with_dir("/d")
+                .with_file("/d/kept.txt", b"kept"),
+        );
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/d"), p("/d"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (out.files, out.dirs),
+            (1, 0),
+            "the existing directory is not recounted"
+        );
+        assert_eq!(read_file(&dst, "/d/new.txt").await, "new");
+        assert_eq!(read_file(&dst, "/d/kept.txt").await, "kept");
     }
 
     /// Regression: a source read that fails mid-file must abort the destination sink, not merely

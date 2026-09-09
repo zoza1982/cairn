@@ -34,7 +34,20 @@ only place cross-backend logic lives, so "pod → S3" is the same code path as "
   Pause and cancel cannot interrupt a buffered `finish` itself (that needs a signature change —
   deferred), so the UI says "pausing…" rather than "paused" until the file lands.
 - **Directory trees** are walked iteratively (an explicit work stack) to avoid async recursion,
-  creating destination directories and enqueuing children.
+  creating destination directories and enqueuing children. The destination directory is only created
+  where the backend advertises `Caps::CREATE_DIR` — object stores have no directories, and asking
+  anyway aborted the transfer before any byte moved.
+- **Entry kinds.** Only `File` is copied and only `Dir` is walked. `Symlink`, `Special` (socket /
+  device / FIFO) and `Stream` are **skipped and counted as skipped** — never opened. Opening a FIFO
+  blocks in the OS with no cancellation point (the transfer hung and `Esc` did nothing), and a
+  symlink-to-directory failed its first read and aborted the whole tree. Recreating symlinks needs a
+  `Vfs::symlink` the trait does not have; until then skipping is the honest outcome.
+- **Move = copy → delete, and the delete is conditional.** The source is removed only when nothing
+  under it was skipped: a skipped file means the destination never received that data, so deleting
+  the source would destroy the only remaining copy. Losing the move is recoverable; losing the data
+  is not. The same-connection rename fast path resolves the conflict policy *before* renaming —
+  `rename(2)` replaces an existing destination, so skipping this silently overrode `Skip`, `Prompt`
+  and `Rename`.
 - **Move** = an atomic `rename` when source and destination share a connection with `Caps::RENAME`;
   otherwise copy-tree then `remove(.., Recurse::Yes)` — the source is deleted only after the copy
   succeeds.

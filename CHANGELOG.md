@@ -189,6 +189,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Move no longer deletes a source it never copied.** With any conflict policy that can skip
+  (`Skip`, or `NewerWins` when the destination is newer), the engine copied nothing and then removed
+  the source anyway — the destination kept its old content and the only other copy was gone. One
+  skipped file inside a moved *tree* took the whole source tree with it. A move now leaves the
+  source in place whenever anything under it was skipped.
+
+- **A same-connection move now honours the conflict policy.** Moving within one backend takes a
+  rename fast path, and `rename(2)` replaces an existing destination — so `Skip` overwrote,
+  `Prompt` returned success instead of asking, and `Rename` clobbered instead of writing
+  `name (1)`. The policy is resolved before the rename, like every other path.
+
+- **A FIFO, socket or device in a copied tree no longer hangs the transfer.** The engine handed
+  anything that was not a directory to the file-copy path; opening a FIFO blocks in the OS until a
+  writer appears, and there is no cancellation point there, so the copy hung with `Esc` dead (and
+  the runtime would not shut down). Such entries are now skipped and reported as skipped.
+
+- **A symlink inside a copied tree no longer aborts the whole transfer.** A symlink is reported by
+  `stat`, not followed; one pointing at a directory reached the file-copy path, failed on its first
+  read, and killed the transfer part-way, leaving a half-written destination. Symlinks are skipped
+  for now (recreating them needs a VFS operation that does not exist yet) and the rest of the tree
+  copies.
+
+- **Copying a directory into an object store no longer fails outright.** `copy_tree` called
+  `create_dir` for every directory; object stores have no directories and answer `Unsupported`, so
+  an `F5` into an S3/GCS/Azure pane aborted before a single byte moved. The call is now gated on
+  `Caps::CREATE_DIR` and the files land under their prefixes.
+
 - **Copying to or from an SSH/SFTP connection now reports real progress.** The SFTP backend used to
   buffer an entire file in memory and upload it in one go during `finish()` (and, for downloads,
   fetch the whole file before yielding the first byte), so the transfer bar raced to 100% at memcpy
