@@ -159,6 +159,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConnectionChoice::hidden = true`) so the switcher's "show hidden" toggle (`S`) can reveal — and
   un-hide — it. The on-disk `[discovery]` schema is unchanged.
 
+### Security
+
+- **Patched five advisories in the dependency tree** (`cargo update`, all within semver — no manifest
+  changes): `wasmtime` 46.0.1 → 46.0.3, fixing four sandbox-relevant advisories that hit
+  `cairn-plugin`'s isolation boundary directly — a filesystem sandbox escape via trailing slashes in
+  paths/symlinks (RUSTSEC-2026-0269), guest-controlled host heap allocation through WASIp3 streams
+  (RUSTSEC-2026-0268), breakable internal VM state via preemption during bulk operations
+  (RUSTSEC-2026-0223), and type-index mixups between engines (RUSTSEC-2026-0222); plus `h2` → 0.4.19
+  for unbounded empty DATA frames (RUSTSEC-2026-0258). Also un-yanked `chacha20` (0.10.1 → 0.10.2,
+  used by the vault) and `der`.
+
+- **RUSTSEC-2026-0275 (`azure_core` 0.21 logs the `authorization` header value) is ignored in
+  `deny.toml`, not fixed** — it has no upgrade path: `azure_storage` 0.21.0 pins `azure_core ^0.21`
+  and is the last release of that line, and the fix exists only in the AAD-only 1.0 SDK rewrite,
+  which cannot do shared-key/SAS (so it cannot talk to Azurite). Behind the non-default `azure`
+  feature. A default run does not emit the line (the SDK logs it at DEBUG; Cairn's default filter is
+  `warn`), but `CAIRN_LOG=debug` on an `azure` build would print an Azure key or SAS token to stderr.
+  Tracked for the 1.0 SDK migration (#187).
+
+### Changed
+
+- **`crates/cairn/src/logging.rs` no longer claims a secret-redaction layer is coming "once
+  `cairn-secrets` lands"** — it landed, credentials now flow through the vault/broker/connect paths,
+  and the LLD §9.5 subscriber layer is still not installed. The module docs now say what actually
+  protects logs today (per-error `redacted()` at the boundaries) and what it does not cover (a
+  dependency that logs a secret itself).
+
+
 ### Added
 
 - **Delete now runs as a tracked operation, like copy/move** — with live progress, cancellation, and
