@@ -7,7 +7,7 @@ use crate::state::{
 use bytes::Bytes;
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
-use cairn_types::{ConnectionId, SessionId, UnixPerms, VfsPath};
+use cairn_types::{Caps, ConnectionId, SessionId, UnixPerms, VfsPath};
 use cairn_vfs::{ListPage, VfsError};
 use std::path::PathBuf;
 
@@ -210,6 +210,11 @@ pub enum AppEvent {
         dir: VfsPath,
         /// The page result.
         result: Result<ListPage, VfsError>,
+        /// What the backend can do *at this directory* (`caps_at`, not the backend-wide `caps` —
+        /// Docker and Kubernetes refine them per depth). Carried with the listing because that is
+        /// the moment the answer is both known and current, and it lets the reducer offer only
+        /// operations that can succeed instead of discovering otherwise after the fact.
+        caps: Caps,
     },
     /// Free/total disk space for a pane's directory. The runtime fetches it when it handles the
     /// pane's [`AppEffect::List`] (a sibling of the listing), and delivers it here. Applied only if
