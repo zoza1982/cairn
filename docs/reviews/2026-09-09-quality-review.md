@@ -11,7 +11,9 @@
 > **15 confirmed high**, 16 confirmed medium (all of them raised as high and downgraded by the skeptic),
 > 53 unverified medium, 14 low. Zero refuted — the reviewers were accurate; the skeptics mostly corrected severity.
 >
-> **Status:** report only. Nothing here has been fixed yet; the point is to choose.
+> **Status (updated 2026-09-09, after the fix run):** all 15 confirmed-high findings and most of the
+> confirmed mediums are closed across PRs #193–#207. The table at the end records which track each
+> PR belongs to. Findings marked ⬜ unverified were never challenged and are the remaining backlog.
 
 ## The picture in one paragraph
 
@@ -852,3 +854,38 @@ risk it removes per hour.
 branches. **E** should land before **D**'s `create_dir` change so the gate lives in one place. **F** is the only
 Large item and the one that most changes the day-to-day feel of the codebase. Object-store streaming (#189) and
 the plugin `CommitMode` gap (#191) stay as tracked milestones and are not repeated here.
+
+---
+
+## What was done (2026-09-09)
+
+Every confirmed **high** is closed, along with the confirmed mediums in tracks C, E, F and I.
+
+| PR | Track | Closes |
+|---|---|---|
+| [#193](https://github.com/zoza1982/cairn/pull/193) | A + B | Move deleting un-copied sources; rename path ignoring conflict policy; FIFO hang; symlink abort; `create_dir` gate. Faithful `MockVfs` (the reason none of it had a test) |
+| [#194](https://github.com/zoza1982/cairn/pull/194) | A | Local overwrite truncated the destination and `abort` deleted it → temp + atomic rename |
+| [#195](https://github.com/zoza1982/cairn/pull/195) | A | Move out of an object store reported success and deleted nothing |
+| [#196](https://github.com/zoza1982/cairn/pull/196) | A | `F5` with both panes on one directory emptied the file |
+| [#197](https://github.com/zoza1982/cairn/pull/197) | — | This report |
+| [#198](https://github.com/zoza1982/cairn/pull/198) | C | Host-key pin bypass — plus `@revoked`/`@cert-authority`/wildcard/case, fail-closed, and algorithm preference, all found by `security-review` rejecting the first version |
+| [#199](https://github.com/zoza1982/cairn/pull/199) | C | Plugins set their own sandbox limits |
+| [#200](https://github.com/zoza1982/cairn/pull/200) | C | Unbounded Argon2 cost from an unauthenticated header; ambiguous credential labels |
+| [#201](https://github.com/zoza1982/cairn/pull/201) | D | Container symlinks read as empty; `tar` exit 1 discarding a listing; recursive listing; file path as empty dir; `--` operand guard |
+| [#202](https://github.com/zoza1982/cairn/pull/202) | G | Ordinary `.tar.bz2` refused as multi-stream (~60% at 16 MB) |
+| [#203](https://github.com/zoza1982/cairn/pull/203) | H | `q` killing a running transfer; stale marks; `F4` freezing the event loop |
+| [#204](https://github.com/zoza1982/cairn/pull/204) | C | AI confirm gate showing prose not operands; relative `PATH` entries; Windows path-segment escape |
+| [#205](https://github.com/zoza1982/cairn/pull/205) | E | `Caps` produced by every backend and read by nothing |
+| [#206](https://github.com/zoza1982/cairn/pull/206) | I | The credential form — the only screen that echoes a typed secret — had no render coverage |
+| [#207](https://github.com/zoza1982/cairn/pull/207) | F | 16-argument `dispatch`; the untestable lifecycle chain |
+
+**Method note.** Every fix carries regression tests that were *mutation-checked*: the fix was
+reverted and the test observed to fail. That caught two tests of my own that could not fail — a
+vault KDF test using a value argon2 itself rejects, and a pre-`finish` cancel test that the existing
+per-iteration check already satisfied. Both were rewritten. It also caught a run where the mutants
+all appeared to survive because the module was behind a feature flag I had not enabled.
+
+**Still open:** the ⬜ unverified mediums and lows above; object-store streaming (#189); the plugin
+`CommitMode` ABI gap (#191); and the items each PR lists under "Deferred" — most notably that a
+host-key rejection still reports as `"connection failed"`, indistinguishable from a TCP refusal,
+which #198 makes more visible by adding rejections.
