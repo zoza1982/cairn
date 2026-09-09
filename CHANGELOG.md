@@ -213,6 +213,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   telling the user their archive was multi-stream when it was not. bzip2 now requires a full 10-byte
   stream header (magic, level digit, and the block or end-of-stream magic), and zstd is answered
   exactly by asking the decoder whether any input remains rather than by scanning bytes at all.
+- **`q` no longer tears down a running transfer without asking.** Quitting killed the process
+  mid-write, leaving a truncated destination and the source still in place with nothing to say what
+  happened — and `q` sits one unmodified key away from `p` and `b` on the transfer dialog, so it was
+  easy to hit during the very operation it destroyed. It now confirms while bytes are moving,
+  naming how many transfers are at stake; a second `q` still means yes. A running *delete* has no
+  half-written state to leave, so it does not prompt.
+
+- **Marks no longer survive a listing refresh.** Marks are positional — indices into the visible
+  rows — so a refresh after a delete, a rename, or an external change re-indexed everything while
+  the marks stayed put, silently pointing at whatever now occupied those positions. The next
+  `F5`/`F8` then acted on files the user never selected. Marks now belong to the listing they were
+  made in.
+
+- **`F4`/`e` on a remote file no longer freezes the UI.** The editor path awaited the backend `stat`
+  and the download *on the event loop*, with no timeout — against a hung or half-open SSH server the
+  whole interface stopped repainting and could not be cancelled. Neither step needs the terminal
+  (only the editor launch that follows does), so both now run off the loop.
 
 
 ### Security

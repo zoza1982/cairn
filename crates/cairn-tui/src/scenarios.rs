@@ -82,6 +82,11 @@ pub fn all() -> Vec<Scenario> {
             build: filter,
         },
         Scenario {
+            name: "confirm-quit",
+            description: "quitting while a transfer is still running: the confirmation that stops `q` from tearing down a copy mid-write",
+            build: confirm_quit,
+        },
+        Scenario {
             name: "transfer-active",
             description: "the status bar showing a live transfer with rate and ETA",
             build: transfer_active,
@@ -356,6 +361,14 @@ fn filter() -> AppState {
     let mut s = dual_pane();
     s.panes[0].filter = Some("src".to_owned());
     s.panes[0].filter_editing = true;
+    s
+}
+
+fn confirm_quit() -> AppState {
+    // `q` sits one key from `p` and `b` on the transfer dialog, so it is easy to hit during the very
+    // operation it would destroy. The prompt names how many transfers are at stake.
+    let mut s = transfer_active();
+    s.overlay = Some(Overlay::ConfirmQuit { active: 1 });
     s
 }
 

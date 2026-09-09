@@ -4204,7 +4204,13 @@ async fn run_editor_suspend(
             // used to refuse, since the P3 path never needs `local_path` to succeed — only
             // `stat`/`open_read`/`open_write`. Neither case has touched the terminal.
             _ => {
-                begin_remote_edit(&vfs, conn, path, event_tx).await;
+                // Off the event loop. `begin_remote_edit` stats the file and downloads it to a temp,
+                // neither of which needs the terminal — only the *editor launch* that follows does,
+                // and that arrives later as its own effect. Awaiting it here blocked the whole loop
+                // on an untimed backend `stat`: against a hung or half-open SFTP server the UI froze
+                // with no repaint and no way to cancel, from a single `F4`.
+                let (vfs, tx) = (vfs.clone(), event_tx.clone());
+                tokio::spawn(async move { begin_remote_edit(&vfs, conn, path, &tx).await });
                 return;
             }
         }

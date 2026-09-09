@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────┐┌ / ───────────────┐
+│>  src/           ││>  src/           │
+┌ Quit ────────────────────────────────┐
+│     1 transfer(s) still running.     │
+│Quitting now leaves partial files behi│
+│                                      │
+│   [y] Quit anyway    [n] Keep going  │
+│                                      │
+└──────────────────────────────────────┘
+│                  ││                  │
+└────── sort: name ┘└────── sort: name ┘
+ 1/4   ⇅ transferring… 4.0 MiB / 8.0 MiB

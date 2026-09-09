@@ -534,6 +534,12 @@ pub struct PendingSave {
 /// A modal overlay awaiting user input.
 #[derive(Debug, Clone)]
 pub enum Overlay {
+    /// Confirm quitting while transfers are still running. Quitting kills them mid-write, so the
+    /// user is asked once rather than losing a long copy to a stray keystroke.
+    ConfirmQuit {
+        /// How many byte-moving transfers are in flight, for the prompt.
+        active: usize,
+    },
     /// Confirm deletion of the listed paths on a connection.
     ConfirmDelete {
         /// The connection the paths live on.
