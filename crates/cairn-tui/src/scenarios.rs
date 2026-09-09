@@ -182,6 +182,21 @@ pub fn all() -> Vec<Scenario> {
             build: vault_unlock,
         },
         Scenario {
+            name: "connection-form-fields",
+            description: "the connection wizard's endpoint stage, with an inline validation error on a rejected field",
+            build: connection_form_fields,
+        },
+        Scenario {
+            name: "connection-form-credential-method",
+            description: "the connection wizard's credential-method picker (agent / key file / inline PEM / password)",
+            build: connection_form_credential_method,
+        },
+        Scenario {
+            name: "connection-form-credential-fields",
+            description: "the only screen that echoes a typed secret: a passphrase must render as bullets, never as the characters typed",
+            build: connection_form_credential_fields,
+        },
+        Scenario {
             name: "connections",
             description: "the connection switcher listing open connections",
             build: connections,
@@ -912,6 +927,93 @@ fn scheme_picker() -> AppState {
         cred_focus: 0,
     });
     s
+}
+
+/// Build a connection-form overlay at a given stage, so the four wizard stages differ only in what
+/// this file says they differ in.
+fn connection_form(
+    stage: ConnectionFormStage,
+    scheme: &str,
+    values: HashMap<String, String>,
+    field_errors: HashMap<String, String>,
+    cred_method: Option<cairn_core::CredentialMethod>,
+    cred_fields: HashMap<String, cairn_core::FieldValue>,
+) -> AppState {
+    let mut s = dual_pane();
+    s.overlay = Some(Overlay::ConnectionForm {
+        stage,
+        scheme: scheme.to_owned(),
+        values,
+        focus: 0,
+        field_errors,
+        editing_id: None,
+        existing_secret_ref: None,
+        cred_method_cursor: 0,
+        cred_method,
+        cred_fields,
+        cred_focus: 0,
+    });
+    s
+}
+
+fn connection_form_fields() -> AppState {
+    // The endpoint stage with one field filled and one rejected, so the inline error line renders.
+    let values = [("host", "dietpi6.local"), ("port", "notaport")]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    let errors = [("port", "must be a number between 1 and 65535")]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    connection_form(
+        ConnectionFormStage::Fields,
+        "ssh",
+        values,
+        errors,
+        None,
+        HashMap::new(),
+    )
+}
+
+fn connection_form_credential_method() -> AppState {
+    connection_form(
+        ConnectionFormStage::CredentialMethodPicker,
+        "ssh",
+        HashMap::new(),
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    )
+}
+
+fn connection_form_credential_fields() -> AppState {
+    // The only place the UI echoes a typed secret. The passphrase must render as bullets — never as
+    // the characters typed — and the non-secret path beside it must stay legible.
+    let mut secret = cairn_core::MaskedInput::new();
+    for c in "Zq7Xv2Kw9Pb4Nm5Tj8Rd1".chars() {
+        secret.push(c);
+    }
+    let fields = [
+        (
+            "cred_path".to_owned(),
+            cairn_core::FieldValue::Plain("~/.ssh/id_ed25519".to_owned()),
+        ),
+        (
+            "cred_passphrase".to_owned(),
+            cairn_core::FieldValue::Secret(secret),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    connection_form(
+        ConnectionFormStage::CredentialFields,
+        "ssh",
+        HashMap::new(),
+        HashMap::new(),
+        Some(cairn_core::CredentialMethod::SshPrivateKeyFile),
+        fields,
+    )
 }
 
 fn vault_create() -> AppState {

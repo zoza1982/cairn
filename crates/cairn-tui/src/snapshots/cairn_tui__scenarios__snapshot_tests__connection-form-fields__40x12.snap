@@ -1,0 +1,16 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ New connection — fill in details ────┐
+│> Name: My SSH server                 │
+│  Host: dietpi6.local                 │
+│  User: admin                         │
+│  Port: notaport  ⚠ must be a number b│
+│  Known-hosts file: ~/.ssh/known_hosts│
+│  Host key check: strict|accept-new|of│
+│  Next: choose authentication method →│
+│                                      │
+│[Tab/↑↓] Navigate fields  [Enter] Next│
+└──────────────────────────────────────┘
+ 1/4   q quit · Tab · ↵ open · v view
