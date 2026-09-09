@@ -260,11 +260,18 @@ impl CredentialBroker for BrokerCredentialAdapter {
     ) -> Result<String, CredentialBrokerError> {
         // Map handle (label) → CredentialId by scanning the secret-free directory.
         // The label is what a plugin author puts in `plugin.toml`; it must match the vault entry.
+        //
+        // Labels are not unique — `Vault::add` does not enforce it, and two credentials for, say,
+        // "prod" is an ordinary thing for a user to end up with. Taking the first match would mean
+        // the secret a plugin receives depends on vault ordering rather than on what the user
+        // granted, so an ambiguous handle is refused outright. Failing closed here costs a plugin an
+        // error message; failing open hands it a credential the user never meant it to have.
         let creds = self.broker.credentials();
-        let info = creds
-            .iter()
-            .find(|c| c.label == handle)
-            .ok_or(CredentialBrokerError::NotFound)?;
+        let mut matches = creds.iter().filter(|c| c.label == handle);
+        let info = matches.next().ok_or(CredentialBrokerError::NotFound)?;
+        if matches.next().is_some() {
+            return Err(CredentialBrokerError::NotFound);
+        }
         let id = info.id;
 
         // Resolve to the secret (stays within this stack frame).
@@ -384,6 +391,53 @@ mod tests {
             ))),
         );
         (Broker::new(v), id, dir)
+    }
+
+    /// Regression: a plugin names a credential by *label*, and labels are not unique — `Vault::add`
+    /// is a bare push with no uniqueness check, so a user can easily hold two credentials called
+    /// "prod". Resolution took the first match, which meant the secret a plugin received depended on
+    /// vault ordering rather than on what the user granted. An ambiguous handle is now refused.
+    #[test]
+    fn an_ambiguous_credential_label_is_refused_rather_than_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v");
+        let mut v = Vault::create_with_params(
+            &path,
+            &SecretString::from("pw".to_owned()),
+            KdfParams::fast_for_tests(),
+        )
+        .unwrap();
+        // Two different secrets, one label — nothing in the vault prevents this.
+        v.add(
+            "prod",
+            CredentialSecret::Ssh(SshCredential::Password(SecretString::from(
+                "first".to_owned(),
+            ))),
+        );
+        v.add(
+            "prod",
+            CredentialSecret::Ssh(SshCredential::Password(SecretString::from(
+                "second".to_owned(),
+            ))),
+        );
+        let adapter = BrokerCredentialAdapter::new(Arc::new(Broker::new(v)));
+        assert!(matches!(
+            adapter.use_credential("some-plugin", "prod", &CredentialAction::BearerToken),
+            Err(CredentialBrokerError::NotFound)
+        ));
+    }
+
+    /// An unambiguous label still resolves — the guard must not break the normal case.
+    #[test]
+    fn a_unique_credential_label_still_resolves() {
+        let (broker, _id, _dir) = unlocked_with_one();
+        let adapter = BrokerCredentialAdapter::new(Arc::new(broker));
+        // The label resolves: whatever the outcome of the *action*, it is not `NotFound` — which is
+        // what an over-eager ambiguity guard would produce.
+        assert!(!matches!(
+            adapter.use_credential("some-plugin", "prod", &CredentialAction::BearerToken),
+            Err(CredentialBrokerError::NotFound)
+        ));
     }
 
     #[test]
