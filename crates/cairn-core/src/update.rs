@@ -9,6 +9,7 @@ use crate::state::{
     PAGER_MAX_BYTES, SESSION_OUTPUT_MAX_BYTES, SESSION_OUTPUT_MAX_LINES,
 };
 use bytes::Bytes;
+use cairn_types::Caps;
 use cairn_types::{ConnectionId, Entry, EntryKind, SessionId, VfsPath};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -240,6 +241,9 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
         // it; this arm covers the (shouldn't-happen) path where no overlay is open.
         Action::ToggleRemember => Vec::new(),
         Action::MakeDir => {
+            if refuse_without_cap(state, state.focus, Caps::CREATE_DIR, "creating directories") {
+                return Vec::new();
+            }
             state.overlay = Some(Overlay::Prompt {
                 kind: PromptKind::MakeDir,
                 input: String::new(),
@@ -247,6 +251,9 @@ fn apply_action(state: &mut AppState, action: Action) -> Vec<AppEffect> {
             Vec::new()
         }
         Action::Rename => {
+            if refuse_without_cap(state, state.focus, Caps::RENAME, "renaming") {
+                return Vec::new();
+            }
             // Rename targets the entry under the cursor; pre-fill its current name.
             let Some(entry) = state.active().current() else {
                 state.status = Some("Nothing to rename".to_owned());
@@ -2708,6 +2715,9 @@ fn start_transfer(state: &mut AppState, is_move: bool) -> Vec<AppEffect> {
     if targets.is_empty() {
         return Vec::new();
     }
+    if refuse_without_cap(state, dst, Caps::WRITE, "writing") {
+        return Vec::new();
+    }
     let dst_cwd = state.pane(dst).cwd.clone();
     let src_conn = state.pane(src).conn;
     let dst_conn = state.pane(dst).conn;
@@ -3387,8 +3397,28 @@ fn calculate_size(state: &mut AppState) -> Vec<AppEffect> {
     vec![AppEffect::CalculateSize { id, conn, path }]
 }
 
+/// Refuse an operation the focused pane's backend has said it cannot do, with a status message
+/// naming the reason.
+///
+/// Written as "refuse when we know it cannot work", never "allow when we know it can": `caps` is
+/// empty until the first listing arrives, so the permissive direction is the safe default — a
+/// missing answer must not take away an operation that would have succeeded. This is what
+/// `Caps` was for; until now every backend advertised them and nothing read them, so a read-only
+/// destination reported failure only after the user had committed to the operation.
+fn refuse_without_cap(state: &mut AppState, side: Side, needed: Caps, what: &str) -> bool {
+    let caps = state.pane(side).caps;
+    if caps.is_empty() || caps.contains(needed) {
+        return false;
+    }
+    state.status = Some(format!("This location does not support {what}"));
+    true
+}
+
 fn confirm_delete(state: &mut AppState) -> Vec<AppEffect> {
     let side = state.focus;
+    if refuse_without_cap(state, side, Caps::DELETE, "deleting") {
+        return Vec::new();
+    }
     let targets = op_targets(state, side);
     if targets.is_empty() {
         return Vec::new();
@@ -3820,6 +3850,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
             pane,
             conn,
             dir,
+            caps,
             result,
         } => {
             let p = state.pane_mut(pane);
@@ -3855,6 +3886,7 @@ fn apply_event(state: &mut AppState, event: AppEvent) -> Vec<AppEffect> {
                     // whatever now occupied those positions: the next F5/F8 acted on files the user
                     // never selected. Marks belong to the listing they were made in.
                     p.marked.clear();
+                    p.caps = caps;
                     // Restore the cursor to a specific child if one was requested (e.g. `leave_dir`
                     // returning to the directory we just exited). Search the *visible* view so the
                     // index is in the same space as `cursor` even if a filter was started during the
@@ -4994,6 +5026,7 @@ mod tests {
                 conn,
                 dir,
                 result: Ok(page(entries)),
+                caps: Caps::all(),
             }),
         );
     }
@@ -5306,6 +5339,58 @@ mod tests {
         }
     }
 
+    /// Every backend advertises `Caps`, and until now nothing read them: the reducer offered
+    /// Copy/Move/Delete/MakeDir/Rename on any pane and the user found out the backend was read-only
+    /// only after committing, via a post-hoc `Unsupported` status. The operations are now refused up
+    /// front, with a message naming what the location cannot do.
+    #[test]
+    fn operations_a_backend_cannot_do_are_refused_up_front() {
+        let deliver_with_caps = |s: &mut AppState, side: Side, caps: Caps| {
+            let (dir, conn) = (s.pane(side).cwd.clone(), s.pane(side).conn);
+            let _ = update(
+                s,
+                Msg::Event(AppEvent::Listed {
+                    pane: side,
+                    conn,
+                    dir,
+                    result: Ok(page(vec![Entry::new("f", EntryKind::File)])),
+                    caps,
+                }),
+            );
+        };
+
+        // A read-only location: listing and reading only.
+        let read_only = Caps::LIST | Caps::READ;
+        for (action, needed, word) in [
+            (Action::Delete, Caps::DELETE, "deleting"),
+            (Action::MakeDir, Caps::CREATE_DIR, "creating directories"),
+            (Action::Rename, Caps::RENAME, "renaming"),
+        ] {
+            let mut s = state();
+            deliver_with_caps(&mut s, Side::Left, read_only);
+            let effects = update(&mut s, Msg::Action(action));
+            assert!(effects.is_empty(), "{word} was dispatched anyway");
+            assert!(
+                s.overlay.is_none(),
+                "{word} opened a prompt it cannot fulfil"
+            );
+            assert!(
+                s.status.clone().unwrap_or_default().contains(word),
+                "expected a status naming {word}, got {:?}",
+                s.status
+            );
+
+            // With the capability present it proceeds as before.
+            let mut s = state();
+            deliver_with_caps(&mut s, Side::Left, read_only | needed);
+            let _ = update(&mut s, Msg::Action(action));
+            assert!(
+                s.overlay.is_some(),
+                "{word} was refused despite the backend advertising it"
+            );
+        }
+    }
+
     /// The guard is about the *path*, not the connection: two panes on one connection in different
     /// directories still transfer, and only the self-targeted item is dropped from a mixed batch.
     #[test]
@@ -5418,6 +5503,45 @@ mod tests {
         assert!(
             s.pane(Side::Left).marked.is_empty(),
             "a stale mark now points at innocent.txt"
+        );
+    }
+
+    /// A copy is refused when the *destination* cannot be written — the pane the user is not
+    /// looking at, which is exactly the one they would not think to check.
+    #[test]
+    fn a_copy_to_a_read_only_destination_is_refused() {
+        let mut s = state();
+        deliver(&mut s, Side::Left, vec![Entry::new("f", EntryKind::File)]);
+        let (dir, conn) = (s.pane(Side::Right).cwd.clone(), s.pane(Side::Right).conn);
+        let _ = update(
+            &mut s,
+            Msg::Event(AppEvent::Listed {
+                pane: Side::Right,
+                conn,
+                dir,
+                result: Ok(page(vec![])),
+                caps: Caps::LIST | Caps::READ,
+            }),
+        );
+        let effects = update(&mut s, Msg::Action(Action::Copy));
+        assert!(effects.is_empty());
+        assert!(s.active_transfers.is_empty());
+        assert!(s.status.unwrap_or_default().contains("writing"));
+    }
+
+    /// Before any listing arrives `caps` is empty, and an unknown capability must never take away an
+    /// operation that would have worked — the gate refuses only what a backend has *said* it cannot
+    /// do.
+    #[test]
+    fn unknown_capabilities_never_block_an_operation() {
+        let mut s = state();
+        s.pane_mut(Side::Left).listing =
+            crate::Listing::Ready(std::sync::Arc::new(vec![Entry::new("f", EntryKind::File)]));
+        assert!(s.pane(Side::Left).caps.is_empty());
+        let _ = update(&mut s, Msg::Action(Action::Delete));
+        assert!(
+            matches!(s.overlay, Some(Overlay::ConfirmDelete { .. })),
+            "an empty capability set blocked an operation"
         );
     }
 
@@ -7547,6 +7671,7 @@ mod tests {
                 conn,
                 dir: VfsPath::parse("/elsewhere").unwrap(),
                 result: Ok(page(vec![Entry::new("ghost", EntryKind::File)])),
+                caps: Caps::all(),
             }),
         );
         assert!(s.pane(Side::Left).listing.entries().is_empty());
@@ -7574,6 +7699,7 @@ mod tests {
                 conn: old_conn,
                 dir: VfsPath::root(),
                 result: Ok(page(vec![Entry::new("ghost", EntryKind::File)])),
+                caps: Caps::all(),
             }),
         );
         assert!(s.active().listing.entries().is_empty());
@@ -7592,6 +7718,7 @@ mod tests {
                 conn,
                 dir,
                 result: Err(VfsError::Forbidden(VfsPath::parse("/secret").unwrap())),
+                caps: Caps::all(),
             }),
         );
         match &s.pane(Side::Left).listing {
@@ -11234,6 +11361,7 @@ mod navigation_dotdot_tests {
                 conn,
                 dir,
                 result: Ok(page(entries)),
+                caps: Caps::all(),
             }),
         );
     }

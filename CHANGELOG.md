@@ -143,6 +143,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by the snapshots and the dump flag.
 
 ### Changed
+- **Operations a backend cannot perform are refused before you commit to them.** Every backend
+  advertises a capability set and nothing read it: Copy/Move/Delete/MakeDir/Rename were offered on
+  any pane, and a read-only location announced itself only afterwards, as a failed operation. The
+  pane now carries the capabilities reported for its current directory (`caps_at`, so Docker and
+  Kubernetes depths are respected) and those actions are refused up front with a message naming what
+  the location cannot do — including a copy whose *destination* is read-only, which is the pane you
+  would not think to check. Capabilities are only ever used to refuse what a backend has said it
+  cannot do; an unknown answer never takes an operation away.
+
+
 
 - **Key bindings for view/edit/rename/refresh, and a two-row hint bar.** `v` now views and `e` edits
   the file under the cursor (`F3`/`F4` are kept as aliases); `r` renames the entry (`F2` alias) and

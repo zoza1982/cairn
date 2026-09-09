@@ -3,7 +3,7 @@
 use cairn_ai::Plan;
 use cairn_secrets::SecretString;
 use cairn_types::SessionId;
-use cairn_types::{ConnectionId, Entry, UnixPerms, VfsPath};
+use cairn_types::{Caps, ConnectionId, Entry, UnixPerms, VfsPath};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
@@ -234,6 +234,11 @@ pub struct PaneState {
     pub cwd: VfsPath,
     /// The current listing.
     pub listing: Listing,
+    /// What the backend can do at [`cwd`](Self::cwd), as of the last successful listing. Empty
+    /// until the first one arrives, which is why every gate below is written as "refuse when we
+    /// know it cannot work" rather than "allow when we know it can" — an unknown capability must
+    /// not block an operation that would have succeeded.
+    pub caps: Caps,
     /// The cursor index into the **visible** (filtered) entries — see [`PaneState::visible`].
     pub cursor: usize,
     /// Marked (multi-selected) entry indices, into the **visible** entries. Cleared whenever the
@@ -287,6 +292,7 @@ impl PaneState {
             conn,
             cwd,
             listing: Listing::Loading,
+            caps: Caps::empty(),
             cursor: 0,
             marked: BTreeSet::new(),
             sort: SortMode::default(),

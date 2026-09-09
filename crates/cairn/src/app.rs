@@ -1324,12 +1324,21 @@ fn dispatch(
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
                 let result = list_dir(&registry, conn, &dir, all).await;
+                // `caps_at`, not the backend-wide `caps()`: Docker and Kubernetes refine what is
+                // possible per depth, so the answer the UI gates on must be for this directory.
+                // Unknown (connection gone) is reported as "everything", so a missing answer never
+                // takes an operation away that would have worked.
+                let caps = match registry.get(conn).await {
+                    Some(vfs) => vfs.caps_at(&dir),
+                    None => Caps::all(),
+                };
                 let _ = event_tx
                     .send(AppEvent::Listed {
                         pane,
                         conn,
                         dir,
                         result,
+                        caps,
                     })
                     .await;
             });
