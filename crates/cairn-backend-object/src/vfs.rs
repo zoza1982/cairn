@@ -162,9 +162,49 @@ impl Vfs for ObjectStoreVfs {
         })))
     }
 
-    async fn remove(&self, path: &VfsPath, _recurse: Recurse) -> Result<(), VfsError> {
-        // Object-store delete is by key; recursive prefix deletion is a provider refinement (M5).
-        self.store.delete(&self.key_for(path)).await
+    async fn remove(&self, path: &VfsPath, recurse: Recurse) -> Result<(), VfsError> {
+        // Resolve what the path actually is rather than trusting delete-by-key: every provider
+        // reports deleting a missing key as success, so a "directory" (a prefix, which is not an
+        // object at all) used to be a silent no-op that reported `Ok`. The transfer engine takes
+        // that `Ok` as proof a Move's source is gone, so moving a folder out of a bucket claimed
+        // success and left every object in place.
+        let key = self.key_for(path);
+        if self.store.head(&key).await.is_ok() {
+            return self.store.delete(&key).await;
+        }
+
+        // Not an object: it is a prefix, or it does not exist. List it flat (no delimiter, so the
+        // whole subtree comes back) and delete what is there.
+        let prefix = self.dir_prefix(path);
+        let mut token: Option<String> = None;
+        let mut deleted = 0usize;
+        loop {
+            let chunk = self
+                .store
+                .list_page(&prefix, None, token.as_deref(), 1000)
+                .await?;
+            if deleted == 0 && chunk.objects.is_empty() && chunk.next_token.is_none() {
+                return Err(VfsError::NotFound(path.clone()));
+            }
+            if recurse == Recurse::No && (deleted > 0 || !chunk.objects.is_empty()) {
+                // A non-recursive remove must refuse a non-empty prefix, as every other backend's
+                // `rmdir` does, rather than deleting a subtree the caller did not ask for.
+                return Err(VfsError::Backend {
+                    code: "object".to_owned(),
+                    msg: format!("{path} is not empty"),
+                    retryable: false,
+                });
+            }
+            for obj in &chunk.objects {
+                self.store.delete(&obj.key).await?;
+                deleted += 1;
+            }
+            match chunk.next_token {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        Ok(())
     }
 
     async fn copy_within(&self, from: &VfsPath, to: &VfsPath) -> Result<(), VfsError> {
@@ -225,6 +265,52 @@ mod tests {
                 .with_object("logs/2026/b.log", b"bbbb"),
         );
         ObjectStoreVfs::new(ConnectionId(1), Scheme::S3, store, "")
+    }
+
+    /// Regression: `remove` deleted a single key and ignored `Recurse`. A "directory" in an object
+    /// store is a prefix, not an object, so deleting its key was a no-op — and every provider
+    /// reports deleting a missing key as success. The engine takes that `Ok` as proof a Move's
+    /// source is gone, so moving a folder out of a bucket claimed success and left everything in it.
+    #[tokio::test]
+    async fn recursive_remove_deletes_the_whole_prefix() {
+        let vfs = backend();
+        vfs.remove(&p("/logs"), Recurse::Yes).await.unwrap();
+        for gone in ["/logs/a.log", "/logs/2026/b.log", "/logs"] {
+            assert!(
+                matches!(vfs.stat(&p(gone)).await, Err(VfsError::NotFound(_))),
+                "{gone} survived the remove"
+            );
+        }
+        // Only the requested prefix: a sibling object is untouched.
+        assert_eq!(vfs.stat(&p("/top.txt")).await.unwrap().size, Some(3));
+    }
+
+    /// A non-recursive remove refuses a non-empty prefix, like every other backend's `rmdir` —
+    /// rather than silently succeeding or deleting a subtree nobody asked it to.
+    #[tokio::test]
+    async fn non_recursive_remove_refuses_a_non_empty_prefix() {
+        let vfs = backend();
+        assert!(matches!(
+            vfs.remove(&p("/logs"), Recurse::No).await,
+            Err(VfsError::Backend { .. })
+        ));
+        assert_eq!(vfs.stat(&p("/logs/a.log")).await.unwrap().size, Some(3));
+    }
+
+    /// A plain object still deletes by key, and a path that is neither an object nor a prefix is
+    /// `NotFound` rather than a success that deleted nothing.
+    #[tokio::test]
+    async fn remove_deletes_an_object_and_reports_a_missing_path() {
+        let vfs = backend();
+        vfs.remove(&p("/top.txt"), Recurse::No).await.unwrap();
+        assert!(matches!(
+            vfs.stat(&p("/top.txt")).await,
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.remove(&p("/never-existed"), Recurse::Yes).await,
+            Err(VfsError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
