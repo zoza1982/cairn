@@ -159,6 +159,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConnectionChoice::hidden = true`) so the switcher's "show hidden" toggle (`S`) can reveal — and
   un-hide — it. The on-disk `[discovery]` schema is unchanged.
 
+### Fixed
+
+- **Cancelling a copy over an existing local file no longer destroys it.** The local backend opened
+  the destination with `truncate` and wrote straight into it, so the old contents were gone the
+  moment the copy started; `abort` — which the transfer engine calls on cancel and on any mid-copy
+  error — then removed what was left, leaving neither the old file nor the new one. Writes now go to
+  a hidden `.<name>.cairn-….part` sibling and are renamed onto the target on completion, which also
+  makes the replacement atomic: a reader sees the old file or the new one, never a half-written one.
+
+
 ### Security
 
 - **Patched five advisories in the dependency tree** (`cargo update`, all within semver — no manifest
