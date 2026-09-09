@@ -18,4 +18,4 @@ thiserror = "2"
 
 [dev-dependencies]
 # Used only by tests/isolation.rs to assert the secret-isolation dependency invariant.
-cargo_metadata = "0.18"
+cargo_metadata = "0.23"
