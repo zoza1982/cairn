@@ -1377,7 +1377,11 @@ fn render_prompt(frame: &mut Frame, kind: &PromptKind, input: &str, theme: &Them
 /// Draw the AI plan → confirm overlay: the summary, each step with its approval status and
 /// reversibility, and the available actions (bulk-approve only when no step is irreversible).
 fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize, theme: &Theme) {
-    let h = u16::try_from(plan.steps.len())
+    // Two rows per step: the verb/description line and the operand line beneath it. Sizing for one
+    // would show half a plan and silently hide the rest — on the dialog whose whole job is letting
+    // someone see everything before approving it.
+    const ROWS_PER_STEP: usize = 2;
+    let h = u16::try_from(plan.steps.len().saturating_mul(ROWS_PER_STEP))
         .unwrap_or(u16::MAX)
         .saturating_add(6)
         .min(frame.area().height);
@@ -1429,7 +1433,18 @@ fn render_ai_plan(frame: &mut Frame, plan: &Plan, cursor: usize, theme: &Theme) 
                 verb_label(s.capability.verb),
                 s.description
             );
-            ListItem::new(line).style(Style::default().fg(color))
+            // The model's description is its own prose about itself; the operand line is the call
+            // the executor will actually make. Approving the former without seeing the latter is
+            // approving a claim rather than an action, so both are shown — the operands dimmed, but
+            // present, because they are the part that is binding.
+            ListItem::new(vec![
+                Line::from(line),
+                Line::styled(
+                    format!("    {}", s.operand_summary()),
+                    Style::default().fg(theme.status),
+                ),
+            ])
+            .style(Style::default().fg(color))
         })
         .collect();
     let list = List::new(items)

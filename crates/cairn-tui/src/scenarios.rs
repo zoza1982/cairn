@@ -971,7 +971,9 @@ fn plan(tools: &[&str]) -> cairn_ai::Plan {
             let capability = capability_for(t)?;
             Some(PlanStep {
                 tool: (*t).to_owned(),
-                input: serde_json::Value::Null,
+                // A realistic input: this line is the one that binds, so the fixture must show a
+                // real call rather than `null`.
+                input: serde_json::json!({ "conn": "conn:1", "path": format!("/srv/{t}-target") }),
                 description: format!("{t} the things"),
                 capability,
                 status: StepStatus::Pending,

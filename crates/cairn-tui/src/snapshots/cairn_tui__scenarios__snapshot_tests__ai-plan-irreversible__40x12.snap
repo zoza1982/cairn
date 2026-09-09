@@ -3,14 +3,14 @@ source: crates/cairn-tui/src/scenarios.rs
 expression: frame
 ---
 ┌ / ───────────────┐┌ / ───────────────┐
-│>  src/           ││>  src/           │
 ┌ AI plan — review before running ─────┐
 │archive old logs                      │
 │                                      │
 │▶ · copy     [safe]  copy the things  │
+│      copy({"conn":"conn:1","path":"/s│
 │  · delete   [IRREVERSIBLE]  delete th│
+│      delete({"conn":"conn:1","path":"│
 │                                      │
 │↵ approve · x reject · esc abort · no │
 └──────────────────────────────────────┘
-└────── sort: name ┘└────── sort: name ┘
  1/4   q quit · Tab · ↵ open · v view

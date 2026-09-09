@@ -3437,9 +3437,20 @@ fn kill_process_tree(_pid: Option<u32>) {
 /// The current `PATH` with `.` and empty entries removed, so a shell action can't resolve a bare
 /// program name against the directory being browsed. `None` if `PATH` is unset.
 fn sanitized_path() -> Option<std::ffi::OsString> {
-    let path = std::env::var_os("PATH")?;
-    let kept: Vec<PathBuf> = std::env::split_paths(&path)
-        .filter(|p| !p.as_os_str().is_empty() && p != std::path::Path::new("."))
+    sanitize_path_value(&std::env::var_os("PATH")?)
+}
+
+/// Drop every entry of a `PATH` value that would resolve against the working directory.
+///
+/// Split out from [`sanitized_path`] so it is testable without mutating process-global environment.
+/// Every *relative* entry goes, not just `.`: both callers run the child with `current_dir` set to
+/// the pane's directory, so `bin`, `./bin`, `..` and `node_modules/.bin` all resolve against
+/// whatever the user happens to be browsing — and browsing an untrusted directory is an ordinary
+/// thing to do with a file manager. An empty entry means "the current directory" in POSIX and goes
+/// for the same reason.
+fn sanitize_path_value(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let kept: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|p| !p.as_os_str().is_empty() && p.is_absolute())
         .collect();
     std::env::join_paths(kept).ok()
 }
@@ -5943,6 +5954,64 @@ mod tests {
         assert_eq!(buffered_file_rate(8 << 20, 4_000), 2 << 20);
         // A sub-50 ms file is floored like every other rate (no one-frame spike).
         assert_eq!(buffered_file_rate(1_000, 1), avg_rate(1_000, 0.001));
+    }
+
+    /// Regression: the filter dropped only the literal `.`, so `bin`, `./bin`, `..` and
+    /// `node_modules/.bin` all survived — and both callers run the child with `current_dir` set to
+    /// the pane's directory, so each of those resolves inside whatever the user is browsing.
+    /// Browsing an untrusted directory is an ordinary thing to do with a file manager.
+    ///
+    /// What counts as absolute is the platform's own question (`/usr/bin` is not absolute on
+    /// Windows, which wants a drive or UNC prefix), so the fixtures are per-platform and the
+    /// assertion is about which entries survive, not about their spelling.
+    #[test]
+    fn every_relative_path_entry_is_dropped() {
+        #[cfg(windows)]
+        let (keep, drop): (&[&str], &[&str]) = (
+            &[r"C:\Windows\System32", r"D:\tools\bin"],
+            &[
+                ".",
+                r".\bin",
+                "bin",
+                "..",
+                r"node_modules\.bin",
+                r"\Windows",
+            ],
+        );
+        #[cfg(not(windows))]
+        let (keep, drop): (&[&str], &[&str]) = (
+            &["/usr/bin", "/usr/local/bin"],
+            &[".", "./bin", "bin", "..", "node_modules/.bin"],
+        );
+
+        // Interleaved, so a filter that merely truncated the list would not pass.
+        let mut all: Vec<&str> = Vec::new();
+        for (i, k) in keep.iter().enumerate() {
+            all.push(k);
+            if let Some(d) = drop.get(i * 2) {
+                all.push(d);
+            }
+            if let Some(d) = drop.get(i * 2 + 1) {
+                all.push(d);
+            }
+        }
+        all.extend(drop.iter().skip(keep.len() * 2));
+
+        let joined = std::env::join_paths(all.iter().map(std::path::Path::new)).unwrap();
+        let sanitized = sanitize_path_value(&joined).unwrap();
+        let kept: Vec<std::path::PathBuf> = std::env::split_paths(&sanitized).collect();
+        let expected: Vec<std::path::PathBuf> = keep.iter().map(std::path::PathBuf::from).collect();
+        assert_eq!(kept, expected, "from {all:?}");
+
+        // An empty entry means "the current directory" in POSIX, so it goes too. `join_paths`
+        // refuses an empty component, so this one is built from the raw separator.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let raw = format!("{sep}{}{sep}", keep[0]);
+        let sanitized = sanitize_path_value(std::ffi::OsStr::new(&raw)).unwrap();
+        assert_eq!(
+            std::env::split_paths(&sanitized).collect::<Vec<_>>(),
+            vec![std::path::PathBuf::from(keep[0])]
+        );
     }
 
     #[tokio::test]
