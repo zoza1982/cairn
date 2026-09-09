@@ -69,6 +69,41 @@ fn tar_io_err(e: impl std::fmt::Display) -> VfsError {
 ///
 /// An empty tar (no entries beyond the self-entry) returns `Ok(vec![])`, which is correct for an
 /// empty or just-started container.
+/// The `tar` argv for listing one directory's children.
+///
+/// `--no-recursion` is what keeps this a *listing*: without it `tar` walks the whole subtree and
+/// streams every file's contents, so drawing one pane of a pod's `/` pulled the entire container
+/// filesystem through the exec stream. `--` keeps a path beginning with `-` an operand, not a flag.
+pub(crate) fn list_dir_argv(path: &str) -> [&str; 8] {
+    ["tar", "cf", "-", "--no-recursion", "-C", path, "--", "."]
+}
+
+/// The `tar` argv for stat-ing or reading a single path.
+///
+/// `-h` dereferences symlinks: a symlink's tar header carries size 0 and no body, so without it
+/// reading `/bin/sh` or `/etc/resolv.conf` — symlinks in most images — yielded an *empty file*
+/// instead of the target's contents, silently.
+pub(crate) fn stat_read_argv<'a>(parent: &'a str, basename: &'a str) -> [&'a str; 8] {
+    ["tar", "cf", "-", "-h", "-C", parent, "--", basename]
+}
+
+/// Entries recoverable from the output of a `tar` run that exited non-zero.
+///
+/// `tar` reports failure when it could not read *any* member — one unreadable subdirectory in a
+/// container running as non-root is enough — while still writing a complete archive of everything
+/// it could read. Treating that as a hard error turned "a few entries are not readable by this
+/// user" into "the directory does not exist". `None` when nothing usable came back, so the caller
+/// can fall through to real error classification.
+pub(crate) fn salvage_partial_listing(stdout: &[u8]) -> Option<Vec<RemoteEntry>> {
+    if stdout.is_empty() {
+        return None;
+    }
+    match parse_list_dir(stdout) {
+        Ok(entries) if !entries.is_empty() => Some(entries),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_list_dir(tar_bytes: &[u8]) -> Result<Vec<RemoteEntry>, VfsError> {
     let mut archive = tar::Archive::new(tar_bytes);
     let mut seen_dirs = BTreeSet::<String>::new();
@@ -181,8 +216,20 @@ pub(crate) fn parse_read_tar(tar_bytes: &[u8], path: &str) -> Result<Vec<u8>, Vf
         .ok_or_else(|| not_found(path))?
         .map_err(tar_io_err)?;
 
-    if entry.header().entry_type().is_dir() {
+    let kind = entry.header().entry_type();
+    if kind.is_dir() {
         return Err(VfsError::Unsupported(Caps::READ));
+    }
+    // A link header carries size 0 and no body, so reading it yields an *empty file* — silent
+    // corruption of exactly the files most likely to be links (`/bin/sh`, `/etc/resolv.conf`).
+    // `stat_read_argv` passes `-h` so tar dereferences and we never see one; if a tar without that
+    // support ever does emit one, say so rather than hand back nothing.
+    if kind.is_symlink() || kind.is_hard_link() {
+        return Err(VfsError::Backend {
+            code: "tar-symlink".to_owned(),
+            msg: format!("{path} is a link the container's tar did not dereference"),
+            retryable: false,
+        });
     }
     let mut data = Vec::new();
     entry.read_to_end(&mut data).map_err(tar_io_err)?;
@@ -196,6 +243,98 @@ pub(crate) fn parse_read_tar(tar_bytes: &[u8], path: &str) -> Result<Vec<u8>, Vf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a tar archive of `(path, kind, contents)` entries, for the parser tests below.
+    fn tar_of(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (path, kind, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_entry_type(*kind);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h.clone(), path, *data).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    /// Regression: `tar` exits non-zero if it could not read *any* member — one unreadable
+    /// subdirectory is enough, which is the norm for a container running as non-root — but still
+    /// writes everything it could read. Discarding that turned "some entries are not readable" into
+    /// "the directory does not exist", so the pane came up empty with a NotFound error.
+    #[test]
+    fn a_partial_archive_from_a_failed_tar_is_salvaged() {
+        let bytes = tar_of(&[
+            ("./readable.txt", tar::EntryType::Regular, b"hi"),
+            ("./sub/", tar::EntryType::Directory, b""),
+        ]);
+        let salvaged = salvage_partial_listing(&bytes).expect("a readable archive is salvageable");
+        let mut names: Vec<_> = salvaged.iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["readable.txt", "sub"]);
+    }
+
+    /// …but an empty or unparseable archive is not "an empty directory": the caller must fall
+    /// through to real error classification (NotFound / exec_unavailable) rather than show a
+    /// successful, empty pane.
+    #[test]
+    fn nothing_is_salvaged_from_empty_or_unusable_output() {
+        assert!(salvage_partial_listing(b"").is_none());
+        assert!(salvage_partial_listing(b"not a tar archive at all").is_none());
+        assert!(
+            salvage_partial_listing(&tar_of(&[])).is_none(),
+            "an empty archive carries no entries to show"
+        );
+    }
+
+    /// Listing must not recurse. Without `--no-recursion`, `tar` walks the whole subtree *and
+    /// streams every file's body*, so drawing one pane of a pod's `/` pulled the entire container
+    /// filesystem through the exec stream.
+    #[test]
+    fn the_listing_command_is_depth_one_and_guards_its_operand() {
+        let argv = list_dir_argv("/var/log");
+        assert!(argv.contains(&"--no-recursion"), "{argv:?}");
+        // `--` immediately before the operand, so a path starting with `-` cannot become a flag.
+        let dashdash = argv.iter().position(|a| *a == "--").expect("`--` present");
+        assert_eq!(argv[dashdash + 1], ".");
+        assert_eq!(argv.last(), Some(&"."));
+    }
+
+    /// Reading must dereference: a symlink's header has size 0 and no body, so `/bin/sh` and
+    /// `/etc/resolv.conf` — symlinks in most images — read back as empty files.
+    #[test]
+    fn the_stat_read_command_dereferences_and_guards_its_operand() {
+        let argv = stat_read_argv("/etc", "resolv.conf");
+        assert!(argv.contains(&"-h"), "{argv:?}");
+        let dashdash = argv.iter().position(|a| *a == "--").expect("`--` present");
+        assert_eq!(argv[dashdash + 1], "resolv.conf");
+        // A basename that looks like a flag stays an operand.
+        let argv = stat_read_argv("/tmp", "--checkpoint-action=exec=sh");
+        let dashdash = argv.iter().position(|a| *a == "--").unwrap();
+        assert_eq!(argv[dashdash + 1], "--checkpoint-action=exec=sh");
+        assert_eq!(argv.len(), dashdash + 2, "the operand is last");
+    }
+
+    /// A symlink entry must not be served as an empty file. With `-h` tar emits the target's
+    /// regular-file header instead, which is what `parse_read_tar` then sees.
+    #[test]
+    fn a_symlink_entry_is_not_read_as_empty_content() {
+        let link = tar_of(&[("resolv.conf", tar::EntryType::Symlink, b"")]);
+        assert!(
+            parse_read_tar(&link, "/etc/resolv.conf").is_err(),
+            "a symlink header must not yield an empty file"
+        );
+        // What `-h` actually produces: the target's content under the requested name.
+        let dereferenced = tar_of(&[(
+            "resolv.conf",
+            tar::EntryType::Regular,
+            b"nameserver 1.1.1.1",
+        )]);
+        assert_eq!(
+            parse_read_tar(&dereferenced, "/etc/resolv.conf").unwrap(),
+            b"nameserver 1.1.1.1"
+        );
+    }
 
     // -- Path helpers ---------------------------------------------------------
 
