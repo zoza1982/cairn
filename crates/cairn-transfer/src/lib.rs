@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use cairn_types::{Caps, Entry, VfsPath};
-use cairn_vfs::{ListOpts, Recurse, Vfs, VfsError, WriteOpts};
+use cairn_vfs::{CommitMode, ListOpts, Recurse, Vfs, VfsError, WriteOpts};
 use futures::StreamExt;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -22,17 +22,67 @@ pub use error::TransferError;
 /// The chunk size used by the stream-through copy path.
 const CHUNK: usize = 1 << 20; // 1 MiB
 
-/// A progress signal from the engine to its caller. Bytes drive the percentage bar; `Finalizing`
-/// marks that a file's bytes are all written and the engine is now flushing/closing (and, under
+/// A progress signal from the engine to its caller. `Bytes` drives the percentage bar and is only
+/// ever emitted for bytes that have actually reached the destination (a [`CommitMode::Streamed`]
+/// sink's chunks, or a buffered file *after* its upload completed). `Finalizing` marks that a
+/// streamed file's bytes are all written and the engine is now flushing/closing (and, under
 /// size-verify, re-stat'ing) it — opaque backend work that moves no bytes, so the caller can show an
 /// honest 100% + "Finalizing…" instead of a bar that appears stuck just short of done. The next
 /// file's first `Bytes` (or the transfer completing) implicitly clears the finalizing state.
+///
+/// A [`CommitMode::Buffered`] sink (the object stores today) gets a different vocabulary: its chunks
+/// are `Staged`, its `finish()` — the real transfer — is announced with `Uploading`, and one `Bytes`
+/// catches the totals up once it returns. `Heartbeat` ticks while *any* `finish()` is awaited so an
+/// animation clock can keep moving through a long fsync/CLOSE/upload that emits nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressEvent {
-    /// `n` more bytes were written by a chunk (or a whole server-side copy).
+    /// `n` more bytes reached the destination (a streamed chunk, a completed buffered file, or a
+    /// whole server-side copy).
     Bytes(u64),
-    /// The current file's bytes are all written; `finish()`/verify is running next.
+    /// The current (streamed) file's bytes are all written; `finish()`/verify is running next.
     Finalizing,
+    /// `n` more bytes were handed to a buffering sink's memory — a memcpy. Never fold this into the
+    /// percentage bar or the throughput rate; it is only useful as "N buffered so far".
+    Staged(u64),
+    /// The current buffered file is fully staged (`n` = its size) and its `finish()` — the actual
+    /// transfer — is in flight. No byte-level progress exists until it returns, then `Bytes(n)`
+    /// follows (or an error and the file contributes nothing). Mutually exclusive with `Finalizing`
+    /// for a given file.
+    Uploading(u64),
+    /// A ~120 ms timer tick while the engine awaits an opaque `finish()` (or server-side copy) that
+    /// emits no bytes of its own. Carries no state: the caller re-signals whatever tail phase it is
+    /// already in so its marquee advances.
+    Heartbeat,
+}
+
+/// How often [`ProgressEvent::Heartbeat`] fires while a `finish()` is awaited. Matches the UI's
+/// minimum progress interval so the marquee moves at the same cadence as byte ticks.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Await `fut` while emitting [`ProgressEvent::Heartbeat`] every [`HEARTBEAT_INTERVAL`].
+///
+/// Cancel-safe by construction: `fut` is pinned once and polled through `&mut` across `select!`
+/// iterations, so a `finish(self: Box<Self>)` future is created exactly once and never dropped
+/// early; `Interval::tick` losing a race loses nothing. The first tick is scheduled one interval
+/// out (not immediately), so an instant `finish` produces no heartbeat at all.
+async fn await_with_heartbeat<F: std::future::Future>(
+    fut: F,
+    progress: &mut (dyn FnMut(ProgressEvent) + Send),
+) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    // A heartbeat is a liveness pulse, not a schedule to catch up on: if the task went unpolled for
+    // several intervals, one tick now — not a burst that teleports the marquee several cells.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            _ = tick.tick() => progress(ProgressEvent::Heartbeat),
+        }
+    }
 }
 
 /// Whether a transfer copies or moves.
@@ -104,9 +154,12 @@ pub struct TransferOutcome {
 
 /// Run a transfer of `items` (source path → destination path) from `src` to `dst`.
 ///
-/// `progress` receives a [`ProgressEvent`] per chunk ([`ProgressEvent::Bytes`]) and once per file
-/// right before its flush/verify tail ([`ProgressEvent::Finalizing`]). Cancellation is cooperative:
-/// the token is checked between chunks and between items; an in-flight write is aborted.
+/// `progress` receives a [`ProgressEvent`] per chunk — [`ProgressEvent::Bytes`] for a
+/// [`CommitMode::Streamed`] sink, [`ProgressEvent::Staged`] for a [`CommitMode::Buffered`] one — plus
+/// the per-file tail signals ([`ProgressEvent::Finalizing`], or [`ProgressEvent::Uploading`] then a
+/// catch-up `Bytes` for a buffered sink) and [`ProgressEvent::Heartbeat`]s while a `finish()` is
+/// awaited; see the variant docs. Cancellation is cooperative: the token is checked between chunks,
+/// once more between the last chunk and `finish()`, and between items; an in-flight write is aborted.
 ///
 /// While `paused` holds `true` the transfer blocks at the next check-point (between items, tree
 /// nodes, and chunks) until it flips back to `false` or the token is cancelled. If the `paused`
@@ -280,7 +333,7 @@ async fn copy_file(
     // the whole operation would be invisible until it's already done.
     if src.connection() == dst.connection() && src.caps_at(from).contains(Caps::COPY_SERVER) {
         progress(ProgressEvent::Finalizing);
-        src.copy_within(from, &to).await?;
+        await_with_heartbeat(src.copy_within(from, &to), progress).await?;
         let written = dst.stat(&to).await?.size.unwrap_or(0);
         progress(ProgressEvent::Bytes(written));
         outcome.files += 1;
@@ -299,6 +352,7 @@ async fn copy_file(
             },
         )
         .await?;
+    let commit_mode = writer.commit_mode();
 
     let mut buf = vec![0u8; CHUNK];
     let mut written: u64 = 0;
@@ -331,13 +385,37 @@ async fn copy_file(
             return Err(e.into());
         }
         written += n as u64;
-        progress(ProgressEvent::Bytes(n as u64));
+        // Only a streamed sink's chunk has actually gone anywhere. A buffered sink's chunk is a
+        // memcpy; reporting it as `Bytes` is exactly how the bar used to race to 100% before the
+        // upload had started.
+        progress(match commit_mode {
+            CommitMode::Streamed => ProgressEvent::Bytes(n as u64),
+            CommitMode::Buffered => ProgressEvent::Staged(n as u64),
+        });
     }
-    // Bytes are all read/written; the flush/close (and the size-verify stat below) is opaque backend
-    // work that moves no bytes — signal it so the caller shows a real 100% + "Finalizing…" rather
-    // than a bar pinned just short of done while a slow remote fsync completes.
-    progress(ProgressEvent::Finalizing);
-    let entry: Entry = writer.finish().await?;
+    // A cancel that arrived after the last chunk but before `finish()` used to be invisible until
+    // `finish()` — of arbitrary duration — returned. For a buffered sink this is also the *only*
+    // cheap cancellation point once staging is done (its `finish` is the whole upload).
+    if cancel.is_cancelled() {
+        writer.abort().await;
+        return Err(TransferError::Cancelled(TransferOutcome::default()));
+    }
+    let entry: Entry = match commit_mode {
+        CommitMode::Streamed => {
+            // Bytes are all read/written; the flush/close (and the size-verify stat below) is opaque
+            // backend work that moves no bytes — signal it so the caller shows a real 100% +
+            // "Finalizing…" rather than a bar pinned just short of done while a slow fsync completes.
+            progress(ProgressEvent::Finalizing);
+            await_with_heartbeat(writer.finish(), progress).await?
+        }
+        CommitMode::Buffered => {
+            // The real transfer starts now. Announce it and keep the caller's clock ticking through
+            // it; the cumulative bytes catch up in one jump *after* the verify below, so a file that
+            // fails verification is never shown as transferred.
+            progress(ProgressEvent::Uploading(written));
+            await_with_heartbeat(writer.finish(), progress).await?
+        }
+    };
 
     if spec.verify == VerifyPolicy::Size {
         // Ask the *destination* what landed. The `Entry` a sink returns from `finish` typically
@@ -354,6 +432,9 @@ async fn copy_file(
                 return Err(TransferError::VerifyFailed(to.clone()));
             }
         }
+    }
+    if commit_mode == CommitMode::Buffered {
+        progress(ProgressEvent::Bytes(written));
     }
 
     outcome.files += 1;
@@ -477,6 +558,173 @@ mod tests {
                 .with_file("/a.txt", b"aaa")
                 .with_file("/b.txt", b"bbb"),
         )
+    }
+
+    /// Collect the whole event stream, in order.
+    fn record(
+        log: &std::sync::Arc<std::sync::Mutex<Vec<ProgressEvent>>>,
+    ) -> impl FnMut(ProgressEvent) + Send {
+        let log = log.clone();
+        move |e| log.lock().unwrap().push(e)
+    }
+
+    /// A buffering sink's chunks are `Staged`, never `Bytes`; the file's real transfer is announced
+    /// with `Uploading(size)`; and only after `finish()` returns does one `Bytes(size)` catch the
+    /// totals up. `Finalizing` is never emitted for it — the two vocabularies are exclusive.
+    #[tokio::test]
+    async fn buffered_sink_stages_then_uploads_then_catches_up() {
+        // 2.5 chunks so the loop runs three times.
+        let data = vec![7u8; (CHUNK * 5) / 2];
+        let src: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(1)).with_file("/f", &data));
+        let dst: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(2)).with_buffered_writes());
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut record(&log),
+        )
+        .await
+        .unwrap();
+        let size = data.len() as u64;
+        let events = log.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                ProgressEvent::Staged(CHUNK as u64),
+                ProgressEvent::Staged(CHUNK as u64),
+                ProgressEvent::Staged(CHUNK as u64 / 2),
+                ProgressEvent::Uploading(size),
+                ProgressEvent::Bytes(size),
+            ]
+        );
+        assert_eq!(out.bytes, size);
+        assert_eq!(read_file(&dst, "/f").await.len(), data.len());
+    }
+
+    /// A streamed sink is untouched by the buffered vocabulary: `Bytes` per chunk, one `Finalizing`.
+    #[tokio::test]
+    async fn streamed_sink_keeps_bytes_then_finalizing() {
+        let src: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(1)).with_file("/f", b"abc"));
+        let dst: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(2)));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut record(&log),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![ProgressEvent::Bytes(3), ProgressEvent::Finalizing]
+        );
+    }
+
+    /// While a slow `finish()` is awaited the engine emits heartbeats at the UI cadence, so the
+    /// caller's marquee keeps moving through an upload/fsync that produces no bytes of its own.
+    /// Paused tokio time makes the 500 ms finish instantaneous and the tick count exact.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_tick_while_finish_is_slow() {
+        let src: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(1)).with_file("/f", b"abc"));
+        let dst: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(2))
+                .with_buffered_writes()
+                .with_finish_delay(std::time::Duration::from_millis(500)),
+        );
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut record(&log),
+        )
+        .await
+        .unwrap();
+        let events = log.lock().unwrap().clone();
+        let beats = events
+            .iter()
+            .filter(|e| **e == ProgressEvent::Heartbeat)
+            .count();
+        // 500 ms / 120 ms → ticks at 120, 240, 360, 480.
+        assert_eq!(beats, 4, "{events:?}");
+        // Heartbeats sit strictly between `Uploading` and the catch-up `Bytes`.
+        let up = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::Uploading(_)))
+            .unwrap();
+        let done = events
+            .iter()
+            .rposition(|e| matches!(e, ProgressEvent::Bytes(_)))
+            .unwrap();
+        assert!(events[up + 1..done]
+            .iter()
+            .all(|e| *e == ProgressEvent::Heartbeat));
+    }
+
+    /// An instant `finish()` produces no heartbeat (the first tick is scheduled one interval out).
+    #[tokio::test(start_paused = true)]
+    async fn no_heartbeat_for_an_instant_finish() {
+        let src: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(1)).with_file("/f", b"abc"));
+        let dst: Arc<dyn Vfs> = Arc::new(MockVfs::new(ConnectionId(2)));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            TransferSpec::default(),
+            &CancellationToken::new(),
+            &never_paused(),
+            &mut record(&log),
+        )
+        .await
+        .unwrap();
+        assert!(!log.lock().unwrap().contains(&ProgressEvent::Heartbeat));
+    }
+
+    /// A cancel that lands *during the final read* — the `read()` that returns EOF — is invisible to
+    /// the between-chunks check (`wait_while_paused` already returned for that iteration), so
+    /// without the dedicated check between the last chunk and `finish()` a buffered sink would run
+    /// its entire upload after the user pressed Esc. The mock fires the cancel from inside that read.
+    /// (Cancelling from a `Staged` callback instead would be caught by the next iteration's
+    /// `wait_while_paused` and would not exercise this path.)
+    #[tokio::test]
+    async fn cancel_during_the_final_read_aborts_instead_of_finishing() {
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let src: Arc<dyn Vfs> = Arc::new(
+            MockVfs::new(ConnectionId(1))
+                .with_file("/f", b"abc")
+                .with_on_eof("/f", move || c2.cancel()),
+        );
+        let dst_mock = Arc::new(MockVfs::new(ConnectionId(2)).with_buffered_writes());
+        let dst: Arc<dyn Vfs> = dst_mock.clone();
+        let res = run_transfer(
+            &src,
+            &dst,
+            &[(p("/f"), p("/f"))],
+            TransferSpec::default(),
+            &cancel,
+            &never_paused(),
+            &mut noop,
+        )
+        .await;
+        assert!(matches!(res, Err(TransferError::Cancelled(_))));
+        assert_eq!(dst_mock.aborted_writes(), vec!["/f".to_owned()]);
+        assert!(matches!(
+            dst.stat(&p("/f")).await,
+            Err(VfsError::NotFound(_))
+        ));
     }
 
     /// Regression: a source read that fails mid-file must abort the destination sink, not merely
@@ -620,6 +868,11 @@ mod tests {
             &mut |e| match e {
                 ProgressEvent::Finalizing => finalizing += 1,
                 ProgressEvent::Bytes(_) => byte_calls += 1,
+                // A streamed sink never stages or uploads; a heartbeat only fires on a slow finish.
+                ProgressEvent::Staged(_) | ProgressEvent::Uploading(_) => {
+                    panic!("streamed sink emitted a buffered-sink event: {e:?}")
+                }
+                ProgressEvent::Heartbeat => {}
             },
         )
         .await

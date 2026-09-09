@@ -998,7 +998,13 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize, the
             }
             let is_sel = ai == cursor;
             let marker = if is_sel { "> " } else { "  " };
-            let paused_marker = if t.paused { "  ⏸ paused" } else { "" };
+            // A pause lands between chunks — but a buffered file's staging and upload have none the
+            // engine can stop at, so until it lands the honest word is "pausing", not "paused".
+            let paused_marker = match (t.paused, t.phase) {
+                (false, _) => "",
+                (true, TransferPhase::Buffering | TransferPhase::Uploading) => "  ⏸ pausing…",
+                (true, _) => "  ⏸ paused",
+            };
             // Truncate the label (not the marker/paused tail) so a long "what → where" can't push the
             // `⏸ paused` indicator off the right edge at narrow widths — the state must stay visible.
             let label_budget = content_width
@@ -1025,15 +1031,24 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize, the
                     Some(total) if total > 0 => Some(pct_of(t.bytes, total)),
                     _ => Some(100),
                 },
-                TransferPhase::Copying => match t.total {
-                    Some(total) if total > 0 => Some(pct_of(t.bytes, total)),
-                    _ => None,
-                },
+                TransferPhase::Copying | TransferPhase::Buffering | TransferPhase::Uploading => {
+                    match t.total {
+                        Some(total) if total > 0 => Some(pct_of(t.bytes, total)),
+                        _ => None,
+                    }
+                }
             };
-            lines.push(Line::from(format!(
-                "  {}",
-                progress_bar(pct, bar_width, t.pulse)
-            )));
+            // A buffered file gets the hybrid bar: the committed fill stays put (those bytes are real)
+            // and a marquee sweeps the *unfilled* remainder, because the file in flight has no
+            // byte-level progress — a plain determinate bar would look stalled, a plain marquee would
+            // throw away the real progress of a multi-file tree.
+            let bar = match (t.phase, pct) {
+                (TransferPhase::Buffering | TransferPhase::Uploading, Some(p)) => {
+                    uploading_bar(p, bar_width, t.pulse)
+                }
+                _ => progress_bar(pct, bar_width, t.pulse),
+            };
+            lines.push(Line::from(format!("  {bar}")));
 
             match t.phase {
                 // Live pre-flight walk: a running item count + bytes found on one line, and the path
@@ -1073,6 +1088,20 @@ fn render_transfer_queue(frame: &mut Frame, state: &AppState, cursor: usize, the
                     lines.push(Line::from(format!(
                         "  {}   Finalizing…",
                         human_bytes(t.bytes)
+                    )));
+                }
+                // The current file is going through a buffering backend: say how much is buffered and
+                // which step we are waiting on — no rate (it would be memcpy speed) and no ETA
+                // (nothing to extrapolate from).
+                TransferPhase::Buffering | TransferPhase::Uploading => {
+                    let step = if t.phase == TransferPhase::Buffering {
+                        "Buffering…"
+                    } else {
+                        "Uploading…"
+                    };
+                    lines.push(Line::from(format!(
+                        "  {} buffered   {step}",
+                        human_bytes(t.staged)
                     )));
                 }
                 TransferPhase::Copying => {
@@ -1213,16 +1242,10 @@ const MARQUEE_BLOCK: usize = 3;
 /// block that sweeps back and forth, positioned by `pulse` (a monotonic per-transfer tick), so it
 /// visibly moves to signal activity. `pulse` is ignored for a determinate bar. The suffix is `--%`.
 fn progress_bar(pct: Option<u64>, width: usize, pulse: u64) -> String {
-    let suffix = match pct {
-        Some(p) => format!(" {}%", p.min(100)),
-        None => " --%".to_owned(),
-    };
-    // Reserve room for the suffix; always leave at least one column for the bar itself so a very
-    // narrow dialog (e.g. 40-wide) still renders *something* rather than just the percentage.
-    let bar_width = width.saturating_sub(suffix.chars().count()).max(1);
+    let (suffix, bar_width) = bar_geometry(pct, width);
     let bar = match pct {
         Some(p) => {
-            let filled = ((p.min(100) as usize) * bar_width) / 100;
+            let filled = filled_cells(p, bar_width);
             std::iter::repeat_n('█', filled)
                 .chain(std::iter::repeat_n('░', bar_width - filled))
                 .collect()
@@ -1230,6 +1253,40 @@ fn progress_bar(pct: Option<u64>, width: usize, pulse: u64) -> String {
         None => indeterminate_bar(bar_width, pulse),
     };
     format!("{bar}{suffix}")
+}
+
+/// The ` NN%` / ` --%` suffix and the columns left for the bar itself. Always leaves at least one
+/// column for the bar so a very narrow dialog (e.g. 40-wide) still renders *something* rather than
+/// just the percentage. Shared by every bar variant so their widths agree.
+fn bar_geometry(pct: Option<u64>, width: usize) -> (String, usize) {
+    let suffix = match pct {
+        Some(p) => format!(" {}%", p.min(100)),
+        None => " --%".to_owned(),
+    };
+    let bar_width = width.saturating_sub(suffix.chars().count()).max(1);
+    (suffix, bar_width)
+}
+
+/// How many of `bar_width` cells a `pct` (clamped to 100) fills.
+fn filled_cells(pct: u64, bar_width: usize) -> usize {
+    ((pct.min(100) as usize) * bar_width) / 100
+}
+
+/// The bar for [`TransferPhase::Uploading`] with a known total: the committed percentage as a fixed
+/// `█` fill (bytes that really landed), then the [`indeterminate_bar`] marquee sweeping only the
+/// unfilled remainder, then the ` NN%` suffix. A single-file upload therefore shows `0%` with a
+/// moving block; file 3 of 5 shows the 40% already committed *and* motion. When the remainder is too
+/// narrow for the marquee it degrades to the plain determinate bar.
+fn uploading_bar(pct: u64, width: usize, pulse: u64) -> String {
+    let (suffix, bar_width) = bar_geometry(Some(pct), width);
+    let filled = filled_cells(pct, bar_width);
+    let remaining = bar_width - filled;
+    let tail = if remaining > 0 {
+        indeterminate_bar(remaining, pulse)
+    } else {
+        String::new()
+    };
+    format!("{}{tail}{suffix}", "█".repeat(filled))
 }
 
 /// The sweeping fill for an indeterminate bar: a `MARQUEE_BLOCK`-wide run of `█` that bounces left↔
@@ -1853,8 +1910,17 @@ fn transfer_status(state: &AppState) -> String {
             // "transferring… 0 B" (which reads as a stall).
             return format!("⇅ scanning… {} items{suffix}", t.scan_entries);
         }
-        if t.paused {
-            return format!("⏸ paused {amount}{suffix}");
+        // A buffered file in flight has no byte-level progress; `amount` already reflects only the
+        // bytes that landed, and `transfer_rate_eta` would hide the rate anyway — name the wait. A
+        // pause cannot take effect until it lands, so say "pausing", not "paused".
+        match (t.paused, t.phase) {
+            (true, TransferPhase::Buffering | TransferPhase::Uploading) => {
+                return format!("⏸ pausing… {amount}{suffix}");
+            }
+            (true, _) => return format!("⏸ paused {amount}{suffix}"),
+            (false, TransferPhase::Buffering) => return format!("⇅ buffering… {amount}{suffix}"),
+            (false, TransferPhase::Uploading) => return format!("⇅ uploading… {amount}{suffix}"),
+            (false, _) => {}
         }
         // Same rate/ETA gating as the progress dialog (`transfer_rate_eta`); `t` is non-paused here
         // (the paused case returned above), just with the status-line's ` at …`/`, ETA …` phrasing.
@@ -2302,6 +2368,7 @@ mod tests {
             scan_entries: 0,
             scan_path: String::new(),
             bytes,
+            staged: 0,
             rate,
             total,
             paused,
@@ -2707,6 +2774,82 @@ mod tests {
         }
     }
 
+    /// The uploading bar keeps the committed fill fixed and sweeps the marquee only through the
+    /// remainder; at 0% it is a pure marquee, at 100% a pure fill (nothing left to sweep).
+    #[test]
+    fn uploading_bar_fills_committed_and_sweeps_the_remainder() {
+        // width 14 → " 40%" suffix (4) → 10 bar cells → 4 filled, 6 remaining (3-wide marquee).
+        let b = uploading_bar(40, 14, 0);
+        assert_eq!(b, "███████░░░ 40%");
+        let b2 = uploading_bar(40, 14, 2);
+        assert_eq!(
+            b2, "████░░███░ 40%",
+            "marquee moved within the unfilled 6 cells"
+        );
+        assert!(b2.starts_with("████"), "the committed fill never moves");
+        // 0%: the whole bar is marquee — same as the indeterminate bar with a real suffix.
+        assert_eq!(
+            uploading_bar(0, 14, 1),
+            format!("{} 0%", indeterminate_bar(11, 1))
+        );
+        // 100%: nothing to sweep, degrades to the plain fill.
+        assert_eq!(uploading_bar(100, 14, 7), progress_bar(Some(100), 14, 7));
+        // Every pulse yields exactly `width` chars.
+        for pulse in 0..20 {
+            assert_eq!(uploading_bar(40, 14, pulse).chars().count(), 14);
+        }
+    }
+
+    /// `Uploading` hides rate and ETA like the other non-flowing phases: a stale `rate` on the
+    /// struct must not leak through, and the status line names the wait.
+    #[test]
+    fn uploading_phase_hides_rate_eta_and_names_the_wait() {
+        use cairn_core::ActiveTransfer;
+        let t = ActiveTransfer {
+            id: 1,
+            kind: OpKind::Copy,
+            label: "x".to_owned(),
+            phase: TransferPhase::Uploading,
+            scan_entries: 0,
+            scan_path: String::new(),
+            bytes: 4 * 1024 * 1024,
+            staged: 2 * 1024 * 1024,
+            rate: Some(999_999), // stale — must be ignored
+            total: Some(10 * 1024 * 1024),
+            paused: false,
+            pulse: 3,
+        };
+        assert_eq!(transfer_rate_eta(&t), (None, None));
+
+        // The state the `transfer-uploading-multi` scenario renders; read its status line.
+        let mut s = ready_state();
+        set_transfer(
+            &mut s,
+            4 * 1024 * 1024,
+            Some(999_999),
+            Some(10 * 1024 * 1024),
+            false,
+        );
+        s.active_transfers[0].phase = TransferPhase::Uploading;
+        s.active_transfers[0].staged = 2 * 1024 * 1024;
+        let line = transfer_status(&s);
+        assert!(
+            line.starts_with("⇅ uploading… 4.0 MiB / 10.0 MiB (40%)"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("/s"),
+            "no rate for an upload in flight: {line}"
+        );
+        s.active_transfers[0].phase = TransferPhase::Buffering;
+        assert!(transfer_status(&s).starts_with("⇅ buffering…"));
+        // A pause cannot take effect until the buffered file lands — the label must not claim it has.
+        s.active_transfers[0].paused = true;
+        assert!(transfer_status(&s).starts_with("⏸ pausing…"));
+        s.active_transfers[0].phase = TransferPhase::Copying;
+        assert!(transfer_status(&s).starts_with("⏸ paused"));
+    }
+
     #[test]
     fn indeterminate_bar_sweeps_back_and_forth() {
         // The marquee block bounces across the bar as `pulse` advances (triangle wave), and always
@@ -2743,6 +2886,7 @@ mod tests {
             scan_entries: 0,
             scan_path: String::new(),
             bytes,
+            staged: 0,
             rate,
             total,
             paused,
@@ -2975,6 +3119,7 @@ mod tests {
             scan_entries: 3,
             scan_path: "/x".to_owned(),
             bytes: 0,
+            staged: 0,
             rate: None,
             total: None,
             paused: false,

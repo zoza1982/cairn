@@ -20,8 +20,8 @@ pub use real::RealSftp;
 use async_trait::async_trait;
 use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, UnixPerms, VfsPath};
 use cairn_vfs::{
-    ByteRange, CapabilityProvider, ListOpts, ListPage, ReadHandle, Recurse, Vfs, VfsError,
-    WriteHandle, WriteOpts, WriteSink,
+    ByteRange, CapabilityProvider, CommitMode, ListOpts, ListPage, ReadHandle, Recurse, Vfs,
+    VfsError, WriteHandle, WriteOpts, WriteSink,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -346,6 +346,11 @@ struct SftpWriteSink<O: SftpOps> {
 
 #[async_trait]
 impl<O: SftpOps> WriteSink for SftpWriteSink<O> {
+    fn commit_mode(&self) -> CommitMode {
+        // Each chunk is on the transport's pipelined WRITE window before `write_all` returns.
+        CommitMode::Streamed
+    }
+
     async fn write_chunk(&mut self, chunk: bytes::Bytes) -> Result<(), VfsError> {
         self.stream.write_all(&chunk).await?;
         self.written += chunk.len() as u64;

@@ -97,6 +97,21 @@ pub fn all() -> Vec<Scenario> {
             build: transfer_finalizing,
         },
         Scenario {
+            name: "transfer-uploading",
+            description: "a single file handed to a buffering backend (object store): committed 0% with a marquee in the remainder and an 'N buffered · Uploading…' label — never a bar already at 100%",
+            build: transfer_uploading,
+        },
+        Scenario {
+            name: "transfer-buffering",
+            description: "a file being read into a buffering backend's memory (object store) before its upload starts: growing 'N buffered · Buffering…', marquee, 0% committed",
+            build: transfer_buffering,
+        },
+        Scenario {
+            name: "transfer-uploading-multi",
+            description: "file 3 of 5 to a buffering backend: the 40% already committed stays as a fixed fill while the marquee sweeps the rest",
+            build: transfer_uploading_multi,
+        },
+        Scenario {
             name: "delete-active",
             description: "a delete running as a tracked operation: item count + current path, indeterminate bar (no bytes)",
             build: delete_active,
@@ -357,6 +372,7 @@ fn transfer_active() -> AppState {
         scan_entries: 0,
         scan_path: String::new(),
         bytes: 4 * 1024 * 1024,
+        staged: 0,
         rate: Some(2 * 1024 * 1024),
         total: Some(8 * 1024 * 1024),
         paused: false,
@@ -380,6 +396,7 @@ fn transfer_scanning() -> AppState {
         scan_entries: 1287,
         scan_path: "/home/me/project/node_modules/react/index.js".to_owned(),
         bytes: 42 * 1024 * 1024,
+        staged: 0,
         rate: None,
         total: None,
         paused: false,
@@ -447,10 +464,86 @@ fn transfer_finalizing() -> AppState {
         scan_entries: 0,
         scan_path: String::new(),
         bytes: 8 * 1024 * 1024,
+        staged: 0,
         rate: Some(2 * 1024 * 1024),
         total: Some(8 * 1024 * 1024),
         paused: false,
         pulse: 0, // determinate (honest 100%): pulse unused
+    });
+    s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+    s
+}
+
+fn transfer_uploading() -> AppState {
+    // A buffering backend (an object store's single-shot PUT) has the whole file in memory and its
+    // real upload is in flight. Nothing has landed, so the bar honestly shows 0% — with a moving
+    // marquee in the unfilled remainder so it reads as "working", not "stalled" — and the label says
+    // how much is buffered and that we are waiting. No rate (it would be memcpy speed), no ETA.
+    let mut s = dual_pane();
+    let id = s.next_transfer_id;
+    s.next_transfer_id += 1;
+    s.active_transfers.push(cairn_core::ActiveTransfer {
+        id,
+        kind: cairn_core::OpKind::Copy,
+        label: "Copying release.tar.gz → s3://bkt".to_owned(),
+        phase: cairn_core::TransferPhase::Uploading,
+        scan_entries: 0,
+        scan_path: String::new(),
+        bytes: 0,
+        staged: 8 * 1024 * 1024,
+        rate: None,
+        total: Some(8 * 1024 * 1024),
+        paused: false,
+        pulse: 5, // fixed marquee position for a deterministic frame
+    });
+    s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+    s
+}
+
+fn transfer_buffering() -> AppState {
+    // The step before `transfer-uploading`: the source is still being read into the buffering
+    // backend's memory (3 of 8 MiB so far). Nothing has been sent, the bar is at 0% with a marquee,
+    // and the label says "Buffering…" rather than pretending the upload has started.
+    let mut s = dual_pane();
+    let id = s.next_transfer_id;
+    s.next_transfer_id += 1;
+    s.active_transfers.push(cairn_core::ActiveTransfer {
+        id,
+        kind: cairn_core::OpKind::Copy,
+        label: "Copying release.tar.gz → s3://bkt".to_owned(),
+        phase: cairn_core::TransferPhase::Buffering,
+        scan_entries: 0,
+        scan_path: String::new(),
+        bytes: 0,
+        staged: 3 * 1024 * 1024,
+        rate: None,
+        total: Some(8 * 1024 * 1024),
+        paused: false,
+        pulse: 2,
+    });
+    s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
+    s
+}
+
+fn transfer_uploading_multi() -> AppState {
+    // Same phase mid-tree: two files (40% of the total) have landed and stay as a fixed fill; the
+    // third is buffered and uploading, so the marquee only sweeps the unfilled 60%.
+    let mut s = dual_pane();
+    let id = s.next_transfer_id;
+    s.next_transfer_id += 1;
+    s.active_transfers.push(cairn_core::ActiveTransfer {
+        id,
+        kind: cairn_core::OpKind::Copy,
+        label: "Copying 5 item(s) → gcs://bkt".to_owned(),
+        phase: cairn_core::TransferPhase::Uploading,
+        scan_entries: 0,
+        scan_path: String::new(),
+        bytes: 4 * 1024 * 1024,
+        staged: 2 * 1024 * 1024,
+        rate: None,
+        total: Some(10 * 1024 * 1024),
+        paused: false,
+        pulse: 11,
     });
     s.overlay = Some(Overlay::TransferQueue { cursor: 0 });
     s
@@ -470,6 +563,7 @@ fn delete_active() -> AppState {
         scan_entries: 128,
         scan_path: "/home/me/project/build/cache/objects/ab/cdef.o".to_owned(),
         bytes: 0,
+        staged: 0,
         rate: None,
         total: None,
         paused: false,
@@ -575,6 +669,7 @@ fn transfer_queue() -> AppState {
         scan_entries: 0,
         scan_path: String::new(),
         bytes: 1024 * 1024,
+        staged: 0,
         rate: None,
         total: None,
         paused: true,

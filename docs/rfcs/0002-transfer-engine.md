@@ -16,8 +16,23 @@ only place cross-backend logic lives, so "pod → S3" is the same code path as "
   `(from, to)` path pairs and a [`TransferSpec`].
 - **Copy paths.** A same-connection **server-side copy** fast path (`copy_within`, when
   `Caps::COPY_SERVER`); otherwise a **stream-through** loop: `open_read` → fixed 1 MiB buffer →
-  `write_chunk` → `finish`. Backpressure is implicit (the write awaits); a bounded reader/writer
-  pipeline is a later optimization.
+  `write_chunk` → `finish`. Backpressure is implicit (the write awaits) **for a
+  `CommitMode::Streamed` sink**; a bounded reader/writer pipeline is a later optimization.
+- **Honest progress vs. buffering sinks.** Every `WriteSink` declares a `CommitMode`. A `Streamed`
+  sink's chunks are reported as `ProgressEvent::Bytes` when `write_chunk` returns (they are with the
+  destination), followed by one `Finalizing` before `finish`. A `Buffered` sink (an object store's
+  single-shot PUT, until M5-4 multipart) stages chunks in memory, so the engine reports them as
+  `Staged` (the UI shows a growing "N buffered · Buffering…" — the staging *is* the source read, and
+  a big file's takes as long as any copy), announces the real transfer with `Uploading(size)` before
+  `finish`, and only after `finish` returns **and the size verify passes** emits `Bytes(size)` so
+  cumulative totals catch up. Reporting a buffered chunk as `Bytes` is exactly how the bar used to
+  race to 100% before the upload had started. While *any* `finish` (or server-side copy) is awaited
+  the engine emits a `Heartbeat` every ~120 ms so the UI's marquee keeps moving through an
+  upload/fsync that produces no bytes of its own. The token is also checked once more between the
+  last chunk and `finish` — the window a cancel lands in while the final, EOF-returning `read()` is
+  awaited — which for a buffered sink is the only cheap cancellation point once staging is done.
+  Pause and cancel cannot interrupt a buffered `finish` itself (that needs a signature change —
+  deferred), so the UI says "pausing…" rather than "paused" until the file lands.
 - **Directory trees** are walked iteratively (an explicit work stack) to avoid async recursion,
   creating destination directories and enqueuing children.
 - **Move** = an atomic `rename` when source and destination share a connection with `Caps::RENAME`;

@@ -184,6 +184,19 @@ pub enum TextEdit {
     PrevField,
 }
 
+/// Where a file going through a buffering backend currently is. Carried by
+/// [`AppEvent::TransferProgress::buffered`]; maps onto [`crate::TransferPhase::Buffering`] and
+/// [`crate::TransferPhase::Uploading`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferedStage {
+    /// The source is being read into the backend's memory; `n` bytes staged so far. Nothing has been
+    /// sent yet.
+    Staging(u64),
+    /// All `n` bytes are staged and the backend's real upload (`finish()`) is in flight. No
+    /// byte-level progress exists until it returns.
+    Uploading(u64),
+}
+
 /// Results flowing back from the async world.
 #[non_exhaustive]
 pub enum AppEvent {
@@ -242,6 +255,11 @@ pub enum AppEvent {
         /// engine is now flushing/verifying it — the transfer is in [`crate::TransferPhase::Finalizing`],
         /// so the bar shows an honest 100% instead of pinning at 99%.
         finalizing: bool,
+        /// `Some(..)` while the current file is going through a *buffering* backend (object stores
+        /// today): `bytes` has not moved for this file and will jump by the staged count when the
+        /// upload completes. Never combined with `finalizing`; wins over it if both are set.
+        /// Re-sent on each engine heartbeat / staging tick so the marquee keeps moving.
+        buffered: Option<BufferedStage>,
     },
     /// A delete/mkdir/rename/plan operation finished; carries a status message and whether it failed.
     OpDone {
