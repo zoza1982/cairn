@@ -125,6 +125,9 @@ rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `MockVfs` (with its `Buffered` write knob) for the runner test that checks a buffering backend's
+# upload is reported as `uploading`, never as bytes transferred.
+cairn-vfs = { workspace = true, features = ["test-utils"] }
 # The connection-opener / vault-unlock tests build a vault + typed credentials to exercise the
 # resolve → dispatch path hermetically (no live servers). Both `cairn-vault` and `cairn-secrets` are
 # normal dependencies now (the unlock flow opens the vault and names `SecretString`).

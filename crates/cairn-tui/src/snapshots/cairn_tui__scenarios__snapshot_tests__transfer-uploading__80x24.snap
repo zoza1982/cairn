@@ -1,0 +1,28 @@
+---
+source: crates/cairn-tui/src/scenarios.rs
+expression: frame
+---
+┌ / ───────────────────────────────────┐┌ / ───────────────────────────────────┐
+│>  src/                               ││>  src/                               │
+│   docs/                              ││   docs/                              │
+│   Cargo.toml                         ││   Cargo.toml                         │
+│   README.md                          ││   README.md                          │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│    ┌ Transfer ──────────────────────────────────────────────────────────┐    │
+│    │> Copying release.tar.gz → s3://bkt                                 │    │
+│    │  ░░░░░███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 0%│    │
+│    │  8.0 MiB buffered   Uploading…                                     │    │
+│    │                                                                    │    │
+│    │[b] background · [p] pause sel · [Esc] abort all                    │    │
+│    │[↑↓] select · [d] cancel/drop · [K/J] reorder · [x] clear           │    │
+│    └────────────────────────────────────────────────────────────────────┘    │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+│                                      ││                                      │
+└────────────────────────── sort: name ┘└────────────────────────── sort: name ┘
+ 1/4   ⇅ uploading… 0 B / 8.0 MiB (0%)

@@ -211,6 +211,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the destination yet), but with streaming writes it left an orphaned, truncated file that later
   looked complete.
 
+- **Copying to S3, GCS or Azure no longer shows a bar that races to 100% and then sits there.** Those
+  backends still upload each object in one shot from memory (real streaming/multipart is tracked in
+  #189), and the engine used to count every buffered chunk as transferred. Write sinks now declare
+  whether they stream or buffer; for a buffering backend the transfer dialog shows the bytes that have
+  actually landed as a fixed fill, a moving marquee in the remainder, and an `N buffered   Buffering…`
+  (source being read into memory) then `Uploading…` label — with no rate or ETA, since neither is
+  knowable — and the status line reads `⇅ buffering…` / `⇅ uploading…`. Totals jump when each file's
+  upload completes and verifies. The marquee keeps moving through any long `finish()` (an upload, a
+  remote `fsync`, an SFTP `CLOSE`); a cancel that lands while the final read is in flight now aborts
+  instead of running the whole upload first; and because a pause cannot take effect until a buffered
+  file lands, the UI says `⏸ pausing…` rather than claiming `paused`.
+
+  **Breaking (crate API, pre-1.0):** `cairn_vfs::WriteSink` gained a required `commit_mode()`; any
+  out-of-tree sink must declare `CommitMode::Streamed` or `Buffered`. Deliberately no default — a
+  silent `Streamed` is exactly the lie this fixes.
+
 - **Size verification (`VerifyPolicy::Size`) now asks the destination what landed.** It compared the
   byte count the sink itself reported — the same number the engine had just summed — so it could never
   fail; it also ran the destination `stat` eagerly on every file and then ignored it. It now stats

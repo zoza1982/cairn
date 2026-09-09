@@ -1626,6 +1626,16 @@ pub enum TransferPhase {
     /// and, under size-verify, re-stat'ing it. No further byte growth until the next file or
     /// completion — rendered as an honest 100% with a "Finalizing…" label, never a stalled ratio.
     Finalizing,
+    /// The current file is being read into a *buffering* backend's memory (an object store's
+    /// single-shot PUT); nothing has been sent yet. [`ActiveTransfer::bytes`] stays put and
+    /// [`ActiveTransfer::staged`] grows. Rendered like `Uploading` with a "Buffering…" label.
+    Buffering,
+    /// The current file is fully staged in a buffering backend and its real upload is in flight.
+    /// There is no byte-level progress for this file: [`ActiveTransfer::bytes`] stays where it was
+    /// and jumps by [`ActiveTransfer::staged`] when the upload lands. Rendered as the committed
+    /// percentage plus a moving marquee in the remainder and an "N buffered · Uploading…" label —
+    /// never as a bar that has already reached 100%.
+    Uploading,
 }
 
 /// One in-flight transfer the reducer tracks for display and control. The full source/destination
@@ -1648,7 +1658,13 @@ pub struct ActiveTransfer {
     /// the tree in real time rather than a static "Counting…". Empty outside `Counting`.
     pub scan_path: String,
     /// Cumulative bytes transferred so far (during `Counting`, the bytes discovered by the scan).
+    /// Only bytes that have actually reached the destination — a buffering backend's staged bytes
+    /// are in [`staged`](Self::staged) until its upload completes.
     pub bytes: u64,
+    /// Bytes of the current file sitting in a buffering backend's memory while
+    /// [`phase`](Self::phase) is [`TransferPhase::Buffering`] or [`TransferPhase::Uploading`].
+    /// Meaningless in other phases.
+    pub staged: u64,
     /// Average throughput (bytes/sec); `None` until the first progress update.
     pub rate: Option<u64>,
     /// Total bytes to transfer (from a pre-scan), if known — enables the percentage/ETA display.

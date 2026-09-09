@@ -20,7 +20,7 @@ pub use action::{
     action_ids, ActionCtx, ActionDescriptor, ActionId, ActionKind, ActionOutcome, SessionHandle,
 };
 pub use error::{BoxError, RedactedError, VfsError};
-pub use handle::{ReadHandle, WriteHandle, WriteSink};
+pub use handle::{CommitMode, ReadHandle, WriteHandle, WriteSink};
 pub use registry::VfsRegistry;
 pub use retry::{backoff_delay, retry, RetryPolicy};
 pub use vfs::{

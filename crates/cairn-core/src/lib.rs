@@ -15,7 +15,7 @@ pub use forms::{
     credential_method_fields, credential_methods, scheme_fields, scheme_needs_credentials,
     CredentialDraft, CredentialMethod, FieldSpec, OsSources, ProfileData, KNOWN_SCHEMES,
 };
-pub use msg::{Action, AppEffect, AppEvent, Msg, TextEdit, WriteBackMode};
+pub use msg::{Action, AppEffect, AppEvent, BufferedStage, Msg, TextEdit, WriteBackMode};
 pub use state::{
     detect_file_kind, next_theme, visible_connection_indices, ActiveTransfer, AppState,
     ArchiveFormat, ChoiceProvenance, ChoiceStatus, ConnectionChoice, ConnectionFormStage,

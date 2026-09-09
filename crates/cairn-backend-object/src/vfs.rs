@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::{Caps, ConnectionId, Entry, EntryKind, Scheme, VfsPath};
 use cairn_vfs::{
-    ByteRange, CapabilityProvider, ListOpts, ListPage, PageCursor, ReadHandle, Recurse, Vfs,
-    VfsError, WriteHandle, WriteOpts, WriteSink,
+    ByteRange, CapabilityProvider, CommitMode, ListOpts, ListPage, PageCursor, ReadHandle, Recurse,
+    Vfs, VfsError, WriteHandle, WriteOpts, WriteSink,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use smol_str::SmolStr;
@@ -183,6 +183,13 @@ struct ObjectWriteSink {
 
 #[async_trait]
 impl WriteSink for ObjectWriteSink {
+    fn commit_mode(&self) -> CommitMode {
+        // Honest declaration: every chunk is staged in `buf` and the single `put` runs in `finish`.
+        // Streaming/multipart uploads are the M5-4 milestone (see issue #189); until then the engine
+        // must not count these bytes as transferred.
+        CommitMode::Buffered
+    }
+
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), VfsError> {
         self.buf.extend_from_slice(&chunk);
         Ok(())
