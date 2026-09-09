@@ -9,16 +9,16 @@ expression: frame
 │   README.md                          ││   README.md                          │
 │                                      ││                                      │
 │                                      ││                                      │
-│                                      ││                                      │
 │       ┌ AI plan — review before running ─────────────────────────────┐       │
 │       │archive old logs                                              │       │
 │       │                                                              │       │
 │       │▶ · copy     [safe]  copy the things                          │       │
+│       │      copy({"conn":"conn:1","path":"/srv/copy-target"})       │       │
 │       │  · delete   [IRREVERSIBLE]  delete the things                │       │
+│       │      delete({"conn":"conn:1","path":"/srv/delete-target"})   │       │
 │       │                                                              │       │
 │       │↵ approve · x reject · esc abort · no bulk (irreversible)     │       │
 │       └──────────────────────────────────────────────────────────────┘       │
-│                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │

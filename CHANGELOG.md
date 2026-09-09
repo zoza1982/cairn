@@ -281,6 +281,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credential by label, labels are not unique — nothing in `Vault::add` enforces it — and resolution
   took the first match, so which secret a plugin received depended on vault ordering. An ambiguous
   handle is now refused outright.
+- **The AI confirm gate now shows the call that will actually run.** It rendered only the model's
+  own `description` — prose the model wrote about itself, with no relationship to the `input` the
+  executor consumes — so a step described as tidying a temporary file could carry an input naming
+  something else entirely, and the approval still applied to the input. Each step now also shows its
+  tool and operands, bounded so a long input cannot push the dialog off screen.
+
+- **Every relative `PATH` entry is dropped before running an editor or shell action**, not just the
+  literal `.`. Both callers set the child's working directory to the pane's directory, so `bin`,
+  `./bin`, `..` and `node_modules/.bin` all resolved inside whatever the user was browsing — and
+  browsing an untrusted directory is an ordinary thing to do with a file manager.
+
+- **A local path segment must be one ordinary component.** `VfsPath` splits on `/` and rejects a
+  `..` segment, which suffices on Unix but not on Windows: `..\..\Windows\win.ini` and
+  `C:\Windows\win.ini` each survive as a single opaque segment, and `PathBuf::push` then resolves
+  the `..` away or replaces the base path outright, escaping the backend root. The local backend now
+  asks the platform's own parser, which catches separators, drive prefixes and UNC together.
 
 
 

@@ -63,18 +63,36 @@ impl LocalVfs {
         }
     }
 
-    /// Resolve a [`VfsPath`] to an absolute OS path under the root. `VfsPath` contains no `..`
-    /// segments, so lexical traversal cannot escape the root.
+    /// Resolve a [`VfsPath`] to an absolute OS path under the root, or `None` if any segment is not
+    /// a single ordinary path component on this platform.
+    ///
+    /// `VfsPath` splits on `/` and rejects a `..` *segment*, which is enough on Unix but not on
+    /// Windows: `..\..\Windows\win.ini` and `C:\Windows\win.ini` each survive as one opaque
+    /// segment, and `PathBuf::push` then either resolves the `..` away or — for a drive-qualified
+    /// segment — replaces the base path outright, escaping the root. Asking the platform's own
+    /// parser whether a segment is exactly one `Component::Normal` catches separators, drive
+    /// prefixes and UNC in one check, and is a no-op for ordinary names on Unix.
     ///
     /// SECURITY (tracked): a pre-existing symlink *inside* the root that points outside it is still
     /// followed by read/list operations. When this backend is treated as a containment boundary
     /// (e.g. for AI-driven ops), resolve symlinks and verify the canonical target stays under `root`.
-    fn resolve(&self, path: &VfsPath) -> PathBuf {
+    fn resolve_checked(&self, path: &VfsPath) -> Option<PathBuf> {
         let mut pb = self.root.clone();
         for seg in path.segments() {
-            pb.push(seg.as_str());
+            let mut components = Path::new(seg.as_str()).components();
+            match (components.next(), components.next()) {
+                (Some(std::path::Component::Normal(c)), None) => pb.push(c),
+                _ => return None,
+            }
         }
-        pb
+        Some(pb)
+    }
+
+    /// [`resolve_checked`](Self::resolve_checked), reporting a rejected path as `NotFound` — which
+    /// is what it is: no entry under this root has that name.
+    fn resolve(&self, path: &VfsPath) -> Result<PathBuf, VfsError> {
+        self.resolve_checked(path)
+            .ok_or_else(|| VfsError::NotFound(path.clone()))
     }
 
     /// Canonicalize `path` and confirm the real target stays under the (canonical) root, returning
@@ -86,7 +104,7 @@ impl LocalVfs {
         // BLOCKING: `canonicalize` is a synchronous `realpath(3)` syscall. Async callers must offload
         // this via `tokio::task::spawn_blocking` (see the `Vfs::local_path` contract).
         let root = self.canonical_root.as_ref()?;
-        let real = std::fs::canonicalize(self.resolve(path)).ok()?;
+        let real = std::fs::canonicalize(self.resolve_checked(path)?).ok()?;
         // Component-wise containment (not string-prefix, which would treat `/a/bc` as under `/a/b`).
         // `canonicalize` resolves every component, so an in-root symlink whose target escapes the root
         // diverges here and is rejected.
@@ -165,13 +183,16 @@ impl Vfs for LocalVfs {
         dir: &VfsPath,
         opts: ListOpts,
     ) -> BoxStream<'a, Result<ListPage, VfsError>> {
-        let base = self.resolve(dir);
+        let base = match self.resolve(dir) {
+            Ok(b) => b,
+            Err(e) => return stream::once(async move { Err(e) }).boxed(),
+        };
         let dir = dir.clone();
         stream::once(async move { read_dir_page(&base, &dir, opts.all).await }).boxed()
     }
 
     async fn stat(&self, path: &VfsPath) -> Result<Entry, VfsError> {
-        let full = self.resolve(path);
+        let full = self.resolve(path)?;
         let meta = tokio::fs::symlink_metadata(&full)
             .await
             .map_err(|e| map_io(e, path))?;
@@ -184,7 +205,7 @@ impl Vfs for LocalVfs {
         path: &VfsPath,
         range: Option<ByteRange>,
     ) -> Result<ReadHandle, VfsError> {
-        let full = self.resolve(path);
+        let full = self.resolve(path)?;
         let mut file = tokio::fs::File::open(&full)
             .await
             .map_err(|e| map_io(e, path))?;
@@ -204,7 +225,7 @@ impl Vfs for LocalVfs {
     }
 
     async fn open_write(&self, path: &VfsPath, opts: WriteOpts) -> Result<WriteHandle, VfsError> {
-        let full = self.resolve(path);
+        let full = self.resolve(path)?;
         // Refuse an existing destination up front when the caller asked us to; below we write to a
         // temp, so `create_new` on the real path can no longer do it for us.
         if !opts.overwrite && tokio::fs::symlink_metadata(&full).await.is_ok() {
@@ -232,13 +253,13 @@ impl Vfs for LocalVfs {
     }
 
     async fn create_dir(&self, path: &VfsPath) -> Result<(), VfsError> {
-        tokio::fs::create_dir(self.resolve(path))
+        tokio::fs::create_dir(self.resolve(path)?)
             .await
             .map_err(|e| map_io(e, path))
     }
 
     async fn remove(&self, path: &VfsPath, recurse: Recurse) -> Result<(), VfsError> {
-        let full = self.resolve(path);
+        let full = self.resolve(path)?;
         let meta = tokio::fs::symlink_metadata(&full)
             .await
             .map_err(|e| map_io(e, path))?;
@@ -254,20 +275,20 @@ impl Vfs for LocalVfs {
     }
 
     async fn rename(&self, from: &VfsPath, to: &VfsPath) -> Result<(), VfsError> {
-        tokio::fs::rename(self.resolve(from), self.resolve(to))
+        tokio::fs::rename(self.resolve(from)?, self.resolve(to)?)
             .await
             .map_err(|e| map_io(e, from))
     }
 
     async fn set_perms(&self, path: &VfsPath, perms: UnixPerms) -> Result<(), VfsError> {
-        set_perms_impl(&self.resolve(path), path, perms).await
+        set_perms_impl(&self.resolve(path)?, path, perms).await
     }
 
     async fn space(&self, path: &VfsPath) -> Result<Option<SpaceInfo>, VfsError> {
         // `fs4::{available_space,total_space}` are blocking syscalls (statvfs / GetDiskFreeSpaceEx),
         // so run them off the async reactor. `resolve` (not the symlink-confined `local_path`) is
         // fine here — this is read-only telemetry, not a shell-out containment boundary.
-        let full = self.resolve(path);
+        let full = self.resolve(path)?;
         let res = tokio::task::spawn_blocking(move || -> std::io::Result<SpaceInfo> {
             Ok(SpaceInfo {
                 total: fs4::total_space(&full)?,
@@ -500,6 +521,60 @@ mod tests {
             b"mine"
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Regression: `VfsPath` splits on `/` and rejects a `..` *segment*, which is enough on Unix but
+    /// not on Windows — `..\..\Windows\win.ini` and `C:\Windows\win.ini` each survive as one
+    /// opaque segment, and `PathBuf::push` then resolves the `..` away or, for a drive-qualified
+    /// segment, replaces the base path outright, escaping the root.
+    ///
+    /// The property is platform-dependent by nature (a backslash is an ordinary filename character
+    /// on Unix and a separator on Windows), which is exactly why the check asks the platform's own
+    /// parser. What must hold everywhere: a resolved path is always a direct child of the root.
+    #[test]
+    fn a_resolved_segment_can_never_leave_the_root() {
+        let (dir, vfs) = backend();
+        let root = dir.path();
+        for hostile in [
+            r"..\..\Windows\win.ini",
+            r"C:\Windows\win.ini",
+            r"\\server\share",
+            "..",
+            "a/b",
+            "ordinary.txt",
+        ] {
+            let Ok(path) = VfsPath::root().join(hostile) else {
+                continue; // rejected by `VfsPath` itself, which is also fine
+            };
+            if let Some(resolved) = vfs.resolve_checked(&path) {
+                assert_eq!(
+                    resolved.parent(),
+                    Some(root),
+                    "{hostile:?} resolved outside the root, to {resolved:?}"
+                );
+            }
+        }
+    }
+
+    /// The Windows-specific half of the above, verified on the Windows CI job: a segment carrying
+    /// separators, a drive prefix or a UNC prefix is refused rather than escaping the root.
+    #[cfg(windows)]
+    #[test]
+    fn windows_separators_and_drive_prefixes_are_refused() {
+        let (_dir, vfs) = backend();
+        for hostile in [
+            r"..\..\Windows\win.ini",
+            r"C:\Windows\win.ini",
+            r"\\server\share",
+        ] {
+            let Ok(path) = VfsPath::root().join(hostile) else {
+                continue;
+            };
+            assert!(
+                vfs.resolve_checked(&path).is_none(),
+                "{hostile:?} was resolved instead of refused"
+            );
+        }
     }
 
     #[tokio::test]

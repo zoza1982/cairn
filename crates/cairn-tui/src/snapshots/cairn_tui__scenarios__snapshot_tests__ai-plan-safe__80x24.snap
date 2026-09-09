@@ -9,16 +9,16 @@ expression: frame
 │   README.md                          ││   README.md                          │
 │                                      ││                                      │
 │                                      ││                                      │
-│                                      ││                                      │
 │       ┌ AI plan — review before running ─────────────────────────────┐       │
 │       │archive old logs                                              │       │
 │       │                                                              │       │
 │       │▶ · list     [safe]  list the things                          │       │
+│       │      list({"conn":"conn:1","path":"/srv/list-target"})       │       │
 │       │  · copy     [safe]  copy the things                          │       │
+│       │      copy({"conn":"conn:1","path":"/srv/copy-target"})       │       │
 │       │                                                              │       │
 │       │↵ approve · a approve all · x reject · esc abort              │       │
 │       └──────────────────────────────────────────────────────────────┘       │
-│                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │
 │                                      ││                                      │

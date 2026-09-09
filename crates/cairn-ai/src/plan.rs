@@ -59,6 +59,37 @@ pub struct PlanStep {
     pub output: Option<String>,
 }
 
+impl PlanStep {
+    /// The largest operand summary worth putting on one line of the confirm dialog.
+    const OPERAND_SUMMARY_MAX: usize = 160;
+
+    /// A compact rendering of the tool and the input **that will actually be executed**.
+    ///
+    /// The confirm gate exists so a human authorises what the model is about to do, and until this
+    /// existed it showed only [`description`](Self::description) — prose the model wrote about
+    /// itself, with no relationship to [`input`](Self::input) that the executor consumes. A model
+    /// (or anything that can influence it) could describe a step as reading a config while its input
+    /// named a different path entirely, and the approval would still be granted for the input.
+    ///
+    /// Rendered from the input verbatim rather than from a per-tool allow-list, so it cannot drift
+    /// out of sync with the tool set as it grows. Inputs carry paths and connection handles; secrets
+    /// cannot reach here by construction (the AI layer depends only on the secret-free
+    /// `cairn-broker-api` — RFC-0008), so there is nothing to redact.
+    #[must_use]
+    pub fn operand_summary(&self) -> String {
+        let input = serde_json::to_string(&self.input).unwrap_or_else(|_| "?".to_owned());
+        let mut summary = format!("{}({input})", self.tool);
+        if summary.chars().count() > Self::OPERAND_SUMMARY_MAX {
+            summary = summary
+                .chars()
+                .take(Self::OPERAND_SUMMARY_MAX - 1)
+                .collect::<String>()
+                + "…";
+        }
+        summary
+    }
+}
+
 /// A proposed, then executable, plan.
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -268,6 +299,59 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::{Capability, Reversibility, Verb};
+
+    /// Regression: the confirm gate rendered only the model's own `description`, so approval was
+    /// granted for prose that had no relationship to the `input` the executor consumes. A step
+    /// described as reading a config could carry an input naming something else entirely, and the
+    /// approval would still apply to the input.
+    #[test]
+    fn the_operand_summary_shows_the_call_that_will_actually_run() {
+        let step = PlanStep {
+            tool: "delete".to_owned(),
+            input: serde_json::json!({ "conn": "conn:1", "path": "/etc/passwd" }),
+            description: "Tidy up a temporary file".to_owned(),
+            capability: Capability {
+                verb: Verb::Delete,
+                reversibility: Reversibility::Irreversible,
+            },
+            status: StepStatus::Pending,
+            error: None,
+            output: None,
+        };
+        let summary = step.operand_summary();
+        assert!(summary.contains("delete"), "{summary}");
+        assert!(
+            summary.contains("/etc/passwd"),
+            "the real target must be visible, not just the description: {summary}"
+        );
+        assert!(!summary.contains("Tidy up"), "{summary}");
+    }
+
+    /// A hostile or merely verbose input cannot push the dialog off screen.
+    #[test]
+    fn the_operand_summary_is_bounded() {
+        let step = PlanStep {
+            tool: "read".to_owned(),
+            input: serde_json::json!({ "path": "/".to_owned() + &"a".repeat(10_000) }),
+            description: String::new(),
+            capability: Capability {
+                verb: Verb::Read,
+                reversibility: Reversibility::Safe,
+            },
+            status: StepStatus::Pending,
+            error: None,
+            output: None,
+        };
+        let summary = step.operand_summary();
+        assert!(
+            summary.chars().count() <= PlanStep::OPERAND_SUMMARY_MAX,
+            "{}",
+            summary.len()
+        );
+        assert!(summary.ends_with('…'));
+    }
     use std::sync::Mutex;
 
     fn proposed(steps: &[(&str, &str)]) -> ProposedPlan {
