@@ -180,6 +180,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panes on one directory is an ordinary thing to have on screen, so this is now refused with a
   status message rather than executed. Copies and moves between different directories of the same
   connection are unaffected, and a mixed selection only drops the self-targeted entries.
+- **Copying a symlinked file out of a container no longer produces an empty file.** A link's tar
+  header carries size 0 and no body, and both container backends read the first entry and returned
+  whatever it contained — so `/bin/sh`, `/etc/resolv.conf` and friends, symlinks in most images,
+  came out empty. Silently. Kubernetes now passes `tar -h` so the target's bytes are archived;
+  Docker (whose archive endpoint has no dereference option) follows the link itself, bounded to
+  eight hops so a cycle terminates. If a link header somehow still arrives, it is an error rather
+  than empty content.
+
+- **A container directory listing no longer discards everything when one entry is unreadable.**
+  `tar` exits non-zero if it could not read *any* member — one root-owned subdirectory is enough in
+  a container running as non-root — while still writing a complete archive of everything it could
+  read. Kubernetes threw that away and reported the directory as missing; it now shows what `tar`
+  managed to produce and only reports the error when nothing usable came back.
+
+- **Listing one directory in a pod no longer downloads its entire subtree.** The listing ran plain
+  recursive `tar`, which streams every file's *contents*, so drawing a single pane of a pod's `/`
+  pulled the whole container filesystem through the exec stream. It now lists one level
+  (`--no-recursion`).
+
+- **Listing a file path in a container reports it, instead of showing an empty directory.** Docker
+  returns the file itself when asked to archive a file path, and its single entry never carried the
+  prefix the listing filtered on, so every entry was dropped and the caller saw a successful, empty
+  directory. It now matches the Kubernetes backend and both mocks.
+
+- **A container path is passed to `tar` as an operand, not a possible flag** (`--` before it), so a
+  file whose name begins with `-` can no longer be interpreted as an argument.
 
 
 ### Security

@@ -588,6 +588,58 @@ fn tar_prefix(path: &str) -> String {
 /// Normalize a raw tar entry name to a parent-relative form: strip the Docker root `/` prefix and
 /// the Podman/older-Moby `./` prefix, then strip the directory `prefix` for the listed path. Returns
 /// `None` when the entry is not under `prefix` (e.g. the archive's self-entry).
+/// Whether the archive is the single non-directory entry Docker returns for a *file* path.
+fn archive_is_single_file(buf: &[u8], path: &str) -> Result<bool, VfsError> {
+    let basename = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    if basename.is_empty() {
+        return Ok(false); // the root is always a directory
+    }
+    let mut archive = tar::Archive::new(buf);
+    let mut entries = archive.entries().map_err(backend_err)?;
+    let Some(first) = entries.next() else {
+        return Ok(false);
+    };
+    let first = first.map_err(backend_err)?;
+    let name = first
+        .path()
+        .map_err(backend_err)?
+        .to_string_lossy()
+        .into_owned();
+    let name = name.trim_start_matches("./").trim_start_matches('/');
+    let is_file = !first.header().entry_type().is_dir();
+    Ok(is_file && name.trim_end_matches('/') == basename && entries.next().is_none())
+}
+
+/// Resolve a tar link target against the linking path's directory. An absolute target is taken as
+/// container-absolute; a relative one is joined to the link's parent. `..` is resolved lexically —
+/// the result is only ever used as a container path, never a host one.
+fn resolve_link_target(link_path: &str, target: &str) -> String {
+    let base = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        link_path
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("")
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut out = base;
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s.to_owned()),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
 fn strip_tar_prefix<'a>(raw: &'a str, prefix: &str) -> Option<&'a str> {
     let normalized = raw.trim_start_matches("./").trim_start_matches('/');
     normalized.strip_prefix(prefix)
@@ -701,6 +753,13 @@ impl ContainerOps for BollardDocker {
     /// stops at depth > 1 without buffering file contents.
     async fn list_dir(&self, container: &str, path: &str) -> Result<Vec<RemoteEntry>, VfsError> {
         let buf = self.fetch_archive(container, path).await?;
+        // Docker returns the *file itself* when asked to archive a file path, and its single entry
+        // never carries the `<basename>/` prefix a directory's children do — so every entry was
+        // filtered out and the caller saw a successful, empty directory. Both mocks (and the k8s
+        // backend) report a file as not-found here; make the real adapter agree.
+        if archive_is_single_file(&buf, path)? {
+            return Err(not_found(path));
+        }
         let prefix = tar_prefix(path);
 
         let mut archive = tar::Archive::new(buf.as_slice());
@@ -804,20 +863,51 @@ impl ContainerOps for BollardDocker {
     /// entry's bytes. A 404 from the daemon maps to [`VfsError::NotFound`]. Reading a directory
     /// path is rejected with [`VfsError::Unsupported`].
     async fn read(&self, container: &str, path: &str) -> Result<Vec<u8>, VfsError> {
-        let buf = self.fetch_archive(container, path).await?;
-        let mut archive = tar::Archive::new(buf.as_slice());
-        let mut entry = archive
-            .entries()
-            .map_err(backend_err)?
-            .next()
-            .ok_or_else(|| not_found(path))?
-            .map_err(backend_err)?;
-        if entry.header().entry_type().is_dir() {
-            return Err(VfsError::Unsupported(Caps::READ));
+        // Follow symlinks ourselves: the Docker archive endpoint has no dereference option, and a
+        // link's tar header carries size 0 with no body — so this used to return an *empty file*,
+        // silently, for exactly the paths most likely to be links (`/bin/sh`, `/etc/resolv.conf`).
+        // Bounded like the kernel's own `ELOOP` limit so a link cycle terminates.
+        const MAX_LINK_HOPS: usize = 8;
+        let mut current = path.to_owned();
+        for _ in 0..MAX_LINK_HOPS {
+            let buf = self.fetch_archive(container, &current).await?;
+            // The archive is not `Send`, so decide what to do inside a scope that ends before the
+            // next await.
+            let outcome = {
+                let mut archive = tar::Archive::new(buf.as_slice());
+                let mut entry = archive
+                    .entries()
+                    .map_err(backend_err)?
+                    .next()
+                    .ok_or_else(|| not_found(&current))?
+                    .map_err(backend_err)?;
+                let kind = entry.header().entry_type();
+                if kind.is_dir() {
+                    return Err(VfsError::Unsupported(Caps::READ));
+                }
+                if kind.is_symlink() || kind.is_hard_link() {
+                    let target = entry
+                        .link_name()
+                        .map_err(backend_err)?
+                        .map(|t| t.to_string_lossy().into_owned())
+                        .ok_or_else(|| not_found(&current))?;
+                    Err(resolve_link_target(&current, &target))
+                } else {
+                    let mut data = Vec::new();
+                    entry.read_to_end(&mut data).map_err(backend_err)?;
+                    Ok(data)
+                }
+            };
+            match outcome {
+                Ok(data) => return Ok(data),
+                Err(next) => current = next,
+            }
         }
-        let mut data = Vec::new();
-        entry.read_to_end(&mut data).map_err(backend_err)?;
-        Ok(data)
+        Err(VfsError::Backend {
+            code: "symlink-loop".to_owned(),
+            msg: format!("{path}: too many symbolic links"),
+            retryable: false,
+        })
     }
 
     /// Stream log output from a container via the Docker `GET /containers/{id}/logs` endpoint.
@@ -1153,6 +1243,66 @@ impl ContainerOps for BollardDocker {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: Docker returns the *file itself* when asked to archive a file path, and its
+    /// single entry never carries the `<basename>/` prefix a directory's children do — so every
+    /// entry was filtered out and the caller saw a successful, **empty directory** rather than an
+    /// error. Both mocks and the k8s backend report a file as not-found here.
+    #[test]
+    fn a_file_path_is_recognised_rather_than_listed_as_an_empty_directory() {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(5);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "hostname", &b"mybox"[..]).unwrap();
+        let archive = b.into_inner().unwrap();
+        assert!(archive_is_single_file(&archive, "/etc/hostname").unwrap());
+        // A directory's archive is not mistaken for one…
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, kind, size) in [
+            ("etc/", tar::EntryType::Directory, 0u64),
+            ("etc/hostname", tar::EntryType::Regular, 5),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(size);
+            h.set_entry_type(kind);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, &b"mybox"[..size as usize])
+                .unwrap();
+        }
+        let dir_archive = b.into_inner().unwrap();
+        assert!(!archive_is_single_file(&dir_archive, "/etc").unwrap());
+        // …and the container root is always a directory.
+        assert!(!archive_is_single_file(&archive, "/").unwrap());
+    }
+
+    /// Link targets resolve the way the kernel would: absolute targets from the container root,
+    /// relative ones against the link's own directory, with `..` applied lexically.
+    #[test]
+    fn link_targets_resolve_against_the_links_directory() {
+        assert_eq!(resolve_link_target("/bin/sh", "/bin/bash"), "/bin/bash");
+        assert_eq!(resolve_link_target("/bin/sh", "bash"), "/bin/bash");
+        assert_eq!(
+            resolve_link_target("/bin/sh", "../usr/bin/bash"),
+            "/usr/bin/bash"
+        );
+        assert_eq!(
+            resolve_link_target(
+                "/etc/resolv.conf",
+                "../run/systemd/resolve/stub-resolv.conf"
+            ),
+            "/run/systemd/resolve/stub-resolv.conf"
+        );
+        assert_eq!(resolve_link_target("/a/b/c", "./d"), "/a/b/d");
+        // Escaping past the root clamps there rather than underflowing.
+        assert_eq!(
+            resolve_link_target("/a", "../../../etc/passwd"),
+            "/etc/passwd"
+        );
+    }
     use super::*;
 
     /// Build a registry with a single, already-initialized cell for `image_id` → `cid`, with

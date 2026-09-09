@@ -43,7 +43,8 @@ use crate::ops::{
     bind_loopback, ContainerInfo, ContextInfo, KubeOps, PodInfo, RemoteEntry, RemoteMeta,
 };
 use crate::tar_exec::{
-    not_found, parse_list_dir, parse_read_tar, parse_stat_tar, tar_basename, tar_parent,
+    list_dir_argv, not_found, parse_list_dir, parse_read_tar, parse_stat_tar,
+    salvage_partial_listing, stat_read_argv, tar_basename, tar_parent,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -621,7 +622,7 @@ impl KubeOps for KubeRsOps {
         container: &str,
         path: &str,
     ) -> Result<Vec<RemoteEntry>, VfsError> {
-        let command = ["tar", "cf", "-", "-C", path, "."];
+        let command = list_dir_argv(path);
         let out = self.exec_tar(ctx, ns, pod, container, &command).await?;
 
         if out.is_success() {
@@ -629,8 +630,13 @@ impl KubeOps for KubeRsOps {
             return parse_list_dir(&out.stdout);
         }
 
-        // Non-zero exit: distinguish path-not-found from exec-unavailable from other errors.
-        // Special case: tar exits non-zero when it cannot open the directory itself.
+        // A non-zero exit does not mean there is nothing to show — see `salvage_partial_listing`.
+        if let Some(entries) = salvage_partial_listing(&out.stdout) {
+            return Ok(entries);
+        }
+
+        // Nothing usable came back: distinguish path-not-found from exec-unavailable from other
+        // errors. Special case: tar exits non-zero when it cannot open the directory itself.
         Err(out.into_vfs_err(path))
     }
 
@@ -660,7 +666,7 @@ impl KubeOps for KubeRsOps {
 
         let parent = tar_parent(path);
         let basename = tar_basename(path);
-        let command = ["tar", "cf", "-", "-C", parent, basename];
+        let command = stat_read_argv(parent, basename);
         let out = self.exec_tar(ctx, ns, pod, container, &command).await?;
 
         if out.is_success() {
@@ -694,7 +700,7 @@ impl KubeOps for KubeRsOps {
         }
         let parent = tar_parent(path);
         let basename = tar_basename(path);
-        let command = ["tar", "cf", "-", "-C", parent, basename];
+        let command = stat_read_argv(parent, basename);
         let out = self.exec_tar(ctx, ns, pod, container, &command).await?;
 
         if out.is_success() {
