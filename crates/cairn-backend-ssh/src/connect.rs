@@ -12,7 +12,9 @@ use cairn_types::ConnectionId;
 use cairn_vault::{CredentialSecret, ExposeSecret, SshCredential};
 use cairn_vfs::VfsError;
 use russh::client::{self, Handle};
-use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
+use russh::keys::known_hosts::{
+    check_known_hosts_path, known_host_keys_path, learn_known_hosts_path,
+};
 use russh::keys::ssh_key::PublicKey;
 use russh::keys::{decode_secret_key, Algorithm, HashAlg, PrivateKeyWithHashAlg};
 use russh_sftp::client::SftpSession;
@@ -88,6 +90,11 @@ fn verify_host_key(
     match policy {
         HostKeyPolicy::Strict { known_hosts } => {
             // Only a recorded, matching key is accepted; unknown / changed / missing-file → reject.
+            // A revocation outranks a match: the same key may appear on both a plain and an
+            // `@revoked` line, and russh's matcher does not look at markers at all.
+            if host_pin(host, port, known_hosts) == HostPin::Revoked {
+                return Ok(false);
+            }
             Ok(matches!(
                 check_known_hosts_path(host, port, key, known_hosts),
                 Ok(true)
@@ -100,11 +107,24 @@ fn verify_host_key(
             ensure_known_hosts(known_hosts)?;
             Ok(match check_known_hosts_path(host, port, key, known_hosts) {
                 Ok(true) => true,
-                // Unknown host key: record it (best-effort) and accept this first connection.
-                Ok(false) => {
-                    let _ = learn_known_hosts_path(host, port, key, known_hosts);
-                    true
-                }
+                // `Ok(false)` means "no matching entry" — which covers BOTH a host we have never
+                // seen AND a host we have pinned under a *different key algorithm* (russh only
+                // reports `Err(KeyChanged)` for a same-algorithm mismatch). Learning on the second
+                // case would let anyone who can answer for the host swap ed25519 for RSA and be
+                // trusted, which is precisely the attack `known_hosts` exists to stop. "Accept new"
+                // means a host we have no key for at all, so ask that question directly.
+                Ok(false) => match host_pin(host, port, known_hosts) {
+                    HostPin::Unseen => {
+                        // Genuine first contact: pin it. A failed write means we would silently
+                        // re-prompt forever, so it is not something to swallow — but there is no
+                        // logging in this crate, so surface it as an infrastructure error.
+                        learn_known_hosts_path(host, port, key, known_hosts).map_err(|e| {
+                            std::io::Error::other(format!("cannot record host key: {e}"))
+                        })?;
+                        true
+                    }
+                    HostPin::Pinned | HostPin::Revoked => false,
+                },
                 // A *changed* key is always rejected (fail-safe).
                 Err(_) => false,
             })
@@ -112,20 +132,191 @@ fn verify_host_key(
     }
 }
 
+/// What `known_hosts` already says about a host — the question "accept new" actually asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostPin {
+    /// No entry: a genuine first contact, safe to learn.
+    Unseen,
+    /// At least one entry exists. Whatever key we were just offered did not match one, so do not
+    /// learn — this is the algorithm-swap case, or an unreadable file we must not gamble on.
+    Pinned,
+    /// An `@revoked` line names this host. Never connect, never learn: the user said no.
+    Revoked,
+}
+
+/// Classify a host against `known_hosts`.
+///
+/// russh's matcher is not sufficient on its own: it compares field 0 of each line for exact string
+/// equality (or the `|1|` HMAC), so it silently fails to match a `@revoked` / `@cert-authority`
+/// marker line, a `host1,host2` list, a `*.example.com` pattern, or a differently-cased hostname.
+/// Every one of those would read as "never seen" and let an impostor's key be learned *and appended
+/// to the user's real `known_hosts`* — strictly worse than the bug this guard exists to close. So we
+/// scan the file ourselves for the forms russh cannot see, and still call russh for the hashed
+/// (`|1|`) entries we deliberately do not reimplement. Either source saying "known" wins.
+fn host_pin(host: &str, port: u16, known_hosts: &Path) -> HostPin {
+    let text = match std::fs::read_to_string(known_hosts) {
+        Ok(t) => t,
+        // Absent: genuine first contact — russh reports the same, and cannot tell us apart from…
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HostPin::Unseen,
+        // …unreadable, which we must not treat as "no pin". Refusing to learn costs a connection;
+        // learning here would trust an impostor because we could not read the user's own file.
+        Err(_) => return HostPin::Pinned,
+    };
+
+    let mut seen = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(first) = fields.next() else { continue };
+        // A line may open with `@revoked` / `@cert-authority`; the patterns are then the next field.
+        let (marker, patterns) = if let Some(m) = first.strip_prefix('@') {
+            match fields.next() {
+                Some(p) => (Some(m), p),
+                None => continue,
+            }
+        } else {
+            (None, first)
+        };
+        if !host_matches_patterns(host, port, patterns) {
+            continue;
+        }
+        // A revocation is the strongest statement in the file and outranks any other line.
+        if marker == Some("revoked") {
+            return HostPin::Revoked;
+        }
+        seen = true;
+    }
+    if seen {
+        return HostPin::Pinned;
+    }
+    // Hashed (`|1|salt|hash`) entries are opaque to the scan above; russh does that matching.
+    match known_host_keys_path(host, port, known_hosts) {
+        Ok(keys) if keys.is_empty() => HostPin::Unseen,
+        Ok(_) => HostPin::Pinned,
+        Err(_) => HostPin::Pinned,
+    }
+}
+
+/// Whether `host`(:`port`) matches a `known_hosts` pattern list (`a.example,*.b.example,!c.b.example`).
+///
+/// Follows `sshd(8)`'s rules: comma-separated patterns, `*`/`?` globs, a leading `!` negation that
+/// vetoes the whole line, and the `[host]:port` form for a non-default port. Hostnames are compared
+/// case-insensitively, as OpenSSH does.
+fn host_matches_patterns(host: &str, port: u16, patterns: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    // OpenSSH writes `[host]:port` for anything other than 22, and plain `host` for 22.
+    let candidate = if port == 22 {
+        host.clone()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let mut matched = false;
+    for pat in patterns.split(',') {
+        let (negated, pat) = match pat.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, pat),
+        };
+        if glob_matches(&pat.to_ascii_lowercase(), &candidate) {
+            if negated {
+                return false; // an explicit exclusion vetoes the line
+            }
+            matched = true;
+        }
+    }
+    matched
+}
+
+/// `*` (any run) and `?` (one char) matching, iterative so a hostile pattern cannot blow the stack.
+fn glob_matches(pat: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Where to resume if the current `*` turns out to have consumed too little.
+    let (mut star, mut resume) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            resume = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            resume += 1;
+            ti = resume;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
+/// Move the algorithms already recorded for this host to the front of the client's host-key
+/// preference list, leaving the rest of russh's order intact behind them.
+fn prefer_pinned_algorithms(
+    config: &mut client::Config,
+    host: &str,
+    port: u16,
+    policy: &HostKeyPolicy,
+) {
+    let known_hosts = match policy {
+        HostKeyPolicy::Strict { known_hosts } | HostKeyPolicy::AcceptNew { known_hosts } => {
+            known_hosts
+        }
+    };
+    let Ok(pinned) = known_host_keys_path(host, port, known_hosts) else {
+        return;
+    };
+    if pinned.is_empty() {
+        return;
+    }
+    let pinned: Vec<_> = pinned.iter().map(|(_, k)| k.algorithm()).collect();
+    let mut order: Vec<_> = pinned.clone();
+    order.extend(
+        config
+            .preferred
+            .key
+            .iter()
+            .filter(|a| !pinned.contains(a))
+            .cloned(),
+    );
+    config.preferred.key = std::borrow::Cow::Owned(order);
+}
+
 /// Create the `known_hosts` file (and parent directory) if absent, so a first connection's
 /// "unknown key" check returns `Ok(false)` rather than an io error. `create(true).append(true)` is
 /// idempotent, so no `exists()` pre-check (which would be a TOCTOU race) is needed.
 fn ensure_known_hosts(path: &Path) -> std::io::Result<()> {
+    let mut dir_opts = std::fs::DirBuilder::new();
+    dir_opts.recursive(true);
+    let mut file_opts = std::fs::OpenOptions::new();
+    file_opts.create(true).append(true);
+    // We may be creating `~/.ssh` and its contents. OpenSSH refuses to use a group- or
+    // world-writable `~/.ssh`, and the umask alone does not guarantee that — so set the modes we
+    // want rather than inheriting whatever the process happens to have. Only applied on creation;
+    // an existing file's permissions are the user's business, not ours.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        dir_opts.mode(0o700);
+        file_opts.mode(0o600);
+    }
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir)?;
+            dir_opts.create(dir)?;
         }
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    Ok(())
+    // Create-only. Opening for append aborted the connection whenever `known_hosts` existed but was
+    // not writable by us — a read-only shared file such as `/etc/ssh/ssh_known_hosts` made every
+    // `accept-new` connection fail with an opaque I/O error, even when the pinned key matched.
+    match file_opts.create_new(true).open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The russh client callback: routes host-key verification through [`verify_host_key`].
@@ -170,11 +361,20 @@ pub async fn ssh_connect(
 
     // Keepalives give a transport-level backstop so a dead/half-open peer is detected on an
     // established session (no explicit per-op timeout in the SFTP adapter yet).
-    let config = Arc::new(client::Config {
+    let mut config = client::Config {
         keepalive_interval: Some(Duration::from_secs(15)),
         keepalive_max: 3,
         ..client::Config::default()
-    });
+    };
+    // Ask for the algorithms this host is already pinned under, first. russh offers a fixed
+    // preference list (Ed25519 ahead of RSA) and never reorders it by `known_hosts`, the way
+    // OpenSSH's `order_hostkeyalgs()` does. Without this, a host pinned only under RSA whose server
+    // also offers Ed25519 would present the Ed25519 key, match nothing, and — now that an unmatched
+    // key for a pinned host is refused rather than learned — fail to connect at all. Preferring the
+    // pinned algorithm makes the server send the key we hold, which also means an impostor cannot
+    // pick an algorithm to dodge the pin.
+    prefer_pinned_algorithms(&mut config, &params.host, params.port, &params.host_key);
+    let config = Arc::new(config);
     let handler = CairnHandler {
         host: params.host.clone(),
         port: params.port,
@@ -397,6 +597,9 @@ mod tests {
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfxRdr5RspdOM74m7aAk/bBnLazyU6TxXgHM/TT5jNA";
     const KEY2: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIwfUWs3P5Y44bfN7pkbRzDS3duf9lQk3qIKPeMtUsJY";
+    /// A *different algorithm* for the same host — the case `check_known_hosts_path` reports as
+    /// "no entry" rather than "changed", which is what made the swap acceptable.
+    const KEY_OTHER_ALGO: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFcILe/T/S9jSYaUWpzZZ92pRq3LI8GIbLZHwT8SGoRMQm6szceUsk1PLIWQrcI0p0CjDtDgNyZSRpInX/CfvhI=";
 
     fn pubkey(s: &str) -> PublicKey {
         PublicKey::from_openssh(s).unwrap()
@@ -433,5 +636,261 @@ mod tests {
         // ...and Strict now also accepts the learned key.
         let strict = HostKeyPolicy::Strict { known_hosts: kh };
         assert!(verify_host_key(&strict, "h", 22, &pubkey(KEY1)).unwrap());
+    }
+
+    /// Regression: a host pinned under one algorithm must not be silently re-pinned under another.
+    /// `check_known_hosts_path` answers "is there a matching entry", and reports a *different
+    /// algorithm* as `Ok(false)` — indistinguishable from a host never seen — so `AcceptNew` learned
+    /// the impostor's key and trusted it. Anyone able to answer for the host could swap ed25519 for
+    /// ECDSA and defeat the pin entirely.
+    #[test]
+    fn accept_new_rejects_a_key_of_a_different_algorithm_for_a_known_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let accept = HostKeyPolicy::AcceptNew {
+            known_hosts: kh.clone(),
+        };
+        assert!(verify_host_key(&accept, "h", 22, &pubkey(KEY1)).unwrap());
+
+        // The impostor presents a different algorithm for the same host.
+        assert!(
+            !verify_host_key(&accept, "h", 22, &pubkey(KEY_OTHER_ALGO)).unwrap(),
+            "an algorithm swap defeated the host-key pin"
+        );
+        // …and it was not written to known_hosts, so a later connection is not poisoned either.
+        assert!(!verify_host_key(
+            &HostKeyPolicy::Strict {
+                known_hosts: kh.clone()
+            },
+            "h",
+            22,
+            &pubkey(KEY_OTHER_ALGO)
+        )
+        .unwrap());
+        // The genuine key still works.
+        assert!(verify_host_key(&accept, "h", 22, &pubkey(KEY1)).unwrap());
+    }
+
+    /// `~/.ssh` and `known_hosts` are created with restrictive modes rather than whatever the
+    /// process umask happens to be: OpenSSH refuses a group/world-writable `~/.ssh`, and a
+    /// world-readable one leaks which hosts the user connects to.
+    #[cfg(unix)]
+    #[test]
+    fn known_hosts_and_its_directory_are_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ssh_dir = dir.path().join(".ssh");
+        let kh = ssh_dir.join("known_hosts");
+        ensure_known_hosts(&kh).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&ssh_dir),
+            0o700,
+            "~/.ssh must not be group/world accessible"
+        );
+        assert_eq!(mode(&kh), 0o600);
+    }
+
+    /// The entry forms russh's matcher cannot see. Each one used to read as "never seen", so the
+    /// impostor's key was accepted **and appended to the user's real `known_hosts`** — worse than
+    /// the bug the guard closes. Found by the security review of the first version of this fix.
+    #[test]
+    fn entry_forms_russh_cannot_match_still_count_as_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("marker", "@cert-authority h ", true),
+            ("comma", "other.example,h ", true),
+            ("wildcard", "*.example.com ", false),
+            ("case", "H ", true),
+        ];
+        for (name, prefix, exact_host) in cases {
+            let kh = dir.path().join(name);
+            let host = if exact_host { "h" } else { "a.example.com" };
+            std::fs::write(&kh, format!("{prefix}{KEY1}\n")).unwrap();
+            let accept = HostKeyPolicy::AcceptNew {
+                known_hosts: kh.clone(),
+            };
+            assert!(
+                !verify_host_key(&accept, host, 22, &pubkey(KEY_OTHER_ALGO)).unwrap(),
+                "{name}: an algorithm swap was accepted"
+            );
+            let after = std::fs::read_to_string(&kh).unwrap();
+            assert_eq!(
+                after.lines().count(),
+                1,
+                "{name}: a trusting line was appended to the user's known_hosts"
+            );
+        }
+    }
+
+    /// A revoked key must never be accepted, under either policy — and `@revoked` outranks a plain
+    /// entry for the same host, since russh's matcher does not look at markers at all.
+    #[test]
+    fn a_revoked_host_key_is_refused_under_both_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        std::fs::write(&kh, format!("@revoked h {KEY1}\n")).unwrap();
+        for policy in [
+            HostKeyPolicy::AcceptNew {
+                known_hosts: kh.clone(),
+            },
+            HostKeyPolicy::Strict {
+                known_hosts: kh.clone(),
+            },
+        ] {
+            assert!(!verify_host_key(&policy, "h", 22, &pubkey(KEY1)).unwrap());
+            assert!(!verify_host_key(&policy, "h", 22, &pubkey(KEY_OTHER_ALGO)).unwrap());
+        }
+        assert_eq!(std::fs::read_to_string(&kh).unwrap().lines().count(), 1);
+    }
+
+    /// An unreadable `known_hosts` must not read as "no pin". Absent means first contact; anything
+    /// else means we cannot see the user's pins and must not gamble on there being none.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_known_hosts_is_not_treated_as_unpinned() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        std::fs::write(&kh, format!("h {KEY1}\n")).unwrap();
+        std::fs::set_permissions(&kh, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        let accept = HostKeyPolicy::AcceptNew {
+            known_hosts: kh.clone(),
+        };
+        assert!(!verify_host_key(&accept, "h", 22, &pubkey(KEY_OTHER_ALGO)).unwrap());
+        // Restore so the tempdir cleans up.
+        std::fs::set_permissions(&kh, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A `known_hosts` that exists but is not writable by us must not abort the connection: a
+    /// read-only shared file (`/etc/ssh/ssh_known_hosts`) made every accept-new connection fail with
+    /// an opaque I/O error, even when the pinned key matched.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_known_hosts_still_verifies() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        std::fs::write(&kh, format!("h {KEY1}\n")).unwrap();
+        std::fs::set_permissions(&kh, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let accept = HostKeyPolicy::AcceptNew {
+            known_hosts: kh.clone(),
+        };
+        assert!(verify_host_key(&accept, "h", 22, &pubkey(KEY1)).unwrap());
+        assert!(!verify_host_key(&accept, "h", 22, &pubkey(KEY_OTHER_ALGO)).unwrap());
+        std::fs::set_permissions(&kh, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Non-default ports use OpenSSH's `[host]:port` form, and the guard must follow it — otherwise
+    /// a host pinned on :2222 reads as unseen.
+    #[test]
+    fn the_guard_follows_the_bracketed_port_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let accept = HostKeyPolicy::AcceptNew {
+            known_hosts: kh.clone(),
+        };
+        assert!(verify_host_key(&accept, "h", 2222, &pubkey(KEY1)).unwrap());
+        assert!(!verify_host_key(&accept, "h", 2222, &pubkey(KEY_OTHER_ALGO)).unwrap());
+        // A different port on the same host is a different pin, and is still learnable.
+        assert!(verify_host_key(&accept, "h", 2200, &pubkey(KEY_OTHER_ALGO)).unwrap());
+    }
+
+    /// The pinned algorithm is offered first, so a server that has since added a stronger host key
+    /// still presents the one we hold. Without this, refusing an unmatched key for a pinned host —
+    /// which is the point of this fix — would break every host pinned under an older algorithm.
+    #[test]
+    fn pinned_algorithms_are_preferred_in_the_negotiation() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let ecdsa = pubkey(KEY_OTHER_ALGO);
+        learn_known_hosts_path("h", 22, &ecdsa, &kh).unwrap();
+
+        let mut config = client::Config::default();
+        let default_order = config.preferred.key.to_vec();
+        assert_ne!(
+            default_order.first(),
+            Some(&ecdsa.algorithm()),
+            "fixture assumes ECDSA is not already russh's first choice"
+        );
+
+        prefer_pinned_algorithms(
+            &mut config,
+            "h",
+            22,
+            &HostKeyPolicy::AcceptNew {
+                known_hosts: kh.clone(),
+            },
+        );
+        assert_eq!(config.preferred.key.first(), Some(&ecdsa.algorithm()));
+        // The rest of russh's order survives behind it, with no duplicates.
+        let after = config.preferred.key.to_vec();
+        assert_eq!(after.len(), default_order.len());
+        for a in &default_order {
+            assert!(
+                after.contains(a),
+                "{a:?} was dropped from the preference list"
+            );
+        }
+    }
+
+    /// An unpinned host leaves russh's own preference order untouched.
+    #[test]
+    fn an_unpinned_host_leaves_the_negotiation_order_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = client::Config::default();
+        let before = config.preferred.key.to_vec();
+        prefer_pinned_algorithms(
+            &mut config,
+            "never-seen",
+            22,
+            &HostKeyPolicy::AcceptNew {
+                known_hosts: dir.path().join("known_hosts"),
+            },
+        );
+        assert_eq!(config.preferred.key.to_vec(), before);
+    }
+
+    #[test]
+    fn glob_and_pattern_matching_follows_sshd_rules() {
+        assert!(host_matches_patterns("a.example.com", 22, "*.example.com"));
+        assert!(host_matches_patterns("A.Example.COM", 22, "*.example.com"));
+        assert!(host_matches_patterns("h", 22, "other,h,third"));
+        assert!(host_matches_patterns("host1", 22, "host?"));
+        // `*` in known_hosts spans dots, unlike a shell glob.
+        assert!(host_matches_patterns(
+            "a.b.example.com",
+            22,
+            "*.example.com"
+        ));
+        // A negation vetoes the whole line even when another pattern on it matched.
+        assert!(!host_matches_patterns(
+            "bad.example.com",
+            22,
+            "*.example.com,!bad.example.com"
+        ));
+        assert!(!host_matches_patterns("other.net", 22, "*.example.com"));
+        // Bracketed form for a non-default port.
+        assert!(host_matches_patterns("h", 2222, "[h]:2222"));
+        assert!(!host_matches_patterns("h", 2222, "h"));
+    }
+
+    /// A host we have never seen is still learned — the swap guard must not break TOFU for a
+    /// genuinely new host that happens to use a different algorithm from some *other* host.
+    #[test]
+    fn accept_new_still_learns_an_unseen_host_of_any_algorithm() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let accept = HostKeyPolicy::AcceptNew {
+            known_hosts: kh.clone(),
+        };
+        assert!(verify_host_key(&accept, "one", 22, &pubkey(KEY1)).unwrap());
+        assert!(verify_host_key(&accept, "two", 22, &pubkey(KEY_OTHER_ALGO)).unwrap());
+        // Both are now pinned under Strict.
+        let strict = HostKeyPolicy::Strict { known_hosts: kh };
+        assert!(verify_host_key(&strict, "one", 22, &pubkey(KEY1)).unwrap());
+        assert!(verify_host_key(&strict, "two", 22, &pubkey(KEY_OTHER_ALGO)).unwrap());
     }
 }

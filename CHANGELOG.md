@@ -183,6 +183,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Security
+- **A host pinned under one key algorithm can no longer be silently re-pinned under another.**
+  Under the default `accept-new` host-key policy, russh reports an *algorithm* mismatch the same way
+  it reports a host never seen — "no matching entry" — so a server that answered for a known host
+  with, say, an ECDSA key where ed25519 was pinned had that key learned and trusted. Anyone able to
+  answer for the host could defeat the pin. Cairn now decides whether a host is already pinned by
+  reading `known_hosts` itself, because russh's matcher compares only field 0 for exact equality and
+  so cannot see `@revoked` / `@cert-authority` marker lines, `host1,host2` lists, `*.example.com`
+  patterns, or a differently-cased hostname — every one of which would otherwise read as "never
+  seen". A host genuinely never seen is still learned, whatever its algorithm.
+
+- **`@revoked` entries are honoured.** A revoked host key is refused under both policies, and
+  outranks a plain entry for the same host. Previously a revocation was invisible: the key was
+  accepted *and a fresh trusting line appended to the user's `known_hosts`*.
+
+- **The algorithms a host is already pinned under are offered first** during key exchange, as
+  OpenSSH's `order_hostkeyalgs()` does. russh's preference list is fixed and ignores `known_hosts`,
+  so without this a host pinned only under RSA whose server has since added Ed25519 would be sent
+  the Ed25519 key, match nothing, and — now that an unmatched key is refused rather than learned —
+  fail to connect. It also means an impostor cannot pick an algorithm to dodge the pin.
+
+- **An unreadable `known_hosts` no longer reads as "no pins".** Only a genuinely absent file counts
+  as first contact; anything else refuses to learn rather than gambling that the user has no pins.
+  Conversely, an existing but read-only `known_hosts` (a shared `/etc/ssh/ssh_known_hosts`) no
+  longer fails every `accept-new` connection outright — the file is created if missing, not opened
+  for writing every time.
+
+- **`~/.ssh` and `known_hosts` are created `0700`/`0600`** instead of inheriting the process umask.
+  OpenSSH refuses a group- or world-writable `~/.ssh`, and a readable one discloses which hosts the
+  user connects to. Only applies when Cairn creates them; existing permissions are left alone.
+
+
 
 - **Patched five advisories in the dependency tree** (`cargo update`, all within semver — no manifest
   changes): `wasmtime` 46.0.1 → 46.0.3, fixing four sandbox-relevant advisories that hit
