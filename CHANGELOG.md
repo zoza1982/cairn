@@ -212,6 +212,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`~/.ssh` and `known_hosts` are created `0700`/`0600`** instead of inheriting the process umask.
   OpenSSH refuses a group- or world-writable `~/.ssh`, and a readable one discloses which hosts the
   user connects to. Only applies when Cairn creates them; existing permissions are left alone.
+- **A plugin can no longer raise its own sandbox limits.** `[limits]` in a plugin manifest is
+  written by the plugin author — the untrusted party — and nothing clamped it, so a manifest could
+  disable the very bounds meant to contain it: `fuel = u64::MAX` neutralises the instruction guard
+  and `max_call_ticks = u64::MAX` the wall-clock one, leaving a guest free to spin or allocate.
+  Manifest values are now clamped to a host ceiling (`Limits::HOST_CEILING`, 4–6× the defaults), as
+  is `[network].max_response_bytes`, which bounds what a guest can make the host buffer. A plugin
+  may still declare *lower* limits than the ceiling.
 
 
 

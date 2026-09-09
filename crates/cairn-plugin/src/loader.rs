@@ -241,7 +241,10 @@ fn validate_plugin_version_arg(version: &str) -> Result<(), PluginError> {
 ///
 /// Returns `(max_response_bytes, connect_timeout_secs, request_timeout_secs, allow_http)`.
 pub(crate) fn http_limits_from_manifest_network(net: &NetworkConfig) -> (usize, u64, u64, bool) {
-    let max_response_bytes = net.max_response_bytes.min(usize::MAX as u64) as usize;
+    let max_response_bytes = net
+        .max_response_bytes
+        .min(MAX_RESPONSE_BYTES_CEILING)
+        .min(usize::MAX as u64) as usize;
     let connect_timeout = net.http_connect_timeout_secs.min(EPOCH_CEILING_SECS);
     let request_timeout = net.http_request_timeout_secs.min(EPOCH_CEILING_SECS);
     (
@@ -315,7 +318,12 @@ fn grants_from_config(
     }
 }
 
-/// Convert the manifest's `[limits]` section to the runtime [`Limits`] type.
+/// Convert the manifest's `[limits]` section to the runtime [`Limits`] type, clamped to what the
+/// host allows.
+///
+/// The manifest is authored by the plugin, so an unclamped value lets untrusted code choose the
+/// bounds meant to contain it — `fuel = u64::MAX` and `max_call_ticks = u64::MAX` together disable
+/// both the instruction and the wall-clock guard. See [`Limits::HOST_CEILING`].
 fn limits_from_manifest(cfg: &LimitsConfig) -> Limits {
     Limits {
         // Clamp `as usize` — on 32-bit platforms `usize` is 4 GiB max, but the
@@ -325,12 +333,74 @@ fn limits_from_manifest(cfg: &LimitsConfig) -> Limits {
         max_stream_bytes: cfg.max_stream_bytes,
         max_call_ticks: cfg.max_call_ticks,
     }
+    .clamped_to_host()
 }
+
+/// The largest HTTP response body a plugin may ask to buffer, whatever its manifest says. Same
+/// reasoning as [`Limits::HOST_CEILING`]: the cap exists to bound the guest, so the guest cannot set
+/// it. 64 MiB is 8× the default.
+const MAX_RESPONSE_BYTES_CEILING: u64 = 64 * 1024 * 1024;
 
 // ── Tests ──────────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: the `[limits]` section is written by the plugin author — the untrusted party —
+    /// and nothing clamped it, so a manifest could simply disable the sandbox's own bounds
+    /// (`fuel = u64::MAX` stops the instruction guard, `max_call_ticks = u64::MAX` the wall-clock
+    /// one) and then spin or allocate freely.
+    #[test]
+    fn a_manifest_cannot_raise_its_own_sandbox_limits() {
+        let greedy = limits_from_manifest(&LimitsConfig {
+            max_memory_bytes: u64::MAX,
+            fuel: u64::MAX,
+            max_call_ticks: u64::MAX,
+            max_stream_bytes: u64::MAX,
+        });
+        let ceiling = Limits::HOST_CEILING;
+        assert_eq!(greedy.fuel, ceiling.fuel);
+        assert_eq!(greedy.max_call_ticks, ceiling.max_call_ticks);
+        assert_eq!(greedy.max_stream_bytes, ceiling.max_stream_bytes);
+        assert_eq!(greedy.max_memory_bytes, ceiling.max_memory_bytes);
+    }
+
+    /// A plugin may still ask for *less* than the ceiling — declaring modest needs is useful, and
+    /// clamping must not silently promote a cautious plugin to the maximum.
+    #[test]
+    fn a_manifest_may_still_lower_its_own_limits() {
+        let modest = limits_from_manifest(&LimitsConfig {
+            max_memory_bytes: 1024 * 1024,
+            fuel: 1_000,
+            max_call_ticks: 2,
+            max_stream_bytes: 4_096,
+        });
+        assert_eq!(modest.max_memory_bytes, 1024 * 1024);
+        assert_eq!(modest.fuel, 1_000);
+        assert_eq!(modest.max_call_ticks, 2);
+        assert_eq!(modest.max_stream_bytes, 4_096);
+    }
+
+    /// `max_call_ticks: 0` would trap every call the instant it started; the clamp floors it at 1.
+    #[test]
+    fn zero_call_ticks_is_floored_rather_than_trapping_everything() {
+        let zero = limits_from_manifest(&LimitsConfig {
+            max_call_ticks: 0,
+            ..LimitsConfig::default()
+        });
+        assert_eq!(zero.max_call_ticks, 1);
+    }
+
+    /// The HTTP response cap bounds what a guest can make the *host* buffer, so the guest cannot
+    /// choose it either.
+    #[test]
+    fn a_manifest_cannot_raise_the_http_response_cap() {
+        let (max_response_bytes, ..) = http_limits_from_manifest_network(&NetworkConfig {
+            max_response_bytes: u64::MAX,
+            ..NetworkConfig::default()
+        });
+        assert_eq!(max_response_bytes as u64, MAX_RESPONSE_BYTES_CEILING);
+    }
     use super::*;
     use crate::manifest::CapabilitiesConfig;
     use cairn_config::{Config, PluginGrantsRecord};
